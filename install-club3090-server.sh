@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="2026-05-05.v4.20"
+SCRIPT_VERSION="2026-05-05.v4.21"
 
 # club-3090 headless server/control installer
 # Install:
