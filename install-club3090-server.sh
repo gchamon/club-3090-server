@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="2026-05-05.v4.17"
+SCRIPT_VERSION="2026-05-05.v4.18.1"
 
 # club-3090 headless server/control installer
 # Install:
@@ -2109,13 +2109,26 @@ def detect_legacy_dual_mode():
         return open_dual[0]
     return None
 
+def legacy_pair_should_autostart(file_mode=None, legacy_mode=None):
+    if file_mode is None:
+        file_mode = read_active_mode_file()
+    if legacy_mode is None:
+        legacy_mode = detect_legacy_dual_mode()
+    return bool(
+        file_mode in DUAL_GPU_MODES
+        or legacy_mode in DUAL_GPU_MODES
+        or DEFAULT_MODE in DUAL_GPU_MODES
+    )
+
 def sync_pair_rows_with_legacy(rows):
     rows = normalize_instances(rows)
     if detect_gpu_count_runtime() != 2:
         return rows, False
+    file_mode = read_active_mode_file()
     legacy_mode = detect_legacy_dual_mode()
     if legacy_mode not in DUAL_GPU_MODES:
         return rows, False
+    should_enable = legacy_pair_should_autostart(file_mode=file_mode, legacy_mode=legacy_mode)
     changed = False
     found = False
     for row in rows:
@@ -2125,15 +2138,17 @@ def sync_pair_rows_with_legacy(rows):
         if row.get("mode") != legacy_mode:
             row["mode"] = legacy_mode
             changed = True
+        if not row.get("enabled") and should_enable and not any(inst.get("enabled") for inst in rows if inst.get("id") != "PAIR0_1"):
+            row["enabled"] = True
+            changed = True
         break
     if not found:
-        file_mode = read_active_mode_file()
         rows.append({
             "id": "PAIR0_1",
             "kind": "dual",
             "gpu_indices": [0, 1],
             "mode": legacy_mode,
-            "enabled": bool(file_mode in DUAL_GPU_MODES or legacy_mode in DUAL_GPU_MODES),
+            "enabled": should_enable,
             "port": PAIR_INSTANCE_PORT_BASE,
         })
         changed = True
@@ -2155,7 +2170,7 @@ def ensure_hidden_legacy_pair_row(rows):
         "kind": "dual",
         "gpu_indices": [0, 1],
         "mode": target_mode,
-        "enabled": bool(file_mode in DUAL_GPU_MODES or legacy_mode in DUAL_GPU_MODES),
+        "enabled": legacy_pair_should_autostart(file_mode=file_mode, legacy_mode=legacy_mode),
         "port": PAIR_INSTANCE_PORT_BASE,
     })
     return normalize_instances(rows), True
@@ -2351,6 +2366,7 @@ def instance_uses_legacy_dual_runtime(instance):
         and instance.get("kind") == "dual"
         and instance.get("id") == "PAIR0_1"
         and detect_gpu_count_runtime() == 2
+        and not gpu_pairing_enabled(gpu_count=2)
     )
 
 def visible_instances(rows=None):
@@ -2409,6 +2425,16 @@ def boot_enabled_instances():
         hidden_pair = get_instance("PAIR0_1")
         if hidden_pair and hidden_pair.get("enabled"):
             rows.append(hidden_pair)
+        elif not any(inst.get("enabled") for inst in rows):
+            file_mode = read_active_mode_file()
+            if file_mode in DUAL_GPU_MODES:
+                try:
+                    result = start_instance("PAIR0_1", wait=True)
+                    outputs.append(f"legacy dual started from active mode {file_mode}: {(result.get('output') or '')[-800:]}")
+                    log_control("BOOT instances: " + " || ".join(outputs))
+                    return outputs
+                except Exception as e:
+                    outputs.append(f"legacy dual fallback failed: {e}")
     started = 0
     for inst in rows:
         if not inst.get("enabled"):
@@ -3914,6 +3940,9 @@ createPairGroup=async function(first=null,second=null){if(!pairingEnabled()){ale
 function activateTab(name,firstRender=false){activeTabName=normalizeTabName(name);document.querySelectorAll('.tabpane').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));const pane=$(activeTabName);if(pane)pane.classList.add('active');const btn=activeTabButton(activeTabName);if(btn)btn.classList.add('active');applyLogVisibility();if(!firstRender){clearLog();connectLogs()}queueUiStateSave();setTimeout(()=>{if(!searchState.active&&$('autoscroll').checked)$('log').scrollTop=$('log').scrollHeight},0)}
 tab=function(e,n){activateTab(n,false)}
 refreshStatus=async function(){try{ensureV414Layout();const r=await fetch('/admin/status',{cache:'no-store'});const j=await r.json();const metrics=j.metrics||{},power=j.power||{};lastStatus=j;hydrateUiState(j.ui_config||{});if($('showGlobalLogs'))$('showGlobalLogs').checked=!!showGlobalLogs;$('summary').textContent=`${j.active_mode} | ${j.container||'no container'} | ${power.profile||'balanced'} | GPUs ${j.gpu_count??0}`;$('mode').textContent=`${j.active_mode} / ${j.active_port}`;$('container').textContent=j.container||'none';$('services').textContent=`vLLM=${j.vllm_service}, control=${j.control_service}, console=${j.console_service}`;$('req').textContent=`total=${metrics.total_requests??0}, active=${metrics.active_requests??0}, fail=${metrics.failed_requests??0}, queue=${metrics.queued_requests??0}`;$('last').textContent=`${metrics.last_status||'-'} latency=${metrics.last_latency_s??'-'}s ttft=${metrics.last_ttft_s??'-'}s tps=${metrics.last_tokens_per_second??'-'}`;$('uptime').textContent=fmtUptime(j.uptime_seconds);renderGpuCards(j.gpus);$('powerbox').textContent=`profile=${power.profile||'-'}, GPU=${power.gpu||'-'}, CPU=${power.cpu||'-'}, fans=${power.fans||'-'}, container=${power.container||'-'}, idle=${power.idle_for_seconds??0}s`;$('optToggle').textContent=power.optimizations_enabled?'Disable Power Optimizations':'Enable Power Optimizations';$('fanToggle').textContent=power.fan_manual_override?'Reset Fans to Default':'Set Fans to Max';renderMetrics(j);renderPresetCatalog(j.presets);renderUsers(j.users||[]);renderGroups(j.groups||[]);renderAudit(j.server_config||{});renderInstances(j.instances||[]);renderPresetScopeTabs();updateScopedCards();renderLogSourcePanel();applyLogVisibility();activateTab(activeTabName,true);syncInstancesBusyState()}catch(e){setMsg('Status error: '+e)}}
+let statusPollTimer=null;
+function bootAdminUi(){ensureV414Layout();resetUserForm(true);resetGroupForm(true);if(!selectedScope)selectedScope=singleScopeItems()[0]?.id||pairScopeItems()[0]?.id||'GLOBAL';setScope(selectedScope,false);clearLog();connectLogs();refreshStatus();if(statusPollTimer)clearInterval(statusPollTimer);statusPollTimer=setInterval(refreshStatus,1000)}
+bootAdminUi()
 </script></body></html>
 """
 class CommonMixin:
