@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="2026-05-05.v4.18.2"
+SCRIPT_VERSION="2026-05-05.v4.19"
 
 # club-3090 headless server/control installer
 # Install:
@@ -2182,9 +2182,14 @@ def read_instances_config():
         rows = normalize_instances(data)
     except Exception:
         rows = normalize_instances([])
-    rows, added_hidden = ensure_hidden_legacy_pair_row(rows)
-    rows, changed = sync_pair_rows_with_legacy(rows)
-    if added_hidden or changed or not os.path.exists(INSTANCES_CONFIG_FILE):
+    count = detect_gpu_count_runtime()
+    if count == 2 and not gpu_pairing_enabled(gpu_count=count):
+        filtered = [row for row in rows if row.get("kind") != "dual"]
+        changed = len(filtered) != len(rows)
+        rows = filtered
+    else:
+        changed = False
+    if changed or not os.path.exists(INSTANCES_CONFIG_FILE):
         write_instances_config(rows)
     return rows
 
@@ -2418,23 +2423,74 @@ def primary_instance():
         return sorted(enabled, key=lambda d: (len(d.get("gpu_indices") or [d["gpu_index"]]), d["gpu_index"], d["id"]))[0]
     return None
 
+def legacy_global_target_mode():
+    legacy_mode = detect_legacy_dual_mode()
+    if legacy_mode in DUAL_GPU_MODES:
+        return legacy_mode
+    for candidate in (
+        read_active_mode_file(),
+        read_last_good_mode_file(),
+        DEFAULT_MODE,
+        "vllm/dual",
+    ):
+        if candidate in DUAL_GPU_MODES:
+            return candidate
+    return "vllm/dual"
+
+def legacy_global_disable_mode():
+    for row in read_instances_config():
+        if row.get("kind") != "single":
+            continue
+        mode = str(row.get("mode") or "")
+        if row.get("enabled") and mode in SINGLE_GPU_MODES:
+            return mode
+    return "vllm/default"
+
+def legacy_global_enabled():
+    file_mode = read_active_mode_file()
+    legacy_mode = detect_legacy_dual_mode()
+    return legacy_pair_should_autostart(file_mode=file_mode, legacy_mode=legacy_mode)
+
+def is_legacy_global_instance_id(instance_id):
+    return (
+        detect_gpu_count_runtime() == 2
+        and not gpu_pairing_enabled(gpu_count=2)
+        and str(instance_id or "").strip().upper() == "GLOBAL"
+    )
+
+def start_legacy_global_instance(wait=True):
+    mode = legacy_global_target_mode()
+    output = run_switch(mode)
+    if wait and not wait_for_port(int(MODES.get(mode, PAIR_INSTANCE_PORT_BASE)), timeout=900):
+        raise RuntimeError(f"Timed out waiting for legacy global dual runtime on port {MODES.get(mode, PAIR_INSTANCE_PORT_BASE)}")
+    return {"instance": legacy_global_instance_snapshot(), "output": output[-4000:]}
+
+def stop_legacy_global_instance():
+    p = subprocess.run(["bash", "scripts/switch.sh", "--down"], cwd=CLUB3090_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=300)
+    out = (p.stdout or "")[-4000:]
+    log_control(f"INSTANCE legacy global stop rc={p.returncode}: {out}")
+    return p.returncode, out
+
+def set_legacy_global_enabled(enabled):
+    if bool(enabled):
+        write_active_mode(legacy_global_target_mode())
+    else:
+        write_active_mode(legacy_global_disable_mode())
+    return legacy_global_instance_snapshot()
+
 def boot_enabled_instances():
     outputs = []
     rows = visible_instances(read_instances_config())
     if detect_gpu_count_runtime() == 2 and not gpu_pairing_enabled(gpu_count=2):
-        hidden_pair = get_instance("PAIR0_1")
-        if hidden_pair and hidden_pair.get("enabled"):
-            rows.append(hidden_pair)
-        elif not any(inst.get("enabled") for inst in rows):
-            file_mode = read_active_mode_file()
-            if file_mode in DUAL_GPU_MODES:
-                try:
-                    result = start_instance("PAIR0_1", wait=True)
-                    outputs.append(f"legacy dual started from active mode {file_mode}: {(result.get('output') or '')[-800:]}")
-                    log_control("BOOT instances: " + " || ".join(outputs))
-                    return outputs
-                except Exception as e:
-                    outputs.append(f"legacy dual fallback failed: {e}")
+        file_mode = read_active_mode_file()
+        if file_mode in DUAL_GPU_MODES:
+            try:
+                result = start_legacy_global_instance(wait=True)
+                outputs.append(f"legacy dual started from active mode {file_mode}: {(result.get('output') or '')[-800:]}")
+                log_control("BOOT instances: " + " || ".join(outputs))
+                return outputs
+            except Exception as e:
+                outputs.append(f"legacy dual fallback failed: {e}")
     started = 0
     for inst in rows:
         if not inst.get("enabled"):
@@ -2466,6 +2522,9 @@ def running_dual_mode():
 
 def running_dual_instances():
     rows = []
+    legacy = legacy_global_instance_snapshot()
+    if legacy and legacy.get("running"):
+        rows.append(dict(legacy))
     for inst in visible_instances(read_instances_config()):
         if inst.get("kind") != "dual" or not instance_running(inst):
             continue
@@ -2475,10 +2534,22 @@ def running_dual_instances():
     rows.sort(key=lambda d: (d.get("gpu_indices") or [], d["id"]))
     return rows
 
+def running_dual_instance_snapshots():
+    snaps = []
+    for inst in running_dual_instances():
+        snaps.append(dict(inst) if "proxy_prefix" in inst else instance_snapshot(inst))
+    return snaps
+
 def stop_overlapping_instances(indices, exclude_ids=None):
     wanted = {int(idx) for idx in (indices or [])}
     excluded = {str(x or "").strip().upper() for x in (exclude_ids or [])}
     results = []
+    legacy = legacy_global_instance_snapshot()
+    if legacy and legacy.get("running") and legacy.get("id") not in excluded:
+        legacy_indices = {int(idx) for idx in (legacy.get("gpu_indices") or [])}
+        if wanted.intersection(legacy_indices):
+            rc, out = stop_legacy_global_instance()
+            results.append({"id": legacy["id"], "rc": rc, "output": out[-1200:]})
     for inst in read_instances_config():
         if inst["id"] in excluded:
             continue
@@ -2563,8 +2634,29 @@ def instances_snapshot():
 def legacy_global_instance_snapshot():
     if detect_gpu_count_runtime() != 2 or gpu_pairing_enabled(gpu_count=2):
         return None
-    inst = get_instance("PAIR0_1")
-    return instance_snapshot(inst) if inst else None
+    mode = legacy_global_target_mode()
+    running_mode = detect_legacy_dual_mode()
+    runtime_mode = running_mode if running_mode in DUAL_GPU_MODES else mode
+    runtime_port = int(MODES.get(runtime_mode, PAIR_INSTANCE_PORT_BASE))
+    running = bool(running_mode in DUAL_GPU_MODES and port_open(runtime_port, timeout=0.08))
+    return {
+        "id": "GLOBAL",
+        "kind": "dual",
+        "gpu_index": 0,
+        "gpu_indices": [0, 1],
+        "mode": runtime_mode,
+        "enabled": legacy_global_enabled(),
+        "port": runtime_port,
+        "container": legacy_runtime_container_name() if running else "",
+        "running": running,
+        "ready_url": f"http://127.0.0.1:{runtime_port}/v1/models",
+        "proxy_prefix": "/v1",
+        "display_name": "Global Dual",
+        "assignment_scope": "global",
+        "assignment_mode": runtime_mode,
+        "assignment_text": f"Global dual runtime uses GPUs 0, 1 with preset {runtime_mode}",
+        "overrides_dual_mode": False,
+    }
 
 def ready_url_for_mode(mode):
     return f"http://localhost:{MODES[mode]}/v1/models"
@@ -3857,8 +3949,8 @@ const searchState={active:false,query:'',matches:[],index:-1,prevAutoscroll:true
     holder.innerHTML=cats.map(cat=>j.gpus.map(g=>`<div class="chart"><canvas id="cGpu${g.index}${cat.suffix}"></canvas></div>`).join('')).join('');
     cats.forEach(cat=>j.gpus.forEach(g=>{const color=cat.color;const label=`GPU${g.index} ${cat.label}`;drawGpuSeries(`cGpu${g.index}${cat.suffix}`,s,g.index,cat.key,label,color)}));
   }
-}async function post(path,obj){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj||{})});const t=await r.text();if(!r.ok)throw new Error(t);appendLog('\n----- result -----\n'+t+'\n------------------');await refreshStatus();return t}let selectedInstance='GPU0';let logEs=null;let selectedUserName='';function setInstanceMsg(t){if(instanceMsg)instanceMsg.textContent=t||''}function getInstanceList(){return (lastStatus&&lastStatus.instances)||[]}function setUsersMsg(t){if(usersMsg)usersMsg.textContent=t||''}function limitText(v,suffix=''){return v===null||v===undefined||v===''?'unlimited':`${v}${suffix}`}
-let currentLogSource='docker';function setAuditMsg(t){if(auditMsg)auditMsg.textContent=t||''}function mirrorAuthToggles(v){if(allowAnonymousProxy)allowAnonymousProxy.checked=!!v;if(auditAllowAnonymousProxy)auditAllowAnonymousProxy.checked=!!v}function openUsersTab(){const btn=usersTabBtn;if(btn)tab({target:btn},'users')}function currentLogHeading(){if(currentLogSource==='audit')return activeTabName==='audit'?'Audit Log - Full View':'Audit Log';return activeTabName==='logs'?'Live Docker Log - Full View':'Live Docker Log'}applyLogVisibility=function(){const isLogs=activeTabName==='logs';const isAudit=activeTabName==='audit';document.body.classList.toggle('logs-tab',isLogs);document.body.classList.toggle('audit-tab',isAudit);const card=document.querySelector('.logs.panel');if(card)card.classList.toggle('log-card-hidden',!isLogs&&!isAudit&&!showGlobalLogs);logTitle.textContent=currentLogHeading();if(logInstanceLabel)logInstanceLabel.textContent=currentLogLabel()};
+}async function post(path,obj){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj||{})});const t=await r.text();if(!r.ok)throw new Error(t);appendLog('\n----- result -----\n'+t+'\n------------------');await refreshStatus();return t}let selectedInstance='GPU0';let logEs=null;let selectedUserName='';function setInstanceMsg(t){const el=$('instanceMsg');if(el)el.textContent=t||''}function getInstanceList(){return (lastStatus&&lastStatus.instances)||[]}function setUsersMsg(t){const el=$('usersMsg');if(el)el.textContent=t||''}function limitText(v,suffix=''){return v===null||v===undefined||v===''?'unlimited':`${v}${suffix}`}
+let currentLogSource='docker';function setAuditMsg(t){const el=$('auditMsg');if(el)el.textContent=t||''}function mirrorAuthToggles(v){const usersToggle=$('allowAnonymousProxy'),auditToggle=$('auditAllowAnonymousProxy');if(usersToggle)usersToggle.checked=!!v;if(auditToggle)auditToggle.checked=!!v}function openUsersTab(){const btn=$('usersTabBtn');if(btn)tab({target:btn},'users')}function currentLogHeading(){if(currentLogSource==='audit')return activeTabName==='audit'?'Audit Log - Full View':'Audit Log';return activeTabName==='logs'?'Live Docker Log - Full View':'Live Docker Log'}applyLogVisibility=function(){const isLogs=activeTabName==='logs';const isAudit=activeTabName==='audit';document.body.classList.toggle('logs-tab',isLogs);document.body.classList.toggle('audit-tab',isAudit);const card=document.querySelector('.logs.panel');if(card)card.classList.toggle('log-card-hidden',!isLogs&&!isAudit&&!showGlobalLogs);const title=$('logTitle');if(title)title.textContent=currentLogHeading();const label=$('logInstanceLabel');if(label)label.textContent=currentLogLabel()};
 let selectedGroupName='';
 function setGroupsMsg(t){const el=$('groupsMsg');if(el)el.textContent=t||''}
 function renderUsers(users){ensureUsersUi();const grid=$('usersGrid');if(!grid)return;users=users||[];if(selectedUserName&&!users.some(u=>u.name===selectedUserName))selectedUserName='';grid.innerHTML=users.map(u=>{const usage=u.usage||{},limits=u.limits||{},effective=u.effective_limits||{},targets=(u.effective_allowed_targets||u.allowed_targets||[]);return `<div class="api-card"><div class="api-card-head"><h3>${u.name}<br><span class="label">${u.enabled?'enabled':'disabled'} | access ${targets.join(', ')||'*'}</span></h3><span class="preset-actions"><button class="iconbtn" title="Edit" onclick="editUser('${u.name}')">Edit</button><button class="iconbtn" title="Reset key" onclick="resetUserKey('${u.name}')">Reset key</button><button class="iconbtn" title="Delete" onclick="deleteUserByName('${u.name}')">Delete</button></span></div><p>Groups: ${(u.groups||[]).join(', ')||'none'}</p><p>Requests: total ${usage.total_requests??0}, 5h ${usage.requests_last_5h??0}, week ${usage.requests_last_week??0}</p><p>Tokens ${usage.total_tokens??0}, tool calls ${usage.total_tool_calls??0}, thinking ${Number(usage.total_thinking_seconds||0).toFixed(1)}s</p><p class="label">Direct limits | total ${limitText(limits.total_requests)} | 5h ${limitText(limits.requests_per_5h)} | week ${limitText(limits.requests_per_week)} | tokens ${limitText(limits.total_tokens)} | tools ${limitText(limits.total_tool_calls)} | thinking ${limitText(limits.total_thinking_seconds,'s')}</p><p class="label">Effective limits | total ${limitText(effective.total_requests)} | 5h ${limitText(effective.requests_per_5h)} | week ${limitText(effective.requests_per_week)} | tokens ${limitText(effective.total_tokens)} | tools ${limitText(effective.total_tool_calls)} | thinking ${limitText(effective.total_thinking_seconds,'s')}</p></div>`}).join('')||'<div class="value">No API users configured yet.</div>'}
@@ -3871,11 +3963,11 @@ function currentScope(){return selectedScope||selectedInstance||'GPU0'}
 function scopeIsGlobal(){return currentScope()==='GLOBAL'}
 function scopeInstance(){if(scopeIsGlobal())return null;const items=getInstanceList();return items.find(x=>x.id===currentScope())||items.find(x=>x.id===selectedInstance)||items[0]||null}
 function ensureV413Layout(){const tabs=document.querySelector('.tabs');const auditBtn=tabs&&tabs.querySelector('.tab[onclick*=\"audit\"]');const logsBtn=tabs&&tabs.querySelector('.tab[onclick*=\"logs\"]');if(auditBtn)auditBtn.remove();if(tabs&&logsBtn)tabs.appendChild(logsBtn);const system=$('system');const presets=$('presets');const logs=$('logs');const audit=$('audit');if(system&&audit){const accessPolicy=findPanelByHeading('audit','Access Policy');if(accessPolicy&&!accessPolicy.dataset.v413Moved){accessPolicy.dataset.v413Moved='1';system.insertBefore(accessPolicy,system.children[1]||null)}const overview=findPanelByHeading('audit','Audit Overview');if(overview&&logs&&!overview.dataset.v413Moved){overview.dataset.v413Moved='1';logs.insertBefore(overview,logs.firstChild||null)}const globalControls=findPanelByHeading('audit','Global Controls');if(globalControls)globalControls.remove();const auditStream=findPanelByHeading('audit','Audit Stream');if(auditStream)auditStream.remove();if(audit.childElementCount===0||!audit.querySelector('.panel'))audit.remove()}const accessCard=findPanelByHeading('system','Access Policy');if(accessCard){const openUsers=[...accessCard.querySelectorAll('button')].find(btn=>(btn.textContent||'').includes('Open Users Management'));if(openUsers)openUsers.remove()}const singleCard=[...document.querySelectorAll('#presets .panel')].find(panel=>{const h=panel.querySelector('.panel-head h2,h2');return h&&((h.textContent||'').includes('Per-Instance Docker Presets')||(h.textContent||'').includes('Single GPU Docker Presets'))});if(singleCard){singleCard.id='singlePresetCard';const title=singleCard.querySelector('h2');if(title)title.textContent='Single GPU Docker Presets'}const customTitle=[...document.querySelectorAll('#presets .panel .panel-head h2')].find(h=>(h.textContent||'').trim()==='Custom Preset Templates');if(customTitle)customTitle.textContent='Custom Configuration Endpoints';if(presets&&!$('presetScopePanel')){const panel=document.createElement('div');panel.className='panel';panel.id='presetScopePanel';panel.innerHTML=`<h2>GPU Scope</h2><div class="subtabs" id="presetScopeTabs"></div><div class="value smallgap" id="presetScopeSummary">-</div>`;presets.insertBefore(panel,presets.firstChild||null)}if(presets&&!$('dualPresetCard')){const panel=document.createElement('div');panel.className='panel';panel.id='dualPresetCard';panel.innerHTML=`<h2>Dual GPU Docker Presets</h2><div class="preset-help">Apply a dual-GPU runtime across the first two detected cards. Use Global scope for these presets.</div><div class="actions"><button class="btn blue" onclick="switchDualMode('vllm/dual')">dual</button><button class="btn blue" onclick="switchDualMode('vllm/dual-turbo')">dual-turbo</button><button class="btn blue" onclick="switchDualMode('vllm/dual-dflash')">dual-dflash</button><button class="btn blue" onclick="switchDualMode('vllm/dual-dflash-noviz')">dual-dflash-noviz</button></div>`;const afterSingle=$('singlePresetCard');if(afterSingle&&afterSingle.parentNode===presets)presets.insertBefore(panel,afterSingle.nextSibling);else presets.insertBefore(panel,presets.children[1]||null)}if(logs&&!$('logsSourcePanel')){const panel=document.createElement('div');panel.className='panel';panel.id='logsSourcePanel';panel.innerHTML=`<h2>Log Sources</h2><div class="subtabs"><button class="subtab" id="logSourceDocker" onclick="setCurrentLogSource('docker')">Docker Logs</button><button class="subtab" id="logSourceAudit" onclick="setCurrentLogSource('audit')">Audit Logs</button></div><div class="value smallgap" id="logsSourceSummary">-</div>`;logs.appendChild(panel)}const profiles=findPanelByHeading('system','Profiles');if(profiles&&!$('profileScopeNote')){const note=document.createElement('div');note.className='preset-help';note.id='profileScopeNote';profiles.insertBefore(note,profiles.querySelector('.actions')||profiles.firstChild)}const power=findPanelByHeading('system','Power + Cooling');if(power&&!$('powerScopeNote')){const note=document.createElement('div');note.className='preset-help';note.id='powerScopeNote';power.insertBefore(note,power.querySelector('.actions')||power.firstChild)}}
-function renderLogSourcePanel(){if($('logSourceDocker'))$('logSourceDocker').classList.toggle('active',currentLogSource==='docker');if($('logSourceAudit'))$('logSourceAudit').classList.toggle('active',currentLogSource==='audit');if($('logsSourceSummary'))$('logsSourceSummary').innerHTML=currentLogSource==='audit'?'Audit logs selected. The shared Live and Search panels now follow <code>/opt/club3090-control/audit.log</code>.':'Docker logs selected. The shared Live and Search panels follow the currently selected GPU instance.'}
+function renderLogSourcePanel(){if($('logSourceDocker'))$('logSourceDocker').classList.toggle('active',currentLogSource==='docker');if($('logSourceAudit'))$('logSourceAudit').classList.toggle('active',currentLogSource==='audit');if($('logsSourceSummary'))$('logsSourceSummary').innerHTML=currentLogSource==='audit'?'Audit logs selected. The shared Live and Search panels now follow <code>/opt/club3090-control/audit.log</code>.':(scopeIsGlobal()&&legacyGlobalDualScope()?'Docker logs selected. The shared Live and Search panels follow the active global dual runtime.':'Docker logs selected. The shared Live and Search panels follow the currently selected GPU instance.')}
 currentLogHeading=function(){return currentLogSource==='audit'?(activeTabName==='logs'?'Audit Logs - Full View':'Audit Logs'):(activeTabName==='logs'?'Docker Logs - Full View':'Docker Logs')}
 applyLogVisibility=function(){const isLogs=activeTabName==='logs';document.body.classList.toggle('logs-tab',isLogs);document.body.classList.remove('audit-tab');const card=document.querySelector('.logs.panel');if(card)card.classList.toggle('log-card-hidden',!isLogs&&!showGlobalLogs);if($('logTitle'))$('logTitle').textContent=currentLogHeading();if($('logInstanceLabel'))$('logInstanceLabel').textContent=currentLogLabel();renderLogSourcePanel()}
 switchMode=async function(m){if(scopeIsGlobal()){alert('Select a GPU tab to apply a single-GPU preset. Dual-GPU presets live in the card below.');return}const cur=scopeInstance();if(!cur){alert('No GPU instance selected');return}const dualMode=(lastStatus&&lastStatus.running_dual_mode)||'';const dualGpus=(lastStatus&&lastStatus.running_dual_gpu_indices)||[];const warning=dualMode&&dualGpus.includes(Number(cur.gpu_index))?`\n\nWarning: GPU ${cur.gpu_index} is currently occupied by the dual preset ${dualMode}. Continuing will stop that dual preset and replace it with ${m} on ${cur.id}.`:'';if(confirm(`Assign ${m} to ${cur.id} and start it?${warning}`))try{await post('/admin/switch',{instance_id:cur.id,mode:m})}catch(e){alert(e)}}
-async function switchDualMode(m){if(!scopeIsGlobal())setScope('GLOBAL',false);const dualGpus=((lastStatus&&lastStatus.running_dual_gpu_indices)||[0,1]).join(', ');if(!confirm(`Apply dual-GPU preset ${m}? This takes over GPUs ${dualGpus||'0, 1'} and will stop overlapping single-GPU runtimes if needed.`))return;try{await post('/admin/switch',{mode:m});setScope('GLOBAL',false)}catch(e){alert(e)}}
+async function switchDualMode(m){if(scopeIsGlobal()&&legacyGlobalDualScope()){const legacy=legacyGlobalPair();const gpus=((legacy&&legacy.gpu_indices)||[0,1]).join(', ');if(!confirm(`Apply dual-GPU preset ${m} to the shared global runtime on GPUs ${gpus}? This will stop overlapping single-GPU runtimes if needed.`))return;try{await post('/admin/switch',{mode:m});setScope('GLOBAL',false)}catch(e){alert(e)}return}const cur=currentScopeInstance(false);if(!cur||cur.kind!=='dual'){alert('Choose a dual pair tab, or use Global on an exactly-two-GPU server, before applying a dual preset.');return}if(!confirm(`Apply dual-GPU preset ${m} to ${cur.id} on GPUs ${(cur.gpu_indices||[]).join(', ')}? This will stop overlapping runtimes that already use those GPUs.`))return;try{await post('/admin/switch',{instance_id:cur.id,mode:m})}catch(e){alert(e)}}
 function parseQuotaNumber(id){const el=$(id);if(!el)return null;const v=el.value.trim();return v===''?null:Number(v)}
 collectUserForm=function(){function val(id){return ($(id)&&$(id).value||'').trim()}return {name:val('userName'),allowed_targets:val('userTargets').split(',').map(x=>x.trim()).filter(Boolean),groups:val('userGroups').split(',').map(x=>x.trim()).filter(Boolean),enabled:$('userEnabled').value==='true',generate_api_key:!selectedUserName,limits:{score_per_5h:parseQuotaNumber('userScore5h'),score_per_week:parseQuotaNumber('userScoreWeek'),max_tokens_per_message:parseQuotaNumber('userMaxTokensMsg'),max_tool_calls_per_message:parseQuotaNumber('userMaxToolsMsg'),input_token_weight:parseQuotaNumber('userInputTokenWeight'),output_token_weight:parseQuotaNumber('userOutputTokenWeight'),tool_call_weight:parseQuotaNumber('userToolCallWeight'),thinking_second_weight:parseQuotaNumber('userThinkingSecondWeight')}}}
 resetGroupForm=function(){ensureGroupUi();selectedGroupName='';$('groupName').disabled=false;$('groupName').value='';$('groupDescription').value='';$('groupTargets').value='*';$('groupScore5h').value='';$('groupScoreWeek').value='';$('groupMaxTokensMsg').value='';$('groupMaxToolsMsg').value='';$('groupInputTokenWeight').value='';$('groupOutputTokenWeight').value='';$('groupToolCallWeight').value='';$('groupThinkingSecondWeight').value='';$('groupEnabled').value='true';setGroupsMsg('')}
@@ -3887,16 +3979,16 @@ function legacyGlobalDualScope(){return gpuCount()===2&&!pairingEnabled()}
 function singleScopeItems(){return scopeItems().filter(x=>x.kind!=='dual')}
 function pairScopeItems(){return pairingEnabled()?scopeItems().filter(x=>x.kind==='dual'):[]}
 function canonicalPairId(a,b){const nums=[Number(a),Number(b)].filter(x=>Number.isInteger(x)&&x>=0).sort((x,y)=>x-y);if(nums.length!==2||nums[0]===nums[1])return'';return `PAIR${nums[0]}_${nums[1]}`}
-function exactTwoPairTarget(){return scopeItems().find(x=>x.id==='PAIR0_1')||null}
-function currentScopeInstance(strict=false){if(currentScope()==='GLOBAL'){if(pairingEnabled())return strict?null:exactTwoPairTarget();return strict?null:legacyGlobalPair()}return scopeItems().find(x=>x.id===currentScope())||singleScopeItems()[0]||pairScopeItems()[0]||legacyGlobalPair()||null}
-function dockerLogTarget(){return currentLogSource==='audit'?null:(currentScopeInstance(false)||scopeItems()[0]||legacyGlobalPair()||null)}
-function scopeLabel(inst){if(!inst)return legacyGlobalDualScope()?'Global Dual':'Global';return inst.kind==='dual'?`Pair ${(inst.gpu_indices||[]).join(' + ')}`:inst.id}
+function exactTwoPairTarget(){return gpuCount()===2?scopeItems().find(x=>x.id==='PAIR0_1')||null:null}
+function currentScopeInstance(strict=false){if(currentScope()==='GLOBAL'){if(legacyGlobalDualScope())return strict?null:legacyGlobalPair();if(pairingEnabled()&&gpuCount()===2)return strict?null:exactTwoPairTarget();return null}return scopeItems().find(x=>x.id===currentScope())||singleScopeItems()[0]||pairScopeItems()[0]||null}
+function dockerLogTarget(){if(currentLogSource==='audit')return null;if(scopeIsGlobal()&&legacyGlobalDualScope())return null;return currentScopeInstance(false)||scopeItems()[0]||null}
+function scopeLabel(inst){if(!inst)return legacyGlobalDualScope()?'Global Dual':'Global';if(inst.id==='GLOBAL')return 'Global Dual';return inst.kind==='dual'?`Pair ${(inst.gpu_indices||[]).join(' + ')}`:inst.id}
 function scopeAllowsSinglePresets(){const inst=currentScopeInstance(true);return !!inst&&inst.kind!=='dual'}
 function scopeAllowsDualPresets(){if(scopeIsGlobal()&&gpuCount()===2)return true;const inst=currentScopeInstance(false);return !!inst&&inst.kind==='dual'}
 const UI_STATE_KEY='club3090-ui-state';let uiStateHydrated=false;let uiStateSaveTimer=null;let instanceBusyState={active:false,message:''};
 function readCachedUiState(){try{return JSON.parse(localStorage.getItem(UI_STATE_KEY)||'{}')||{}}catch(e){return {}}}
 function writeCachedUiState(data){try{localStorage.setItem(UI_STATE_KEY,JSON.stringify(data||{}))}catch(e){}}
-function normalizeTabName(name){return ['overview','system','metrics','users','audit','logs'].includes(name)?name:'overview'}
+function normalizeTabName(name){return ['overview','system','presets','metrics','users','audit','logs'].includes(name)?name:'overview'}
 function currentUiState(){return{active_tab:normalizeTabName(activeTabName),selected_scope:selectedScope||'GLOBAL',current_log_source:currentLogSource==='audit'?'audit':'docker',show_global_logs:!!showGlobalLogs}}
 function queueUiStateSave(extra={}){const state={...currentUiState(),...extra};writeCachedUiState(state);if(uiStateSaveTimer)clearTimeout(uiStateSaveTimer);uiStateSaveTimer=setTimeout(async()=>{try{await fetch('/admin/ui-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(state)})}catch(e){}},120)}
 function activeTabButton(name){return [...document.querySelectorAll('.tab')].find(btn=>(btn.getAttribute('onclick')||'').includes(`'${name}'`)||btn.id===`${name}TabBtn`)||null}
@@ -3930,11 +4022,11 @@ setScope=function(scope,reconnect=true){const ids=new Set(scopeItems().map(x=>x.
 renderInstances=function(instances){ensureV414Layout();const tabs=$('instanceTabs');const summary=$('instanceSummary');const btn=$('instanceEnableBtn');const panel=findPanelByHeading('system','Instances');if(!tabs||!summary||!panel)return;instances=scopeItems();if(!selectedScope||!(selectedScope==='GLOBAL'||instances.some(x=>x.id===selectedScope)))selectedScope=singleScopeItems()[0]?.id||pairScopeItems()[0]?.id||'GLOBAL';tabs.innerHTML=singleScopeItems().map(x=>`<button class="subtab ${x.id===currentScope()?'active':''}" onclick="setScope('${x.id}')">${x.id}${x.running?' | on':' | off'}</button>`).join('')+pairScopeItems().map(x=>`<button class="subtab ${x.id===currentScope()?'active':''}" onclick="setScope('${x.id}')">Pair ${(x.gpu_indices||[]).join('+')}${x.running?' | on':' | off'}</button>`).join('')+`<button class="subtab ${scopeIsGlobal()?'active':''}" onclick="setScope('GLOBAL')">Global</button>`;ensurePairManager();const legacy=legacyGlobalPair();const target=scopeIsGlobal()&&legacyGlobalDualScope()&&legacy?legacy:currentScopeInstance(false);const actionButtons=[...panel.querySelectorAll('.actions .btn')].filter(x=>x.id!=='instanceEnableBtn'&&!x.closest('#pairManagerBar')&&!x.closest('#pairingToggleRow'));if(scopeIsGlobal()&&legacyGlobalDualScope()&&legacy){summary.innerHTML=`Global scope manages the shared two-GPU runtime on GPUs ${(legacy.gpu_indices||[0,1]).join(', ')} | mode ${legacy.mode||((lastStatus&&lastStatus.running_dual_mode)||'vllm/dual')} | port ${legacy.port||((lastStatus&&lastStatus.active_port)||'-')} | proxy <code>${legacy.proxy_prefix||'/v1'}/</code> | ${legacy.enabled?'autostart enabled':'autostart disabled'}`;if(btn){btn.disabled=!!instanceBusyState.active;btn.textContent=legacy.enabled?'Disable Boot Autostart':'Enable Boot Autostart'}actionButtons.forEach(x=>x.disabled=!!instanceBusyState.active)}else if(scopeIsGlobal()&&target&&gpuCount()===2){summary.innerHTML=`Global scope manages the shared dual pair <code>${target.id}</code> on GPUs ${(target.gpu_indices||[]).join(', ')} | mode ${target.mode} | port ${target.port} | proxy <code>${target.proxy_prefix}/</code> | ${target.enabled?'autostart enabled':'autostart disabled'}`;if(btn){btn.disabled=!!instanceBusyState.active;btn.textContent=target.enabled?'Disable Boot Autostart':'Enable Boot Autostart'}actionButtons.forEach(x=>x.disabled=!!instanceBusyState.active)}else if(scopeIsGlobal()){summary.innerHTML='Global scope selected. Host-wide controls still apply below. Enable GPU pairing or choose a pair tab to manage arbitrary dual-GPU presets.';if(btn){btn.disabled=true;btn.textContent='Select a GPU or Pair Scope'}actionButtons.forEach(x=>x.disabled=true)}else if(target){summary.innerHTML=`${scopeLabel(target)} | ${target.assignment_text} | port ${target.port} | ${target.running?'running':'stopped'} | proxy <code>${target.proxy_prefix}/</code> | ${target.enabled?'autostart enabled':'autostart disabled'}`;if(btn){btn.disabled=!!instanceBusyState.active;btn.textContent=target.enabled?'Disable Boot Autostart':'Enable Boot Autostart'}actionButtons.forEach(x=>x.disabled=!!instanceBusyState.active)}else{summary.textContent='No GPU instances configured';if(btn){btn.disabled=true;btn.textContent='Boot autostart unavailable'}actionButtons.forEach(x=>x.disabled=true)}syncInstancesBusyState();if($('logInstanceLabel'))$('logInstanceLabel').textContent=currentLogLabel()}
 renderPresetScopeTabs=function(){const tabs=$('presetScopeTabs');const summary=$('presetScopeSummary');if(!tabs||!summary)return;tabs.innerHTML=singleScopeItems().map(x=>`<button class="subtab ${x.id===currentScope()?'active':''}" onclick="setScope('${x.id}')">${x.id}</button>`).join('')+pairScopeItems().map(x=>`<button class="subtab ${x.id===currentScope()?'active':''}" onclick="setScope('${x.id}')">Pair ${(x.gpu_indices||[]).join('+')}</button>`).join('')+`<button class="subtab ${scopeIsGlobal()?'active':''}" onclick="setScope('GLOBAL')">Global</button>`;const target=currentScopeInstance(false),legacy=legacyGlobalPair();if(scopeIsGlobal()&&legacyGlobalDualScope()&&legacy)summary.innerHTML=`Global scope targets the shared two-GPU runtime on GPUs ${(legacy.gpu_indices||[0,1]).join(', ')}. Dual preset buttons below will update that shared container.`;else if(scopeIsGlobal()&&target&&gpuCount()===2)summary.innerHTML=`Global scope targets the shared dual pair <code>${target.id}</code>. Dual preset buttons below will apply to GPUs ${(target.gpu_indices||[]).join(', ')}.`;else if(scopeIsGlobal())summary.innerHTML='Global scope selected. Single-GPU presets are disabled here. Enable GPU pairing or choose a dual pair tab to apply dual presets.';else if(currentScopeInstance(true))summary.innerHTML=`Targeting ${scopeLabel(currentScopeInstance(true))} | ${currentScopeInstance(true).assignment_text} | proxy <code>${currentScopeInstance(true).proxy_prefix}/</code>`;else summary.textContent='No preset scope available';document.querySelectorAll('#singlePresetCard .actions .btn').forEach(btn=>btn.disabled=!scopeAllowsSinglePresets());document.querySelectorAll('#dualPresetCard .actions .btn').forEach(btn=>btn.disabled=!scopeAllowsDualPresets())}
 updateScopedCards=function(){const target=currentScopeInstance(false);if($('profileScopeNote'))$('profileScopeNote').innerHTML=scopeIsGlobal()?'Global scope: these profile buttons apply host-wide defaults for the full server.':`${scopeLabel(target)} scope: ${target?target.assignment_text:'select a scope to continue'}`;if($('powerScopeNote'))$('powerScopeNote').innerHTML=scopeIsGlobal()?'Global scope: power and cooling controls below affect the whole host.':`${scopeLabel(target)} scope: using the selected runtime context while keeping host-level power controls in sync.`;renderLogSourcePanel()}
-currentLogLabel=function(){if(currentLogSource==='audit')return 'source: audit';const cur=dockerLogTarget();return 'instance: '+((cur&&cur.id)||'primary')}
+currentLogLabel=function(){if(currentLogSource==='audit')return 'source: audit';if(scopeIsGlobal()&&legacyGlobalDualScope())return 'instance: Global dual';const cur=dockerLogTarget();return 'instance: '+((cur&&cur.id)||'primary')}
 connectLogs=function(){if(logEs){try{logEs.close()}catch(e){}}let url='/admin/audit-stream';if(currentLogSource!=='audit'){const cur=dockerLogTarget();const qs=cur?`?instance=${encodeURIComponent(cur.id)}`:'';url='/admin/logs'+qs}logEs=new EventSource(url);logEs.onopen=()=>appendLog(currentLogSource==='audit'?'--- audit stream connected ---':'--- log connected ---');logEs.onmessage=e=>appendLog(e.data.replaceAll('\\u0000','\n'));logEs.onerror=()=>appendLog(currentLogSource==='audit'?'--- audit stream disconnected; retrying ---':'--- log disconnected; retrying ---')}
-powerAction=async function(a){const legacy=legacyGlobalPair();const cur=scopeIsGlobal()&&legacyGlobalDualScope()&&legacy?legacy:currentScopeInstance(false);const needsTarget=['stop_container','start_instance','restart_instance','toggle_enabled'].includes(a);if(needsTarget&&!cur){alert('Select a GPU or Pair scope first.');return}if(a==='stop_container'&&!confirm(`Stop ${scopeLabel(cur)} now?`))return;try{await post('/admin/power',{action:a,instance_id:cur?cur.id:null,enabled:cur?!cur.enabled:undefined})}catch(e){alert(e)}}
+powerAction=async function(a){const legacy=legacyGlobalPair();const cur=scopeIsGlobal()&&legacyGlobalDualScope()&&legacy?legacy:currentScopeInstance(false);const legacyGlobal=scopeIsGlobal()&&legacyGlobalDualScope();const needsTarget=['stop_container','start_instance','restart_instance','toggle_enabled'].includes(a);if(needsTarget&&!cur&&!legacyGlobal){alert('Select a GPU or Pair scope first.');return}if(a==='stop_container'&&!confirm(`Stop ${scopeLabel(cur)} now?`))return;const instanceId=legacyGlobal?'GLOBAL':(cur?cur.id:null);try{await post('/admin/power',{action:a,instance_id:instanceId,enabled:cur?!cur.enabled:undefined})}catch(e){alert(e)}}
 instanceAction=async function(a){await powerAction(a)}
-toggleInstanceEnabled=async function(){const legacy=legacyGlobalPair();const cur=scopeIsGlobal()&&legacyGlobalDualScope()&&legacy?legacy:currentScopeInstance(false);if(!cur){alert('Select a GPU or Pair scope first.');return}try{await post('/admin/power',{action:'toggle_enabled',instance_id:cur.id,enabled:!cur.enabled})}catch(e){alert(e)}}
+toggleInstanceEnabled=async function(){const legacy=legacyGlobalPair();const cur=scopeIsGlobal()&&legacyGlobalDualScope()&&legacy?legacy:currentScopeInstance(false);const legacyGlobal=scopeIsGlobal()&&legacyGlobalDualScope();if(!cur&&!legacyGlobal){alert('Select a GPU or Pair scope first.');return}try{await post('/admin/power',{action:'toggle_enabled',instance_id:legacyGlobal?'GLOBAL':cur.id,enabled:!cur.enabled})}catch(e){alert(e)}}
 createPairGroup=async function(first=null,second=null){if(!pairingEnabled()){alert('Enable GPU Pairing first.');return}if(gpuCount()<2){alert('At least two GPUs are required to create a dual pair.');return}let a=first,b=second;if(a===null||b===null){a=prompt(`First GPU index (0-${Math.max(gpuCount()-1,0)}):`,'0');if(a===null)return;b=prompt(`Second GPU index (0-${Math.max(gpuCount()-1,0)}):`,'1');if(b===null)return}const id=canonicalPairId(a,b);if(!id){alert('Select two distinct GPU indices.');return}try{const r=await fetch('/admin/instances',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'save_pair',gpu_indices:[Number(a),Number(b)],mode:'vllm/dual',enabled:false})});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'pair save failed');setInstanceMsg(`Saved pair group ${id}`);await refreshStatus();setScope(id,false)}catch(e){alert('Pair group failed: '+e)}}
 function activateTab(name,firstRender=false){activeTabName=normalizeTabName(name);document.querySelectorAll('.tabpane').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));const pane=$(activeTabName);if(pane)pane.classList.add('active');const btn=activeTabButton(activeTabName);if(btn)btn.classList.add('active');applyLogVisibility();if(!firstRender){clearLog();connectLogs()}queueUiStateSave();setTimeout(()=>{if(!searchState.active&&$('autoscroll').checked)$('log').scrollTop=$('log').scrollHeight},0)}
 tab=function(e,n){activateTab(n,false)}
@@ -4004,7 +4096,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                 m = dict(metrics)
             ap = active_port()
             cfg = read_server_config()
-            dual_rows = [instance_snapshot(inst) for inst in running_dual_instances()]
+            dual_rows = running_dual_instance_snapshots()
             legacy_dual_mode = detect_legacy_dual_mode()
             self.send_json({"active_mode":active_mode(),"active_port":ap,"container":current_container(),"club3090_dir":CLUB3090_DIR,"uptime_seconds":int(time.time()-startup_time),"vllm_service":service_status("club3090-vllm.service"),"control_service":service_status("club3090-control.service"),"caddy_service":service_status("club3090-caddy.service") if cfg.get("https_enabled", False) else "disabled","console_service":service_status("club3090-console-log.service"),"metrics":m,"recent_requests":list(recent_requests),"gpus":gpu_stats(),"power":power_status(),"system":system_stats(),"series":list(series_points),"ui_config":read_ui_config(),"presets":preset_catalog(),"gpu_count":detect_gpu_count_runtime(),"instances":instances_snapshot(),"legacy_global_instance":legacy_global_instance_snapshot(),"single_gpu_modes":list(SINGLE_GPU_MODES),"dual_gpu_modes":list(DUAL_GPU_MODES),"running_dual_mode":(dual_rows[0]["mode"] if dual_rows else legacy_dual_mode),"running_dual_gpu_indices":(dual_rows[0]["gpu_indices"] if dual_rows else ([0, 1] if legacy_dual_mode else [])),"running_dual_instances":dual_rows,"users":list_users_public(),"groups":list_groups_public(),"server_config":cfg,"local_api":{"enabled":cfg.get("local_api_enabled", False),"port":cfg.get("local_api_port", LOCAL_API_PORT)},"admin_port":ADMIN_PORT,"proxy_port":PROXY_PORT})
             return
@@ -4030,7 +4122,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             self.send_json({"ok": True, "presets": preset_catalog()})
             return
         if path == "/admin/instances":
-            self.send_json({"ok": True, "instances": instances_snapshot(), "single_gpu_modes": list(SINGLE_GPU_MODES), "dual_gpu_modes": list(DUAL_GPU_MODES), "running_dual_instances": [instance_snapshot(inst) for inst in running_dual_instances()]})
+            self.send_json({"ok": True, "instances": instances_snapshot(), "single_gpu_modes": list(SINGLE_GPU_MODES), "dual_gpu_modes": list(DUAL_GPU_MODES), "running_dual_instances": running_dual_instance_snapshots()})
             return
         if path == "/admin/users":
             self.send_json({"ok": True, "users": list_users_public(), "groups": list_groups_public(), "server_config": read_server_config()})
@@ -4075,13 +4167,13 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                     updated = update_instance(instance_id, mode=mode, enabled=True)
                     result = start_instance(updated["id"], wait=True)
                     log_audit("admin_switch_mode", instance=updated["id"], mode=mode, stopped_instances=[row["id"] for row in stopped])
-                    self.send_json({"ok": True, "instance": instance_snapshot(updated), "mode": mode, "output": result.get("output", ""), "stopped_instances": stopped, "instances": instances_snapshot(), "running_dual_instances": [instance_snapshot(inst) for inst in running_dual_instances()]})
+                    self.send_json({"ok": True, "instance": instance_snapshot(updated), "mode": mode, "output": result.get("output", ""), "stopped_instances": stopped, "instances": instances_snapshot(), "running_dual_instances": running_dual_instance_snapshots()})
                 else:
                     if detect_gpu_count_runtime() == 2 and not gpu_pairing_enabled():
                         rc, stop_msg = stop_vllm_container("legacy_dual_switch")
                         result = run_switch(mode)
                         log_audit("admin_switch_mode_legacy_global", instance="legacy", mode=mode, stop_rc=rc)
-                        self.send_json({"ok": True, "instance": None, "mode": mode, "output": (stop_msg + "\n" + result)[-12000:], "stopped_instances": ([{"id": "legacy", "rc": rc, "output": stop_msg[-1200:]}] if stop_msg else []), "instances": instances_snapshot(), "running_dual_instances": [instance_snapshot(inst) for inst in running_dual_instances()]})
+                        self.send_json({"ok": True, "instance": None, "mode": mode, "output": (stop_msg + "\n" + result)[-12000:], "stopped_instances": ([{"id": "legacy", "rc": rc, "output": stop_msg[-1200:]}] if stop_msg else []), "instances": instances_snapshot(), "running_dual_instances": running_dual_instance_snapshots()})
                         return
                     pairs = [inst for inst in read_instances_config() if inst.get("kind") == "dual"]
                     if len(pairs) != 1:
@@ -4091,7 +4183,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                     updated = update_instance(target["id"], mode=mode, enabled=True)
                     result = start_instance(updated["id"], wait=True)
                     log_audit("admin_switch_mode_pair_default", instance=updated["id"], mode=mode, stopped_instances=[row["id"] for row in stopped])
-                    self.send_json({"ok": True, "instance": instance_snapshot(updated), "mode": mode, "output": result.get("output", ""), "stopped_instances": stopped, "instances": instances_snapshot(), "running_dual_instances": [instance_snapshot(inst) for inst in running_dual_instances()]})
+                    self.send_json({"ok": True, "instance": instance_snapshot(updated), "mode": mode, "output": result.get("output", ""), "stopped_instances": stopped, "instances": instances_snapshot(), "running_dual_instances": running_dual_instance_snapshots()})
             except Exception as e:
                 self.send_json({"ok": False, "error": str(e)}, 500)
             return
@@ -4105,19 +4197,28 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                 elif action == "idle_clocks":
                     out = {"cpu": apply_cpu_idle_power(), "gpu": apply_gpu_idle_power()}
                 elif action == "stop_container":
-                    rc, msg = stop_vllm_container("manual_admin", instance_id=instance_id)
+                    if is_legacy_global_instance_id(instance_id):
+                        rc, msg = stop_legacy_global_instance()
+                    else:
+                        rc, msg = stop_vllm_container("manual_admin", instance_id=instance_id)
                     out = {"container_stop_rc": rc, "container_stop_output": msg, "cpu": apply_cpu_idle_power(), "gpu": apply_gpu_idle_power()}
                 elif action == "start_instance":
-                    out = start_instance(instance_id, wait=True)
+                    out = start_legacy_global_instance(wait=True) if is_legacy_global_instance_id(instance_id) else start_instance(instance_id, wait=True)
                 elif action == "restart_instance":
-                    stop_vllm_container("manual_restart", instance_id=instance_id)
-                    out = start_instance(instance_id, wait=True)
+                    if is_legacy_global_instance_id(instance_id):
+                        stop_legacy_global_instance()
+                        out = start_legacy_global_instance(wait=True)
+                    else:
+                        stop_vllm_container("manual_restart", instance_id=instance_id)
+                        out = start_instance(instance_id, wait=True)
                 elif action == "toggle_enabled":
-                    if not instance_id and detect_gpu_count_runtime() == 2 and not gpu_pairing_enabled(gpu_count=2):
-                        instance_id = "PAIR0_1"
                     enabled = bool(data.get("enabled"))
-                    inst = update_instance(instance_id, enabled=enabled)
-                    out = {"instance": instance_snapshot(inst)}
+                    if is_legacy_global_instance_id(instance_id) or (not instance_id and detect_gpu_count_runtime() == 2 and not gpu_pairing_enabled(gpu_count=2)):
+                        instance_id = "GLOBAL"
+                        out = {"instance": set_legacy_global_enabled(enabled)}
+                    else:
+                        inst = update_instance(instance_id, enabled=enabled)
+                        out = {"instance": instance_snapshot(inst)}
                 elif action == "disable_optimizations":
                     out = set_power_optimizations(False)
                 elif action == "enable_optimizations":
@@ -4184,12 +4285,12 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                 if action == "save_pair":
                     instance = save_pair_instance(data.get("gpu_indices") or [], mode=data.get("mode"), enabled=data.get("enabled"))
                     log_audit("admin_pair_saved", instance=instance["id"], gpu_indices=instance.get("gpu_indices") or [], mode=instance.get("mode"))
-                    self.send_json({"ok": True, "instance": instance_snapshot(instance), "instances": instances_snapshot(), "running_dual_instances": [instance_snapshot(inst) for inst in running_dual_instances()]})
+                    self.send_json({"ok": True, "instance": instance_snapshot(instance), "instances": instances_snapshot(), "running_dual_instances": running_dual_instance_snapshots()})
                     return
                 if action == "delete_pair":
                     instances = delete_pair_instance(data.get("instance_id"))
                     log_audit("admin_pair_deleted", instance=str(data.get("instance_id") or "").strip().upper())
-                    self.send_json({"ok": True, "instances": instances, "running_dual_instances": [instance_snapshot(inst) for inst in running_dual_instances()]})
+                    self.send_json({"ok": True, "instances": instances, "running_dual_instances": running_dual_instance_snapshots()})
                     return
                 raise ValueError("Invalid instances action")
             except Exception as e:
@@ -4270,7 +4371,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                 params = {}
         requested = str(params.get("instance") or "").strip().upper()
         while True:
-            instance = get_instance(requested) if requested else primary_instance()
+            instance = None if is_legacy_global_instance_id(requested) else (get_instance(requested) if requested else primary_instance())
             container = instance_runtime_container_name(instance) if instance else current_container()
             if not container:
                 try:
