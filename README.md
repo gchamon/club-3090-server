@@ -1,4 +1,4 @@
-# Club-3090 Server Control Installer
+# Club-3090 Server
 
 Single-file installer for a [club-3090](https://github.com/noonghunna/club-3090) inference host, providing a full-featured browser admin control panel, distro-aware install/update logic, systemd service setup, a reverse proxy that automatically routes requests to the correct containers via a single endpoint with optional configurable vLLM setting presets, live log management, GPU power and fan speed controls, multi-instance GPU orchestration, and API access control for multiple users.
 
@@ -74,13 +74,13 @@ Legacy upstream dual-GPU presets that remain available as fallback/default modes
 Default install:
 
 ```bash
-curl -fsSL https://tinyurl.com/club-3090-server | bash
+curl -fsSL https://tinyurl.com/club-3090-webserver | bash
 ```
 
 Custom upstream checkout path and default mode:
 
 ```bash
-curl -fsSL https://tinyurl.com/club-3090-server | \
+curl -fsSL https://tinyurl.com/club-3090-webserver | \
   CLUB3090_DIR=/opt/ai/club-3090 DEFAULT_MODE=vllm/dual-dflash bash
 ```
 
@@ -118,7 +118,7 @@ bash install-club3090-server.sh --online use-https
 Updates the control layer without intentionally stopping an already-running backend:
 
 ```bash
-curl -fsSL https://tinyurl.com/club-3090-server | bash -s -- --update
+curl -fsSL https://tinyurl.com/club-3090-webserver | bash -s -- --update
 ```
 
 Or from a local copy:
@@ -403,5 +403,5 @@ These services are gated by the kernel command-line flag `club3090.server=1`, so
 
 ## Repository Layout
 
-- [`install-club3090-server-v4.11.sh`](./install-club3090-server-v4.11.sh): full installer/updater
+- [`install-club3090-server.sh`](./install-club3090-server.sh): full installer/updater
 - [`README.md`](./README.md): feature and usage reference

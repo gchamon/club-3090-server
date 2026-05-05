@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="2026-05-03.v4.11.0"
+SCRIPT_VERSION="2026-05-05.v4.12.0"
 
 # club-3090 headless server/control installer
 # Install:
@@ -581,33 +581,33 @@ detect_primary_local_ip() {
   printf '%s\n' "${ip_value}"
 }
 
+close_runtime_exposure() {
+  local runtime_port
+  for runtime_port in $(seq 8010 8020) $(seq 8200 8299); do
+    if command -v ufw >/dev/null 2>&1; then
+      "${SUDO[@]}" ufw delete allow "${runtime_port}"/tcp >/dev/null 2>&1 || true
+    elif command -v firewall-cmd >/dev/null 2>&1 && "${SUDO[@]}" firewall-cmd --state >/dev/null 2>&1; then
+      "${SUDO[@]}" firewall-cmd --permanent --remove-port="${runtime_port}"/tcp >/dev/null 2>&1 || true
+    elif command -v iptables >/dev/null 2>&1; then
+      while "${SUDO[@]}" iptables -C INPUT -p tcp --dport "${runtime_port}" -j ACCEPT >/dev/null 2>&1; do
+        "${SUDO[@]}" iptables -D INPUT -p tcp --dport "${runtime_port}" -j ACCEPT >/dev/null 2>&1 || break
+      done
+    fi
+    if command -v upnpc >/dev/null 2>&1; then
+      upnpc -d "${runtime_port}" tcp >/dev/null 2>&1 || true
+    fi
+  done
+  if command -v firewall-cmd >/dev/null 2>&1 && "${SUDO[@]}" firewall-cmd --state >/dev/null 2>&1; then
+    "${SUDO[@]}" firewall-cmd --reload >/dev/null 2>&1 || true
+  fi
+}
+
 configure_online_exposure() {
   local local_ip
   local_ip="$(detect_primary_local_ip)"
   local opened_fw=0
   local opened_upnp=0
   local firewall_manager="none"
-
-  close_runtime_exposure() {
-    local runtime_port
-    for runtime_port in $(seq 8010 8020) $(seq 8200 8299); do
-      if command -v ufw >/dev/null 2>&1; then
-        "${SUDO[@]}" ufw delete allow "${runtime_port}"/tcp >/dev/null 2>&1 || true
-      elif command -v firewall-cmd >/dev/null 2>&1 && "${SUDO[@]}" firewall-cmd --state >/dev/null 2>&1; then
-        "${SUDO[@]}" firewall-cmd --permanent --remove-port="${runtime_port}"/tcp >/dev/null 2>&1 || true
-      elif command -v iptables >/dev/null 2>&1; then
-        while "${SUDO[@]}" iptables -C INPUT -p tcp --dport "${runtime_port}" -j ACCEPT >/dev/null 2>&1; do
-          "${SUDO[@]}" iptables -D INPUT -p tcp --dport "${runtime_port}" -j ACCEPT >/dev/null 2>&1 || break
-        done
-      fi
-      if command -v upnpc >/dev/null 2>&1; then
-        upnpc -d "${runtime_port}" tcp >/dev/null 2>&1 || true
-      fi
-    done
-    if command -v firewall-cmd >/dev/null 2>&1 && "${SUDO[@]}" firewall-cmd --state >/dev/null 2>&1; then
-      "${SUDO[@]}" firewall-cmd --reload >/dev/null 2>&1 || true
-    fi
-  }
 
   echo "Configuring online exposure for ports ${ADMIN_PORT} (admin) and ${PROXY_PORT} (proxy)..."
   echo "Runtime backend ports like 8010-8020 and 8200+ will remain private."
@@ -3288,7 +3288,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                 m = dict(metrics)
             ap = active_port()
             cfg = read_server_config()
-            self.send_json({"active_mode":active_mode(),"active_port":ap,"container":current_container(),"club3090_dir":CLUB3090_DIR,"uptime_seconds":int(time.time()-startup_time),"vllm_service":service_status("club3090-vllm.service"),"control_service":service_status("club3090-control.service"),"console_service":service_status("club3090-console-log.service"),"metrics":m,"recent_requests":list(recent_requests),"gpus":gpu_stats(),"power":power_status(),"system":system_stats(),"series":list(series_points),"ui_config":read_ui_config(),"presets":preset_catalog(),"gpu_count":detect_gpu_count_runtime(),"instances":instances_snapshot(),"single_gpu_modes":list(SINGLE_GPU_MODES),"users":list_users_public(),"groups":list_groups_public(),"server_config":cfg,"local_api":{"enabled":cfg.get("local_api_enabled", False),"port":cfg.get("local_api_port", LOCAL_API_PORT)},"admin_port":ADMIN_PORT,"proxy_port":PROXY_PORT})
+            self.send_json({"active_mode":active_mode(),"active_port":ap,"container":current_container(),"club3090_dir":CLUB3090_DIR,"uptime_seconds":int(time.time()-startup_time),"vllm_service":service_status("club3090-vllm.service"),"control_service":service_status("club3090-control.service"),"caddy_service":service_status("club3090-caddy.service") if cfg.get("https_enabled", False) else "disabled","console_service":service_status("club3090-console-log.service"),"metrics":m,"recent_requests":list(recent_requests),"gpus":gpu_stats(),"power":power_status(),"system":system_stats(),"series":list(series_points),"ui_config":read_ui_config(),"presets":preset_catalog(),"gpu_count":detect_gpu_count_runtime(),"instances":instances_snapshot(),"single_gpu_modes":list(SINGLE_GPU_MODES),"users":list_users_public(),"groups":list_groups_public(),"server_config":cfg,"local_api":{"enabled":cfg.get("local_api_enabled", False),"port":cfg.get("local_api_port", LOCAL_API_PORT)},"admin_port":ADMIN_PORT,"proxy_port":PROXY_PORT})
             return
         if path == "/admin/logs":
             self.close_connection = False
