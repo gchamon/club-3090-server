@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="2026-05-05.v4.12.0"
+SCRIPT_VERSION="2026-05-05.v4.13.0"
 
 # club-3090 headless server/control installer
 # Install:
@@ -310,6 +310,14 @@ if [[ "${OS_FAMILY}" == "unsupported" ]]; then
   echo "ERROR: Unsupported distribution: ${PRETTY_NAME:-${ID:-unknown}}. Supported families: Arch and Ubuntu/Debian." >&2
   exit 1
 fi
+
+log_step() {
+  printf '\n[%s] %s\n' "$(date +%H:%M:%S)" "$*"
+}
+
+log_done() {
+  printf '[%s] done: %s\n' "$(date +%H:%M:%S)" "$*"
+}
 
 APT_UPDATED=0
 install_packages() {
@@ -646,6 +654,8 @@ configure_online_exposure() {
   write_network_state "${firewall_manager}" "$([[ "${opened_upnp}" -eq 1 ]] && echo true || echo false)" "${ONLINE_TLS_EFFECTIVE_ENABLED}" >/dev/null 2>&1 || true
 }
 
+log_step "Preparing dependencies for ${PRETTY_NAME:-${ID:-unknown}} (${OS_FAMILY})"
+
 if ! command -v systemctl >/dev/null 2>&1; then
   echo "ERROR: systemctl is required because this installer configures systemd services." >&2
   exit 1
@@ -675,7 +685,7 @@ case "${OS_FAMILY}" in
     ;;
   debian)
     ensure_command_or_install python3 "Installing Python 3..." python3
-    ensure_command_or_install cpupower "cpupower is recommended for CPU governor power management. Installing Linux CPU power tools..." linux-cpupower || ensure_command_or_install cpupower "Falling back to generic Linux CPU power tools..." linux-tools-common linux-tools-generic || true
+    ensure_command_or_install cpupower "cpupower is recommended for CPU governor power management. Installing Ubuntu/Debian CPU power tools..." linux-tools-common || ensure_command_or_install cpupower "Falling back to distro-specific cpupower packages..." linux-cpupower || ensure_command_or_install cpupower "Falling back to generic Linux CPU power tools meta-package..." linux-tools-generic || true
     ensure_pamtester_available
     if [[ "${ONLINE_EFFECTIVE_ENABLED}" == "true" ]]; then
       ensure_command_or_install upnpc "Installing miniupnpc for online port forwarding..." miniupnpc || true
@@ -702,6 +712,8 @@ if [[ -z "${PYTHON_BIN}" ]]; then
   exit 1
 fi
 
+log_done "Dependency preparation complete"
+
 "${SUDO[@]}" mkdir -p "${CONTROL_DIR}"
 
 # Disable older manual GPU power-limit services from earlier setup; v2.6 manages this dynamically.
@@ -711,14 +723,17 @@ fi
 # On update, stop the previous console follower first so a noisy old version
 # does not keep spamming the active TTY while files are being replaced.
 if [[ "${ACTION}" == "update" ]]; then
+  log_step "Stopping currently managed club-3090 services before update"
   # Stop old services before replacing files so a broken/stale Python process cannot
   # keep serving old code while the update is being installed.
   "${SUDO[@]}" systemctl stop club3090-console-log.service 2>/dev/null || true
   "${SUDO[@]}" systemctl stop club3090-control.service 2>/dev/null || true
   "${SUDO[@]}" systemctl stop club3090-caddy.service 2>/dev/null || true
   "${SUDO[@]}" systemctl stop club3090-headless-x.service 2>/dev/null || true
+  log_done "Old services stopped"
 fi
 
+log_step "Writing embedded control backend to ${CONTROL_PY}"
 "${SUDO[@]}" tee "${CONTROL_PY}" >/dev/null <<'PYCTRL'
 #!/usr/bin/env python3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -790,6 +805,12 @@ SINGLE_GPU_MODES = (
     "vllm/minimal",
     "llamacpp/default",
     "llamacpp/concurrent",
+)
+DUAL_GPU_MODES = (
+    "vllm/dual",
+    "vllm/dual-turbo",
+    "vllm/dual-dflash",
+    "vllm/dual-dflash-noviz",
 )
 VARIANT_SPECS = {
     "vllm/default": {"engine": "vllm", "compose_dir": "models/qwen3.6-27b/vllm/compose", "compose_file": "docker-compose.yml", "service": "vllm-qwen36-27b"},
@@ -1050,15 +1071,134 @@ def normalize_limit_float(value):
     return round(n, 3)
 
 
+DEFAULT_USAGE_WEIGHTS = {
+    "input_tokens": 1.0,
+    "output_tokens": 1.0,
+    "tool_calls": 4000.0,
+    "thinking_seconds": 250.0,
+}
+USAGE_RETENTION_SECONDS = 8 * 24 * 3600
+
+
+def first_defined(*values):
+    for value in values:
+        if value not in ("", None, False):
+            return value
+    return None
+
+
+def normalize_weight(value, default=None, fill_defaults=False):
+    if value in ("", None, False):
+        if fill_defaults:
+            return round(float(default or 0.0), 3)
+        return None
+    n = float(value)
+    if n < 0:
+        raise ValueError("Weights cannot be negative")
+    return round(n, 3)
+
+
+def normalize_limits(raw, fill_defaults=False):
+    raw = raw if isinstance(raw, dict) else {}
+    return {
+        "score_per_5h": normalize_limit_float(raw.get("score_per_5h")),
+        "score_per_week": normalize_limit_float(raw.get("score_per_week")),
+        "max_tokens_per_message": normalize_limit_int(raw.get("max_tokens_per_message")),
+        "max_tool_calls_per_message": normalize_limit_int(raw.get("max_tool_calls_per_message")),
+        "input_token_weight": normalize_weight(raw.get("input_token_weight"), DEFAULT_USAGE_WEIGHTS["input_tokens"], fill_defaults=fill_defaults),
+        "output_token_weight": normalize_weight(raw.get("output_token_weight"), DEFAULT_USAGE_WEIGHTS["output_tokens"], fill_defaults=fill_defaults),
+        "tool_call_weight": normalize_weight(raw.get("tool_call_weight"), DEFAULT_USAGE_WEIGHTS["tool_calls"], fill_defaults=fill_defaults),
+        "thinking_second_weight": normalize_weight(raw.get("thinking_second_weight"), DEFAULT_USAGE_WEIGHTS["thinking_seconds"], fill_defaults=fill_defaults),
+    }
+
+
 def default_user_usage():
     return {
-        "total_requests": 0,
-        "total_tokens": 0,
-        "total_tool_calls": 0,
-        "total_thinking_seconds": 0.0,
         "events": [],
         "last_request_at": 0,
     }
+
+
+def usage_weights_from_limits(limits):
+    limits = normalize_limits(limits or {}, fill_defaults=True)
+    return {
+        "input_tokens": float(limits.get("input_token_weight") or DEFAULT_USAGE_WEIGHTS["input_tokens"]),
+        "output_tokens": float(limits.get("output_token_weight") or DEFAULT_USAGE_WEIGHTS["output_tokens"]),
+        "tool_calls": float(limits.get("tool_call_weight") or DEFAULT_USAGE_WEIGHTS["tool_calls"]),
+        "thinking_seconds": float(limits.get("thinking_second_weight") or DEFAULT_USAGE_WEIGHTS["thinking_seconds"]),
+    }
+
+
+def usage_score(metrics, limits):
+    weights = usage_weights_from_limits(limits)
+    return round(
+        max(0, int(metrics.get("input_tokens") or 0)) * weights["input_tokens"]
+        + max(0, int(metrics.get("output_tokens") or 0)) * weights["output_tokens"]
+        + max(0, int(metrics.get("tool_calls") or 0)) * weights["tool_calls"]
+        + max(0.0, float(metrics.get("thinking_seconds") or 0.0)) * weights["thinking_seconds"],
+        3,
+    )
+
+
+def normalize_usage_event(event):
+    if not isinstance(event, dict):
+        return None
+    try:
+        ts = int(event.get("ts") or 0)
+    except Exception:
+        ts = 0
+    try:
+        status = int(event.get("status") or 0)
+    except Exception:
+        status = 0
+    input_tokens = max(0, int(first_defined(event.get("input_tokens"), event.get("prompt_tokens"), 0) or 0))
+    output_tokens = max(0, int(first_defined(event.get("output_tokens"), event.get("completion_tokens"), event.get("tokens"), 0) or 0))
+    tool_calls = max(0, int(event.get("tool_calls") or 0))
+    thinking_seconds = round(max(0.0, float(event.get("thinking_seconds") or 0.0)), 3)
+    requests = max(0, int(event.get("requests") or 0))
+    if not requests and (input_tokens or output_tokens or tool_calls or thinking_seconds):
+        requests = 1
+    return {
+        "ts": ts,
+        "requests": requests,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "tool_calls": tool_calls,
+        "thinking_seconds": thinking_seconds,
+        "status": status,
+    }
+
+
+def prune_usage_events(events):
+    keep_after = int(time.time()) - USAGE_RETENTION_SECONDS
+    clean = []
+    for event in events or []:
+        normalized = normalize_usage_event(event)
+        if normalized and int(normalized.get("ts") or 0) >= keep_after:
+            clean.append(normalized)
+    return clean
+
+
+def usage_window_totals(events, since_ts, limits):
+    totals = {
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "tool_calls": 0,
+        "thinking_seconds": 0.0,
+        "score": 0.0,
+    }
+    for raw_event in events or []:
+        event = normalize_usage_event(raw_event)
+        if not event or int(event.get("ts") or 0) < since_ts:
+            continue
+        totals["requests"] += int(event.get("requests") or 0)
+        totals["input_tokens"] += int(event.get("input_tokens") or 0)
+        totals["output_tokens"] += int(event.get("output_tokens") or 0)
+        totals["tool_calls"] += int(event.get("tool_calls") or 0)
+        totals["thinking_seconds"] = round(totals["thinking_seconds"] + float(event.get("thinking_seconds") or 0.0), 3)
+        totals["score"] = round(totals["score"] + usage_score(event, limits), 3)
+    return totals
 
 
 def normalize_group_names(value):
@@ -1105,14 +1245,7 @@ def normalize_group_record(raw_name, raw):
     if not allowed_clean:
         allowed_clean = ["*"]
     limits_raw = raw.get("limits") if isinstance(raw.get("limits"), dict) else raw
-    limits = {
-        "total_requests": normalize_limit_int(limits_raw.get("total_requests")),
-        "requests_per_5h": normalize_limit_int(limits_raw.get("requests_per_5h")),
-        "requests_per_week": normalize_limit_int(limits_raw.get("requests_per_week")),
-        "total_tokens": normalize_limit_int(limits_raw.get("total_tokens")),
-        "total_tool_calls": normalize_limit_int(limits_raw.get("total_tool_calls")),
-        "total_thinking_seconds": normalize_limit_float(limits_raw.get("total_thinking_seconds")),
-    }
+    limits = normalize_limits(limits_raw)
     return {
         "name": name,
         "enabled": bool(raw.get("enabled", True)),
@@ -1154,6 +1287,7 @@ def public_group_view(group):
         "description": str(group.get("description") or ""),
         "allowed_targets": list(group.get("allowed_targets") or ["*"]),
         "limits": dict(group.get("limits") or {}),
+        "resolved_limits": normalize_limits(group.get("limits") or {}, fill_defaults=True),
     }
 
 
@@ -1190,40 +1324,11 @@ def normalize_user_record(raw_name, raw):
         allowed_clean = ["*"]
     groups = normalize_group_names(raw.get("groups"))
     limits_raw = raw.get("limits") if isinstance(raw.get("limits"), dict) else raw
-    limits = {
-        "total_requests": normalize_limit_int(limits_raw.get("total_requests")),
-        "requests_per_5h": normalize_limit_int(limits_raw.get("requests_per_5h")),
-        "requests_per_week": normalize_limit_int(limits_raw.get("requests_per_week")),
-        "total_tokens": normalize_limit_int(limits_raw.get("total_tokens")),
-        "total_tool_calls": normalize_limit_int(limits_raw.get("total_tool_calls")),
-        "total_thinking_seconds": normalize_limit_float(limits_raw.get("total_thinking_seconds")),
-    }
+    limits = normalize_limits(limits_raw)
     usage = default_user_usage()
     raw_usage = raw.get("usage") if isinstance(raw.get("usage"), dict) else {}
-    usage["total_requests"] = int(raw_usage.get("total_requests") or 0)
-    usage["total_tokens"] = int(raw_usage.get("total_tokens") or 0)
-    usage["total_tool_calls"] = int(raw_usage.get("total_tool_calls") or 0)
-    usage["total_thinking_seconds"] = round(float(raw_usage.get("total_thinking_seconds") or 0.0), 3)
     usage["last_request_at"] = int(raw_usage.get("last_request_at") or 0)
-    keep_after = int(time.time()) - (8 * 24 * 3600)
-    events = []
-    for event in raw_usage.get("events") or []:
-        if not isinstance(event, dict):
-            continue
-        try:
-            ts = int(event.get("ts") or 0)
-        except Exception:
-            ts = 0
-        if ts < keep_after:
-            continue
-        events.append({
-            "ts": ts,
-            "requests": int(event.get("requests") or 0),
-            "tokens": int(event.get("tokens") or 0),
-            "tool_calls": int(event.get("tool_calls") or 0),
-            "thinking_seconds": round(float(event.get("thinking_seconds") or 0.0), 3),
-        })
-    usage["events"] = events
+    usage["events"] = prune_usage_events(raw_usage.get("events") or [])
     api_key_hash = str(raw.get("api_key_hash") or "").strip()
     return {
         "name": name,
@@ -1281,16 +1386,16 @@ def effective_limits(user):
         for key, value in (group.get("limits") or {}).items():
             if merged.get(key) is None and value is not None:
                 merged[key] = value
-    return merged
+    return normalize_limits(merged, fill_defaults=True)
 
 
 def public_user_view(user):
     usage = user.get("usage") or default_user_usage()
     now = int(time.time())
-    req_5h = sum(int((e or {}).get("requests") or 0) for e in usage.get("events", []) if int((e or {}).get("ts") or 0) >= now - (5 * 3600))
-    req_week = sum(int((e or {}).get("requests") or 0) for e in usage.get("events", []) if int((e or {}).get("ts") or 0) >= now - (7 * 24 * 3600))
     effective_targets = effective_allowed_targets(user)
     merged_limits = effective_limits(user)
+    window_5h = usage_window_totals(usage.get("events") or [], now - (5 * 3600), merged_limits)
+    window_week = usage_window_totals(usage.get("events") or [], now - (7 * 24 * 3600), merged_limits)
     return {
         "name": user["name"],
         "enabled": bool(user.get("enabled", True)),
@@ -1301,13 +1406,9 @@ def public_user_view(user):
         "limits": dict(user.get("limits") or {}),
         "effective_limits": merged_limits,
         "usage": {
-            "total_requests": int(usage.get("total_requests") or 0),
-            "total_tokens": int(usage.get("total_tokens") or 0),
-            "total_tool_calls": int(usage.get("total_tool_calls") or 0),
-            "total_thinking_seconds": round(float(usage.get("total_thinking_seconds") or 0.0), 3),
             "last_request_at": int(usage.get("last_request_at") or 0),
-            "requests_last_5h": req_5h,
-            "requests_last_week": req_week,
+            "window_5h": window_5h,
+            "window_week": window_week,
         },
         "has_api_key": bool(user.get("api_key_hash")),
     }
@@ -1448,30 +1549,100 @@ def is_quota_counted_path(upstream_path):
     return upstream_path.startswith("/v1/chat/completions") or upstream_path.startswith("/v1/completions")
 
 
-def user_limit_error(user, count_request):
+def estimate_text_tokens(text):
+    text = str(text or "")
+    return max(0, int(len(text) / 4)) if text else 0
+
+
+def collect_request_text_fragments(value, out):
+    if value in ("", None, False):
+        return
+    if isinstance(value, str):
+        out.append(value)
+        return
+    if isinstance(value, list):
+        for item in value:
+            collect_request_text_fragments(item, out)
+        return
+    if isinstance(value, dict):
+        for key in ("text", "content", "prompt", "input", "instructions", "system", "developer", "user", "assistant"):
+            if key in value:
+                collect_request_text_fragments(value.get(key), out)
+
+
+def extract_request_usage(body):
+    usage = {
+        "input_tokens": 0,
+        "requested_output_tokens": 0,
+        "estimated_total_tokens": 0,
+        "requested_tool_calls": None,
+    }
+    if not body:
+        return usage
+    text = body.decode("utf-8", errors="ignore") if isinstance(body, (bytes, bytearray)) else str(body)
+    usage["input_tokens"] = estimate_text_tokens(text)
+    try:
+        obj = json.loads(text)
+    except Exception:
+        usage["estimated_total_tokens"] = usage["input_tokens"]
+        return usage
+    if isinstance(obj, dict):
+        fragments = []
+        for key in ("messages", "prompt", "input", "instructions"):
+            if key in obj:
+                collect_request_text_fragments(obj.get(key), fragments)
+        if fragments:
+            usage["input_tokens"] = max(usage["input_tokens"], estimate_text_tokens(" ".join(fragments)))
+        try:
+            usage["requested_output_tokens"] = max(0, int(first_defined(obj.get("max_completion_tokens"), obj.get("max_tokens")) or 0))
+        except Exception:
+            usage["requested_output_tokens"] = 0
+        try:
+            requested_tools = first_defined(obj.get("max_tool_calls"), obj.get("max_parallel_tool_calls"))
+            if requested_tools not in ("", None, False):
+                usage["requested_tool_calls"] = max(0, int(requested_tools))
+            elif isinstance(obj.get("tool_choice"), dict):
+                usage["requested_tool_calls"] = 1
+            elif str(obj.get("tool_choice") or "").strip().lower() == "required":
+                usage["requested_tool_calls"] = 1
+        except Exception:
+            usage["requested_tool_calls"] = None
+    usage["estimated_total_tokens"] = usage["input_tokens"] + usage["requested_output_tokens"]
+    return usage
+
+
+def user_limit_error(user, count_request, request_usage=None):
+    if not count_request:
+        return None
     usage = user.get("usage") or default_user_usage()
     limits = effective_limits(user)
+    request_usage = request_usage or {}
+    estimated_total_tokens = max(0, int(request_usage.get("estimated_total_tokens") or 0))
+    max_tokens_per_message = limits.get("max_tokens_per_message")
+    if max_tokens_per_message is not None and estimated_total_tokens > int(max_tokens_per_message):
+        return "per-message token limit reached"
+    requested_tool_calls = request_usage.get("requested_tool_calls")
+    max_tool_calls_per_message = limits.get("max_tool_calls_per_message")
+    if max_tool_calls_per_message is not None and requested_tool_calls is not None and int(requested_tool_calls) > int(max_tool_calls_per_message):
+        return "per-message tool-call limit reached"
     now = int(time.time())
     events = usage.get("events") or []
-    if count_request:
-        r5 = sum(int((e or {}).get("requests") or 0) for e in events if int((e or {}).get("ts") or 0) >= now - (5 * 3600))
-        rweek = sum(int((e or {}).get("requests") or 0) for e in events if int((e or {}).get("ts") or 0) >= now - (7 * 24 * 3600))
-        if limits.get("requests_per_5h") is not None and r5 >= int(limits["requests_per_5h"]):
-            return "5-hour request limit reached"
-        if limits.get("requests_per_week") is not None and rweek >= int(limits["requests_per_week"]):
-            return "weekly request limit reached"
-        if limits.get("total_requests") is not None and int(usage.get("total_requests") or 0) >= int(limits["total_requests"]):
-            return "total request limit reached"
-    if limits.get("total_tokens") is not None and int(usage.get("total_tokens") or 0) >= int(limits["total_tokens"]):
-        return "total token limit reached"
-    if limits.get("total_tool_calls") is not None and int(usage.get("total_tool_calls") or 0) >= int(limits["total_tool_calls"]):
-        return "total tool-call limit reached"
-    if limits.get("total_thinking_seconds") is not None and float(usage.get("total_thinking_seconds") or 0.0) >= float(limits["total_thinking_seconds"]):
-        return "total thinking-time limit reached"
+    window_5h = usage_window_totals(events, now - (5 * 3600), limits)
+    window_week = usage_window_totals(events, now - (7 * 24 * 3600), limits)
+    estimated_score = usage_score({
+        "input_tokens": max(0, int(request_usage.get("input_tokens") or 0)),
+        "output_tokens": max(0, int(request_usage.get("requested_output_tokens") or 0)),
+        "tool_calls": max(0, int(requested_tool_calls or 0)),
+        "thinking_seconds": 0.0,
+    }, limits)
+    if limits.get("score_per_5h") is not None and round(window_5h["score"] + estimated_score, 3) > float(limits["score_per_5h"]):
+        return "5-hour usage score limit reached"
+    if limits.get("score_per_week") is not None and round(window_week["score"] + estimated_score, 3) > float(limits["score_per_week"]):
+        return "weekly usage score limit reached"
     return None
 
 
-def authorize_proxy_request(headers, instance_id, upstream_path):
+def authorize_proxy_request(headers, instance_id, upstream_path, request_usage=None):
     cfg = read_server_config()
     target_id = resolve_target_id(instance_id)
     count_request = is_quota_counted_path(upstream_path)
@@ -1481,7 +1652,7 @@ def authorize_proxy_request(headers, instance_id, upstream_path):
         if not user_can_access_target(user, target_id):
             log_audit("proxy_access_denied", reason="target_not_allowed", user=user["name"], target=target_id, path=upstream_path)
             return False, 403, {"error": "API key is not allowed to access this backend", "target": target_id}
-        err = user_limit_error(user, count_request=count_request)
+        err = user_limit_error(user, count_request=count_request, request_usage=request_usage)
         if err:
             log_audit("proxy_quota_denied", user=user["name"], target=target_id, path=upstream_path, reason=err)
             return False, 429, {"error": err, "user": user["name"]}
@@ -1493,7 +1664,7 @@ def authorize_proxy_request(headers, instance_id, upstream_path):
 
 
 def extract_response_usage(payload):
-    usage = {"tokens": 0, "tool_calls": 0}
+    usage = {"tokens": 0, "input_tokens": 0, "output_tokens": 0, "tool_calls": 0}
     try:
         obj = json.loads(payload.decode("utf-8", errors="ignore"))
     except Exception:
@@ -1501,7 +1672,12 @@ def extract_response_usage(payload):
     if isinstance(obj, dict):
         if isinstance(obj.get("usage"), dict):
             try:
-                usage["tokens"] = int(obj["usage"].get("total_tokens") or 0)
+                usage_block = obj["usage"]
+                usage["input_tokens"] = max(0, int(first_defined(usage_block.get("prompt_tokens"), usage_block.get("input_tokens")) or 0))
+                usage["output_tokens"] = max(0, int(first_defined(usage_block.get("completion_tokens"), usage_block.get("output_tokens")) or 0))
+                usage["tokens"] = max(0, int(usage_block.get("total_tokens") or (usage["input_tokens"] + usage["output_tokens"])))
+                if usage["output_tokens"] == 0 and usage["tokens"] and usage["input_tokens"] == 0:
+                    usage["output_tokens"] = usage["tokens"]
             except Exception:
                 usage["tokens"] = 0
         tool_calls = 0
@@ -1514,7 +1690,7 @@ def extract_response_usage(payload):
     return usage
 
 
-def record_user_usage(user_name, count_request, status_code, token_count, tool_calls, thinking_seconds):
+def record_user_usage(user_name, count_request, status_code, request_usage, response_usage, thinking_seconds):
     if not user_name or not count_request:
         return
     users = read_users()
@@ -1522,27 +1698,51 @@ def record_user_usage(user_name, count_request, status_code, token_count, tool_c
     if not user:
         return
     usage = user.get("usage") or default_user_usage()
+    limits = effective_limits(user)
     now = int(time.time())
-    usage["total_requests"] = int(usage.get("total_requests") or 0) + 1
-    usage["total_tokens"] = int(usage.get("total_tokens") or 0) + max(0, int(token_count or 0))
-    usage["total_tool_calls"] = int(usage.get("total_tool_calls") or 0) + max(0, int(tool_calls or 0))
-    usage["total_thinking_seconds"] = round(float(usage.get("total_thinking_seconds") or 0.0) + max(0.0, float(thinking_seconds or 0.0)), 3)
+    request_usage = request_usage or {}
+    response_usage = response_usage or {}
+    input_tokens = max(0, int(first_defined(response_usage.get("input_tokens"), request_usage.get("input_tokens"), 0) or 0))
+    output_tokens = max(0, int(first_defined(response_usage.get("output_tokens"), response_usage.get("tokens"), 0) or 0))
+    tool_calls = max(0, int(response_usage.get("tool_calls") or 0))
+    thinking_seconds = round(max(0.0, float(thinking_seconds or 0.0)), 3)
+    score = usage_score({
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "tool_calls": tool_calls,
+        "thinking_seconds": thinking_seconds,
+    }, limits)
     usage["last_request_at"] = now
     usage.setdefault("events", [])
     usage["events"].append({
         "ts": now,
         "requests": 1,
-        "tokens": max(0, int(token_count or 0)),
-        "tool_calls": max(0, int(tool_calls or 0)),
-        "thinking_seconds": round(max(0.0, float(thinking_seconds or 0.0)), 3),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "tool_calls": tool_calls,
+        "thinking_seconds": thinking_seconds,
         "status": int(status_code or 0),
+        "score": score,
     })
-    keep_after = now - (8 * 24 * 3600)
-    usage["events"] = [e for e in usage["events"] if int((e or {}).get("ts") or 0) >= keep_after]
+    usage["events"] = prune_usage_events(usage.get("events") or [])
     user["usage"] = usage
     users[user_name] = normalize_user_record(user_name, user)
     write_users(users)
-    log_audit("proxy_usage", user=user_name, status=int(status_code or 0), tokens=max(0, int(token_count or 0)), tool_calls=max(0, int(tool_calls or 0)), thinking_seconds=round(max(0.0, float(thinking_seconds or 0.0)), 3))
+    combined_tokens = input_tokens + output_tokens
+    overages = []
+    if limits.get("max_tokens_per_message") is not None and combined_tokens > int(limits["max_tokens_per_message"]):
+        overages.append("message_tokens")
+    if limits.get("max_tool_calls_per_message") is not None and tool_calls > int(limits["max_tool_calls_per_message"]):
+        overages.append("message_tool_calls")
+    window_5h = usage_window_totals(user["usage"].get("events") or [], now - (5 * 3600), limits)
+    window_week = usage_window_totals(user["usage"].get("events") or [], now - (7 * 24 * 3600), limits)
+    if limits.get("score_per_5h") is not None and window_5h["score"] > float(limits["score_per_5h"]):
+        overages.append("score_5h")
+    if limits.get("score_per_week") is not None and window_week["score"] > float(limits["score_per_week"]):
+        overages.append("score_week")
+    log_audit("proxy_usage", user=user_name, status=int(status_code or 0), input_tokens=input_tokens, output_tokens=output_tokens, total_tokens=combined_tokens, tool_calls=tool_calls, thinking_seconds=thinking_seconds, score=score)
+    if overages:
+        log_audit("proxy_usage_overage", user=user_name, status=int(status_code or 0), kinds=overages, total_tokens=combined_tokens, tool_calls=tool_calls, thinking_seconds=thinking_seconds, score=score)
 
 
 def local_api_token_ok(header_value):
@@ -1917,9 +2117,68 @@ def boot_enabled_instances():
     log_control("BOOT instances: " + " || ".join(outputs))
     return outputs
 
+def mode_gpu_indices(mode, gpu_count=None):
+    if mode not in DUAL_GPU_MODES:
+        return []
+    try:
+        count = int(gpu_count if gpu_count is not None else detect_gpu_count_runtime())
+    except Exception:
+        count = 0
+    return list(range(min(max(count, 0), 2)))
+
+def running_dual_mode():
+    for mode in DUAL_GPU_MODES:
+        port = MODES.get(mode)
+        if port and port_open(port, timeout=0.08):
+            return mode
+    mode = read_active_mode_file()
+    if mode in DUAL_GPU_MODES:
+        port = MODES.get(mode)
+        if port and port_open(port, timeout=0.08):
+            return mode
+    return None
+
+def stop_global_mode():
+    log_control("GLOBAL mode stop requested")
+    p = subprocess.run(["bash", "scripts/switch.sh", "--down"], cwd=CLUB3090_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=300)
+    out = (p.stdout or "")[-4000:]
+    log_control(f"GLOBAL mode stop rc={p.returncode}: {out}")
+    return p.returncode, out
+
+def stop_instances_for_gpu_indices(indices):
+    results = []
+    wanted = {int(idx) for idx in (indices or [])}
+    for inst in read_instances_config():
+        if int(inst.get("gpu_index", -1)) not in wanted:
+            continue
+        if not port_open(int(inst["port"]), timeout=0.08):
+            continue
+        rc, out = stop_instance(inst["id"])
+        results.append({"id": inst["id"], "rc": rc, "output": out[-1200:]})
+    return results
+
+def instance_assignment(instance, dual_mode=None):
+    dual_mode = dual_mode or running_dual_mode()
+    gpu_idx = int(instance.get("gpu_index", -1))
+    if dual_mode and gpu_idx in mode_gpu_indices(dual_mode):
+        return {
+            "scope": "global",
+            "mode": dual_mode,
+            "text": f"GPU {gpu_idx} is currently occupied by the global dual preset {dual_mode}",
+            "override": True,
+        }
+    mode = str(instance.get("mode") or "vllm/default")
+    return {
+        "scope": "per-gpu",
+        "mode": mode,
+        "text": f"GPU {gpu_idx} is assigned to the per-GPU preset {mode}",
+        "override": False,
+    }
+
 def instance_snapshot(instance):
     container = instance_container_name(instance)
     running = port_open(int(instance["port"]), timeout=0.1)
+    assigned = instance_assignment(instance)
     return {
         "id": instance["id"],
         "gpu_index": instance["gpu_index"],
@@ -1930,6 +2189,10 @@ def instance_snapshot(instance):
         "running": running,
         "ready_url": instance_ready_url(instance),
         "proxy_prefix": f"/{instance['id']}",
+        "assignment_scope": assigned["scope"],
+        "assignment_mode": assigned["mode"],
+        "assignment_text": assigned["text"],
+        "overrides_dual_mode": bool(assigned["override"]),
     }
 
 def instances_snapshot():
@@ -3229,6 +3492,44 @@ const searchState={active:false,query:'',matches:[],index:-1,prevAutoscroll:true
 }async function post(path,obj){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj||{})});const t=await r.text();if(!r.ok)throw new Error(t);appendLog('\n----- result -----\n'+t+'\n------------------');await refreshStatus();return t}let selectedInstance='GPU0';let logEs=null;let selectedUserName='';function setInstanceMsg(t){if($('instanceMsg'))$('instanceMsg').textContent=t||''}function getInstanceList(){return (lastStatus&&lastStatus.instances)||[]}function getSelectedInstance(){const items=getInstanceList();return items.find(x=>x.id===selectedInstance)||items[0]||null}function selectInstance(id){selectedInstance=id;renderInstances(getInstanceList());applyLogVisibility();clearLog();connectLogs()}function renderInstances(instances){const tabs=$('instanceTabs');const summary=$('instanceSummary');const btn=$('instanceEnableBtn');if(!tabs||!summary)return;instances=instances||[];if(instances.length&&!instances.some(x=>x.id===selectedInstance))selectedInstance=instances[0].id;tabs.innerHTML=instances.map(x=>`<button class="subtab ${x.id===selectedInstance?'active':''}" onclick="selectInstance('${x.id}')">${x.id}${x.running?' • on':' • off'}</button>`).join('');const cur=getSelectedInstance();if(!cur){summary.textContent='No GPU instances configured';if(btn)btn.textContent='Boot autostart unavailable';return}summary.innerHTML=`GPU ${cur.gpu_index} · mode ${cur.mode} · port ${cur.port} · ${cur.running?'running':'stopped'} · proxy <code>${cur.proxy_prefix}/</code> · ${cur.enabled?'autostart enabled':'autostart disabled'}`;if(btn)btn.textContent=cur.enabled?'Disable Boot Autostart':'Enable Boot Autostart';if($('logInstanceLabel'))$('logInstanceLabel').textContent='instance: '+cur.id}function ensureUsersUi(){const tabs=document.querySelector('.tabs');if(tabs&&!document.getElementById('usersTabBtn')){const b=document.createElement('button');b.className='tab';b.id='usersTabBtn';b.textContent='Users';b.onclick=(ev)=>tab(ev,'users');tabs.insertBefore(b,tabs.querySelector('.tab[onclick*=\"metrics\"]')||null)}const main=document.querySelector('main.container');if(main&&!document.getElementById('users')){const section=document.createElement('section');section.id='users';section.className='tabpane content-tab';section.innerHTML=`<div class="panel"><h2>Proxy Access</h2><div class="actions"><label class="label"><input type="checkbox" id="allowAnonymousProxy"> allow requests without per-user API keys</label></div><div class="value smallgap" id="authSummary">-</div><div class="actions"><button class="btn blue" onclick="saveAuthSettings()">Save Access Policy</button></div><div class="msg" id="usersMsg"></div></div><div class="panel"><div class="panel-head"><h2>User Accounts</h2><button class="add-preset-btn" title="New user" aria-label="New user" onclick="resetUserForm()"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none"/></svg></button></div><div class="formgrid"><label>User name<input id="userName" placeholder="client_a" /></label><label>Allowed targets (comma-separated)<input id="userTargets" placeholder="*, legacy, GPU0, GPU1" /></label><label>Total requests<input id="userTotalRequests" type="number" step="1" placeholder="unlimited" /></label><label>Requests per 5h<input id="userRequests5h" type="number" step="1" placeholder="unlimited" /></label><label>Requests per week<input id="userRequestsWeek" type="number" step="1" placeholder="unlimited" /></label><label>Total tokens<input id="userTotalTokens" type="number" step="1" placeholder="unlimited" /></label><label>Total tool calls<input id="userTotalToolCalls" type="number" step="1" placeholder="unlimited" /></label><label>Total thinking seconds<input id="userThinkingSeconds" type="number" step="0.1" placeholder="unlimited" /></label><label>Enabled<select id="userEnabled"><option value="true">Enabled</option><option value="false">Disabled</option></select></label></div><div class="preset-form-actions"><button class="btn green" onclick="saveUserForm()">Save User</button><button class="btn amber" onclick="resetUserForm()">Clear</button></div></div><div class="panel"><h2>Configured Users</h2><div id="usersGrid" class="api-grid"></div></div>`;main.insertBefore(section,document.getElementById('metrics'))}}function setUsersMsg(t){if($('usersMsg'))$('usersMsg').textContent=t||''}function limitText(v,suffix=''){return v===null||v===undefined||v===''?'unlimited':`${v}${suffix}`}function renderUsers(users,cfg){ensureUsersUi();if($('allowAnonymousProxy'))$('allowAnonymousProxy').checked=!!(cfg&&cfg.allow_proxy_without_api_key);if($('authSummary'))$('authSummary').innerHTML=`Admin UI: <code>:8008/admin</code> · Proxy auth: ${cfg&&cfg.allow_proxy_without_api_key?'optional':'required'} · Local automation API: <code>127.0.0.1:${(cfg&&cfg.local_api_port)||10881}</code>`;const grid=$('usersGrid');if(!grid)return;users=users||[];if(selectedUserName&&!users.some(u=>u.name===selectedUserName))selectedUserName='';grid.innerHTML=users.map(u=>`<div class="api-card"><div class="api-card-head"><h3>${u.name}<br><span class="label">${u.enabled?'enabled':'disabled'} · access ${(u.allowed_targets||[]).join(', ')||'*'}</span></h3><span class="preset-actions"><button class="iconbtn" title="Edit" onclick="editUser('${u.name}')">✏️</button><button class="iconbtn" title="Reset key" onclick="resetUserKey('${u.name}')">🔑</button><button class="iconbtn" title="Delete" onclick="deleteUserByName('${u.name}')">❌</button></span></div><p>Requests: total ${u.usage.total_requests}, 5h ${u.usage.requests_last_5h}, week ${u.usage.requests_last_week}</p><p>Tokens ${u.usage.total_tokens}, tool calls ${u.usage.total_tool_calls}, thinking ${Number(u.usage.total_thinking_seconds||0).toFixed(1)}s</p><p class="label">Limits · total ${limitText(u.limits.total_requests)} · 5h ${limitText(u.limits.requests_per_5h)} · week ${limitText(u.limits.requests_per_week)} · tokens ${limitText(u.limits.total_tokens)} · tools ${limitText(u.limits.total_tool_calls)} · thinking ${limitText(u.limits.total_thinking_seconds,'s')}</p></div>`).join('')||'<div class="value">No API users configured yet.</div>'}function editUser(name){const user=(lastStatus&&lastStatus.users||[]).find(u=>u.name===name);if(!user)return;selectedUserName=name;$('userName').value=user.name;$('userName').disabled=true;$('userTargets').value=(user.allowed_targets||[]).join(', ');$('userTotalRequests').value=user.limits.total_requests??'';$('userRequests5h').value=user.limits.requests_per_5h??'';$('userRequestsWeek').value=user.limits.requests_per_week??'';$('userTotalTokens').value=user.limits.total_tokens??'';$('userTotalToolCalls').value=user.limits.total_tool_calls??'';$('userThinkingSeconds').value=user.limits.total_thinking_seconds??'';$('userEnabled').value=String(!!user.enabled)}function resetUserForm(){ensureUsersUi();selectedUserName='';$('userName').disabled=false;$('userName').value='';$('userTargets').value='*';$('userTotalRequests').value='';$('userRequests5h').value='';$('userRequestsWeek').value='';$('userTotalTokens').value='';$('userTotalToolCalls').value='';$('userThinkingSeconds').value='';$('userEnabled').value='true';setUsersMsg('')}function collectUserForm(){function val(id){return $(id).value.trim()}function num(id){const v=val(id);return v===''?null:Number(v)}return {name:val('userName'),allowed_targets:val('userTargets').split(',').map(x=>x.trim()).filter(Boolean),enabled:$('userEnabled').value==='true',generate_api_key:!selectedUserName,limits:{total_requests:num('userTotalRequests'),requests_per_5h:num('userRequests5h'),requests_per_week:num('userRequestsWeek'),total_tokens:num('userTotalTokens'),total_tool_calls:num('userTotalToolCalls'),total_thinking_seconds:num('userThinkingSeconds')}}}async function saveUserForm(){try{const r=await fetch('/admin/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'save',user:collectUserForm()})});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'save failed');if(j.api_key)alert('API key for '+j.user.name+':\n\n'+j.api_key+'\n\nStore it now; it will not be shown again.');resetUserForm();setUsersMsg('Saved user '+j.user.name);await refreshStatus()}catch(e){alert('User save failed: '+e)}}async function resetUserKey(name){if(!confirm('Reset API key for '+name+'?'))return;try{const r=await fetch('/admin/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'reset_key',name})});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'reset failed');alert('New API key for '+name+':\n\n'+j.api_key+'\n\nStore it now; it will not be shown again.');setUsersMsg('Reset API key for '+name);await refreshStatus()}catch(e){alert('API key reset failed: '+e)}}async function deleteUserByName(name){if(!confirm('Delete user '+name+'?'))return;try{const r=await fetch('/admin/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'delete',name})});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'delete failed');if(selectedUserName===name)resetUserForm();setUsersMsg('Deleted user '+name);await refreshStatus()}catch(e){alert('User delete failed: '+e)}}async function saveAuthSettings(){try{const r=await fetch('/admin/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'save_server_config',allow_proxy_without_api_key:$('allowAnonymousProxy').checked})});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'config failed');setUsersMsg('Saved proxy access policy');await refreshStatus()}catch(e){alert('Proxy access policy failed: '+e)}}async function refreshStatus(){try{ensureUsersUi();const r=await fetch('/admin/status',{cache:'no-store'});const j=await r.json();lastStatus=j;if(j.ui_config&&typeof j.ui_config.show_global_logs==='boolean'){showGlobalLogs=j.ui_config.show_global_logs;if($('showGlobalLogs'))$('showGlobalLogs').checked=showGlobalLogs;applyLogVisibility();}$('summary').textContent=`${j.active_mode} · ${j.container||'no container'} · ${j.power.profile||'balanced'} · GPUs ${j.gpu_count??0}`;$('mode').textContent=`${j.active_mode} / ${j.active_port}`;$('container').textContent=j.container||'none';$('services').textContent=`vLLM=${j.vllm_service}, control=${j.control_service}, console=${j.console_service}`;$('req').textContent=`total=${j.metrics.total_requests}, active=${j.metrics.active_requests}, fail=${j.metrics.failed_requests}, queue=${j.metrics.queued_requests}`;$('last').textContent=`${j.metrics.last_status||'-'} latency=${j.metrics.last_latency_s??'-'}s ttft=${j.metrics.last_ttft_s??'-'}s tps=${j.metrics.last_tokens_per_second??'-'}`;$('uptime').textContent=fmtUptime(j.uptime_seconds);renderGpuCards(j.gpus);$('powerbox').textContent=`profile=${j.power.profile}, GPU=${j.power.gpu}, CPU=${j.power.cpu}, fans=${j.power.fans}, container=${j.power.container}, idle=${j.power.idle_for_seconds}s`;$('optToggle').textContent=j.power.optimizations_enabled?'Disable Power Optimizations':'Enable Power Optimizations';$('fanToggle').textContent=j.power.fan_manual_override?'Reset Fans to Default':'Set Fans to Max';renderMetrics(j);renderPresetCatalog(j.presets);renderInstances(j.instances||[]);renderUsers(j.users||[],j.server_config||{})}catch(e){setMsg('Status error: '+e)}}async function switchMode(m){const cur=getSelectedInstance();if(!cur){alert('No GPU instance selected');return}if(confirm('Assign '+m+' to '+cur.id+' and start it?'))try{await post('/admin/switch',{instance_id:cur.id,mode:m})}catch(e){alert(e)}}async function powerAction(a){const cur=getSelectedInstance();if(a==='stop_container'&&!confirm('Stop selected instance now?'))return;try{await post('/admin/power',{action:a,instance_id:cur?cur.id:null})}catch(e){alert(e)}}async function instanceAction(a){try{await powerAction(a)}catch(e){alert(e)}}async function toggleInstanceEnabled(){const cur=getSelectedInstance();if(!cur)return;try{await post('/admin/power',{action:'toggle_enabled',instance_id:cur.id,enabled:!cur.enabled})}catch(e){alert(e)}}function profileDescription(p){const d={eco:'Eco profile: lower GPU power limits, lower idle clocks, powersave CPU governor, faster idle/container stop timers.',balanced:'Balanced profile: normal server profile with 280W active GPU cap, idle downclocking after 10 minutes, and container stop after 1 hour.',default:'Default profile: keeps the 280W safety GPU cap but removes idle clock locking, uses schedutil CPU while active, and keeps standard idle timers.',turbo:'Turbo profile: higher GPU power allowance, performance CPU governor, relaxed idle timers, and minimal downclocking. Use when performance matters more than power.'};return d[p]||'Apply profile?'}async function profile(p){if(!confirm(profileDescription(p)+'\n\nApply this profile now?'))return;try{await post('/admin/profile',{profile:p})}catch(e){alert(e)}}async function togglePowerOptimizations(){await powerAction($('optToggle').textContent.includes('Enable')?'enable_optimizations':'disable_optimizations')}async function toggleFansMax(){await powerAction($('fanToggle').textContent.includes('Reset')?'fans_auto':'fans_max')}async function wol(){const mac=prompt('MAC address to wake (blank = configured default):','');try{await post('/admin/wol',{mac})}catch(e){alert(e)}}async function machineAction(a){const label=a==='reboot'?'RESTART':'SHUT DOWN';if(!confirm(label+' machine now?'))return;if(!confirm('Final confirmation: '+label+' now.'))return;try{await post('/admin/machine',{action:a})}catch(e){alert(e)}}function connectLogs(){if(logEs){try{logEs.close()}catch(e){}}const cur=getSelectedInstance();const qs=cur?`?instance=${encodeURIComponent(cur.id)}`:'';logEs=new EventSource('/admin/logs'+qs);logEs.onopen=()=>appendLog('--- log connected ---');logEs.onmessage=e=>appendLog(e.data.replaceAll('\\u0000','\n'));logEs.onerror=()=>appendLog('--- log disconnected; retrying ---')}ensureUsersUi();resetUserForm();refreshStatus();connectLogs();setInterval(refreshStatus,3000);
 let currentLogSource='docker';function setAuditMsg(t){if($('auditMsg'))$('auditMsg').textContent=t||''}function mirrorAuthToggles(v){if($('allowAnonymousProxy'))$('allowAnonymousProxy').checked=!!v;if($('auditAllowAnonymousProxy'))$('auditAllowAnonymousProxy').checked=!!v}function openUsersTab(){const btn=$('usersTabBtn');if(btn)tab({target:btn},'users')}function currentLogHeading(){if(currentLogSource==='audit')return activeTabName==='audit'?'Audit Log - Full View':'Audit Log';return activeTabName==='logs'?'Live Docker Log - Full View':'Live Docker Log'}function currentLogLabel(){if(currentLogSource==='audit')return 'source: audit';const cur=getSelectedInstance();return 'instance: '+((cur&&cur.id)||'primary')}function renderAudit(cfg){cfg=cfg||{};const adminPort=(lastStatus&&lastStatus.admin_port)||8008;const proxyPort=(lastStatus&&lastStatus.proxy_port)||8009;const adminPath=(cfg&&cfg.admin_path)||'/admin';const online=!!cfg.online_enabled;const authOptional=!!cfg.allow_proxy_without_api_key;const localEnabled=!!cfg.local_api_enabled;const localPort=cfg.local_api_port||10881;if($('auditAdminEndpoint'))$('auditAdminEndpoint').innerHTML=`:${adminPort}${adminPath}`;if($('auditProxyEndpoint'))$('auditProxyEndpoint').innerHTML=`:${proxyPort}`;if($('auditExposure'))$('auditExposure').textContent=online?'online through proxy/admin only':'local/private only';if($('auditLocalApi'))$('auditLocalApi').textContent=localEnabled?`127.0.0.1:${localPort}`:'disabled';if($('auditSummary'))$('auditSummary').innerHTML='Audit entries capture admin actions, proxy authentication outcomes, quota denials, and user-management events. Use the shared log viewer below to search live audit activity.';if($('auditPolicyText'))$('auditPolicyText').innerHTML=`Proxy API keys are currently <b>${authOptional?'optional':'required'}</b>. Admin UI remains under <code>:${adminPort}${adminPath}</code>.`;mirrorAuthToggles(authOptional)}applyLogVisibility=function(){const isLogs=activeTabName==='logs';const isAudit=activeTabName==='audit';document.body.classList.toggle('logs-tab',isLogs);document.body.classList.toggle('audit-tab',isAudit);const card=document.querySelector('.logs.panel');if(card)card.classList.toggle('log-card-hidden',!isLogs&&!isAudit&&!showGlobalLogs);$('logTitle').textContent=currentLogHeading();if($('logInstanceLabel'))$('logInstanceLabel').textContent=currentLogLabel()};selectInstance=function(id){selectedInstance=id;renderInstances(getInstanceList());applyLogVisibility();if(currentLogSource==='docker'){clearLog();connectLogs()}};tab=function(e,n){activeTabName=n;currentLogSource=n==='audit'?'audit':'docker';document.querySelectorAll('.tabpane').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));if(n!=='logs')$(n).classList.add('active');e.target.classList.add('active');applyLogVisibility();clearLog();connectLogs();setTimeout(()=>{if(!searchState.active&&$('autoscroll').checked)$('log').scrollTop=$('log').scrollHeight},0)};renderUsers=function(users,cfg){ensureUsersUi();cfg=cfg||{};const adminPort=(lastStatus&&lastStatus.admin_port)||8008;const adminPath=(cfg&&cfg.admin_path)||'/admin';const localEnabled=!!cfg.local_api_enabled;const localPort=cfg.local_api_port||10881;mirrorAuthToggles(!!cfg.allow_proxy_without_api_key);if($('authSummary'))$('authSummary').innerHTML=`Admin UI: <code>:${adminPort}${adminPath}</code> · Proxy auth: ${cfg.allow_proxy_without_api_key?'optional':'required'} · Local automation API: <code>${localEnabled?`127.0.0.1:${localPort}`:'disabled'}</code>`;const grid=$('usersGrid');if(grid){users=users||[];if(selectedUserName&&!users.some(u=>u.name===selectedUserName))selectedUserName='';grid.innerHTML=users.map(u=>`<div class="api-card"><div class="api-card-head"><h3>${u.name}<br><span class="label">${u.enabled?'enabled':'disabled'} · access ${(u.allowed_targets||[]).join(', ')||'*'}</span></h3><span class="preset-actions"><button class="iconbtn" title="Edit" onclick="editUser('${u.name}')">✏️</button><button class="iconbtn" title="Reset key" onclick="resetUserKey('${u.name}')">🔑</button><button class="iconbtn" title="Delete" onclick="deleteUserByName('${u.name}')">❌</button></span></div><p>Requests: total ${u.usage.total_requests}, 5h ${u.usage.requests_last_5h}, week ${u.usage.requests_last_week}</p><p>Tokens ${u.usage.total_tokens}, tool calls ${u.usage.total_tool_calls}, thinking ${Number(u.usage.total_thinking_seconds||0).toFixed(1)}s</p><p class="label">Limits · total ${limitText(u.limits.total_requests)} · 5h ${limitText(u.limits.requests_per_5h)} · week ${limitText(u.limits.requests_per_week)} · tokens ${limitText(u.limits.total_tokens)} · tools ${limitText(u.limits.total_tool_calls)} · thinking ${limitText(u.limits.total_thinking_seconds,'s')}</p></div>`).join('')||'<div class="value">No API users configured yet.</div>'}renderAudit(cfg);applyLogVisibility()};saveAuthSettings=async function(){const allow=!!(($('allowAnonymousProxy')&&$('allowAnonymousProxy').checked)||($('auditAllowAnonymousProxy')&&$('auditAllowAnonymousProxy').checked));mirrorAuthToggles(allow);try{const r=await fetch('/admin/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'save_server_config',allow_proxy_without_api_key:allow})});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'config failed');setUsersMsg('Saved proxy access policy');setAuditMsg('Saved proxy access policy');await refreshStatus()}catch(e){alert('Proxy access policy failed: '+e)}};connectLogs=function(){if(logEs){try{logEs.close()}catch(e){}}let url='/admin/audit-stream';if(currentLogSource!=='audit'){const cur=getSelectedInstance();const qs=cur?`?instance=${encodeURIComponent(cur.id)}`:'';url='/admin/logs'+qs}logEs=new EventSource(url);logEs.onopen=()=>appendLog(currentLogSource==='audit'?'--- audit stream connected ---':'--- log connected ---');logEs.onmessage=e=>appendLog(e.data.replaceAll('\\u0000','\n'));logEs.onerror=()=>appendLog(currentLogSource==='audit'?'--- audit stream disconnected; retrying ---':'--- log disconnected; retrying ---')};applyLogVisibility();if(lastStatus&&lastStatus.server_config)renderAudit(lastStatus.server_config);clearLog();connectLogs();
 function ensureGroupUi(){const users=$('users');if(!users||document.getElementById('groupsPanel'))return;const formGrid=users.querySelector('.formgrid');if(formGrid&&!document.getElementById('userGroups')){const wrap=document.createElement('label');wrap.innerHTML='Groups (comma-separated)<input id="userGroups" placeholder="starter, premium" />';formGrid.appendChild(wrap)}const panel=document.createElement('div');panel.className='panel';panel.id='groupsPanel';panel.innerHTML=`<div class="panel-head"><h2>User Groups / Plans</h2><button class="add-preset-btn" title="New group" aria-label="New group" onclick="resetGroupForm()"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none"/></svg></button></div><div class="formgrid"><label>Group name<input id="groupName" placeholder="starter" /></label><label>Description<input id="groupDescription" placeholder="Shared plan description" /></label><label>Allowed targets<input id="groupTargets" placeholder="*, legacy, GPU0, GPU1" /></label><label>Total requests<input id="groupTotalRequests" type="number" step="1" placeholder="unlimited" /></label><label>Requests per 5h<input id="groupRequests5h" type="number" step="1" placeholder="unlimited" /></label><label>Requests per week<input id="groupRequestsWeek" type="number" step="1" placeholder="unlimited" /></label><label>Total tokens<input id="groupTotalTokens" type="number" step="1" placeholder="unlimited" /></label><label>Total tool calls<input id="groupTotalToolCalls" type="number" step="1" placeholder="unlimited" /></label><label>Total thinking seconds<input id="groupThinkingSeconds" type="number" step="0.1" placeholder="unlimited" /></label><label>Enabled<select id="groupEnabled"><option value="true">Enabled</option><option value="false">Disabled</option></select></label></div><div class="preset-form-actions"><button class="btn green" onclick="saveGroupForm()">Save Group</button><button class="btn amber" onclick="resetGroupForm()">Clear</button></div><div class="msg" id="groupsMsg"></div><div class="panel" style="margin-top:12px"><h2>Configured Groups</h2><div id="groupsGrid" class="api-grid"></div></div>`;users.appendChild(panel)}let selectedGroupName='';function setGroupsMsg(t){if($('groupsMsg'))$('groupsMsg').textContent=t||''}function resetGroupForm(){ensureGroupUi();selectedGroupName='';$('groupName').disabled=false;$('groupName').value='';$('groupDescription').value='';$('groupTargets').value='*';$('groupTotalRequests').value='';$('groupRequests5h').value='';$('groupRequestsWeek').value='';$('groupTotalTokens').value='';$('groupTotalToolCalls').value='';$('groupThinkingSeconds').value='';$('groupEnabled').value='true';setGroupsMsg('')}function collectGroupForm(){function val(id){return $(id).value.trim()}function num(id){const v=val(id);return v===''?null:Number(v)}return {name:val('groupName'),description:val('groupDescription'),allowed_targets:val('groupTargets').split(',').map(x=>x.trim()).filter(Boolean),enabled:$('groupEnabled').value==='true',limits:{total_requests:num('groupTotalRequests'),requests_per_5h:num('groupRequests5h'),requests_per_week:num('groupRequestsWeek'),total_tokens:num('groupTotalTokens'),total_tool_calls:num('groupTotalToolCalls'),total_thinking_seconds:num('groupThinkingSeconds')}}}function renderGroups(groups){ensureGroupUi();const grid=$('groupsGrid');if(!grid)return;groups=groups||[];if(selectedGroupName&&!groups.some(g=>g.name===selectedGroupName))selectedGroupName='';grid.innerHTML=groups.map(g=>`<div class="api-card"><div class="api-card-head"><h3>${g.name}<br><span class="label">${g.enabled?'enabled':'disabled'} · access ${(g.allowed_targets||[]).join(', ')||'*'}</span></h3><span class="preset-actions"><button class="iconbtn" title="Edit" onclick="editGroup('${g.name}')">✏️</button><button class="iconbtn" title="Delete" onclick="deleteGroupByName('${g.name}')">❌</button></span></div><p>${g.description||'No description'}</p><p class="label">Limits · total ${limitText(g.limits.total_requests)} · 5h ${limitText(g.limits.requests_per_5h)} · week ${limitText(g.limits.requests_per_week)} · tokens ${limitText(g.limits.total_tokens)} · tools ${limitText(g.limits.total_tool_calls)} · thinking ${limitText(g.limits.total_thinking_seconds,'s')}</p></div>`).join('')||'<div class="value">No groups configured yet.</div>'}function editGroup(name){const group=(lastStatus&&lastStatus.groups||[]).find(g=>g.name===name);if(!group)return;ensureGroupUi();selectedGroupName=name;$('groupName').disabled=true;$('groupName').value=group.name;$('groupDescription').value=group.description||'';$('groupTargets').value=(group.allowed_targets||[]).join(', ');$('groupTotalRequests').value=group.limits.total_requests??'';$('groupRequests5h').value=group.limits.requests_per_5h??'';$('groupRequestsWeek').value=group.limits.requests_per_week??'';$('groupTotalTokens').value=group.limits.total_tokens??'';$('groupTotalToolCalls').value=group.limits.total_tool_calls??'';$('groupThinkingSeconds').value=group.limits.total_thinking_seconds??'';$('groupEnabled').value=String(!!group.enabled)}async function saveGroupForm(){try{const r=await fetch('/admin/groups',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'save',group:collectGroupForm()})});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'group save failed');resetGroupForm();setGroupsMsg('Saved group '+j.group.name);await refreshStatus()}catch(e){alert('Group save failed: '+e)}}async function deleteGroupByName(name){if(!confirm('Delete group '+name+'?'))return;try{const r=await fetch('/admin/groups',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'delete',name})});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'group delete failed');if(selectedGroupName===name)resetGroupForm();setGroupsMsg('Deleted group '+name);await refreshStatus()}catch(e){alert('Group delete failed: '+e)}}const _oldEditUser=editUser;editUser=function(name){_oldEditUser(name);ensureGroupUi();const user=(lastStatus&&lastStatus.users||[]).find(u=>u.name===name);if(user&&$('userGroups'))$('userGroups').value=(user.groups||[]).join(', ')};const _oldResetUserForm=resetUserForm;resetUserForm=function(){_oldResetUserForm();ensureGroupUi();if($('userGroups'))$('userGroups').value=''};const _oldCollectUserForm=collectUserForm;collectUserForm=function(){const data=_oldCollectUserForm();ensureGroupUi();data.groups=$('userGroups')?$('userGroups').value.trim().split(',').map(x=>x.trim()).filter(Boolean):[];return data};const _oldRenderAudit=renderAudit;renderAudit=function(cfg){_oldRenderAudit(cfg);cfg=cfg||{};const httpsEnabled=!!cfg.https_enabled;if($('auditSummary'))$('auditSummary').innerHTML=`Audit entries capture admin actions, proxy authentication outcomes, quota denials, API usage, group changes, and user-management events. Transport is currently <b>${httpsEnabled?'HTTPS':'HTTP'}</b>. Use the shared log viewer below to search live audit activity.`};const _oldRenderUsers=renderUsers;renderUsers=function(users,cfg){ensureGroupUi();_oldRenderUsers(users,cfg);const grid=$('usersGrid');if(!grid)return;users=users||[];grid.innerHTML=users.map(u=>`<div class="api-card"><div class="api-card-head"><h3>${u.name}<br><span class="label">${u.enabled?'enabled':'disabled'} · access ${(u.effective_allowed_targets||u.allowed_targets||[]).join(', ')||'*'}</span></h3><span class="preset-actions"><button class="iconbtn" title="Edit" onclick="editUser('${u.name}')">✏️</button><button class="iconbtn" title="Reset key" onclick="resetUserKey('${u.name}')">🔑</button><button class="iconbtn" title="Delete" onclick="deleteUserByName('${u.name}')">❌</button></span></div><p>Groups: ${(u.groups||[]).join(', ')||'none'}</p><p>Requests: total ${u.usage.total_requests}, 5h ${u.usage.requests_last_5h}, week ${u.usage.requests_last_week}</p><p>Tokens ${u.usage.total_tokens}, tool calls ${u.usage.total_tool_calls}, thinking ${Number(u.usage.total_thinking_seconds||0).toFixed(1)}s</p><p class="label">Direct limits · total ${limitText(u.limits.total_requests)} · 5h ${limitText(u.limits.requests_per_5h)} · week ${limitText(u.limits.requests_per_week)} · tokens ${limitText(u.limits.total_tokens)} · tools ${limitText(u.limits.total_tool_calls)} · thinking ${limitText(u.limits.total_thinking_seconds,'s')}</p><p class="label">Effective limits · total ${limitText((u.effective_limits||{}).total_requests)} · 5h ${limitText((u.effective_limits||{}).requests_per_5h)} · week ${limitText((u.effective_limits||{}).requests_per_week)} · tokens ${limitText((u.effective_limits||{}).total_tokens)} · tools ${limitText((u.effective_limits||{}).total_tool_calls)} · thinking ${limitText((u.effective_limits||{}).total_thinking_seconds,'s')}</p></div>`).join('')||'<div class="value">No API users configured yet.</div>'};const _oldRefreshStatus=refreshStatus;refreshStatus=async function(){await _oldRefreshStatus();ensureGroupUi();if(lastStatus){renderGroups(lastStatus.groups||[]);if(lastStatus.server_config)renderAudit(lastStatus.server_config)}};ensureGroupUi();resetGroupForm();
+function findPanelByHeading(sectionId, heading){return [...document.querySelectorAll(`#${sectionId} .panel`)].find(panel=>{const title=panel.querySelector('.panel-head h2,h2');return (title&&title.textContent||'').trim()===heading})||null}
+let selectedScope='GPU0';
+function currentScope(){return selectedScope||selectedInstance||'GPU0'}
+function scopeIsGlobal(){return currentScope()==='GLOBAL'}
+function scopeInstance(){if(scopeIsGlobal())return null;const items=getInstanceList();return items.find(x=>x.id===currentScope())||items.find(x=>x.id===selectedInstance)||items[0]||null}
+function setScope(scope,reconnect=true){selectedScope=scope||selectedInstance||'GPU0';if(!scopeIsGlobal())selectedInstance=selectedScope;renderInstances(getInstanceList());renderPresetScopeTabs();updateScopedCards();applyLogVisibility();if(reconnect&&currentLogSource==='docker'){clearLog();connectLogs()}}
+function renderInstances(instances){const tabs=$('instanceTabs');const summary=$('instanceSummary');const btn=$('instanceEnableBtn');const panel=findPanelByHeading('system','Instances');if(!tabs||!summary||!panel)return;instances=instances||[];if(instances.length&&!instances.some(x=>x.id===selectedInstance))selectedInstance=instances[0].id;if(instances.length&&!instances.some(x=>x.id===selectedScope)&&!scopeIsGlobal())selectedScope=instances[0].id;const gpuTabs=instances.map(x=>`<button class="subtab ${x.id===currentScope()?'active':''}" onclick="setScope('${x.id}')">${x.id}${x.running?' • on':' • off'}</button>`).join('');tabs.innerHTML=gpuTabs+`<button class="subtab ${scopeIsGlobal()?'active':''}" onclick="setScope('GLOBAL')">Global</button>`;const actionButtons=[...panel.querySelectorAll('.actions .btn')].filter(x=>x.id!=='instanceEnableBtn');const cur=scopeInstance();if(scopeIsGlobal()){const dualMode=(lastStatus&&lastStatus.running_dual_mode)||'';const dualGpus=((lastStatus&&lastStatus.running_dual_gpu_indices)||[]).join(', ');summary.innerHTML=dualMode?`Global dual preset <code>${dualMode}</code> is active on GPUs ${dualGpus||'0, 1'} · port ${(lastStatus&&lastStatus.active_port)||'-'} · proxy <code>/v1</code>`:'Global scope selected. Use this view for host-wide controls and dual-GPU presets.';if(btn){btn.disabled=true;btn.textContent='Select a GPU Tab to Toggle Autostart'}actionButtons.forEach(x=>x.disabled=true)}else if(cur){summary.innerHTML=`GPU ${cur.gpu_index} · ${cur.assignment_text} · port ${cur.port} · ${cur.running?'running':'stopped'} · proxy <code>${cur.proxy_prefix}/</code> · ${cur.enabled?'autostart enabled':'autostart disabled'}`;if(btn){btn.disabled=false;btn.textContent=cur.enabled?'Disable Boot Autostart':'Enable Boot Autostart'}actionButtons.forEach(x=>x.disabled=false)}else{summary.textContent='No GPU instances configured';if(btn){btn.disabled=true;btn.textContent='Boot autostart unavailable'}actionButtons.forEach(x=>x.disabled=true)}if($('logInstanceLabel'))$('logInstanceLabel').textContent=currentLogLabel()}
+function ensureV413Layout(){const tabs=document.querySelector('.tabs');const auditBtn=tabs&&tabs.querySelector('.tab[onclick*=\"audit\"]');const logsBtn=tabs&&tabs.querySelector('.tab[onclick*=\"logs\"]');if(auditBtn)auditBtn.remove();if(tabs&&logsBtn)tabs.appendChild(logsBtn);const system=$('system');const presets=$('presets');const logs=$('logs');const audit=$('audit');if(system&&audit){const accessPolicy=findPanelByHeading('audit','Access Policy');if(accessPolicy&&!accessPolicy.dataset.v413Moved){accessPolicy.dataset.v413Moved='1';system.insertBefore(accessPolicy,system.children[1]||null)}const overview=findPanelByHeading('audit','Audit Overview');if(overview&&logs&&!overview.dataset.v413Moved){overview.dataset.v413Moved='1';logs.insertBefore(overview,logs.firstChild||null)}const globalControls=findPanelByHeading('audit','Global Controls');if(globalControls)globalControls.remove();const auditStream=findPanelByHeading('audit','Audit Stream');if(auditStream)auditStream.remove();if(audit.childElementCount===0||!audit.querySelector('.panel'))audit.remove()}const accessCard=findPanelByHeading('system','Access Policy');if(accessCard){const openUsers=[...accessCard.querySelectorAll('button')].find(btn=>(btn.textContent||'').includes('Open Users Management'));if(openUsers)openUsers.remove()}const singleCard=[...document.querySelectorAll('#presets .panel')].find(panel=>{const h=panel.querySelector('.panel-head h2,h2');return h&&((h.textContent||'').includes('Per-Instance Docker Presets')||(h.textContent||'').includes('Single GPU Docker Presets'))});if(singleCard){singleCard.id='singlePresetCard';const title=singleCard.querySelector('h2');if(title)title.textContent='Single GPU Docker Presets'}const customTitle=[...document.querySelectorAll('#presets .panel .panel-head h2')].find(h=>(h.textContent||'').trim()==='Custom Preset Templates');if(customTitle)customTitle.textContent='Custom Configuration Endpoints';if(presets&&!$('presetScopePanel')){const panel=document.createElement('div');panel.className='panel';panel.id='presetScopePanel';panel.innerHTML=`<h2>GPU Scope</h2><div class="subtabs" id="presetScopeTabs"></div><div class="value smallgap" id="presetScopeSummary">-</div>`;presets.insertBefore(panel,presets.firstChild||null)}if(presets&&!$('dualPresetCard')){const panel=document.createElement('div');panel.className='panel';panel.id='dualPresetCard';panel.innerHTML=`<h2>Dual GPU Docker Presets</h2><div class="preset-help">Apply a dual-GPU runtime across the first two detected cards. Use Global scope for these presets.</div><div class="actions"><button class="btn blue" onclick="switchDualMode('vllm/dual')">dual</button><button class="btn blue" onclick="switchDualMode('vllm/dual-turbo')">dual-turbo</button><button class="btn blue" onclick="switchDualMode('vllm/dual-dflash')">dual-dflash</button><button class="btn blue" onclick="switchDualMode('vllm/dual-dflash-noviz')">dual-dflash-noviz</button></div>`;const afterSingle=$('singlePresetCard');if(afterSingle&&afterSingle.parentNode===presets)presets.insertBefore(panel,afterSingle.nextSibling);else presets.insertBefore(panel,presets.children[1]||null)}if(logs&&!$('logsSourcePanel')){const panel=document.createElement('div');panel.className='panel';panel.id='logsSourcePanel';panel.innerHTML=`<h2>Log Sources</h2><div class="subtabs"><button class="subtab" id="logSourceDocker" onclick="setCurrentLogSource('docker')">Docker Logs</button><button class="subtab" id="logSourceAudit" onclick="setCurrentLogSource('audit')">Audit Logs</button></div><div class="value smallgap" id="logsSourceSummary">-</div>`;logs.appendChild(panel)}const profiles=findPanelByHeading('system','Profiles');if(profiles&&!$('profileScopeNote')){const note=document.createElement('div');note.className='preset-help';note.id='profileScopeNote';profiles.insertBefore(note,profiles.querySelector('.actions')||profiles.firstChild)}const power=findPanelByHeading('system','Power + Cooling');if(power&&!$('powerScopeNote')){const note=document.createElement('div');note.className='preset-help';note.id='powerScopeNote';power.insertBefore(note,power.querySelector('.actions')||power.firstChild)}}
+function renderPresetScopeTabs(){const tabs=$('presetScopeTabs');const summary=$('presetScopeSummary');if(!tabs||!summary)return;const instances=getInstanceList();tabs.innerHTML=instances.map(x=>`<button class="subtab ${x.id===currentScope()?'active':''}" onclick="setScope('${x.id}')">${x.id}</button>`).join('')+`<button class="subtab ${scopeIsGlobal()?'active':''}" onclick="setScope('GLOBAL')">Global</button>`;const cur=scopeInstance();if(scopeIsGlobal())summary.innerHTML=`Global scope selected. Single-GPU preset buttons are disabled here; use the dual-GPU card below to manage <code>${(lastStatus&&lastStatus.running_dual_mode)||'shared dual runtimes'}</code>.`;else if(cur)summary.innerHTML=`Targeting ${cur.id} · ${cur.assignment_text} · proxy <code>${cur.proxy_prefix}/</code>`;else summary.textContent='No GPU scope available';document.querySelectorAll('#singlePresetCard .actions .btn').forEach(btn=>btn.disabled=scopeIsGlobal());document.querySelectorAll('#dualPresetCard .actions .btn').forEach(btn=>btn.disabled=!scopeIsGlobal())}
+function updateScopedCards(){const cur=scopeInstance();if($('profileScopeNote'))$('profileScopeNote').innerHTML=scopeIsGlobal()?'Global scope: these profile buttons apply host-wide defaults for the full server.':`GPU scope: ${cur?cur.assignment_text:'select a GPU tab to continue'}`;if($('powerScopeNote'))$('powerScopeNote').innerHTML=scopeIsGlobal()?'Global scope: power and cooling controls below affect the whole host.':`GPU scope: targeting ${(cur&&cur.id)||'the selected GPU'} while keeping the UI aligned with that card selection.`;renderLogSourcePanel()}
+function renderLogSourcePanel(){if($('logSourceDocker'))$('logSourceDocker').classList.toggle('active',currentLogSource==='docker');if($('logSourceAudit'))$('logSourceAudit').classList.toggle('active',currentLogSource==='audit');if($('logsSourceSummary'))$('logsSourceSummary').innerHTML=currentLogSource==='audit'?'Audit logs selected. The shared Live and Search panels now follow <code>/opt/club3090-control/audit.log</code>.':'Docker logs selected. The shared Live and Search panels follow the currently selected GPU instance.'}
+function setCurrentLogSource(source){currentLogSource=source==='audit'?'audit':'docker';renderLogSourcePanel();applyLogVisibility();clearLog();connectLogs()}
+currentLogHeading=function(){return currentLogSource==='audit'?(activeTabName==='logs'?'Audit Logs - Full View':'Audit Logs'):(activeTabName==='logs'?'Docker Logs - Full View':'Docker Logs')}
+currentLogLabel=function(){if(currentLogSource==='audit')return 'source: audit';const cur=scopeInstance();return 'instance: '+((cur&&cur.id)||'primary')}
+applyLogVisibility=function(){const isLogs=activeTabName==='logs';document.body.classList.toggle('logs-tab',isLogs);document.body.classList.remove('audit-tab');const card=document.querySelector('.logs.panel');if(card)card.classList.toggle('log-card-hidden',!isLogs&&!showGlobalLogs);if($('logTitle'))$('logTitle').textContent=currentLogHeading();if($('logInstanceLabel'))$('logInstanceLabel').textContent=currentLogLabel();renderLogSourcePanel()}
+tab=function(e,n){activeTabName=n;document.querySelectorAll('.tabpane').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));const pane=$(n);if(pane)pane.classList.add('active');if(e&&e.target)e.target.classList.add('active');ensureUsersUi();ensureV413Layout();applyLogVisibility();clearLog();connectLogs();setTimeout(()=>{if(!searchState.active&&$('autoscroll').checked)$('log').scrollTop=$('log').scrollHeight},0)}
+connectLogs=function(){if(logEs){try{logEs.close()}catch(e){}}let url='/admin/audit-stream';if(currentLogSource!=='audit'){const cur=scopeInstance();const qs=cur?`?instance=${encodeURIComponent(cur.id)}`:'';url='/admin/logs'+qs}logEs=new EventSource(url);logEs.onopen=()=>appendLog(currentLogSource==='audit'?'--- audit stream connected ---':'--- log connected ---');logEs.onmessage=e=>appendLog(e.data.replaceAll('\\u0000','\n'));logEs.onerror=()=>appendLog(currentLogSource==='audit'?'--- audit stream disconnected; retrying ---':'--- log disconnected; retrying ---')}
+switchMode=async function(m){if(scopeIsGlobal()){alert('Select a GPU tab to apply a single-GPU preset. Dual-GPU presets live in the card below.');return}const cur=scopeInstance();if(!cur){alert('No GPU instance selected');return}const dualMode=(lastStatus&&lastStatus.running_dual_mode)||'';const dualGpus=(lastStatus&&lastStatus.running_dual_gpu_indices)||[];const warning=dualMode&&dualGpus.includes(Number(cur.gpu_index))?`\n\nWarning: GPU ${cur.gpu_index} is currently occupied by the dual preset ${dualMode}. Continuing will stop that dual preset and replace it with ${m} on ${cur.id}.`:'';if(confirm(`Assign ${m} to ${cur.id} and start it?${warning}`))try{await post('/admin/switch',{instance_id:cur.id,mode:m})}catch(e){alert(e)}}
+async function switchDualMode(m){if(!scopeIsGlobal())setScope('GLOBAL',false);const dualGpus=((lastStatus&&lastStatus.running_dual_gpu_indices)||[0,1]).join(', ');if(!confirm(`Apply dual-GPU preset ${m}? This takes over GPUs ${dualGpus||'0, 1'} and will stop overlapping single-GPU runtimes if needed.`))return;try{await post('/admin/switch',{mode:m});setScope('GLOBAL',false)}catch(e){alert(e)}}
+function quotaLimitText(v,suffix=''){return v===null||v===undefined||v===''?'unlimited':`${v}${suffix}`}
+function quotaWeightText(v){return v===null||v===undefined||v===''?'default':String(Number(v).toFixed(3)).replace(/\.?0+$/,'')}
+function quotaWindowText(windowData){windowData=windowData||{};return `${windowData.requests||0} msgs · score ${Number(windowData.score||0).toFixed(1)} · in ${windowData.input_tokens||0} · out ${windowData.output_tokens||0} · tools ${windowData.tool_calls||0} · thinking ${Number(windowData.thinking_seconds||0).toFixed(1)}s`}
+function quotaWeightLine(limits){limits=limits||{};return `in ${quotaWeightText(limits.input_token_weight)} · out ${quotaWeightText(limits.output_token_weight)} · tools ${quotaWeightText(limits.tool_call_weight)} · thinking ${quotaWeightText(limits.thinking_second_weight)}`}
+function quotaBudgetLine(limits){limits=limits||{};return `5h ${quotaLimitText(limits.score_per_5h)} · week ${quotaLimitText(limits.score_per_week)} · /msg tokens ${quotaLimitText(limits.max_tokens_per_message)} · /msg tools ${quotaLimitText(limits.max_tool_calls_per_message)}`}
+function parseQuotaNumber(id){const el=$(id);if(!el)return null;const v=el.value.trim();return v===''?null:Number(v)}
+ensureUsersUi=function(){const tabs=document.querySelector('.tabs');if(tabs&&!document.getElementById('usersTabBtn')){const b=document.createElement('button');b.className='tab';b.id='usersTabBtn';b.textContent='Users';b.onclick=(ev)=>tab(ev,'users');tabs.insertBefore(b,tabs.querySelector('.tab[onclick*="metrics"]')||null)}const main=document.querySelector('main.container');if(!main)return;let section=$('users');if(!section){section=document.createElement('section');section.id='users';section.className='tabpane content-tab';main.insertBefore(section,document.getElementById('metrics'))}if(section.dataset.codexQuotaUi!=='1'){section.dataset.codexQuotaUi='1';section.innerHTML=`<div class="panel"><div class="panel-head"><h2>User Accounts</h2><button class="add-preset-btn" title="New user" aria-label="New user" onclick="resetUserForm()"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none"/></svg></button></div><div class="preset-help">Usage score works like Codex-style budgeting: <code>input tokens × weight</code> + <code>output tokens × weight</code> + <code>tool calls × weight</code> + <code>thinking seconds × weight</code>. Only the 5-hour and weekly score budgets are enforced, along with per-message caps.</div><div class="formgrid"><label>User name<input id="userName" placeholder="client_a" /></label><label>Allowed targets<input id="userTargets" placeholder="*, legacy, GPU0, GPU1" /></label><label>Groups<input id="userGroups" placeholder="starter, premium" /></label><label>5h score budget<input id="userScore5h" type="number" step="0.1" placeholder="unlimited" /></label><label>Weekly score budget<input id="userScoreWeek" type="number" step="0.1" placeholder="unlimited" /></label><label>Max tokens / message<input id="userMaxTokensMsg" type="number" step="1" placeholder="unlimited" /></label><label>Max tool calls / message<input id="userMaxToolsMsg" type="number" step="1" placeholder="unlimited" /></label><label>Input token weight<input id="userInputTokenWeight" type="number" step="0.001" placeholder="default" /></label><label>Output token weight<input id="userOutputTokenWeight" type="number" step="0.001" placeholder="default" /></label><label>Tool-call weight<input id="userToolCallWeight" type="number" step="0.001" placeholder="default" /></label><label>Thinking-second weight<input id="userThinkingSecondWeight" type="number" step="0.001" placeholder="default" /></label><label>Enabled<select id="userEnabled"><option value="true">Enabled</option><option value="false">Disabled</option></select></label></div><div class="preset-form-actions"><button class="btn green" onclick="saveUserForm()">Save User</button><button class="btn amber" onclick="resetUserForm()">Clear</button></div><div class="msg" id="usersMsg"></div></div><div class="panel"><h2>Configured Users</h2><div id="usersGrid" class="api-grid"></div></div>`}const proxyCard=[...section.querySelectorAll('.panel')].find(panel=>{const h=panel.querySelector('.panel-head h2,h2');return h&&h.textContent.trim()==='Proxy Access'});if(proxyCard)proxyCard.remove()}
+resetUserForm=function(){ensureUsersUi();selectedUserName='';$('userName').disabled=false;$('userName').value='';$('userTargets').value='*';$('userGroups').value='';$('userScore5h').value='';$('userScoreWeek').value='';$('userMaxTokensMsg').value='';$('userMaxToolsMsg').value='';$('userInputTokenWeight').value='';$('userOutputTokenWeight').value='';$('userToolCallWeight').value='';$('userThinkingSecondWeight').value='';$('userEnabled').value='true';setUsersMsg('')}
+collectUserForm=function(){function val(id){return ($(id)&&$(id).value||'').trim()}return {name:val('userName'),allowed_targets:val('userTargets').split(',').map(x=>x.trim()).filter(Boolean),groups:val('userGroups').split(',').map(x=>x.trim()).filter(Boolean),enabled:$('userEnabled').value==='true',generate_api_key:!selectedUserName,limits:{score_per_5h:parseQuotaNumber('userScore5h'),score_per_week:parseQuotaNumber('userScoreWeek'),max_tokens_per_message:parseQuotaNumber('userMaxTokensMsg'),max_tool_calls_per_message:parseQuotaNumber('userMaxToolsMsg'),input_token_weight:parseQuotaNumber('userInputTokenWeight'),output_token_weight:parseQuotaNumber('userOutputTokenWeight'),tool_call_weight:parseQuotaNumber('userToolCallWeight'),thinking_second_weight:parseQuotaNumber('userThinkingSecondWeight')}}}
+editUser=function(name){const user=(lastStatus&&lastStatus.users||[]).find(u=>u.name===name);if(!user)return;ensureUsersUi();selectedUserName=name;$('userName').disabled=true;$('userName').value=user.name;$('userTargets').value=(user.allowed_targets||[]).join(', ');$('userGroups').value=(user.groups||[]).join(', ');$('userScore5h').value=user.limits.score_per_5h??'';$('userScoreWeek').value=user.limits.score_per_week??'';$('userMaxTokensMsg').value=user.limits.max_tokens_per_message??'';$('userMaxToolsMsg').value=user.limits.max_tool_calls_per_message??'';$('userInputTokenWeight').value=user.limits.input_token_weight??'';$('userOutputTokenWeight').value=user.limits.output_token_weight??'';$('userToolCallWeight').value=user.limits.tool_call_weight??'';$('userThinkingSecondWeight').value=user.limits.thinking_second_weight??'';$('userEnabled').value=String(!!user.enabled)}
+renderUsers=function(users,cfg){ensureUsersUi();const grid=$('usersGrid');if(!grid)return;users=users||[];if(selectedUserName&&!users.some(u=>u.name===selectedUserName))selectedUserName='';grid.innerHTML=users.map(u=>`<div class="api-card"><div class="api-card-head"><h3>${u.name}<br><span class="label">${u.enabled?'enabled':'disabled'} · access ${(u.effective_allowed_targets||u.allowed_targets||[]).join(', ')||'*'}</span></h3><span class="preset-actions"><button class="iconbtn" title="Edit" onclick="editUser('${u.name}')">✏️</button><button class="iconbtn" title="Reset key" onclick="resetUserKey('${u.name}')">🔑</button><button class="iconbtn" title="Delete" onclick="deleteUserByName('${u.name}')">❌</button></span></div><p>Groups: ${(u.groups||[]).join(', ')||'none'}</p><p>Last 5h: ${quotaWindowText((u.usage||{}).window_5h)}</p><p>Last week: ${quotaWindowText((u.usage||{}).window_week)}</p><p class="label">Direct budgets · ${quotaBudgetLine(u.limits||{})}</p><p class="label">Direct weights · ${quotaWeightLine(u.limits||{})}</p><p class="label">Effective budgets · ${quotaBudgetLine(u.effective_limits||{})}</p><p class="label">Effective weights · ${quotaWeightLine(u.effective_limits||{})}</p></div>`).join('')||'<div class="value">No API users configured yet.</div>';applyLogVisibility()}
+ensureGroupUi=function(){ensureUsersUi();const users=$('users');if(!users)return;let panel=$('groupsPanel');if(!panel){panel=document.createElement('div');panel.className='panel';panel.id='groupsPanel';users.appendChild(panel)}if(panel.dataset.codexQuotaUi!=='1'){panel.dataset.codexQuotaUi='1';panel.innerHTML=`<div class="panel-head"><h2>User Groups / Plans</h2><button class="add-preset-btn" title="New group" aria-label="New group" onclick="resetGroupForm()"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none"/></svg></button></div><div class="preset-help">Groups use the same scored-budget model as users. Leave any field blank to inherit or stay unlimited.</div><div class="formgrid"><label>Group name<input id="groupName" placeholder="starter" /></label><label>Description<input id="groupDescription" placeholder="Shared plan description" /></label><label>Allowed targets<input id="groupTargets" placeholder="*, legacy, GPU0, GPU1" /></label><label>5h score budget<input id="groupScore5h" type="number" step="0.1" placeholder="unlimited" /></label><label>Weekly score budget<input id="groupScoreWeek" type="number" step="0.1" placeholder="unlimited" /></label><label>Max tokens / message<input id="groupMaxTokensMsg" type="number" step="1" placeholder="unlimited" /></label><label>Max tool calls / message<input id="groupMaxToolsMsg" type="number" step="1" placeholder="unlimited" /></label><label>Input token weight<input id="groupInputTokenWeight" type="number" step="0.001" placeholder="default" /></label><label>Output token weight<input id="groupOutputTokenWeight" type="number" step="0.001" placeholder="default" /></label><label>Tool-call weight<input id="groupToolCallWeight" type="number" step="0.001" placeholder="default" /></label><label>Thinking-second weight<input id="groupThinkingSecondWeight" type="number" step="0.001" placeholder="default" /></label><label>Enabled<select id="groupEnabled"><option value="true">Enabled</option><option value="false">Disabled</option></select></label></div><div class="preset-form-actions"><button class="btn green" onclick="saveGroupForm()">Save Group</button><button class="btn amber" onclick="resetGroupForm()">Clear</button></div><div class="msg" id="groupsMsg"></div><div class="panel" style="margin-top:12px"><h2>Configured Groups</h2><div id="groupsGrid" class="api-grid"></div></div>`}}
+resetGroupForm=function(){ensureGroupUi();selectedGroupName='';$('groupName').disabled=false;$('groupName').value='';$('groupDescription').value='';$('groupTargets').value='*';$('groupScore5h').value='';$('groupScoreWeek').value='';$('groupMaxTokensMsg').value='';$('groupMaxToolsMsg').value='';$('groupInputTokenWeight').value='';$('groupOutputTokenWeight').value='';$('groupToolCallWeight').value='';$('groupThinkingSecondWeight').value='';$('groupEnabled').value='true';setGroupsMsg('')}
+collectGroupForm=function(){function val(id){return ($(id)&&$(id).value||'').trim()}return {name:val('groupName'),description:val('groupDescription'),allowed_targets:val('groupTargets').split(',').map(x=>x.trim()).filter(Boolean),enabled:$('groupEnabled').value==='true',limits:{score_per_5h:parseQuotaNumber('groupScore5h'),score_per_week:parseQuotaNumber('groupScoreWeek'),max_tokens_per_message:parseQuotaNumber('groupMaxTokensMsg'),max_tool_calls_per_message:parseQuotaNumber('groupMaxToolsMsg'),input_token_weight:parseQuotaNumber('groupInputTokenWeight'),output_token_weight:parseQuotaNumber('groupOutputTokenWeight'),tool_call_weight:parseQuotaNumber('groupToolCallWeight'),thinking_second_weight:parseQuotaNumber('groupThinkingSecondWeight')}}}
+editGroup=function(name){const group=(lastStatus&&lastStatus.groups||[]).find(g=>g.name===name);if(!group)return;ensureGroupUi();selectedGroupName=name;$('groupName').disabled=true;$('groupName').value=group.name;$('groupDescription').value=group.description||'';$('groupTargets').value=(group.allowed_targets||[]).join(', ');$('groupScore5h').value=group.limits.score_per_5h??'';$('groupScoreWeek').value=group.limits.score_per_week??'';$('groupMaxTokensMsg').value=group.limits.max_tokens_per_message??'';$('groupMaxToolsMsg').value=group.limits.max_tool_calls_per_message??'';$('groupInputTokenWeight').value=group.limits.input_token_weight??'';$('groupOutputTokenWeight').value=group.limits.output_token_weight??'';$('groupToolCallWeight').value=group.limits.tool_call_weight??'';$('groupThinkingSecondWeight').value=group.limits.thinking_second_weight??'';$('groupEnabled').value=String(!!group.enabled)}
+renderGroups=function(groups){ensureGroupUi();const grid=$('groupsGrid');if(!grid)return;groups=groups||[];if(selectedGroupName&&!groups.some(g=>g.name===selectedGroupName))selectedGroupName='';grid.innerHTML=groups.map(g=>`<div class="api-card"><div class="api-card-head"><h3>${g.name}<br><span class="label">${g.enabled?'enabled':'disabled'} · access ${(g.allowed_targets||[]).join(', ')||'*'}</span></h3><span class="preset-actions"><button class="iconbtn" title="Edit" onclick="editGroup('${g.name}')">✏️</button><button class="iconbtn" title="Delete" onclick="deleteGroupByName('${g.name}')">❌</button></span></div><p>${g.description||'No description'}</p><p class="label">Configured budgets · ${quotaBudgetLine(g.limits||{})}</p><p class="label">Configured weights · ${quotaWeightLine(g.limits||{})}</p><p class="label">Resolved budgets · ${quotaBudgetLine(g.resolved_limits||g.limits||{})}</p><p class="label">Resolved weights · ${quotaWeightLine(g.resolved_limits||g.limits||{})}</p></div>`).join('')||'<div class="value">No groups configured yet.</div>'}
+ensureUsersUi();ensureGroupUi();resetUserForm();resetGroupForm();
+const _v413RefreshStatus=refreshStatus;refreshStatus=async function(){await _v413RefreshStatus();ensureV413Layout();if(!selectedScope)selectedScope=selectedInstance||'GPU0';renderInstances(getInstanceList());renderPresetScopeTabs();updateScopedCards();if(lastStatus&&lastStatus.server_config)renderAudit(lastStatus.server_config)}
+ensureV413Layout();if(!selectedScope)selectedScope=selectedInstance||'GPU0';setScope(selectedScope,false);
 </script></body></html>
 """
 class CommonMixin:
@@ -3288,7 +3589,8 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                 m = dict(metrics)
             ap = active_port()
             cfg = read_server_config()
-            self.send_json({"active_mode":active_mode(),"active_port":ap,"container":current_container(),"club3090_dir":CLUB3090_DIR,"uptime_seconds":int(time.time()-startup_time),"vllm_service":service_status("club3090-vllm.service"),"control_service":service_status("club3090-control.service"),"caddy_service":service_status("club3090-caddy.service") if cfg.get("https_enabled", False) else "disabled","console_service":service_status("club3090-console-log.service"),"metrics":m,"recent_requests":list(recent_requests),"gpus":gpu_stats(),"power":power_status(),"system":system_stats(),"series":list(series_points),"ui_config":read_ui_config(),"presets":preset_catalog(),"gpu_count":detect_gpu_count_runtime(),"instances":instances_snapshot(),"single_gpu_modes":list(SINGLE_GPU_MODES),"users":list_users_public(),"groups":list_groups_public(),"server_config":cfg,"local_api":{"enabled":cfg.get("local_api_enabled", False),"port":cfg.get("local_api_port", LOCAL_API_PORT)},"admin_port":ADMIN_PORT,"proxy_port":PROXY_PORT})
+            dual_mode = running_dual_mode()
+            self.send_json({"active_mode":active_mode(),"active_port":ap,"container":current_container(),"club3090_dir":CLUB3090_DIR,"uptime_seconds":int(time.time()-startup_time),"vllm_service":service_status("club3090-vllm.service"),"control_service":service_status("club3090-control.service"),"caddy_service":service_status("club3090-caddy.service") if cfg.get("https_enabled", False) else "disabled","console_service":service_status("club3090-console-log.service"),"metrics":m,"recent_requests":list(recent_requests),"gpus":gpu_stats(),"power":power_status(),"system":system_stats(),"series":list(series_points),"ui_config":read_ui_config(),"presets":preset_catalog(),"gpu_count":detect_gpu_count_runtime(),"instances":instances_snapshot(),"single_gpu_modes":list(SINGLE_GPU_MODES),"dual_gpu_modes":list(DUAL_GPU_MODES),"running_dual_mode":dual_mode,"running_dual_gpu_indices":mode_gpu_indices(dual_mode),"users":list_users_public(),"groups":list_groups_public(),"server_config":cfg,"local_api":{"enabled":cfg.get("local_api_enabled", False),"port":cfg.get("local_api_port", LOCAL_API_PORT)},"admin_port":ADMIN_PORT,"proxy_port":PROXY_PORT})
             return
         if path == "/admin/logs":
             self.close_connection = False
@@ -3312,7 +3614,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             self.send_json({"ok": True, "presets": preset_catalog()})
             return
         if path == "/admin/instances":
-            self.send_json({"ok": True, "instances": instances_snapshot(), "single_gpu_modes": list(SINGLE_GPU_MODES)})
+            self.send_json({"ok": True, "instances": instances_snapshot(), "single_gpu_modes": list(SINGLE_GPU_MODES), "dual_gpu_modes": list(DUAL_GPU_MODES), "running_dual_mode": running_dual_mode()})
             return
         if path == "/admin/users":
             self.send_json({"ok": True, "users": list_users_public(), "groups": list_groups_public(), "server_config": read_server_config()})
@@ -3344,12 +3646,26 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                 data = self.read_json_body()
                 instance_id = data.get("instance_id")
                 mode = data.get("mode")
-                if not instance_id:
-                    raise ValueError("instance_id is required")
-                updated = update_instance(instance_id, mode=mode, enabled=True)
-                result = start_instance(updated["id"], wait=True)
-                log_audit("admin_switch_mode", instance=updated["id"], mode=mode)
-                self.send_json({"ok": True, "instance": instance_snapshot(updated), "mode": mode, "output": result.get("output", "")})
+                if mode not in MODES:
+                    raise ValueError("Invalid mode")
+                if instance_id:
+                    target = get_instance(instance_id)
+                    if not target:
+                        raise ValueError(f"Unknown instance: {instance_id}")
+                    dual_mode = running_dual_mode()
+                    if dual_mode and int(target.get("gpu_index", -1)) in mode_gpu_indices(dual_mode):
+                        stop_global_mode()
+                    updated = update_instance(instance_id, mode=mode, enabled=True)
+                    result = start_instance(updated["id"], wait=True)
+                    log_audit("admin_switch_mode", instance=updated["id"], mode=mode)
+                    self.send_json({"ok": True, "instance": instance_snapshot(updated), "mode": mode, "output": result.get("output", ""), "running_dual_mode": running_dual_mode()})
+                else:
+                    if mode not in DUAL_GPU_MODES:
+                        raise ValueError("Global switching is only supported for dual-GPU presets")
+                    stopped = stop_instances_for_gpu_indices(mode_gpu_indices(mode))
+                    output = run_switch(mode, allow_fallback=False)
+                    log_audit("admin_switch_mode_global", mode=mode, stopped_instances=[row["id"] for row in stopped])
+                    self.send_json({"ok": True, "mode": mode, "output": output, "stopped_instances": stopped, "running_dual_mode": running_dual_mode(), "instances": instances_snapshot()})
             except Exception as e:
                 self.send_json({"ok": False, "error": str(e)}, 500)
             return
@@ -3668,11 +3984,11 @@ class ProxyHandler(CommonMixin, BaseHTTPRequestHandler):
     def forward(self, body, upstream_path, preset_name, cap, instance_id=None):
         start = time.time()
         status = None
-        token_count = 0
-        tool_call_count = 0
+        response_usage = {"tokens": 0, "input_tokens": 0, "output_tokens": 0, "tool_calls": 0}
         target = get_instance(instance_id) if instance_id else primary_instance()
         target_id = target["id"] if target else "legacy"
-        auth_result = authorize_proxy_request(self.headers, instance_id, upstream_path)
+        request_usage = extract_request_usage(body) if body is not None and is_quota_counted_path(upstream_path) else {}
+        auth_result = authorize_proxy_request(self.headers, instance_id, upstream_path, request_usage=request_usage)
         if auth_result[0] is False:
             _, code, payload = auth_result
             self.send_json(payload, code)
@@ -3725,7 +4041,8 @@ class ProxyHandler(CommonMixin, BaseHTTPRequestHandler):
                     self.wfile.flush()
                 if first_chunk_at is not None:
                     toks = estimate_tokens_from_stream_bytes(bytes(total_bytes))
-                    token_count = max(token_count, int(toks or 0))
+                    response_usage["output_tokens"] = max(int(response_usage.get("output_tokens") or 0), int(toks or 0))
+                    response_usage["tokens"] = max(int(response_usage.get("tokens") or 0), int(toks or 0))
                     ttft = round(first_chunk_at - start, 3)
                     gen_time = max(0.001, time.time() - first_chunk_at)
                     with metrics_lock:
@@ -3733,14 +4050,14 @@ class ProxyHandler(CommonMixin, BaseHTTPRequestHandler):
                         metrics["last_estimated_tokens"] = toks
                         metrics["last_tokens_per_second"] = round(toks / gen_time, 2) if toks else None
                 parsed_usage = extract_response_usage(bytes(total_bytes))
-                token_count = max(token_count, int(parsed_usage.get("tokens") or 0))
-                tool_call_count = max(tool_call_count, int(parsed_usage.get("tool_calls") or 0))
+                for key in ("tokens", "input_tokens", "output_tokens", "tool_calls"):
+                    response_usage[key] = max(int(response_usage.get(key) or 0), int(parsed_usage.get(key) or 0))
         except urllib.error.HTTPError as e:
             status = e.code
             payload = e.read()
             parsed_usage = extract_response_usage(payload)
-            token_count = max(token_count, int(parsed_usage.get("tokens") or 0))
-            tool_call_count = max(tool_call_count, int(parsed_usage.get("tool_calls") or 0))
+            for key in ("tokens", "input_tokens", "output_tokens", "tool_calls"):
+                response_usage[key] = max(int(response_usage.get(key) or 0), int(parsed_usage.get(key) or 0))
             self.send_response(e.code)
             self.send_header("Content-Type", e.headers.get("Content-Type","text/plain"))
             self.send_header("Content-Length", str(len(payload)))
@@ -3771,13 +4088,22 @@ class ProxyHandler(CommonMixin, BaseHTTPRequestHandler):
                         self.send_header("X-Club3090-Instance", target_id)
                         self.send_header("Connection","close")
                         self.end_headers()
+                        retry_bytes = bytearray()
                         while True:
                             chunk = r2.read1(8192) if hasattr(r2, "read1") else r2.read(8192)
                             if not chunk:
                                 break
-                            token_count = max(token_count, int(estimate_tokens_from_stream_bytes(chunk) or 0))
+                            if len(retry_bytes) < 2000000:
+                                retry_bytes.extend(chunk)
                             self.wfile.write(chunk)
                             self.wfile.flush()
+                        parsed_retry_usage = extract_response_usage(bytes(retry_bytes))
+                        for key in ("tokens", "input_tokens", "output_tokens", "tool_calls"):
+                            response_usage[key] = max(int(response_usage.get(key) or 0), int(parsed_retry_usage.get(key) or 0))
+                        if int(response_usage.get("output_tokens") or 0) == 0:
+                            retry_toks = estimate_tokens_from_stream_bytes(bytes(retry_bytes))
+                            response_usage["output_tokens"] = max(int(response_usage.get("output_tokens") or 0), int(retry_toks or 0))
+                            response_usage["tokens"] = max(int(response_usage.get("tokens") or 0), int(retry_toks or 0))
                         return
                 except Exception as failover_error:
                     log_control(f"PROXY failover failed: {failover_error}")
@@ -3792,8 +4118,9 @@ class ProxyHandler(CommonMixin, BaseHTTPRequestHandler):
                 metrics["last_latency_s"] = latency
                 metrics["last_status"] = status
                 recent_requests.appendleft({"time":time.strftime("%H:%M:%S"),"status":status,"latency_s":latency,"preset":preset_name or "raw","path":self.path,"upstream":upstream_path,"instance":target_id,"user":auth_context.get("user_name") or "anonymous"})
-            record_user_usage(auth_context.get("user_name"), auth_context.get("count_request", False), status, token_count, tool_call_count, latency)
-            log_control(f"REQ user={(auth_context.get('user_name') or 'anonymous')} instance={target_id} status={status} latency={latency}s preset={preset_name or 'raw'} path={self.path} upstream={upstream_path} tokens={token_count} tool_calls={tool_call_count}")
+            record_user_usage(auth_context.get("user_name"), auth_context.get("count_request", False), status, request_usage, response_usage, latency)
+            total_tokens = max(int(response_usage.get("tokens") or 0), int(response_usage.get("input_tokens") or 0) + int(response_usage.get("output_tokens") or 0))
+            log_control(f"REQ user={(auth_context.get('user_name') or 'anonymous')} instance={target_id} status={status} latency={latency}s preset={preset_name or 'raw'} path={self.path} upstream={upstream_path} input_tokens={int(response_usage.get('input_tokens') or 0)} output_tokens={int(response_usage.get('output_tokens') or 0)} total_tokens={total_tokens} tool_calls={int(response_usage.get('tool_calls') or 0)}")
 
 def serve(port, handler, bind="0.0.0.0"):
     server = ThreadingHTTPServer((bind, port), handler)
@@ -3831,7 +4158,9 @@ if __name__ == "__main__":
 PYCTRL
 
 "${SUDO[@]}" chmod +x "${CONTROL_PY}"
+log_done "Control backend written"
 
+log_step "Writing headless X and runtime helper scripts"
 "${SUDO[@]}" tee "${HEADLESS_X_SH}" >/dev/null <<'HEADLESSX'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -4000,6 +4329,7 @@ while true; do
 done
 LOGFOLLOW
 "${SUDO[@]}" chmod +x "${FOLLOW_SH}"
+log_done "Helper scripts written"
 
 if [[ ! -f "${ACTIVE_MODE_FILE}" ]]; then
   echo "${DEFAULT_MODE}" | "${SUDO[@]}" tee "${ACTIVE_MODE_FILE}" >/dev/null
@@ -4008,6 +4338,7 @@ if [[ ! -f "${CONTROL_DIR}/last_good_mode" ]]; then
   "${SUDO[@]}" cp "${ACTIVE_MODE_FILE}" "${CONTROL_DIR}/last_good_mode" 2>/dev/null || true
 fi
 
+log_step "Refreshing persisted server configuration"
 "${SUDO[@]}" "${PYTHON_BIN}" - "${CONTROL_DIR}" "${ONLINE_EFFECTIVE_ENABLED}" "${LOCAL_AUTOMATION_EFFECTIVE_ENABLED}" "${ONLINE_TLS_EFFECTIVE_ENABLED}" "${LOCAL_API_PORT}" "${TLS_CERT_FILE}" "${TLS_KEY_FILE}" <<'PYSERVERCFG'
 import json, os, sys
 control_dir = sys.argv[1]
@@ -4056,7 +4387,9 @@ with open(tmp, "w", encoding="utf-8") as f:
     json.dump(current, f, indent=2, sort_keys=True)
 os.replace(tmp, path)
 PYSERVERCFG
+log_done "Server configuration refreshed"
 
+log_step "Validating generated control files"
 "${SUDO[@]}" "${BASH_BIN}" -n "${HEADLESS_X_SH}"
 "${SUDO[@]}" "${PYTHON_BIN}" -m py_compile "${CONTROL_PY}"
 # Structural validation: catch missing helper functions before replacing a working service.
@@ -4075,6 +4408,7 @@ if grep -q 'urlopen.*health\|/health.*urlopen' "${CONTROL_PY}"; then
   echo "ERROR: control.py still contains HTTP /health polling" >&2
   exit 1
 fi
+log_done "Generated files validated"
 
 write_control_units() {
   "${SUDO[@]}" tee /etc/systemd/system/club3090-control.service >/dev/null <<UNIT
@@ -4277,27 +4611,39 @@ restart_runtime_services_if_booted() {
 }
 
 if [[ "${ACTION}" == "install" ]]; then
+  log_step "Writing and enabling systemd units for a fresh install"
   write_vllm_unit
   write_control_units
   configure_https_frontend
+  log_step "Reloading systemd manager configuration"
   "${SUDO[@]}" systemctl daemon-reload
+  log_step "Enabling managed club-3090 services"
   enable_managed_units
+  log_step "Configuring networking and frontend exposure"
   configure_networking_and_frontend
+  log_step "Restarting runtime-facing services when server boot mode is active"
   restart_runtime_services_if_booted
+  log_done "Install actions completed"
 
   echo
   echo "Installed club-3090 server control services."
   echo "They start unattended before login, but only when booted with kernel arg: club3090.server=1"
 else
+  log_step "Refreshing systemd units and managed services for update"
   # Update the vLLM unit too so the next reboot uses the last selected mode.
   # Do not restart it here; that would interrupt a running model session.
   write_vllm_unit
   write_control_units
   configure_https_frontend
+  log_step "Reloading systemd manager configuration"
   "${SUDO[@]}" systemctl daemon-reload
+  log_step "Re-enabling managed club-3090 services"
   enable_managed_units
+  log_step "Refreshing networking and frontend exposure"
   configure_networking_and_frontend
+  log_step "Restarting control-plane services if the server boot flag is active"
   restart_runtime_services_if_booted
+  log_done "Update actions completed"
   echo
   echo "Updated club-3090 multi-instance control plane, proxy, metrics UI, console log follower, and boot unit."
   echo "Running Docker instances were left unchanged; next server boot will restore enabled entries from ${CONTROL_DIR}/instances.json."
