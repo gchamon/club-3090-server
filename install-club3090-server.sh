@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="2026-05-05.v4.14.0"
+SCRIPT_VERSION="2026-05-05.v4.15.0"
 
 # club-3090 headless server/control installer
 # Install:
@@ -983,6 +983,7 @@ def default_server_config():
         "admin_path": "/admin",
         "local_api_enabled": False,
         "local_api_port": LOCAL_API_PORT,
+        "gpu_pairing_enabled": True,
     }
 
 
@@ -999,6 +1000,10 @@ def read_server_config():
     merged["upnp_enabled"] = bool(merged.get("upnp_enabled", False))
     merged["https_enabled"] = bool(merged.get("https_enabled", False))
     merged["local_api_enabled"] = bool(merged.get("local_api_enabled", False))
+    if "gpu_pairing_enabled" in data:
+        merged["gpu_pairing_enabled"] = bool(data.get("gpu_pairing_enabled"))
+    else:
+        merged["gpu_pairing_enabled"] = detect_gpu_count_runtime() != 2
     try:
         merged["local_api_port"] = int(merged.get("local_api_port", LOCAL_API_PORT))
     except Exception:
@@ -1011,7 +1016,7 @@ def read_server_config():
 
 def write_server_config(data):
     current = read_server_config()
-    for key in ("allow_proxy_without_api_key", "online_enabled", "upnp_enabled", "https_enabled", "local_api_enabled"):
+    for key in ("allow_proxy_without_api_key", "online_enabled", "upnp_enabled", "https_enabled", "local_api_enabled", "gpu_pairing_enabled"):
         if key in data:
             current[key] = bool(data[key])
     if "local_api_port" in data:
@@ -1911,6 +1916,23 @@ def detect_gpu_count_runtime():
         except Exception:
             return 0
 
+def gpu_pairing_default_enabled(gpu_count=None):
+    try:
+        count = int(gpu_count if gpu_count is not None else detect_gpu_count_runtime())
+    except Exception:
+        count = 0
+    return count != 2
+
+def gpu_pairing_enabled(cfg=None, gpu_count=None):
+    config = cfg if isinstance(cfg, dict) else read_server_config()
+    try:
+        count = int(gpu_count if gpu_count is not None else detect_gpu_count_runtime())
+    except Exception:
+        count = 0
+    if isinstance(config, dict) and "gpu_pairing_enabled" in config:
+        return bool(config.get("gpu_pairing_enabled"))
+    return gpu_pairing_default_enabled(count)
+
 def default_instances_config():
     count = detect_gpu_count_runtime()
     rows = []
@@ -1923,7 +1945,7 @@ def default_instances_config():
             "enabled": gpu_idx == 0 and DEFAULT_MODE in SINGLE_GPU_MODES,
             "port": INSTANCE_PORT_BASE + gpu_idx,
         })
-    if count == 2:
+    if count == 2 and gpu_pairing_enabled(gpu_count=count):
         rows.append({
             "id": "PAIR0_1",
             "kind": "dual",
@@ -1968,6 +1990,8 @@ def instance_default_port(kind, gpu_indices):
     if kind == "dual":
         pair = normalize_pair_indices(gpu_indices)
         if not pair:
+            return PAIR_INSTANCE_PORT_BASE
+        if pair == [0, 1]:
             return PAIR_INSTANCE_PORT_BASE
         return PAIR_INSTANCE_PORT_BASE + (pair[0] * 100) + pair[1]
     idx = int((gpu_indices or [0])[0])
@@ -2042,7 +2066,7 @@ def normalize_instances(rows):
         if inst is not None:
             clean.append(inst)
             existing_ids.add(inst["id"])
-    if count == 2 and "PAIR0_1" not in existing_ids:
+    if count == 2 and gpu_pairing_enabled(gpu_count=count) and "PAIR0_1" not in existing_ids:
         inst = normalize_instance({"id": "PAIR0_1", "kind": "dual", "gpu_indices": [0, 1], "mode": DEFAULT_MODE if DEFAULT_MODE in DUAL_GPU_MODES else "vllm/dual", "enabled": DEFAULT_MODE in DUAL_GPU_MODES, "port": PAIR_INSTANCE_PORT_BASE}, used_ids, used_ports)
         if inst is not None:
             clean.append(inst)
@@ -2051,6 +2075,55 @@ def normalize_instances(rows):
     clean.sort(key=lambda d: (d.get("gpu_index", 9999), d.get("id", "")))
     return clean
 
+def detect_legacy_dual_mode():
+    if detect_gpu_count_runtime() != 2:
+        return None
+    file_mode = None
+    try:
+        file_mode = open(ACTIVE_MODE_FILE, "r", encoding="utf-8").read().strip()
+    except Exception:
+        file_mode = None
+    if file_mode in DUAL_GPU_MODES and port_open(MODES[file_mode], timeout=0.08):
+        return file_mode
+    open_dual = [mode for mode in DUAL_GPU_MODES if port_open(MODES[mode], timeout=0.08)]
+    if len(open_dual) == 1:
+        return open_dual[0]
+    return None
+
+def sync_pair_rows_with_legacy(rows):
+    rows = normalize_instances(rows)
+    if detect_gpu_count_runtime() != 2 or not gpu_pairing_enabled(gpu_count=2):
+        return rows, False
+    legacy_mode = detect_legacy_dual_mode()
+    if legacy_mode not in DUAL_GPU_MODES:
+        return rows, False
+    changed = False
+    found = False
+    for row in rows:
+        if row.get("id") != "PAIR0_1":
+            continue
+        found = True
+        if row.get("mode") != legacy_mode:
+            row["mode"] = legacy_mode
+            changed = True
+        if not row.get("enabled"):
+            row["enabled"] = True
+            changed = True
+        break
+    if not found:
+        rows.append({
+            "id": "PAIR0_1",
+            "kind": "dual",
+            "gpu_indices": [0, 1],
+            "mode": legacy_mode,
+            "enabled": True,
+            "port": PAIR_INSTANCE_PORT_BASE,
+        })
+        changed = True
+    if changed:
+        rows = normalize_instances(rows)
+    return rows, changed
+
 def read_instances_config():
     try:
         with open(INSTANCES_CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -2058,6 +2131,8 @@ def read_instances_config():
         rows = normalize_instances(data)
     except Exception:
         rows = normalize_instances([])
+    rows, changed = sync_pair_rows_with_legacy(rows)
+    if changed or not os.path.exists(INSTANCES_CONFIG_FILE):
         write_instances_config(rows)
     return rows
 
@@ -2130,9 +2205,15 @@ def instance_compose_args(instance):
     return compose_cmd() + ["-p", instance_project_name(instance), "--env-file", paths["env"], "-f", compose_file, "-f", paths["override"]]
 
 def start_instance(instance_id, wait=True):
+    if not instance_id:
+        output = run_switch(active_mode())
+        return {"instance": None, "output": output[-4000:]}
     instance = get_instance(instance_id)
     if not instance:
         raise ValueError(f"Unknown instance: {instance_id}")
+    if instance_uses_legacy_dual_runtime(instance):
+        output = run_switch(instance_runtime_mode(instance))
+        return {"instance": get_instance(instance["id"]), "output": output[-4000:]}
     cmd = instance_compose_args(instance) + ["up", "-d"]
     rc, out = run_cmd(cmd, timeout=1800)
     log_control(f"INSTANCE start {instance['id']} mode={instance['mode']} rc={rc}: {out[-4000:]}")
@@ -2143,9 +2224,17 @@ def start_instance(instance_id, wait=True):
     return {"instance": instance, "output": out[-4000:]}
 
 def stop_instance(instance_id):
+    if not instance_id:
+        p = subprocess.run(["bash", "scripts/switch.sh", "--down"], cwd=CLUB3090_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=300)
+        return p.returncode, (p.stdout or "")[-4000:]
     instance = get_instance(instance_id)
     if not instance:
         raise ValueError(f"Unknown instance: {instance_id}")
+    if instance_uses_legacy_dual_runtime(instance):
+        p = subprocess.run(["bash", "scripts/switch.sh", "--down"], cwd=CLUB3090_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=300)
+        out = (p.stdout or "")[-4000:]
+        log_control(f"INSTANCE legacy stop {instance['id']} rc={p.returncode}: {out}")
+        return p.returncode, out
     cmd = instance_compose_args(instance) + ["down"]
     rc, out = run_cmd(cmd, timeout=600)
     if rc != 0:
@@ -2219,11 +2308,56 @@ def delete_pair_instance(instance_id):
     write_instances_config(remaining)
     return instances_snapshot()
 
+def instance_uses_legacy_dual_runtime(instance):
+    return bool(
+        instance
+        and instance.get("kind") == "dual"
+        and instance.get("id") == "PAIR0_1"
+        and detect_gpu_count_runtime() == 2
+    )
+
+def visible_instances(rows=None):
+    items = list(rows if isinstance(rows, list) else read_instances_config())
+    if gpu_pairing_enabled(gpu_count=detect_gpu_count_runtime()):
+        return items
+    return [inst for inst in items if inst.get("kind") != "dual"]
+
+def instance_runtime_mode(instance):
+    mode = str((instance or {}).get("mode") or "")
+    if instance_uses_legacy_dual_runtime(instance):
+        legacy_mode = detect_legacy_dual_mode()
+        if legacy_mode in DUAL_GPU_MODES:
+            return legacy_mode
+    return mode
+
+def instance_runtime_port(instance):
+    if instance_uses_legacy_dual_runtime(instance):
+        mode = instance_runtime_mode(instance)
+        return int(MODES.get(mode, (instance or {}).get("port") or PAIR_INSTANCE_PORT_BASE))
+    return int((instance or {}).get("port") or 0)
+
+def instance_running(instance):
+    return port_open(instance_runtime_port(instance), timeout=0.08)
+
+def legacy_runtime_container_name():
+    names = vllm_container_names(all_containers=False)
+    if not names:
+        return ""
+    preferred = [name for name in names if "pair0_1" not in name.lower()]
+    return preferred[0] if preferred else names[0]
+
+def instance_runtime_container_name(instance):
+    if instance_uses_legacy_dual_runtime(instance):
+        return legacy_runtime_container_name()
+    return instance_container_name(instance)
+
 def primary_instance():
-    rows = read_instances_config()
+    rows = visible_instances(read_instances_config())
     if not rows:
         return None
-    running = [inst for inst in rows if port_open(int(inst["port"]), timeout=0.08)]
+    if detect_gpu_count_runtime() == 2 and not gpu_pairing_enabled(gpu_count=2) and detect_legacy_dual_mode():
+        return None
+    running = [inst for inst in rows if instance_running(inst)]
     if running:
         return sorted(running, key=lambda d: (len(d.get("gpu_indices") or [d["gpu_index"]]), d["gpu_index"], d["id"]))[0]
     enabled = [inst for inst in rows if inst.get("enabled")]
@@ -2233,7 +2367,7 @@ def primary_instance():
 
 def boot_enabled_instances():
     outputs = []
-    rows = read_instances_config()
+    rows = visible_instances(read_instances_config())
     started = 0
     for inst in rows:
         if not inst.get("enabled"):
@@ -2257,14 +2391,20 @@ def mode_gpu_indices(mode, gpu_count=None):
     return [idx for idx in range(max(count, 0))][:2]
 
 def running_dual_mode():
-    rows = [inst for inst in read_instances_config() if inst.get("kind") == "dual" and port_open(int(inst["port"]), timeout=0.08)]
+    rows = running_dual_instances()
     if not rows:
         return None
     rows.sort(key=lambda d: (d["gpu_indices"], d["id"]))
     return rows[0]["mode"]
 
 def running_dual_instances():
-    rows = [inst for inst in read_instances_config() if inst.get("kind") == "dual" and port_open(int(inst["port"]), timeout=0.08)]
+    rows = []
+    for inst in visible_instances(read_instances_config()):
+        if inst.get("kind") != "dual" or not instance_running(inst):
+            continue
+        row = dict(inst)
+        row["mode"] = instance_runtime_mode(inst)
+        rows.append(row)
     rows.sort(key=lambda d: (d.get("gpu_indices") or [], d["id"]))
     return rows
 
@@ -2278,7 +2418,7 @@ def stop_overlapping_instances(indices, exclude_ids=None):
         inst_indices = {int(idx) for idx in (inst.get("gpu_indices") or [inst.get("gpu_index", -1)])}
         if not wanted.intersection(inst_indices):
             continue
-        if not port_open(int(inst["port"]), timeout=0.08):
+        if not instance_running(inst):
             continue
         rc, out = stop_instance(inst["id"])
         results.append({"id": inst["id"], "rc": rc, "output": out[-1200:]})
@@ -2294,17 +2434,18 @@ def stop_instances_for_gpu_indices(indices):
 def instance_assignment(instance, dual_mode=None):
     gpu_indices = [int(idx) for idx in (instance.get("gpu_indices") or [instance.get("gpu_index", -1)])]
     if instance.get("kind") == "dual":
-        if port_open(int(instance["port"]), timeout=0.08):
+        runtime_mode = instance_runtime_mode(instance)
+        if instance_running(instance):
             return {
                 "scope": "pair",
-                "mode": str(instance.get("mode") or "vllm/dual"),
-                "text": f"GPUs {', '.join(str(idx) for idx in gpu_indices)} are running the dual preset {instance['mode']}",
+                "mode": runtime_mode,
+                "text": f"GPUs {', '.join(str(idx) for idx in gpu_indices)} are running the dual preset {runtime_mode}",
                 "override": False,
             }
         return {
             "scope": "pair",
-            "mode": str(instance.get("mode") or "vllm/dual"),
-            "text": f"GPUs {', '.join(str(idx) for idx in gpu_indices)} are reserved for dual preset {instance['mode']}",
+            "mode": runtime_mode,
+            "text": f"GPUs {', '.join(str(idx) for idx in gpu_indices)} are reserved for dual preset {runtime_mode}",
             "override": False,
         }
     for pair in running_dual_instances():
@@ -2325,20 +2466,22 @@ def instance_assignment(instance, dual_mode=None):
     }
 
 def instance_snapshot(instance):
-    container = instance_container_name(instance)
-    running = port_open(int(instance["port"]), timeout=0.1)
+    container = instance_runtime_container_name(instance)
+    runtime_mode = instance_runtime_mode(instance)
+    runtime_port = instance_runtime_port(instance)
+    running = port_open(runtime_port, timeout=0.1)
     assigned = instance_assignment(instance)
     return {
         "id": instance["id"],
         "kind": instance.get("kind", "single"),
         "gpu_index": instance["gpu_index"],
         "gpu_indices": list(instance.get("gpu_indices") or [instance["gpu_index"]]),
-        "mode": instance["mode"],
+        "mode": runtime_mode,
         "enabled": bool(instance.get("enabled")),
-        "port": int(instance["port"]),
+        "port": runtime_port,
         "container": container,
         "running": running,
-        "ready_url": instance_ready_url(instance),
+        "ready_url": f"http://127.0.0.1:{runtime_port}/v1/models",
         "proxy_prefix": f"/{instance['id']}",
         "display_name": instance["id"] if instance.get("kind") != "dual" else f"Pair {', '.join(str(idx) for idx in instance.get('gpu_indices') or [])}",
         "assignment_scope": assigned["scope"],
@@ -2348,7 +2491,7 @@ def instance_snapshot(instance):
     }
 
 def instances_snapshot():
-    return [instance_snapshot(inst) for inst in read_instances_config()]
+    return [instance_snapshot(inst) for inst in visible_instances(read_instances_config())]
 
 def ready_url_for_mode(mode):
     return f"http://localhost:{MODES[mode]}/v1/models"
@@ -2391,7 +2534,7 @@ def port_open(port, timeout=0.25):
 def detected_mode():
     primary = primary_instance()
     if primary:
-        return primary["mode"]
+        return instance_runtime_mode(primary)
     # Source of truth is the mode selected by this controller/switch.sh.
     # If the file is stale, use a TCP-only port scan as a fallback. Never call /health.
     file_mode = read_active_mode_file()
@@ -2419,7 +2562,7 @@ def active_mode():
 def active_port():
     primary = primary_instance()
     if primary:
-        return int(primary["port"])
+        return instance_runtime_port(primary)
     return MODES.get(active_mode(), 8020)
 
 def password_ok(username, password):
@@ -2473,8 +2616,8 @@ def vllm_container_names(all_containers=False):
 
 def current_container():
     primary = primary_instance()
-    if primary and port_open(int(primary["port"]), timeout=0.08):
-        return instance_container_name(primary)
+    if primary and instance_running(primary):
+        return instance_runtime_container_name(primary)
     names = vllm_container_names(all_containers=False)
     return names[0] if names else ""
 
@@ -3583,7 +3726,7 @@ def parse_instance_path(path):
 
 HTML = r"""<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>club-3090 Control</title><style>
-:root{color-scheme:dark;--bg:#0b0f14;--panel:#121923;--line:#273243;--text:#e8eef7;--muted:#9dafc3;--blue:#72c7ff;--green:#2fc46b;--red:#ff5b6c;--amber:#ffcb6b;--orange:#ff8a2a;--field:#081018;--cyan:#7dd3fc;--turquoise:#26d6c6}*{box-sizing:border-box}html,body{min-height:100%;margin:0}body{font-family:system-ui,-apple-system,Segoe UI,Arial,sans-serif;background:var(--bg);color:var(--text);overflow-y:auto;overflow-x:hidden}header{position:sticky;top:0;z-index:10;padding:10px 12px;background:#111925f7;backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}.top{display:flex;justify-content:space-between;align-items:center;gap:8px}.brand{font-size:18px;font-weight:800}.pill{color:var(--muted);font-size:12px;border:1px solid var(--line);border-radius:999px;padding:4px 8px;background:#0a1119;margin-top:4px}.tabs,.subtabs{display:flex;gap:6px;overflow-x:auto}.tabs{padding-top:10px}.subtabs{margin-bottom:10px}.tab,.subtab,.btn{border:1px solid #34445a;background:#1b2635;color:#eef4ff;border-radius:10px;padding:9px 11px;font-size:13px;cursor:pointer;white-space:nowrap}.tab.active,.subtab.active{background:#203149;border-color:#3d6fa3}.btn:disabled{opacity:.5;cursor:not-allowed}.green{background:#113d25;border-color:#2c8a54}.turquoise{background:#079c9c;border-color:#4df5e8;color:#041316}.red{background:#4a1118;border-color:#8a2b35}.amber{background:#4a3511;border-color:#8a652b}.orange{background:#c45512;border-color:#ffae42;color:#fff}.blue{background:#12314d;border-color:#2a72a8}.default-profile{background:#1d5f96;border-color:#78c7ff;color:#fff}.container{display:flex;flex-direction:column;gap:10px;padding:10px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:12px;box-shadow:0 8px 30px #0004;margin-bottom:10px}.panel h2{font-size:14px;margin:0 0 10px}.chartgrid + .panel{margin-top:10px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.stat{background:#0b1119;border:1px solid #222d3c;border-radius:10px;padding:8px}.label{color:var(--muted);font-size:11px}.value{font-weight:700;font-size:13px;overflow-wrap:anywhere}.actions{display:flex;gap:7px;flex-wrap:wrap}.tabpane{display:none}.tabpane.active{display:block}.metricpane{display:none}.metricpane.active{display:block}.logs{min-height:0;display:flex;flex-direction:column;margin-bottom:0}.loghead{display:flex;justify-content:space-between;align-items:center;padding-bottom:7px;gap:10px}.logheadchecks{display:flex;align-items:center;gap:12px;white-space:nowrap}.log{width:100%;height:clamp(360px,calc(100dvh - 430px),560px);min-height:320px;resize:vertical;white-space:pre-wrap;overflow-wrap:anywhere;background:#030608;color:#a5ffa5;border:1px solid #26313f;border-radius:12px;padding:12px;font-family:Consolas,monospace;font-size:12px;line-height:1.35}.log-card-hidden{display:none!important}.logs-tab .container{min-height:calc(100dvh - 108px)}.logs-tab .logs.panel{height:calc(100dvh - 252px);min-height:500px;margin-bottom:0}.logs-tab .log{height:auto;min-height:0;flex:1;resize:none}.logs-tab .content-tab{display:none!important}.logtools{display:none}.logs-tab .logtools,.audit-tab .logtools{display:block;margin-bottom:10px}.logtools h2{display:block;margin:0 0 10px}.logtools .searchbox{display:flex}.searchbox{display:flex;align-items:center;gap:6px;flex-wrap:nowrap;width:100%}.searchbox input{flex:1 1 auto;min-width:80px;background:var(--field);color:var(--text);border:1px solid #2c3a4f;border-radius:9px;padding:9px}.chartgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.gpu-chartgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.chart{height:145px;background:#081018;border:1px solid #213044;border-radius:12px;padding:8px}.chart.tall{height:220px}canvas{width:100%;height:100%}.msg{color:var(--amber);font-size:12px;min-height:18px;padding-top:6px}.smallgap{margin-bottom:5px}.gpu-cards{display:grid;grid-template-columns:1fr;gap:10px}.gpu-card{background:#101722;border:1px solid #26313f;border-radius:14px;padding:12px}.gpu-title{font-weight:800;color:#d9ecff;margin-bottom:10px;border-bottom:1px solid #26313f;padding-bottom:7px}.gpu-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.gpu-section-title{color:#9dafc3;font-size:12px;text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px}.gpu-line{display:flex;justify-content:space-between;gap:8px;font-size:13px;padding:2px 0}.meter{height:7px;background:#081018;border-radius:99px;overflow:hidden;margin-top:5px}.meter span{display:block;height:100%;background:#2fc46b}.coregrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(90px,1fr));gap:6px}.storage-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px}.storage-section{display:flex;flex-direction:column;gap:10px}.storage-card.user-facing{background:#10243a;border-color:#2a72a8}.storage-card{background:#0b1119;border:1px solid #243144;border-radius:12px;padding:10px;min-width:0}.storage-title{font-weight:800;color:#d9ecff;margin-bottom:6px;overflow-wrap:anywhere}.storage-meta{color:#9dafc3;font-size:12px;margin-bottom:6px;overflow-wrap:anywhere}.storage-sizes{display:grid;grid-template-columns:minmax(85px,.8fr) minmax(85px,.8fr) minmax(95px,.9fr);gap:6px;margin-bottom:8px}.storage-sizes .stat{padding:6px}.diskbar{height:8px;background:#081018;border-radius:99px;overflow:hidden;width:100%;margin-bottom:3px;margin-top:3px}.diskbar span{display:block;height:100%;background:#72c7ff}.netgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px}.temp-blue{color:#60a5fa}.temp-green{color:#2fc46b}.temp-yellow{color:#ffde59}.temp-orange{color:#ff8a2a}.temp-red{color:#ff5b6c}.temp-crimson{color:#dc143c;font-weight:900}.machine-row{margin-top:7px}.api-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:8px}.api-card{background:#0b1119;border:1px solid #243144;border-radius:12px;padding:10px}.api-card h3{font-size:13px;margin:0 0 6px;color:#d9ecff}.api-card p{margin:0;color:var(--muted);font-size:12px;line-height:1.35}.api-card-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.preset-actions{display:flex;gap:4px}.iconbtn{border:1px solid #34445a;background:#182231;color:#eef4ff;border-radius:8px;padding:5px 7px;cursor:pointer}.preset-editor{display:none}.preset-editor.open{display:block}.formgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}.formgrid label{display:flex;flex-direction:column;gap:4px;color:var(--muted);font-size:12px}.formgrid input,.formgrid select{background:var(--field);color:var(--text);border:1px solid #2c3a4f;border-radius:9px;padding:8px}.preset-help{color:var(--muted);font-size:12px;line-height:1.35;margin-bottom:10px}.profile-balanced{background:#0faeb0;border-color:#5ff5e8;color:#031516}.panel-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:10px}.panel-head h2{margin:0}.add-preset-btn{width:30px;height:30px;border-radius:999px;border:1px solid #55ee91;background:#128a45;color:#fff;display:inline-flex;align-items:center;justify-content:center;padding:0;box-shadow:none}.add-preset-btn:hover{background:#18a957}.add-preset-btn svg{width:15px;height:15px;stroke:#fff;stroke-width:3;stroke-linecap:round}.preset-form-actions{display:flex;justify-content:center;gap:18px;margin-top:14px}.preset-intro{color:var(--muted);font-size:13px;line-height:1.45;margin:4px 0 2px}.preset-intro.hidden{display:none}@media(max-width:900px){.chartgrid{grid-template-columns:1fr}.gpu-chartgrid{grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.grid{grid-template-columns:1fr 1fr}.gpu-grid{grid-template-columns:1fr}.log{height:clamp(320px,calc(100dvh - 410px),520px)}.logs-tab .logs.panel{height:calc(100dvh - 250px);min-height:500px}.logs-tab .log{height:auto;min-height:0}}
+:root{color-scheme:dark;--bg:#0b0f14;--panel:#121923;--line:#273243;--text:#e8eef7;--muted:#9dafc3;--blue:#72c7ff;--green:#2fc46b;--red:#ff5b6c;--amber:#ffcb6b;--orange:#ff8a2a;--field:#081018;--cyan:#7dd3fc;--turquoise:#26d6c6}*{box-sizing:border-box}html,body{min-height:100%;margin:0}body{font-family:system-ui,-apple-system,Segoe UI,Arial,sans-serif;background:var(--bg);color:var(--text);overflow-y:auto;overflow-x:hidden}header{position:sticky;top:0;z-index:10;padding:10px 12px;background:#111925f7;backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}.top{display:flex;justify-content:space-between;align-items:center;gap:8px}.brand{font-size:18px;font-weight:800}.pill{color:var(--muted);font-size:12px;border:1px solid var(--line);border-radius:999px;padding:4px 8px;background:#0a1119;margin-top:4px}.tabs,.subtabs{display:flex;gap:6px;overflow-x:auto}.tabs{padding-top:10px}.subtabs{margin-bottom:10px}.tab,.subtab,.btn{border:1px solid #34445a;background:#1b2635;color:#eef4ff;border-radius:10px;padding:9px 11px;font-size:13px;cursor:pointer;white-space:nowrap}.tab.active,.subtab.active{background:#203149;border-color:#3d6fa3}.btn:disabled{opacity:.5;cursor:not-allowed}.green{background:#113d25;border-color:#2c8a54}.turquoise{background:#079c9c;border-color:#4df5e8;color:#041316}.red{background:#4a1118;border-color:#8a2b35}.amber{background:#4a3511;border-color:#8a652b}.orange{background:#c45512;border-color:#ffae42;color:#fff}.blue{background:#12314d;border-color:#2a72a8}.purple{background:#4b1f75;border-color:#9460df;color:#fff}.default-profile{background:#1d5f96;border-color:#78c7ff;color:#fff}.container{display:flex;flex-direction:column;gap:10px;padding:10px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:12px;box-shadow:0 8px 30px #0004;margin-bottom:10px}.panel h2{font-size:14px;margin:0 0 10px}.chartgrid + .panel{margin-top:10px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.stat{background:#0b1119;border:1px solid #222d3c;border-radius:10px;padding:8px}.label{color:var(--muted);font-size:11px}.value{font-weight:700;font-size:13px;overflow-wrap:anywhere}.actions{display:flex;gap:7px;flex-wrap:wrap}.tabpane{display:none}.tabpane.active{display:block}.metricpane{display:none}.metricpane.active{display:block}.logs{min-height:0;display:flex;flex-direction:column;margin-bottom:0}.loghead{display:flex;justify-content:space-between;align-items:center;padding-bottom:7px;gap:10px}.logheadchecks{display:flex;align-items:center;gap:12px;white-space:nowrap}.log{width:100%;height:clamp(360px,calc(100dvh - 430px),560px);min-height:320px;resize:vertical;white-space:pre-wrap;overflow-wrap:anywhere;background:#030608;color:#a5ffa5;border:1px solid #26313f;border-radius:12px;padding:12px;font-family:Consolas,monospace;font-size:12px;line-height:1.35}.log-card-hidden{display:none!important}.logs-tab .container{min-height:calc(100dvh - 108px)}.logs-tab .logs.panel{height:calc(100dvh - 252px);min-height:500px;margin-bottom:0}.logs-tab .log{height:auto;min-height:0;flex:1;resize:none}.logs-tab .content-tab{display:none!important}.logtools{display:none}.logs-tab .logtools,.audit-tab .logtools{display:block;margin-bottom:10px}.logtools h2{display:block;margin:0 0 10px}.logtools .searchbox{display:flex}.searchbox{display:flex;align-items:center;gap:6px;flex-wrap:nowrap;width:100%}.searchbox input{flex:1 1 auto;min-width:80px;background:var(--field);color:var(--text);border:1px solid #2c3a4f;border-radius:9px;padding:9px}.chartgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.gpu-chartgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.chart{height:145px;background:#081018;border:1px solid #213044;border-radius:12px;padding:8px}.chart.tall{height:220px}canvas{width:100%;height:100%}.msg{color:var(--amber);font-size:12px;min-height:18px;padding-top:6px}.smallgap{margin-bottom:5px}.gpu-cards{display:grid;grid-template-columns:1fr;gap:10px}.gpu-card{background:#101722;border:1px solid #26313f;border-radius:14px;padding:12px}.gpu-title{font-weight:800;color:#d9ecff;margin-bottom:10px;border-bottom:1px solid #26313f;padding-bottom:7px}.gpu-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.gpu-section-title{color:#9dafc3;font-size:12px;text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px}.gpu-line{display:flex;justify-content:space-between;gap:8px;font-size:13px;padding:2px 0}.meter{height:7px;background:#081018;border-radius:99px;overflow:hidden;margin-top:5px}.meter span{display:block;height:100%;background:#2fc46b}.coregrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(90px,1fr));gap:6px}.storage-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px}.storage-section{display:flex;flex-direction:column;gap:10px}.storage-card.user-facing{background:#10243a;border-color:#2a72a8}.storage-card{background:#0b1119;border:1px solid #243144;border-radius:12px;padding:10px;min-width:0}.storage-title{font-weight:800;color:#d9ecff;margin-bottom:6px;overflow-wrap:anywhere}.storage-meta{color:#9dafc3;font-size:12px;margin-bottom:6px;overflow-wrap:anywhere}.storage-sizes{display:grid;grid-template-columns:minmax(85px,.8fr) minmax(85px,.8fr) minmax(95px,.9fr);gap:6px;margin-bottom:8px}.storage-sizes .stat{padding:6px}.diskbar{height:8px;background:#081018;border-radius:99px;overflow:hidden;width:100%;margin-bottom:3px;margin-top:3px}.diskbar span{display:block;height:100%;background:#72c7ff}.netgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px}.temp-blue{color:#60a5fa}.temp-green{color:#2fc46b}.temp-yellow{color:#ffde59}.temp-orange{color:#ff8a2a}.temp-red{color:#ff5b6c}.temp-crimson{color:#dc143c;font-weight:900}.machine-row{margin-top:7px}.api-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:8px}.api-card{background:#0b1119;border:1px solid #243144;border-radius:12px;padding:10px}.api-card h3{font-size:13px;margin:0 0 6px;color:#d9ecff}.api-card p{margin:0;color:var(--muted);font-size:12px;line-height:1.35}.api-card-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.preset-actions{display:flex;gap:4px}.iconbtn{border:1px solid #34445a;background:#182231;color:#eef4ff;border-radius:8px;padding:5px 7px;cursor:pointer}.preset-editor{display:none}.preset-editor.open{display:block}.formgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}.formgrid label{display:flex;flex-direction:column;gap:4px;color:var(--muted);font-size:12px}.formgrid input,.formgrid select{background:var(--field);color:var(--text);border:1px solid #2c3a4f;border-radius:9px;padding:8px}.preset-help{color:var(--muted);font-size:12px;line-height:1.35;margin-bottom:10px}.profile-balanced{background:#0faeb0;border-color:#5ff5e8;color:#031516}.panel-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:10px}.panel-head h2{margin:0}.add-preset-btn{width:30px;height:30px;border-radius:999px;border:1px solid #55ee91;background:#128a45;color:#fff;display:inline-flex;align-items:center;justify-content:center;padding:0;box-shadow:none}.add-preset-btn:hover{background:#18a957}.add-preset-btn svg{width:15px;height:15px;stroke:#fff;stroke-width:3;stroke-linecap:round}.preset-form-actions{display:flex;justify-content:center;gap:18px;margin-top:14px}.preset-intro{color:var(--muted);font-size:13px;line-height:1.45;margin:4px 0 2px}.preset-intro.hidden{display:none}@media(max-width:900px){.chartgrid{grid-template-columns:1fr}.gpu-chartgrid{grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.grid{grid-template-columns:1fr 1fr}.gpu-grid{grid-template-columns:1fr}.log{height:clamp(320px,calc(100dvh - 410px),520px)}.logs-tab .logs.panel{height:calc(100dvh - 250px);min-height:500px}.logs-tab .log{height:auto;min-height:0}}
 </style></head><body><header><div class="top"><div><div class="brand">club-3090 Control</div><div class="pill" id="summary">loading...</div></div></div><div class="tabs"><button class="tab active" onclick="tab(event,'overview')">Main</button><button class="tab" onclick="tab(event,'system')">System</button><button class="tab" onclick="tab(event,'presets')">Presets</button><button class="tab" onclick="tab(event,'audit')">Audit</button><button class="tab" onclick="tab(event,'metrics')">Metrics</button><button class="tab" onclick="tab(event,'logs')">Logs</button></div></header>
 <main class="container"><section id="overview" class="tabpane content-tab active"><div class="panel"><h2>Status</h2><div class="grid"><div class="stat"><div class="label">Mode</div><div class="value" id="mode">-</div></div><div class="stat"><div class="label">Container</div><div class="value" id="container">-</div></div><div class="stat"><div class="label">Requests</div><div class="value" id="req">-</div></div><div class="stat"><div class="label">Last</div><div class="value" id="last">-</div></div><div class="stat"><div class="label">Power</div><div class="value" id="powerbox">-</div></div><div class="stat"><div class="label">Uptime</div><div class="value" id="uptime">-</div></div></div><div class="msg" id="msg"></div></div><div id="gpuCards" class="gpu-cards"></div></section>
 <section id="system" class="tabpane content-tab"><div class="panel"><h2>Services</h2><div class="value" id="services">-</div></div><div class="panel"><h2>Instances</h2><div class="subtabs" id="instanceTabs"></div><div class="value smallgap" id="instanceSummary">-</div><div class="actions"><button class="btn blue" onclick="instanceAction('start_instance')">Start</button><button class="btn amber" onclick="instanceAction('restart_instance')">Restart</button><button class="btn red" onclick="instanceAction('stop_container')">Stop</button><button class="btn green" id="instanceEnableBtn" onclick="toggleInstanceEnabled()">Disable Boot Autostart</button></div><div class="msg" id="instanceMsg"></div></div><div class="panel"><h2>System</h2><div class="actions"><button class="btn amber" onclick="wol()">Wake-on-LAN</button></div><div class="actions machine-row"><button class="btn red" onclick="machineAction('reboot')">Restart Machine</button><button class="btn red" onclick="machineAction('shutdown')">Shutdown Machine</button></div></div><div class="panel"><h2>Profiles</h2><div class="actions"><button class="btn green" onclick="profile('eco')">Eco</button><button class="btn profile-balanced" onclick="profile('balanced')">Balanced</button><button class="btn default-profile" onclick="profile('default')">Default</button><button class="btn orange" onclick="profile('turbo')">Turbo</button></div></div><div class="panel"><h2>Power + Cooling</h2><div class="actions"><button class="btn green" id="optToggle" onclick="togglePowerOptimizations()">Disable Power Optimizations</button><button class="btn green" id="fanToggle" onclick="toggleFansMax()">Set Fans to Max</button></div></div></section>
@@ -3684,17 +3827,19 @@ const _v413RefreshStatus=refreshStatus;refreshStatus=async function(){await _v41
 ensureV413Layout();if(!selectedScope)selectedScope=selectedInstance||'GPU0';setScope(selectedScope,false);
 selectedGroupName=selectedGroupName||'';
 function scopeItems(){const items=getInstanceList().slice();items.sort((a,b)=>{const ak=a.kind==='dual'?1:0;const bk=b.kind==='dual'?1:0;if(ak!==bk)return ak-bk;const ai=(a.gpu_indices||[a.gpu_index])[0]||0;const bi=(b.gpu_indices||[b.gpu_index])[0]||0;return ai-bi||String(a.id).localeCompare(String(b.id))});return items}
-function singleScopeItems(){return scopeItems().filter(x=>x.kind!=='dual')}
-function pairScopeItems(){return scopeItems().filter(x=>x.kind==='dual')}
 function gpuCount(){return Number((lastStatus&&lastStatus.gpu_count)||0)}
+function pairingEnabled(){return !!(lastStatus&&lastStatus.server_config&&lastStatus.server_config.gpu_pairing_enabled)}
+function legacyGlobalDualScope(){return gpuCount()===2&&!pairingEnabled()}
+function singleScopeItems(){return scopeItems().filter(x=>x.kind!=='dual')}
+function pairScopeItems(){return pairingEnabled()?scopeItems().filter(x=>x.kind==='dual'):[]}
 function canonicalPairId(a,b){const nums=[Number(a),Number(b)].filter(x=>Number.isInteger(x)&&x>=0).sort((x,y)=>x-y);if(nums.length!==2||nums[0]===nums[1])return'';return `PAIR${nums[0]}_${nums[1]}`}
-function exactTwoPairTarget(){return pairScopeItems().find(x=>JSON.stringify((x.gpu_indices||[]).slice().sort((a,b)=>a-b))==='[0,1]')||null}
-function currentScopeInstance(strict=false){if(currentScope()==='GLOBAL')return strict?null:exactTwoPairTarget();return scopeItems().find(x=>x.id===currentScope())||singleScopeItems()[0]||pairScopeItems()[0]||null}
+function exactTwoPairTarget(){return scopeItems().find(x=>x.id==='PAIR0_1')||null}
+function currentScopeInstance(strict=false){if(currentScope()==='GLOBAL')return strict?null:(pairingEnabled()?exactTwoPairTarget():null);return scopeItems().find(x=>x.id===currentScope())||singleScopeItems()[0]||pairScopeItems()[0]||null}
 function currentScopeKind(){const inst=currentScopeInstance(true);return inst?inst.kind:(currentScope()==='GLOBAL'?'global':'single')}
-function dockerLogTarget(){return currentScopeInstance(false)||scopeItems()[0]||null}
-function scopeLabel(inst){if(!inst)return'Global';return inst.kind==='dual'?`Pair ${(inst.gpu_indices||[]).join(' + ')}`:inst.id}
+function dockerLogTarget(){if(scopeIsGlobal()&&legacyGlobalDualScope())return null;return currentScopeInstance(false)||scopeItems()[0]||null}
+function scopeLabel(inst){if(!inst)return legacyGlobalDualScope()?'Global Dual':'Global';return inst.kind==='dual'?`Pair ${(inst.gpu_indices||[]).join(' + ')}`:inst.id}
 function scopeAllowsSinglePresets(){const inst=currentScopeInstance(true);return !!inst&&inst.kind!=='dual'}
-function scopeAllowsDualPresets(){const inst=currentScopeInstance(false);return !!inst&&inst.kind==='dual'}
+function scopeAllowsDualPresets(){if(scopeIsGlobal()&&gpuCount()===2)return true;const inst=currentScopeInstance(false);return !!inst&&inst.kind==='dual'}
 function setEditorState(editorId,introId,open){const ed=$(editorId),intro=$(introId);if(ed)ed.classList.toggle('open',!!open);if(intro)intro.classList.toggle('hidden',!!open)}
 function openUserEditor(){ensureUsersUi();setEditorState('userEditor','userIntro',true)}
 function openGroupEditor(){ensureGroupUi();setEditorState('groupEditor','groupIntro',true)}
@@ -3709,12 +3854,15 @@ collectGroupForm=function(){function val(id){return ($(id)&&$(id).value||'').tri
 editGroup=function(name){const group=(lastStatus&&lastStatus.groups||[]).find(g=>g.name===name);if(!group)return;ensureGroupUi();selectedGroupName=name;$('groupName').disabled=true;$('groupName').value=group.name;$('groupDescription').value=group.description||'';$('groupTargets').value=(group.allowed_targets||[]).join(', ');$('groupScore5h').value=group.limits.score_per_5h??'';$('groupScoreWeek').value=group.limits.score_per_week??'';$('groupMaxTokensMsg').value=group.limits.max_tokens_per_message??'';$('groupMaxToolsMsg').value=group.limits.max_tool_calls_per_message??'';$('groupInputTokenWeight').value=group.limits.input_token_weight??'';$('groupOutputTokenWeight').value=group.limits.output_token_weight??'';$('groupToolCallWeight').value=group.limits.tool_call_weight??'';$('groupThinkingSecondWeight').value=group.limits.thinking_second_weight??'';$('groupEnabled').value=String(!!group.enabled);openGroupEditor()}
 renderGroups=function(groups){ensureGroupUi();const grid=$('groupsGrid');if(!grid)return;groups=groups||[];if(selectedGroupName&&!groups.some(g=>g.name===selectedGroupName))selectedGroupName='';grid.innerHTML=groups.map(g=>`<div class="api-card"><div class="api-card-head"><h3>${g.name}<br><span class="label">${g.enabled?'enabled':'disabled'} · access ${(g.allowed_targets||[]).join(', ')||'*'}</span></h3><span class="preset-actions"><button class="iconbtn" title="Edit" onclick="editGroup('${g.name}')">✏️</button><button class="iconbtn" title="Delete" onclick="deleteGroupByName('${g.name}')">❌</button></span></div><p>${g.description||'No description'}</p><p class="label">Configured budgets · ${quotaBudgetLine(g.limits||{})}</p><p class="label">Configured weights · ${quotaWeightLine(g.limits||{})}</p><p class="label">Resolved budgets · ${quotaBudgetLine(g.resolved_limits||g.limits||{})}</p><p class="label">Resolved weights · ${quotaWeightLine(g.resolved_limits||g.limits||{})}</p></div>`).join('')||'<div class="value">No groups configured yet.</div>'}
 function ensureAccessPolicyCard(){const card=findPanelByHeading('system','Access Policy');if(!card)return;if(card.dataset.v414Policy!=='1'){card.dataset.v414Policy='1';card.innerHTML=`<h2>Access Policy</h2><div class="actions" id="accessPolicyRow"><label class="label"><input type="checkbox" id="auditAllowAnonymousProxy" onchange="mirrorAuthToggles(this.checked)"> allow requests without per-user API keys</label><button class="btn blue" onclick="saveAuthSettings()">Save Policy</button></div><div class="value smallgap" style="margin-top:10px" id="auditPolicyText">-</div>`}}
+function ensureAuditOverviewCard(){const system=$('system');const overview=findPanelByHeading('logs','Audit Overview')||findPanelByHeading('audit','Audit Overview')||findPanelByHeading('system','Audit Overview');if(system&&overview){const services=findPanelByHeading('system','Services');system.insertBefore(overview,(services&&services.nextSibling)||system.children[1]||null)}}
 function ensureMachineButtons(){const systemCard=findPanelByHeading('system','System');if(!systemCard)return;const rows=[...systemCard.querySelectorAll('.actions')];const wolBtn=[...systemCard.querySelectorAll('button')].find(btn=>(btn.textContent||'').includes('Wake-on-LAN'));const row=systemCard.querySelector('.machine-row');if(wolBtn&&row&&!row.contains(wolBtn))row.prepend(wolBtn);rows.forEach(actions=>{if(actions!==row&&!actions.querySelector('button'))actions.remove()})}
 function allPairChoices(){const count=gpuCount(),pairs=[];for(let a=0;a<count;a+=1){for(let b=a+1;b<count;b+=1)pairs.push([a,b])}return pairs}
-function ensurePairManager(){const panel=findPanelByHeading('system','Instances');if(!panel)return;let bar=$('pairManagerBar');if(!bar){bar=document.createElement('div');bar.id='pairManagerBar';bar.className='actions';const summary=$('instanceSummary');if(summary&&summary.parentNode===panel)summary.insertAdjacentElement('afterend',bar)}const pair=currentScopeInstance(true);const showDelete=!!pair&&pair.kind==='dual';const existing=new Set(pairScopeItems().map(x=>x.id));const quickAdds=allPairChoices().filter(([a,b])=>!existing.has(canonicalPairId(a,b))).map(([a,b])=>`<button class="btn blue" onclick="createPairGroup(${a},${b})">Add Pair ${a}+${b}</button>`).join('');bar.style.margin='8px 0 10px';bar.innerHTML=gpuCount()>1?`${quickAdds||''}<button class="btn blue" onclick="createPairGroup()">Custom Pair Group</button>${showDelete?`<button class="btn red" onclick="deleteCurrentPairGroup()">Delete ${scopeLabel(pair)}</button>`:''}`:''}
-function ensureV414Layout(){ensureV413Layout();ensureUsersUi();ensureGroupUi();ensureAccessPolicyCard();ensureMachineButtons();ensurePairManager()}
+function ensurePairingToggle(){const panel=findPanelByHeading('system','Instances');if(!panel)return;let row=$('pairingToggleRow');if(!row){row=document.createElement('div');row.id='pairingToggleRow';row.className='actions';const tabs=$('instanceTabs');if(tabs&&tabs.parentNode===panel)tabs.insertAdjacentElement('beforebegin',row)}const count=gpuCount();const enabled=pairingEnabled();row.innerHTML=`<label class="label"><input type="checkbox" id="gpuPairingEnabled" ${enabled?'checked':''} ${count<2?'disabled':''} onchange="saveGpuPairingSetting(this.checked)"> Enable GPU Pairing Instances</label><span class="label">${count===2?'Defaults to disabled on two-GPU systems so Global remains the main dual-runtime control surface.':'Defaults to enabled on larger systems so arbitrary two-GPU groups can be managed.'}</span>`}
+function ensurePairManager(){const panel=findPanelByHeading('system','Instances');if(!panel)return;let bar=$('pairManagerBar');if(!bar){bar=document.createElement('div');bar.id='pairManagerBar';bar.className='actions';const summary=$('instanceSummary');if(summary&&summary.parentNode===panel)summary.insertAdjacentElement('afterend',bar)}if(!pairingEnabled()||gpuCount()<2){bar.innerHTML='';return}const pair=currentScopeInstance(true);const showDelete=!!pair&&pair.kind==='dual';const existing=new Set(pairScopeItems().map(x=>x.id));const quickAdds=allPairChoices().filter(([a,b])=>!existing.has(canonicalPairId(a,b))).map(([a,b])=>`<button class="btn blue" onclick="createPairGroup(${a},${b})">Add Pair ${a}+${b}</button>`).join('');bar.style.margin='8px 0 10px';bar.innerHTML=`${quickAdds||''}<button class="btn purple" onclick="createPairGroup()">Custom Pair Group</button>${showDelete?`<button class="btn red" onclick="deleteCurrentPairGroup()">Delete ${scopeLabel(pair)}</button>`:''}`}
+function ensureV414Layout(){ensureV413Layout();ensureUsersUi();ensureGroupUi();ensureAccessPolicyCard();ensureAuditOverviewCard();ensureMachineButtons();ensurePairingToggle();ensurePairManager()}
 renderAudit=function(cfg){cfg=cfg||{};ensureV414Layout();const adminPort=(lastStatus&&lastStatus.admin_port)||8008;const proxyPort=(lastStatus&&lastStatus.proxy_port)||8009;const adminPath=(cfg.admin_path)||'/admin';const online=!!cfg.online_enabled;const authOptional=!!cfg.allow_proxy_without_api_key;const localEnabled=!!cfg.local_api_enabled;const localPort=cfg.local_api_port||10881;if($('auditAdminEndpoint'))$('auditAdminEndpoint').innerHTML=`:${adminPort}${adminPath}`;if($('auditProxyEndpoint'))$('auditProxyEndpoint').innerHTML=`:${proxyPort}`;if($('auditExposure'))$('auditExposure').textContent=online?'online through proxy/admin only':'local/private only';if($('auditLocalApi'))$('auditLocalApi').textContent=localEnabled?`127.0.0.1:${localPort}`:'disabled';if($('auditSummary'))$('auditSummary').innerHTML='Audit entries capture admin actions, proxy authentication outcomes, quota denials, API usage, group changes, and user-management events. Use the shared log viewer below to inspect either Docker runtime logs or the audit log stream.';if($('auditPolicyText'))$('auditPolicyText').innerHTML=`Proxy API keys are currently <b>${authOptional?'optional':'required'}</b>. Admin UI remains under <code>:${adminPort}${adminPath}</code>.`;mirrorAuthToggles(authOptional)}
 saveAuthSettings=async function(){const allow=!!(($('auditAllowAnonymousProxy')&&$('auditAllowAnonymousProxy').checked)||($('allowAnonymousProxy')&&$('allowAnonymousProxy').checked));mirrorAuthToggles(allow);try{const r=await fetch('/admin/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'save_server_config',allow_proxy_without_api_key:allow})});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'config failed');if(j.server_config)renderAudit(j.server_config);setAuditMsg('Saved access policy');await refreshStatus()}catch(e){alert('Access policy failed: '+e)}}
+async function saveGpuPairingSetting(enabled){try{const r=await fetch('/admin/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'save_server_config',gpu_pairing_enabled:!!enabled})});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'pairing config failed');setInstanceMsg(`GPU pairing instances ${enabled?'enabled':'disabled'}`);await refreshStatus();if(legacyGlobalDualScope())setScope('GLOBAL',false)}catch(e){alert('GPU pairing setting failed: '+e)}}
 setScope=function(scope,reconnect=true){const ids=new Set(scopeItems().map(x=>x.id));selectedScope=scope==='GLOBAL'?'GLOBAL':(ids.has(scope)?scope:(singleScopeItems()[0]?.id||pairScopeItems()[0]?.id||'GLOBAL'));if(selectedScope!=='GLOBAL')selectedInstance=selectedScope;renderInstances(getInstanceList());renderPresetScopeTabs();updateScopedCards();applyLogVisibility();if(reconnect&&currentLogSource==='docker'){clearLog();connectLogs()}}
 renderInstances=function(instances){ensureV414Layout();const tabs=$('instanceTabs');const summary=$('instanceSummary');const btn=$('instanceEnableBtn');const panel=findPanelByHeading('system','Instances');if(!tabs||!summary||!panel)return;instances=scopeItems();if(!selectedScope||!(selectedScope==='GLOBAL'||instances.some(x=>x.id===selectedScope)))selectedScope=singleScopeItems()[0]?.id||pairScopeItems()[0]?.id||'GLOBAL';const tabsHtml=singleScopeItems().map(x=>`<button class="subtab ${x.id===currentScope()?'active':''}" onclick="setScope('${x.id}')">${x.id}${x.running?' • on':' • off'}</button>`).join('')+pairScopeItems().map(x=>`<button class="subtab ${x.id===currentScope()?'active':''}" onclick="setScope('${x.id}')">Pair ${(x.gpu_indices||[]).join('+')}${x.running?' • on':' • off'}</button>`).join('')+`<button class="subtab ${scopeIsGlobal()?'active':''}" onclick="setScope('GLOBAL')">Global</button>`;tabs.innerHTML=tabsHtml;ensurePairManager();const target=currentScopeInstance(false);const actionButtons=[...panel.querySelectorAll('.actions .btn')].filter(x=>x.id!=='instanceEnableBtn'&&!x.closest('#pairManagerBar'));if(scopeIsGlobal()&&target&&gpuCount()===2){summary.innerHTML=`Global scope controls the only dual pair <code>${target.id}</code> on GPUs ${(target.gpu_indices||[]).join(', ')} · mode ${target.mode} · port ${target.port} · proxy <code>${target.proxy_prefix}/</code>`;if(btn){btn.disabled=false;btn.textContent=target.enabled?'Disable Boot Autostart':'Enable Boot Autostart'}actionButtons.forEach(x=>x.disabled=false)}else if(scopeIsGlobal()){summary.innerHTML='Global scope selected. Host-wide controls still apply below. Create or choose a dual pair tab to manage arbitrary two-GPU dual presets.';if(btn){btn.disabled=true;btn.textContent='Select a GPU or Pair Scope'}actionButtons.forEach(x=>x.disabled=true)}else if(target){summary.innerHTML=`${scopeLabel(target)} · ${target.assignment_text} · port ${target.port} · ${target.running?'running':'stopped'} · proxy <code>${target.proxy_prefix}/</code> · ${target.enabled?'autostart enabled':'autostart disabled'}`;if(btn){btn.disabled=false;btn.textContent=target.enabled?'Disable Boot Autostart':'Enable Boot Autostart'}actionButtons.forEach(x=>x.disabled=false)}else{summary.textContent='No GPU instances configured';if(btn){btn.disabled=true;btn.textContent='Boot autostart unavailable'}actionButtons.forEach(x=>x.disabled=true)}if($('logInstanceLabel'))$('logInstanceLabel').textContent=currentLogLabel()}
 renderPresetScopeTabs=function(){const tabs=$('presetScopeTabs');const summary=$('presetScopeSummary');if(!tabs||!summary)return;tabs.innerHTML=singleScopeItems().map(x=>`<button class="subtab ${x.id===currentScope()?'active':''}" onclick="setScope('${x.id}')">${x.id}</button>`).join('')+pairScopeItems().map(x=>`<button class="subtab ${x.id===currentScope()?'active':''}" onclick="setScope('${x.id}')">Pair ${(x.gpu_indices||[]).join('+')}</button>`).join('')+`<button class="subtab ${scopeIsGlobal()?'active':''}" onclick="setScope('GLOBAL')">Global</button>`;const exactGlobal=currentScopeInstance(false);if(scopeIsGlobal()&&exactGlobal&&gpuCount()===2)summary.innerHTML=`Global scope targets the only dual pair <code>${exactGlobal.id}</code>. Dual preset buttons below will apply to GPUs ${(exactGlobal.gpu_indices||[]).join(', ')}.`;else if(scopeIsGlobal())summary.innerHTML='Global scope selected. Single-GPU presets are disabled here. Choose or create a dual pair tab to apply dual presets.';else if(currentScopeInstance(true))summary.innerHTML=`Targeting ${scopeLabel(currentScopeInstance(true))} · ${currentScopeInstance(true).assignment_text} · proxy <code>${currentScopeInstance(true).proxy_prefix}/</code>`;else summary.textContent='No preset scope available';document.querySelectorAll('#singlePresetCard .actions .btn').forEach(btn=>btn.disabled=!scopeAllowsSinglePresets());document.querySelectorAll('#dualPresetCard .actions .btn').forEach(btn=>btn.disabled=!scopeAllowsDualPresets())}
@@ -3731,6 +3879,24 @@ async function switchDualMode(m){const cur=currentScopeInstance(false);if(!cur||
 tab=function(e,n){activeTabName=n;document.querySelectorAll('.tabpane').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));const pane=$(n);if(pane)pane.classList.add('active');if(e&&e.target)e.target.classList.add('active');if(n==='logs'){}applyLogVisibility();clearLog();connectLogs();setTimeout(()=>{if(!searchState.active&&$('autoscroll').checked)$('log').scrollTop=$('log').scrollHeight},0)}
 refreshStatus=async function(){try{ensureV414Layout();const r=await fetch('/admin/status',{cache:'no-store'});const j=await r.json();lastStatus=j;if(j.ui_config&&typeof j.ui_config.show_global_logs==='boolean'){showGlobalLogs=j.ui_config.show_global_logs;if($('showGlobalLogs'))$('showGlobalLogs').checked=showGlobalLogs}$('summary').textContent=`${j.active_mode} · ${j.container||'no container'} · ${j.power.profile||'balanced'} · GPUs ${j.gpu_count??0}`;$('mode').textContent=`${j.active_mode} / ${j.active_port}`;$('container').textContent=j.container||'none';$('services').textContent=`vLLM=${j.vllm_service}, control=${j.control_service}, console=${j.console_service}`;$('req').textContent=`total=${j.metrics.total_requests}, active=${j.metrics.active_requests}, fail=${j.metrics.failed_requests}, queue=${j.metrics.queued_requests}`;$('last').textContent=`${j.metrics.last_status||'-'} latency=${j.metrics.last_latency_s??'-'}s ttft=${j.metrics.last_ttft_s??'-'}s tps=${j.metrics.last_tokens_per_second??'-'}`;$('uptime').textContent=fmtUptime(j.uptime_seconds);renderGpuCards(j.gpus);$('powerbox').textContent=`profile=${j.power.profile}, GPU=${j.power.gpu}, CPU=${j.power.cpu}, fans=${j.power.fans}, container=${j.power.container}, idle=${j.power.idle_for_seconds}s`;$('optToggle').textContent=j.power.optimizations_enabled?'Disable Power Optimizations':'Enable Power Optimizations';$('fanToggle').textContent=j.power.fan_manual_override?'Reset Fans to Default':'Set Fans to Max';renderMetrics(j);renderPresetCatalog(j.presets);renderUsers(j.users||[]);renderGroups(j.groups||[]);renderAudit(j.server_config||{});renderInstances(j.instances||[]);renderPresetScopeTabs();updateScopedCards();renderLogSourcePanel();applyLogVisibility()}catch(e){setMsg('Status error: '+e)}}
 ensureV414Layout();resetUserForm(true);resetGroupForm(true);if(!selectedScope)selectedScope=singleScopeItems()[0]?.id||pairScopeItems()[0]?.id||'GLOBAL';setScope(selectedScope,false);
+function ensureAuditOverviewCardV415(){const system=$('system');const overview=findPanelByHeading('logs','Audit Overview')||findPanelByHeading('audit','Audit Overview')||findPanelByHeading('system','Audit Overview');if(system&&overview){const services=findPanelByHeading('system','Services');system.insertBefore(overview,(services&&services.nextSibling)||system.children[1]||null)}}
+function ensurePairingToggleV415(){const panel=findPanelByHeading('system','Instances');if(!panel)return;let row=$('pairingToggleRow');if(!row){row=document.createElement('div');row.id='pairingToggleRow';row.className='actions';const tabs=$('instanceTabs');if(tabs&&tabs.parentNode===panel)tabs.insertAdjacentElement('beforebegin',row)}const count=gpuCount();const enabled=pairingEnabled();row.innerHTML=`<label class="label"><input type="checkbox" id="gpuPairingEnabled" ${enabled?'checked':''} ${count<2?'disabled':''} onchange="saveGpuPairingSettingV415(this.checked)"> Enable GPU Pairing Instances</label><span class="label">${count===2?'Defaults to disabled on two-GPU systems so Global remains the main dual-runtime control surface.':'Defaults to enabled on larger systems so arbitrary two-GPU groups can be managed.'}</span>`}
+function ensurePairManagerV415(){const panel=findPanelByHeading('system','Instances');if(!panel)return;let bar=$('pairManagerBar');if(!bar){bar=document.createElement('div');bar.id='pairManagerBar';bar.className='actions';const summary=$('instanceSummary');if(summary&&summary.parentNode===panel)summary.insertAdjacentElement('afterend',bar)}if(!pairingEnabled()||gpuCount()<2){bar.innerHTML='';return}const pair=currentScopeInstance(true);const showDelete=!!pair&&pair.kind==='dual';const existing=new Set(pairScopeItems().map(x=>x.id));const quickAdds=allPairChoices().filter(([a,b])=>!existing.has(canonicalPairId(a,b))).map(([a,b])=>`<button class="btn blue" onclick="createPairGroupV415(${a},${b})">Add Pair ${a}+${b}</button>`).join('');bar.style.margin='8px 0 10px';bar.innerHTML=`${quickAdds||''}<button class="btn purple" onclick="createPairGroupV415()">Custom Pair Group</button>${showDelete?`<button class="btn red" onclick="deleteCurrentPairGroup()">Delete ${scopeLabel(pair)}</button>`:''}`}
+ensureV414Layout=function(){ensureV413Layout();ensureUsersUi();ensureGroupUi();ensureAccessPolicyCard();ensureAuditOverviewCardV415();ensureMachineButtons();ensurePairingToggleV415();ensurePairManagerV415()}
+currentScopeInstance=function(strict=false){if(currentScope()==='GLOBAL')return strict?null:(pairingEnabled()?exactTwoPairTarget():null);return scopeItems().find(x=>x.id===currentScope())||singleScopeItems()[0]||pairScopeItems()[0]||null}
+dockerLogTarget=function(){if(scopeIsGlobal()&&legacyGlobalDualScope())return null;return currentScopeInstance(false)||scopeItems()[0]||null}
+scopeAllowsDualPresets=function(){if(scopeIsGlobal()&&gpuCount()===2)return true;const inst=currentScopeInstance(false);return !!inst&&inst.kind==='dual'}
+saveGpuPairingSettingV415=async function(enabled){try{const r=await fetch('/admin/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'save_server_config',gpu_pairing_enabled:!!enabled})});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'pairing config failed');setInstanceMsg(`GPU pairing instances ${enabled?'enabled':'disabled'}`);await refreshStatus();if(legacyGlobalDualScope())setScope('GLOBAL',false)}catch(e){alert('GPU pairing setting failed: '+e)}}
+renderAudit=function(cfg){cfg=cfg||{};ensureV414Layout();const adminPort=(lastStatus&&lastStatus.admin_port)||8008;const proxyPort=(lastStatus&&lastStatus.proxy_port)||8009;const adminPath=(cfg.admin_path)||'/admin';const online=!!cfg.online_enabled;const authOptional=!!cfg.allow_proxy_without_api_key;const localEnabled=!!cfg.local_api_enabled;const localPort=cfg.local_api_port||10881;if($('auditAdminEndpoint'))$('auditAdminEndpoint').innerHTML=`:${adminPort}${adminPath}`;if($('auditProxyEndpoint'))$('auditProxyEndpoint').innerHTML=`:${proxyPort}`;if($('auditExposure'))$('auditExposure').textContent=online?'online through proxy/admin only':'local/private only';if($('auditLocalApi'))$('auditLocalApi').textContent=localEnabled?`127.0.0.1:${localPort}`:'disabled';if($('auditSummary'))$('auditSummary').innerHTML='Audit entries capture admin actions, proxy authentication outcomes, quota denials, API usage, group changes, and user-management events. Use the shared log viewer below to inspect either Docker runtime logs or the audit log stream.';if($('auditPolicyText'))$('auditPolicyText').innerHTML=`Proxy API keys are currently <b>${authOptional?'optional':'required'}</b>. Admin UI remains under <code>:${adminPort}${adminPath}</code>.`;mirrorAuthToggles(authOptional)}
+renderInstances=function(instances){ensureV414Layout();const tabs=$('instanceTabs');const summary=$('instanceSummary');const btn=$('instanceEnableBtn');const panel=findPanelByHeading('system','Instances');if(!tabs||!summary||!panel)return;instances=scopeItems();if(!selectedScope||!(selectedScope==='GLOBAL'||instances.some(x=>x.id===selectedScope)))selectedScope=singleScopeItems()[0]?.id||pairScopeItems()[0]?.id||'GLOBAL';tabs.innerHTML=singleScopeItems().map(x=>`<button class="subtab ${x.id===currentScope()?'active':''}" onclick="setScope('${x.id}')">${x.id}${x.running?' â€¢ on':' â€¢ off'}</button>`).join('')+pairScopeItems().map(x=>`<button class="subtab ${x.id===currentScope()?'active':''}" onclick="setScope('${x.id}')">Pair ${(x.gpu_indices||[]).join('+')}${x.running?' â€¢ on':' â€¢ off'}</button>`).join('')+`<button class="subtab ${scopeIsGlobal()?'active':''}" onclick="setScope('GLOBAL')">Global</button>`;ensurePairManagerV415();const target=currentScopeInstance(false);const actionButtons=[...panel.querySelectorAll('.actions .btn')].filter(x=>x.id!=='instanceEnableBtn'&&!x.closest('#pairManagerBar')&&!x.closest('#pairingToggleRow'));if(scopeIsGlobal()&&legacyGlobalDualScope()){const dualMode=(lastStatus&&lastStatus.running_dual_mode)||'vllm/dual';const dualGpus=((lastStatus&&lastStatus.running_dual_gpu_indices)||[0,1]).join(', ');summary.innerHTML=`Global scope is managing the legacy two-GPU dual runtime on GPUs ${dualGpus} Â· mode <code>${dualMode}</code> Â· port ${(lastStatus&&lastStatus.active_port)||'-'} Â· proxy <code>/v1</code>`;if(btn){btn.disabled=true;btn.textContent='Legacy dual autostart follows the active global mode'}actionButtons.forEach(x=>x.disabled=false)}else if(scopeIsGlobal()&&target&&gpuCount()===2){summary.innerHTML=`Global scope controls the shared dual pair <code>${target.id}</code> on GPUs ${(target.gpu_indices||[]).join(', ')} Â· mode ${target.mode} Â· port ${target.port} Â· proxy <code>${target.proxy_prefix}/</code>`;if(btn){btn.disabled=false;btn.textContent=target.enabled?'Disable Boot Autostart':'Enable Boot Autostart'}actionButtons.forEach(x=>x.disabled=false)}else if(scopeIsGlobal()){summary.innerHTML='Global scope selected. Host-wide controls still apply below. Enable GPU pairing instances or choose a pair tab to manage arbitrary two-GPU dual presets.';if(btn){btn.disabled=true;btn.textContent='Select a GPU or Pair Scope'}actionButtons.forEach(x=>x.disabled=true)}else if(target){summary.innerHTML=`${scopeLabel(target)} Â· ${target.assignment_text} Â· port ${target.port} Â· ${target.running?'running':'stopped'} Â· proxy <code>${target.proxy_prefix}/</code> Â· ${target.enabled?'autostart enabled':'autostart disabled'}`;if(btn){btn.disabled=false;btn.textContent=target.enabled?'Disable Boot Autostart':'Enable Boot Autostart'}actionButtons.forEach(x=>x.disabled=false)}else{summary.textContent='No GPU instances configured';if(btn){btn.disabled=true;btn.textContent='Boot autostart unavailable'}actionButtons.forEach(x=>x.disabled=true)}if($('logInstanceLabel'))$('logInstanceLabel').textContent=currentLogLabel()}
+renderPresetScopeTabs=function(){const tabs=$('presetScopeTabs');const summary=$('presetScopeSummary');if(!tabs||!summary)return;tabs.innerHTML=singleScopeItems().map(x=>`<button class="subtab ${x.id===currentScope()?'active':''}" onclick="setScope('${x.id}')">${x.id}</button>`).join('')+pairScopeItems().map(x=>`<button class="subtab ${x.id===currentScope()?'active':''}" onclick="setScope('${x.id}')">Pair ${(x.gpu_indices||[]).join('+')}</button>`).join('')+`<button class="subtab ${scopeIsGlobal()?'active':''}" onclick="setScope('GLOBAL')">Global</button>`;const exactGlobal=currentScopeInstance(false);if(scopeIsGlobal()&&legacyGlobalDualScope())summary.innerHTML='Global scope targets the legacy two-GPU dual runtime directly. Dual preset buttons below will update that shared container.';else if(scopeIsGlobal()&&exactGlobal&&gpuCount()===2)summary.innerHTML=`Global scope targets the shared dual pair <code>${exactGlobal.id}</code>. Dual preset buttons below will apply to GPUs ${(exactGlobal.gpu_indices||[]).join(', ')}.`;else if(scopeIsGlobal())summary.innerHTML='Global scope selected. Single-GPU presets are disabled here. Enable GPU pairing instances or choose a dual pair tab to apply dual presets.';else if(currentScopeInstance(true))summary.innerHTML=`Targeting ${scopeLabel(currentScopeInstance(true))} Â· ${currentScopeInstance(true).assignment_text} Â· proxy <code>${currentScopeInstance(true).proxy_prefix}/</code>`;else summary.textContent='No preset scope available';document.querySelectorAll('#singlePresetCard .actions .btn').forEach(btn=>btn.disabled=!scopeAllowsSinglePresets());document.querySelectorAll('#dualPresetCard .actions .btn').forEach(btn=>btn.disabled=!scopeAllowsDualPresets())}
+updateScopedCards=function(){const target=currentScopeInstance(false);if($('profileScopeNote'))$('profileScopeNote').innerHTML=scopeIsGlobal()?'Global scope: these profile buttons apply host-wide defaults for the full server.':`${scopeLabel(target)} scope: ${target?target.assignment_text:'select a scope to continue'}`;if($('powerScopeNote'))$('powerScopeNote').innerHTML=scopeIsGlobal()?'Global scope: power and cooling controls below affect the whole host.':`${scopeLabel(target)} scope: using the selected runtime context while keeping host-level power controls in sync.`;renderLogSourcePanel()}
+powerAction=async function(a){const cur=currentScopeInstance(false);const canUseLegacyGlobal=scopeIsGlobal()&&legacyGlobalDualScope();const needsTarget=['stop_container','start_instance','restart_instance','toggle_enabled'].includes(a);if(needsTarget&&!cur&&!canUseLegacyGlobal){alert('Select a GPU or Pair scope first.');return}if(a==='stop_container'&&!confirm(`Stop ${scopeLabel(cur)} now?`))return;try{await post('/admin/power',{action:a,instance_id:(cur&&!canUseLegacyGlobal)?cur.id:null,enabled:cur?!cur.enabled:undefined})}catch(e){alert(e)}}
+toggleInstanceEnabled=async function(){const cur=currentScopeInstance(false);if(scopeIsGlobal()&&legacyGlobalDualScope()){alert('Legacy global dual mode does not expose a separate boot-autostart toggle.');return}if(!cur){alert('Select a GPU or Pair scope first.');return}try{await post('/admin/power',{action:'toggle_enabled',instance_id:cur.id,enabled:!cur.enabled})}catch(e){alert(e)}}
+createPairGroupV415=async function(first=null,second=null){if(!pairingEnabled()){alert('Enable GPU Pairing Instances first.');return}if(gpuCount()<2){alert('At least two GPUs are required to create a dual pair.');return}let a=first,b=second;if(a===null||b===null){a=prompt(`First GPU index (0-${Math.max(gpuCount()-1,0)}):`,'0');if(a===null)return;b=prompt(`Second GPU index (0-${Math.max(gpuCount()-1,0)}):`,'1');if(b===null)return}const id=canonicalPairId(a,b);if(!id){alert('Select two distinct GPU indices.');return}try{const r=await fetch('/admin/instances',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'save_pair',gpu_indices:[Number(a),Number(b)],mode:'vllm/dual',enabled:false})});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'pair save failed');setInstanceMsg(`Saved pair group ${id}`);await refreshStatus();setScope(id,false)}catch(e){alert('Pair group failed: '+e)}}
+createPairGroup=createPairGroupV415
+switchDualMode=async function(m){if(scopeIsGlobal()&&legacyGlobalDualScope()){if(confirm(`Apply dual preset ${m} to the legacy global two-GPU runtime on GPUs ${((lastStatus&&lastStatus.running_dual_gpu_indices)||[0,1]).join(', ')}?`))try{await post('/admin/switch',{mode:m})}catch(e){alert(e)}return}const cur=currentScopeInstance(false);if(!cur||cur.kind!=='dual'){alert('Choose a dual pair tab, or use Global on an exactly-two-GPU server, before applying a dual preset.');return}if(confirm(`Apply dual preset ${m} to ${cur.id} on GPUs ${(cur.gpu_indices||[]).join(', ')}? This will stop overlapping runtimes that already use those GPUs.`))try{await post('/admin/switch',{instance_id:cur.id,mode:m})}catch(e){alert(e)}}
+refreshStatus=async function(){try{ensureV414Layout();const r=await fetch('/admin/status',{cache:'no-store'});const j=await r.json();lastStatus=j;if(j.ui_config&&typeof j.ui_config.show_global_logs==='boolean'){showGlobalLogs=j.ui_config.show_global_logs;if($('showGlobalLogs'))$('showGlobalLogs').checked=showGlobalLogs}$('summary').textContent=`${j.active_mode} Â· ${j.container||'no container'} Â· ${j.power.profile||'balanced'} Â· GPUs ${j.gpu_count??0}`;$('mode').textContent=`${j.active_mode} / ${j.active_port}`;$('container').textContent=j.container||'none';$('services').textContent=`vLLM=${j.vllm_service}, control=${j.control_service}, console=${j.console_service}`;$('req').textContent=`total=${j.metrics.total_requests}, active=${j.metrics.active_requests}, fail=${j.metrics.failed_requests}, queue=${j.metrics.queued_requests}`;$('last').textContent=`${j.metrics.last_status||'-'} latency=${j.metrics.last_latency_s??'-'}s ttft=${j.metrics.last_ttft_s??'-'}s tps=${j.metrics.last_tokens_per_second??'-'}`;$('uptime').textContent=fmtUptime(j.uptime_seconds);renderGpuCards(j.gpus);$('powerbox').textContent=`profile=${j.power.profile}, GPU=${j.power.gpu}, CPU=${j.power.cpu}, fans=${j.power.fans}, container=${j.power.container}, idle=${j.power.idle_for_seconds}s`;$('optToggle').textContent=j.power.optimizations_enabled?'Disable Power Optimizations':'Enable Power Optimizations';$('fanToggle').textContent=j.power.fan_manual_override?'Reset Fans to Default':'Set Fans to Max';renderMetrics(j);renderPresetCatalog(j.presets);renderUsers(j.users||[]);renderGroups(j.groups||[]);renderAudit(j.server_config||{});renderInstances(j.instances||[]);renderPresetScopeTabs();updateScopedCards();renderLogSourcePanel();applyLogVisibility()}catch(e){setMsg('Status error: '+e)}}
 </script></body></html>
 """
 class CommonMixin:
@@ -3791,7 +3957,8 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             ap = active_port()
             cfg = read_server_config()
             dual_rows = [instance_snapshot(inst) for inst in running_dual_instances()]
-            self.send_json({"active_mode":active_mode(),"active_port":ap,"container":current_container(),"club3090_dir":CLUB3090_DIR,"uptime_seconds":int(time.time()-startup_time),"vllm_service":service_status("club3090-vllm.service"),"control_service":service_status("club3090-control.service"),"caddy_service":service_status("club3090-caddy.service") if cfg.get("https_enabled", False) else "disabled","console_service":service_status("club3090-console-log.service"),"metrics":m,"recent_requests":list(recent_requests),"gpus":gpu_stats(),"power":power_status(),"system":system_stats(),"series":list(series_points),"ui_config":read_ui_config(),"presets":preset_catalog(),"gpu_count":detect_gpu_count_runtime(),"instances":instances_snapshot(),"single_gpu_modes":list(SINGLE_GPU_MODES),"dual_gpu_modes":list(DUAL_GPU_MODES),"running_dual_mode":(dual_rows[0]["mode"] if dual_rows else None),"running_dual_gpu_indices":(dual_rows[0]["gpu_indices"] if dual_rows else []),"running_dual_instances":dual_rows,"users":list_users_public(),"groups":list_groups_public(),"server_config":cfg,"local_api":{"enabled":cfg.get("local_api_enabled", False),"port":cfg.get("local_api_port", LOCAL_API_PORT)},"admin_port":ADMIN_PORT,"proxy_port":PROXY_PORT})
+            legacy_dual_mode = detect_legacy_dual_mode()
+            self.send_json({"active_mode":active_mode(),"active_port":ap,"container":current_container(),"club3090_dir":CLUB3090_DIR,"uptime_seconds":int(time.time()-startup_time),"vllm_service":service_status("club3090-vllm.service"),"control_service":service_status("club3090-control.service"),"caddy_service":service_status("club3090-caddy.service") if cfg.get("https_enabled", False) else "disabled","console_service":service_status("club3090-console-log.service"),"metrics":m,"recent_requests":list(recent_requests),"gpus":gpu_stats(),"power":power_status(),"system":system_stats(),"series":list(series_points),"ui_config":read_ui_config(),"presets":preset_catalog(),"gpu_count":detect_gpu_count_runtime(),"instances":instances_snapshot(),"single_gpu_modes":list(SINGLE_GPU_MODES),"dual_gpu_modes":list(DUAL_GPU_MODES),"running_dual_mode":(dual_rows[0]["mode"] if dual_rows else legacy_dual_mode),"running_dual_gpu_indices":(dual_rows[0]["gpu_indices"] if dual_rows else ([0, 1] if legacy_dual_mode else [])),"running_dual_instances":dual_rows,"users":list_users_public(),"groups":list_groups_public(),"server_config":cfg,"local_api":{"enabled":cfg.get("local_api_enabled", False),"port":cfg.get("local_api_port", LOCAL_API_PORT)},"admin_port":ADMIN_PORT,"proxy_port":PROXY_PORT})
             return
         if path == "/admin/logs":
             self.close_connection = False
@@ -3862,6 +4029,12 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                     log_audit("admin_switch_mode", instance=updated["id"], mode=mode, stopped_instances=[row["id"] for row in stopped])
                     self.send_json({"ok": True, "instance": instance_snapshot(updated), "mode": mode, "output": result.get("output", ""), "stopped_instances": stopped, "instances": instances_snapshot(), "running_dual_instances": [instance_snapshot(inst) for inst in running_dual_instances()]})
                 else:
+                    if detect_gpu_count_runtime() == 2 and not gpu_pairing_enabled():
+                        rc, stop_msg = stop_vllm_container("legacy_dual_switch")
+                        result = run_switch(mode)
+                        log_audit("admin_switch_mode_legacy_global", instance="legacy", mode=mode, stop_rc=rc)
+                        self.send_json({"ok": True, "instance": None, "mode": mode, "output": (stop_msg + "\n" + result)[-12000:], "stopped_instances": ([{"id": "legacy", "rc": rc, "output": stop_msg[-1200:]}] if stop_msg else []), "instances": instances_snapshot(), "running_dual_instances": [instance_snapshot(inst) for inst in running_dual_instances()]})
+                        return
                     pairs = [inst for inst in read_instances_config() if inst.get("kind") == "dual"]
                     if len(pairs) != 1:
                         raise ValueError("Select a specific dual pair scope before applying a dual preset")
@@ -3989,8 +4162,14 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                     self.send_json({"ok": True, "user": user, "api_key": api_key, "users": list_users_public(), "groups": list_groups_public(), "server_config": read_server_config()})
                     return
                 if action == "save_server_config":
-                    cfg = write_server_config({"allow_proxy_without_api_key": bool(data.get("allow_proxy_without_api_key", True))})
-                    log_audit("admin_server_config", allow_proxy_without_api_key=cfg.get("allow_proxy_without_api_key", True))
+                    cfg_data = {}
+                    if "allow_proxy_without_api_key" in data:
+                        cfg_data["allow_proxy_without_api_key"] = bool(data.get("allow_proxy_without_api_key", True))
+                    if "gpu_pairing_enabled" in data:
+                        cfg_data["gpu_pairing_enabled"] = bool(data.get("gpu_pairing_enabled"))
+                    cfg = write_server_config(cfg_data)
+                    read_instances_config()
+                    log_audit("admin_server_config", allow_proxy_without_api_key=cfg.get("allow_proxy_without_api_key", True), gpu_pairing_enabled=cfg.get("gpu_pairing_enabled"))
                     self.send_json({"ok": True, "server_config": cfg, "users": list_users_public(), "groups": list_groups_public()})
                     return
                 raise ValueError("Invalid users action")
@@ -4042,7 +4221,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
         requested = str(params.get("instance") or "").strip().upper()
         while True:
             instance = get_instance(requested) if requested else primary_instance()
-            container = instance_container_name(instance) if instance else current_container()
+            container = instance_runtime_container_name(instance) if instance else current_container()
             if not container:
                 try:
                     self.wfile.write(b"data: no running club-3090 runtime container found; waiting...\n\n")
@@ -4230,7 +4409,8 @@ class ProxyHandler(CommonMixin, BaseHTTPRequestHandler):
             ensure_vllm_running_for_request(target["id"] if target else None)
             with metrics_lock:
                 metrics["queued_requests"] = max(0, metrics["queued_requests"] - 1)
-        url = f"http://127.0.0.1:{int(target['port']) if target else active_port()}" + upstream_path
+        target_port = instance_runtime_port(target) if target else active_port()
+        url = f"http://127.0.0.1:{target_port}" + upstream_path
         headers = {k:v for k,v in self.headers.items() if k.lower() not in HOP_HEADERS}
         for secret_header in ("Authorization", "authorization", "X-API-Key", "x-api-key", "api-key"):
             headers.pop(secret_header, None)
@@ -4300,7 +4480,7 @@ class ProxyHandler(CommonMixin, BaseHTTPRequestHandler):
                         start_instance(target["id"], wait=True)
                     else:
                         run_switch(active_mode(), allow_fallback=False)
-                    retry_url = f"http://127.0.0.1:{int(target['port']) if target else active_port()}" + upstream_path
+                    retry_url = f"http://127.0.0.1:{instance_runtime_port(target) if target else active_port()}" + upstream_path
                     retry_req = urllib.request.Request(retry_url, data=body, headers=headers, method=self.command)
                     with urllib.request.urlopen(retry_req, timeout=None) as r2:
                         status = r2.status
