@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="2026-05-05.v4.19"
+SCRIPT_VERSION="2026-05-05.v4.20"
 
 # club-3090 headless server/control installer
 # Install:
@@ -2786,6 +2786,47 @@ def current_container():
     names = vllm_container_names(all_containers=False)
     return names[0] if names else ""
 
+def parse_admin_query_params(parsed):
+    if not parsed or not parsed.query:
+        return {}
+    try:
+        return {k: v[0] for k, v in parse_qs(parsed.query).items() if v}
+    except Exception:
+        return {}
+
+def parse_tail_lines_param(params, default=250):
+    raw = params.get("tail") if isinstance(params, dict) else None
+    try:
+        return max(0, min(1000, int(raw)))
+    except Exception:
+        return int(default)
+
+def resolve_runtime_log_container(requested_instance_id=""):
+    requested = str(requested_instance_id or "").strip().upper()
+    if is_legacy_global_instance_id(requested):
+        return None, current_container()
+    instance = get_instance(requested) if requested else primary_instance()
+    container = instance_runtime_container_name(instance) if instance else current_container()
+    return instance, container
+
+def recent_runtime_log_text(requested_instance_id="", tail_lines=250):
+    _, container = resolve_runtime_log_container(requested_instance_id)
+    if not container:
+        return "no running club-3090 runtime container found; waiting..."
+    lines = max(0, int(tail_lines))
+    if lines <= 0:
+        return ""
+    try:
+        out = subprocess.check_output(
+            ["docker", "logs", "--tail", str(lines), container],
+            text=True,
+            stderr=subprocess.STDOUT,
+            timeout=8,
+        )
+        return (out or "")[-20000:]
+    except Exception as e:
+        return f"docker logs failed for {container}: {e}"
+
 def cleanup_vllm_containers():
     results = []
     for inst in read_instances_config():
@@ -3464,10 +3505,22 @@ def run_nvidia_settings(args):
         return 999, str(e)
 
 
-def set_gpu_fans(speed=None, auto=False):
+def set_gpu_fans(speed=None, auto=False, indices=None):
     # Headless fan control path: private Xorg :99 + nvidia-settings + CoolBits.
     results = []
-    indices = gpu_indices()
+    available_indices = gpu_indices()
+    if indices is None:
+        indices = list(available_indices)
+    else:
+        clean = []
+        for idx in indices:
+            try:
+                clean.append(int(idx))
+            except Exception:
+                pass
+        indices = [idx for idx in clean if idx in available_indices]
+    if not indices:
+        return ["no GPU targets selected"]
     if auto:
         attrs = []
         for gpu_idx in indices:
@@ -3720,14 +3773,27 @@ def set_power_optimizations(enabled):
     return {"cpu": set_cpu_governor("performance"), "gpu": reset_gpu_power_defaults()}
 
 
-def set_fan_max_toggle(enable):
+def fan_target_gpu_indices(instance_id=None):
+    raw = str(instance_id or "").strip().upper()
+    if raw in ("", "GLOBAL"):
+        return gpu_indices()
+    instance = get_instance(raw)
+    if instance:
+        return [int(idx) for idx in (instance.get("gpu_indices") or [instance.get("gpu_index", 0)])]
+    parsed = parse_instance_identifier(raw)
+    if parsed:
+        return [int(idx) for idx in (parsed.get("gpu_indices") or [])]
+    return gpu_indices()
+
+def set_fan_max_toggle(enable, instance_id=None):
     global fan_manual_override, fan_curve_pause_until
+    target_indices = fan_target_gpu_indices(instance_id)
     fan_manual_override = bool(enable)
     if fan_manual_override:
         fan_curve_pause_until = 0.0
-        return set_gpu_fans(speed=FAN_MAX_SPEED, auto=False)
+        return set_gpu_fans(speed=FAN_MAX_SPEED, auto=False, indices=target_indices)
     fan_curve_pause_until = time.time() + 300
-    return set_gpu_fans(auto=True)
+    return set_gpu_fans(auto=True, indices=target_indices)
 
 def power_status():
     with metrics_lock:
@@ -3949,14 +4015,16 @@ const searchState={active:false,query:'',matches:[],index:-1,prevAutoscroll:true
     holder.innerHTML=cats.map(cat=>j.gpus.map(g=>`<div class="chart"><canvas id="cGpu${g.index}${cat.suffix}"></canvas></div>`).join('')).join('');
     cats.forEach(cat=>j.gpus.forEach(g=>{const color=cat.color;const label=`GPU${g.index} ${cat.label}`;drawGpuSeries(`cGpu${g.index}${cat.suffix}`,s,g.index,cat.key,label,color)}));
   }
-}async function post(path,obj){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj||{})});const t=await r.text();if(!r.ok)throw new Error(t);appendLog('\n----- result -----\n'+t+'\n------------------');await refreshStatus();return t}let selectedInstance='GPU0';let logEs=null;let selectedUserName='';function setInstanceMsg(t){const el=$('instanceMsg');if(el)el.textContent=t||''}function getInstanceList(){return (lastStatus&&lastStatus.instances)||[]}function setUsersMsg(t){const el=$('usersMsg');if(el)el.textContent=t||''}function limitText(v,suffix=''){return v===null||v===undefined||v===''?'unlimited':`${v}${suffix}`}
+}async function post(path,obj){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj||{})});const t=await r.text();if(!r.ok)throw new Error(t);appendLog('\n----- result -----\n'+t+'\n------------------');await refreshStatus();return t}let selectedInstance='GPU0';let logEs=null;let logConnectSeq=0;let selectedUserName='';function setInstanceMsg(t){const el=$('instanceMsg');if(el)el.textContent=t||''}function getInstanceList(){return (lastStatus&&lastStatus.instances)||[]}function setUsersMsg(t){const el=$('usersMsg');if(el)el.textContent=t||''}function limitText(v,suffix=''){return v===null||v===undefined||v===''?'unlimited':`${v}${suffix}`}
 let currentLogSource='docker';function setAuditMsg(t){const el=$('auditMsg');if(el)el.textContent=t||''}function mirrorAuthToggles(v){const usersToggle=$('allowAnonymousProxy'),auditToggle=$('auditAllowAnonymousProxy');if(usersToggle)usersToggle.checked=!!v;if(auditToggle)auditToggle.checked=!!v}function openUsersTab(){const btn=$('usersTabBtn');if(btn)tab({target:btn},'users')}function currentLogHeading(){if(currentLogSource==='audit')return activeTabName==='audit'?'Audit Log - Full View':'Audit Log';return activeTabName==='logs'?'Live Docker Log - Full View':'Live Docker Log'}applyLogVisibility=function(){const isLogs=activeTabName==='logs';const isAudit=activeTabName==='audit';document.body.classList.toggle('logs-tab',isLogs);document.body.classList.toggle('audit-tab',isAudit);const card=document.querySelector('.logs.panel');if(card)card.classList.toggle('log-card-hidden',!isLogs&&!isAudit&&!showGlobalLogs);const title=$('logTitle');if(title)title.textContent=currentLogHeading();const label=$('logInstanceLabel');if(label)label.textContent=currentLogLabel()};
 let selectedGroupName='';
 function setGroupsMsg(t){const el=$('groupsMsg');if(el)el.textContent=t||''}
 function renderUsers(users){ensureUsersUi();const grid=$('usersGrid');if(!grid)return;users=users||[];if(selectedUserName&&!users.some(u=>u.name===selectedUserName))selectedUserName='';grid.innerHTML=users.map(u=>{const usage=u.usage||{},limits=u.limits||{},effective=u.effective_limits||{},targets=(u.effective_allowed_targets||u.allowed_targets||[]);return `<div class="api-card"><div class="api-card-head"><h3>${u.name}<br><span class="label">${u.enabled?'enabled':'disabled'} | access ${targets.join(', ')||'*'}</span></h3><span class="preset-actions"><button class="iconbtn" title="Edit" onclick="editUser('${u.name}')">Edit</button><button class="iconbtn" title="Reset key" onclick="resetUserKey('${u.name}')">Reset key</button><button class="iconbtn" title="Delete" onclick="deleteUserByName('${u.name}')">Delete</button></span></div><p>Groups: ${(u.groups||[]).join(', ')||'none'}</p><p>Requests: total ${usage.total_requests??0}, 5h ${usage.requests_last_5h??0}, week ${usage.requests_last_week??0}</p><p>Tokens ${usage.total_tokens??0}, tool calls ${usage.total_tool_calls??0}, thinking ${Number(usage.total_thinking_seconds||0).toFixed(1)}s</p><p class="label">Direct limits | total ${limitText(limits.total_requests)} | 5h ${limitText(limits.requests_per_5h)} | week ${limitText(limits.requests_per_week)} | tokens ${limitText(limits.total_tokens)} | tools ${limitText(limits.total_tool_calls)} | thinking ${limitText(limits.total_thinking_seconds,'s')}</p><p class="label">Effective limits | total ${limitText(effective.total_requests)} | 5h ${limitText(effective.requests_per_5h)} | week ${limitText(effective.requests_per_week)} | tokens ${limitText(effective.total_tokens)} | tools ${limitText(effective.total_tool_calls)} | thinking ${limitText(effective.total_thinking_seconds,'s')}</p></div>`}).join('')||'<div class="value">No API users configured yet.</div>'}
 function renderGroups(groups){ensureGroupUi();const grid=$('groupsGrid');if(!grid)return;groups=groups||[];if(selectedGroupName&&!groups.some(g=>g.name===selectedGroupName))selectedGroupName='';grid.innerHTML=groups.map(g=>{const limits=g.limits||{},targets=(g.allowed_targets||[]);return `<div class="api-card"><div class="api-card-head"><h3>${g.name}<br><span class="label">${g.enabled?'enabled':'disabled'} | access ${targets.join(', ')||'*'}</span></h3><span class="preset-actions"><button class="iconbtn" title="Edit" onclick="editGroup('${g.name}')">Edit</button><button class="iconbtn" title="Delete" onclick="deleteGroupByName('${g.name}')">Delete</button></span></div><p>${g.description||'No description'}</p><p class="label">Limits | 5h ${limitText(limits.score_per_5h)} | week ${limitText(limits.score_per_week)} | max tokens ${limitText(limits.max_tokens_per_message)} | max tools ${limitText(limits.max_tool_calls_per_message)} | thinking weight ${limitText(limits.thinking_second_weight)}</p></div>`}).join('')||'<div class="value">No groups configured yet.</div>'}
-async function saveGroupForm(){try{const r=await fetch('/admin/groups',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'save',group:collectGroupForm()})});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'group save failed');resetGroupForm(true);setGroupsMsg('Saved group '+j.group.name);await refreshStatus()}catch(e){alert('Group save failed: '+e)}}
-async function deleteGroupByName(name){if(!confirm('Delete group '+name+'?'))return;try{const r=await fetch('/admin/groups',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'delete',name})});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'group delete failed');if(selectedGroupName===name)resetGroupForm(true);setGroupsMsg('Deleted group '+name);await refreshStatus()}catch(e){alert('Group delete failed: '+e)}}
+function applyDirectoryPayload(j){if(!lastStatus)lastStatus={};if(Array.isArray(j.users)){lastStatus.users=j.users;renderUsers(j.users)}if(Array.isArray(j.groups)){lastStatus.groups=j.groups;renderGroups(j.groups)}if(j.server_config){lastStatus.server_config=j.server_config;renderAudit(j.server_config)}}
+function setLogContents(text){const b=$('log');if(!b)return;b.value=(text||'').replace(/\r\n?/g,'\n');if(b.value.length>900000)b.value=b.value.slice(-750000);if(searchState.active){recalculateMatches(false);return}if($('autoscroll').checked)b.scrollTop=b.scrollHeight}
+async function saveGroupForm(){try{const r=await fetch('/admin/groups',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'save',group:collectGroupForm()})});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'group save failed');applyDirectoryPayload(j);resetGroupForm(true);setGroupsMsg('Saved group '+j.group.name);refreshStatus().catch(()=>{})}catch(e){alert('Group save failed: '+e)}}
+async function deleteGroupByName(name){if(!confirm('Delete group '+name+'?'))return;try{const r=await fetch('/admin/groups',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'delete',name})});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'group delete failed');applyDirectoryPayload(j);if(selectedGroupName===name)resetGroupForm(true);setGroupsMsg('Deleted group '+name);refreshStatus().catch(()=>{})}catch(e){alert('Group delete failed: '+e)}}
 function findPanelByHeading(sectionId, heading){return [...document.querySelectorAll(`#${sectionId} .panel`)].find(panel=>{const title=panel.querySelector('.panel-head h2,h2');return (title&&title.textContent||'').trim()===heading})||null}
 let selectedScope='GPU0';
 function currentScope(){return selectedScope||selectedInstance||'GPU0'}
@@ -3981,7 +4049,7 @@ function pairScopeItems(){return pairingEnabled()?scopeItems().filter(x=>x.kind=
 function canonicalPairId(a,b){const nums=[Number(a),Number(b)].filter(x=>Number.isInteger(x)&&x>=0).sort((x,y)=>x-y);if(nums.length!==2||nums[0]===nums[1])return'';return `PAIR${nums[0]}_${nums[1]}`}
 function exactTwoPairTarget(){return gpuCount()===2?scopeItems().find(x=>x.id==='PAIR0_1')||null:null}
 function currentScopeInstance(strict=false){if(currentScope()==='GLOBAL'){if(legacyGlobalDualScope())return strict?null:legacyGlobalPair();if(pairingEnabled()&&gpuCount()===2)return strict?null:exactTwoPairTarget();return null}return scopeItems().find(x=>x.id===currentScope())||singleScopeItems()[0]||pairScopeItems()[0]||null}
-function dockerLogTarget(){if(currentLogSource==='audit')return null;if(scopeIsGlobal()&&legacyGlobalDualScope())return null;return currentScopeInstance(false)||scopeItems()[0]||null}
+function dockerLogTarget(){if(currentLogSource==='audit')return null;const legacy=legacyGlobalPair();const cur=currentScopeInstance(false)||scopeItems()[0]||null;if(scopeIsGlobal()&&legacyGlobalDualScope())return null;if(legacyGlobalDualScope()&&legacy&&legacy.running&&cur&&cur.kind!=='dual'&&(cur.assignment_scope==='pair'||cur.overrides_dual_mode||!cur.running))return null;return cur}
 function scopeLabel(inst){if(!inst)return legacyGlobalDualScope()?'Global Dual':'Global';if(inst.id==='GLOBAL')return 'Global Dual';return inst.kind==='dual'?`Pair ${(inst.gpu_indices||[]).join(' + ')}`:inst.id}
 function scopeAllowsSinglePresets(){const inst=currentScopeInstance(true);return !!inst&&inst.kind!=='dual'}
 function scopeAllowsDualPresets(){if(scopeIsGlobal()&&gpuCount()===2)return true;const inst=currentScopeInstance(false);return !!inst&&inst.kind==='dual'}
@@ -4023,14 +4091,16 @@ renderInstances=function(instances){ensureV414Layout();const tabs=$('instanceTab
 renderPresetScopeTabs=function(){const tabs=$('presetScopeTabs');const summary=$('presetScopeSummary');if(!tabs||!summary)return;tabs.innerHTML=singleScopeItems().map(x=>`<button class="subtab ${x.id===currentScope()?'active':''}" onclick="setScope('${x.id}')">${x.id}</button>`).join('')+pairScopeItems().map(x=>`<button class="subtab ${x.id===currentScope()?'active':''}" onclick="setScope('${x.id}')">Pair ${(x.gpu_indices||[]).join('+')}</button>`).join('')+`<button class="subtab ${scopeIsGlobal()?'active':''}" onclick="setScope('GLOBAL')">Global</button>`;const target=currentScopeInstance(false),legacy=legacyGlobalPair();if(scopeIsGlobal()&&legacyGlobalDualScope()&&legacy)summary.innerHTML=`Global scope targets the shared two-GPU runtime on GPUs ${(legacy.gpu_indices||[0,1]).join(', ')}. Dual preset buttons below will update that shared container.`;else if(scopeIsGlobal()&&target&&gpuCount()===2)summary.innerHTML=`Global scope targets the shared dual pair <code>${target.id}</code>. Dual preset buttons below will apply to GPUs ${(target.gpu_indices||[]).join(', ')}.`;else if(scopeIsGlobal())summary.innerHTML='Global scope selected. Single-GPU presets are disabled here. Enable GPU pairing or choose a dual pair tab to apply dual presets.';else if(currentScopeInstance(true))summary.innerHTML=`Targeting ${scopeLabel(currentScopeInstance(true))} | ${currentScopeInstance(true).assignment_text} | proxy <code>${currentScopeInstance(true).proxy_prefix}/</code>`;else summary.textContent='No preset scope available';document.querySelectorAll('#singlePresetCard .actions .btn').forEach(btn=>btn.disabled=!scopeAllowsSinglePresets());document.querySelectorAll('#dualPresetCard .actions .btn').forEach(btn=>btn.disabled=!scopeAllowsDualPresets())}
 updateScopedCards=function(){const target=currentScopeInstance(false);if($('profileScopeNote'))$('profileScopeNote').innerHTML=scopeIsGlobal()?'Global scope: these profile buttons apply host-wide defaults for the full server.':`${scopeLabel(target)} scope: ${target?target.assignment_text:'select a scope to continue'}`;if($('powerScopeNote'))$('powerScopeNote').innerHTML=scopeIsGlobal()?'Global scope: power and cooling controls below affect the whole host.':`${scopeLabel(target)} scope: using the selected runtime context while keeping host-level power controls in sync.`;renderLogSourcePanel()}
 currentLogLabel=function(){if(currentLogSource==='audit')return 'source: audit';if(scopeIsGlobal()&&legacyGlobalDualScope())return 'instance: Global dual';const cur=dockerLogTarget();return 'instance: '+((cur&&cur.id)||'primary')}
-connectLogs=function(){if(logEs){try{logEs.close()}catch(e){}}let url='/admin/audit-stream';if(currentLogSource!=='audit'){const cur=dockerLogTarget();const qs=cur?`?instance=${encodeURIComponent(cur.id)}`:'';url='/admin/logs'+qs}logEs=new EventSource(url);logEs.onopen=()=>appendLog(currentLogSource==='audit'?'--- audit stream connected ---':'--- log connected ---');logEs.onmessage=e=>appendLog(e.data.replaceAll('\\u0000','\n'));logEs.onerror=()=>appendLog(currentLogSource==='audit'?'--- audit stream disconnected; retrying ---':'--- log disconnected; retrying ---')}
+function currentLogTailUrl(){if(currentLogSource==='audit')return '/admin/audit-log';const cur=dockerLogTarget();const parts=[];if(cur)parts.push(`instance=${encodeURIComponent(cur.id)}`);return '/admin/runtime-log'+(parts.length?`?${parts.join('&')}`:'')}
+function syncActiveTabDisplay(){document.querySelectorAll('.tabpane').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));const pane=$(activeTabName);if(pane)pane.classList.add('active');const btn=activeTabButton(activeTabName);if(btn)btn.classList.add('active');applyLogVisibility()}
+connectLogs=function(){const seq=++logConnectSeq;if(logEs){try{logEs.close()}catch(e){}}setLogContents('Loading recent logs...\n');const cur=dockerLogTarget();const parts=['tail=0'];if(cur)parts.unshift(`instance=${encodeURIComponent(cur.id)}`);const streamUrl=currentLogSource==='audit'?'/admin/audit-stream?tail=0':`/admin/logs?${parts.join('&')}`;fetch(currentLogTailUrl(),{cache:'no-store'}).then(async r=>{const text=await r.text();if(seq!==logConnectSeq)return;setLogContents(text||'');if(!(text||'').trim())appendLog(currentLogSource==='audit'?'no audit entries yet; waiting...':'no running club-3090 runtime container found; waiting...')}).catch(e=>{if(seq!==logConnectSeq)return;setLogContents('');appendLog(`--- failed to load recent ${currentLogSource==='audit'?'audit':'runtime'} logs: ${e} ---`)});logEs=new EventSource(streamUrl);logEs.onopen=()=>{if(seq!==logConnectSeq)return;if(!$('log').value.trim())appendLog(currentLogSource==='audit'?'--- audit stream connected ---':'--- log connected ---')};logEs.onmessage=e=>{if(seq!==logConnectSeq)return;appendLog(e.data.replaceAll('\\u0000','\n'))};logEs.onerror=()=>{if(seq!==logConnectSeq)return;appendLog(currentLogSource==='audit'?'--- audit stream disconnected; retrying ---':'--- log disconnected; retrying ---')}}
 powerAction=async function(a){const legacy=legacyGlobalPair();const cur=scopeIsGlobal()&&legacyGlobalDualScope()&&legacy?legacy:currentScopeInstance(false);const legacyGlobal=scopeIsGlobal()&&legacyGlobalDualScope();const needsTarget=['stop_container','start_instance','restart_instance','toggle_enabled'].includes(a);if(needsTarget&&!cur&&!legacyGlobal){alert('Select a GPU or Pair scope first.');return}if(a==='stop_container'&&!confirm(`Stop ${scopeLabel(cur)} now?`))return;const instanceId=legacyGlobal?'GLOBAL':(cur?cur.id:null);try{await post('/admin/power',{action:a,instance_id:instanceId,enabled:cur?!cur.enabled:undefined})}catch(e){alert(e)}}
 instanceAction=async function(a){await powerAction(a)}
 toggleInstanceEnabled=async function(){const legacy=legacyGlobalPair();const cur=scopeIsGlobal()&&legacyGlobalDualScope()&&legacy?legacy:currentScopeInstance(false);const legacyGlobal=scopeIsGlobal()&&legacyGlobalDualScope();if(!cur&&!legacyGlobal){alert('Select a GPU or Pair scope first.');return}try{await post('/admin/power',{action:'toggle_enabled',instance_id:legacyGlobal?'GLOBAL':cur.id,enabled:!cur.enabled})}catch(e){alert(e)}}
 createPairGroup=async function(first=null,second=null){if(!pairingEnabled()){alert('Enable GPU Pairing first.');return}if(gpuCount()<2){alert('At least two GPUs are required to create a dual pair.');return}let a=first,b=second;if(a===null||b===null){a=prompt(`First GPU index (0-${Math.max(gpuCount()-1,0)}):`,'0');if(a===null)return;b=prompt(`Second GPU index (0-${Math.max(gpuCount()-1,0)}):`,'1');if(b===null)return}const id=canonicalPairId(a,b);if(!id){alert('Select two distinct GPU indices.');return}try{const r=await fetch('/admin/instances',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'save_pair',gpu_indices:[Number(a),Number(b)],mode:'vllm/dual',enabled:false})});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'pair save failed');setInstanceMsg(`Saved pair group ${id}`);await refreshStatus();setScope(id,false)}catch(e){alert('Pair group failed: '+e)}}
-function activateTab(name,firstRender=false){activeTabName=normalizeTabName(name);document.querySelectorAll('.tabpane').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));const pane=$(activeTabName);if(pane)pane.classList.add('active');const btn=activeTabButton(activeTabName);if(btn)btn.classList.add('active');applyLogVisibility();if(!firstRender){clearLog();connectLogs()}queueUiStateSave();setTimeout(()=>{if(!searchState.active&&$('autoscroll').checked)$('log').scrollTop=$('log').scrollHeight},0)}
+function activateTab(name,firstRender=false){activeTabName=normalizeTabName(name);syncActiveTabDisplay();if(!firstRender){clearLog();connectLogs()}queueUiStateSave();setTimeout(()=>{if(!searchState.active&&$('autoscroll').checked)$('log').scrollTop=$('log').scrollHeight},0)}
 tab=function(e,n){activateTab(n,false)}
-refreshStatus=async function(){try{ensureV414Layout();const r=await fetch('/admin/status',{cache:'no-store'});const j=await r.json();const metrics=j.metrics||{},power=j.power||{};lastStatus=j;hydrateUiState(j.ui_config||{});if($('showGlobalLogs'))$('showGlobalLogs').checked=!!showGlobalLogs;$('summary').textContent=`${j.active_mode} | ${j.container||'no container'} | ${power.profile||'balanced'} | GPUs ${j.gpu_count??0}`;$('mode').textContent=`${j.active_mode} / ${j.active_port}`;$('container').textContent=j.container||'none';$('services').textContent=`vLLM=${j.vllm_service}, control=${j.control_service}, console=${j.console_service}`;$('req').textContent=`total=${metrics.total_requests??0}, active=${metrics.active_requests??0}, fail=${metrics.failed_requests??0}, queue=${metrics.queued_requests??0}`;$('last').textContent=`${metrics.last_status||'-'} latency=${metrics.last_latency_s??'-'}s ttft=${metrics.last_ttft_s??'-'}s tps=${metrics.last_tokens_per_second??'-'}`;$('uptime').textContent=fmtUptime(j.uptime_seconds);renderGpuCards(j.gpus);$('powerbox').textContent=`profile=${power.profile||'-'}, GPU=${power.gpu||'-'}, CPU=${power.cpu||'-'}, fans=${power.fans||'-'}, container=${power.container||'-'}, idle=${power.idle_for_seconds??0}s`;$('optToggle').textContent=power.optimizations_enabled?'Disable Power Optimizations':'Enable Power Optimizations';$('fanToggle').textContent=power.fan_manual_override?'Reset Fans to Default':'Set Fans to Max';renderMetrics(j);renderPresetCatalog(j.presets);renderUsers(j.users||[]);renderGroups(j.groups||[]);renderAudit(j.server_config||{});renderInstances(j.instances||[]);renderPresetScopeTabs();updateScopedCards();renderLogSourcePanel();applyLogVisibility();activateTab(activeTabName,true);syncInstancesBusyState()}catch(e){setMsg('Status error: '+e)}}
+refreshStatus=async function(){try{ensureV414Layout();const r=await fetch('/admin/status',{cache:'no-store'});const j=await r.json();const metrics=j.metrics||{},power=j.power||{};lastStatus=j;hydrateUiState(j.ui_config||{});if($('showGlobalLogs'))$('showGlobalLogs').checked=!!showGlobalLogs;$('summary').textContent=`${j.active_mode} | ${j.container||'no container'} | ${power.profile||'balanced'} | GPUs ${j.gpu_count??0}`;$('mode').textContent=`${j.active_mode} / ${j.active_port}`;$('container').textContent=j.container||'none';$('services').textContent=`vLLM=${j.vllm_service}, control=${j.control_service}, console=${j.console_service}`;$('req').textContent=`total=${metrics.total_requests??0}, active=${metrics.active_requests??0}, fail=${metrics.failed_requests??0}, queue=${metrics.queued_requests??0}`;$('last').textContent=`${metrics.last_status||'-'} latency=${metrics.last_latency_s??'-'}s ttft=${metrics.last_ttft_s??'-'}s tps=${metrics.last_tokens_per_second??'-'}`;$('uptime').textContent=fmtUptime(j.uptime_seconds);renderGpuCards(j.gpus);$('powerbox').textContent=`profile=${power.profile||'-'}, GPU=${power.gpu||'-'}, CPU=${power.cpu||'-'}, fans=${power.fans||'-'}, container=${power.container||'-'}, idle=${power.idle_for_seconds??0}s`;$('optToggle').textContent=power.optimizations_enabled?'Disable Power Optimizations':'Enable Power Optimizations';$('fanToggle').textContent=power.fan_manual_override?'Reset Fans to Default':'Set Fans to Max';renderMetrics(j);renderPresetCatalog(j.presets);renderUsers(j.users||[]);renderGroups(j.groups||[]);renderAudit(j.server_config||{});renderInstances(j.instances||[]);renderPresetScopeTabs();updateScopedCards();renderLogSourcePanel();syncActiveTabDisplay();syncInstancesBusyState()}catch(e){setMsg('Status error: '+e)}}
 let statusPollTimer=null;
 function bootAdminUi(){ensureV414Layout();resetUserForm(true);resetGroupForm(true);if(!selectedScope)selectedScope=singleScopeItems()[0]?.id||pairScopeItems()[0]?.id||'GLOBAL';setScope(selectedScope,false);clearLog();connectLogs();refreshStatus();if(statusPollTimer)clearInterval(statusPollTimer);statusPollTimer=setInterval(refreshStatus,1000)}
 bootAdminUi()
@@ -4110,13 +4180,14 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             self.stream_logs(parsed)
             return
         if path == "/admin/audit-stream":
+            params = parse_admin_query_params(parsed)
             self.close_connection = False
             self.send_response(200)
             self.send_header("Content-Type","text/event-stream")
             self.send_header("Cache-Control","no-cache")
             self.send_header("Connection","keep-alive")
             self.end_headers()
-            self.stream_text_file(AUDIT_LOG_FILE, "no audit entries yet; waiting...")
+            self.stream_text_file(AUDIT_LOG_FILE, "no audit entries yet; waiting...", initial_tail_lines=parse_tail_lines_param(params, 250))
             return
         if path == "/admin/presets":
             self.send_json({"ok": True, "presets": preset_catalog()})
@@ -4142,6 +4213,12 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                 payload = subprocess.check_output(["tail","-n","300",AUDIT_LOG_FILE], text=True, stderr=subprocess.DEVNULL, timeout=3).encode("utf-8", errors="replace")
             except Exception:
                 payload = b""
+            self.send_bytes(payload, "text/plain; charset=utf-8")
+            return
+        if path == "/admin/runtime-log":
+            params = parse_admin_query_params(parsed)
+            requested = str(params.get("instance") or "").strip().upper()
+            payload = recent_runtime_log_text(requested, tail_lines=parse_tail_lines_param(params, 250)).encode("utf-8", errors="replace")
             self.send_bytes(payload, "text/plain; charset=utf-8")
             return
         self.send_error(404)
@@ -4224,9 +4301,9 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                 elif action == "enable_optimizations":
                     out = set_power_optimizations(True)
                 elif action == "fans_max":
-                    out = {"fans": set_fan_max_toggle(True)}
+                    out = {"fans": set_fan_max_toggle(True, instance_id=instance_id)}
                 elif action == "fans_auto":
-                    out = {"fans": set_fan_max_toggle(False)}
+                    out = {"fans": set_fan_max_toggle(False, instance_id=instance_id)}
                 else:
                     raise ValueError("Invalid power action")
                 log_audit("admin_power_action", action=action, instance=instance_id)
@@ -4363,16 +4440,11 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             return
         self.send_error(404)
     def stream_logs(self, parsed):
-        params = {}
-        if parsed and parsed.query:
-            try:
-                params = {k: v[0] for k, v in parse_qs(parsed.query).items() if v}
-            except Exception:
-                params = {}
+        params = parse_admin_query_params(parsed)
         requested = str(params.get("instance") or "").strip().upper()
+        tail_lines = parse_tail_lines_param(params, 250)
         while True:
-            instance = None if is_legacy_global_instance_id(requested) else (get_instance(requested) if requested else primary_instance())
-            container = instance_runtime_container_name(instance) if instance else current_container()
+            instance, container = resolve_runtime_log_container(requested)
             if not container:
                 try:
                     self.wfile.write(b"data: no running club-3090 runtime container found; waiting...\n\n")
@@ -4383,7 +4455,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                 continue
             p = None
             try:
-                p = subprocess.Popen(["docker","logs","--tail","250","-f",container], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+                p = subprocess.Popen(["docker","logs","--tail",str(tail_lines),"-f",container], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
                 assert p.stdout is not None
                 last_line = None
                 last_emit = 0.0
@@ -4409,8 +4481,9 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                         p.terminate()
                     except Exception:
                         pass
+            tail_lines = 0
             time.sleep(2)
-    def stream_text_file(self, path, empty_message="waiting..."):
+    def stream_text_file(self, path, empty_message="waiting...", initial_tail_lines=250):
         sent_empty = False
         offset = 0
         while True:
@@ -4424,13 +4497,17 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                     continue
                 with open(path, "r", encoding="utf-8", errors="replace") as f:
                     if offset <= 0:
-                        lines = deque(f, maxlen=250)
-                        for line in lines:
-                            clean = line.rstrip("\n").replace("\n", "\\u0000")
-                            self.wfile.write(f"data: {clean}\n\n".encode("utf-8", errors="replace"))
-                        self.wfile.flush()
+                        if int(initial_tail_lines) > 0:
+                            lines = deque(f, maxlen=int(initial_tail_lines))
+                            for line in lines:
+                                clean = line.rstrip("\n").replace("\n", "\\u0000")
+                                self.wfile.write(f"data: {clean}\n\n".encode("utf-8", errors="replace"))
+                            self.wfile.flush()
+                        else:
+                            f.seek(0, os.SEEK_END)
                         offset = f.tell()
                         sent_empty = True
+                        initial_tail_lines = 0
                     else:
                         try:
                             size_now = os.path.getsize(path)
