@@ -823,6 +823,7 @@ VARIANT_SPECS = {
     "llamacpp/concurrent": {"engine": "llamacpp", "compose_dir": "models/qwen3.6-27b/llama-cpp/compose", "compose_file": "docker-compose.concurrent.yml", "service": "llama-cpp-qwen36-27b-concurrent"},
 }
 INSTANCE_PORT_BASE = int(os.environ.get("CLUB3090_INSTANCE_PORT_BASE", "8200"))
+PAIR_INSTANCE_PORT_BASE = int(os.environ.get("CLUB3090_PAIR_INSTANCE_PORT_BASE", "8300"))
 COMPOSE_BIN = os.environ.get("CLUB3090_COMPOSE_BIN", "docker compose")
 
 PRESETS = {
@@ -1540,9 +1541,19 @@ def resolve_target_id(instance_id=None):
     return primary["id"] if primary else "legacy"
 
 
+def target_gpu_labels(target_id):
+    parsed = parse_instance_identifier(target_id)
+    if not parsed:
+        return []
+    return [f"GPU{int(idx)}" for idx in parsed.get("gpu_indices") or []]
+
+
 def user_can_access_target(user, target_id):
     allowed = set(effective_allowed_targets(user))
-    return "*" in allowed or target_id in allowed
+    if "*" in allowed or target_id in allowed:
+        return True
+    labels = target_gpu_labels(target_id)
+    return bool(labels) and all(label in allowed for label in labels)
 
 
 def is_quota_counted_path(upstream_path):
@@ -1906,46 +1917,110 @@ def default_instances_config():
     for gpu_idx in range(count):
         rows.append({
             "id": f"GPU{gpu_idx}",
-            "gpu_index": gpu_idx,
+            "kind": "single",
+            "gpu_indices": [gpu_idx],
             "mode": "vllm/default",
             "enabled": gpu_idx == 0 and DEFAULT_MODE in SINGLE_GPU_MODES,
             "port": INSTANCE_PORT_BASE + gpu_idx,
         })
+    if count == 2:
+        rows.append({
+            "id": "PAIR0_1",
+            "kind": "dual",
+            "gpu_indices": [0, 1],
+            "mode": DEFAULT_MODE if DEFAULT_MODE in DUAL_GPU_MODES else "vllm/dual",
+            "enabled": DEFAULT_MODE in DUAL_GPU_MODES,
+            "port": PAIR_INSTANCE_PORT_BASE,
+        })
     return rows
+
+def normalize_pair_indices(value):
+    if not isinstance(value, (list, tuple)):
+        return None
+    try:
+        items = sorted({int(x) for x in value})
+    except Exception:
+        return None
+    if len(items) != 2 or any(x < 0 for x in items):
+        return None
+    return items
+
+def pair_instance_id(indices):
+    pair = normalize_pair_indices(indices)
+    if not pair:
+        raise ValueError("Dual preset pairs must contain exactly two distinct GPU indices")
+    return f"PAIR{pair[0]}_{pair[1]}"
+
+def parse_instance_identifier(instance_id):
+    raw = str(instance_id or "").strip().upper()
+    if re.fullmatch(r"GPU[0-9]+", raw):
+        idx = int(raw[3:])
+        return {"id": raw, "kind": "single", "gpu_indices": [idx], "gpu_index": idx}
+    match = re.fullmatch(r"PAIR([0-9]+)_([0-9]+)", raw)
+    if match:
+        pair = normalize_pair_indices([int(match.group(1)), int(match.group(2))])
+        if not pair:
+            return None
+        return {"id": pair_instance_id(pair), "kind": "dual", "gpu_indices": pair, "gpu_index": pair[0]}
+    return None
+
+def instance_default_port(kind, gpu_indices):
+    if kind == "dual":
+        pair = normalize_pair_indices(gpu_indices)
+        if not pair:
+            return PAIR_INSTANCE_PORT_BASE
+        return PAIR_INSTANCE_PORT_BASE + (pair[0] * 100) + pair[1]
+    idx = int((gpu_indices or [0])[0])
+    return INSTANCE_PORT_BASE + idx
 
 def normalize_instance(raw, used_ids=None, used_ports=None):
     used_ids = used_ids if isinstance(used_ids, set) else set()
     used_ports = used_ports if isinstance(used_ports, set) else set()
     if not isinstance(raw, dict):
         return None
-    instance_id = str(raw.get("id") or "").strip().upper()
-    if not re.fullmatch(r"GPU[0-9]+", instance_id):
+    parsed = parse_instance_identifier(raw.get("id"))
+    if not parsed:
+        gpu_indices = normalize_pair_indices(raw.get("gpu_indices"))
+        if gpu_indices:
+            parsed = parse_instance_identifier(pair_instance_id(gpu_indices))
+        elif raw.get("gpu_index") not in ("", None, False):
+            try:
+                parsed = parse_instance_identifier(f"GPU{int(raw.get('gpu_index'))}")
+            except Exception:
+                parsed = None
+    if not parsed:
         return None
-    try:
-        gpu_index = int(raw.get("gpu_index"))
-    except Exception:
-        try:
-            gpu_index = int(instance_id[3:])
-        except Exception:
-            return None
-    mode = str(raw.get("mode") or "vllm/default").strip()
-    if mode not in SINGLE_GPU_MODES or mode not in VARIANT_SPECS:
-        mode = "vllm/default"
+    instance_id = parsed["id"]
+    kind = parsed["kind"]
+    gpu_indices = list(parsed["gpu_indices"])
+    gpu_index = int(gpu_indices[0])
+    mode = str(raw.get("mode") or ("vllm/dual" if kind == "dual" else "vllm/default")).strip()
+    valid_modes = DUAL_GPU_MODES if kind == "dual" else SINGLE_GPU_MODES
+    if mode not in valid_modes or mode not in VARIANT_SPECS:
+        mode = "vllm/dual" if kind == "dual" else "vllm/default"
     try:
         port = int(raw.get("port"))
     except Exception:
-        port = INSTANCE_PORT_BASE + gpu_index
+        port = instance_default_port(kind, gpu_indices)
     if port < 1024:
-        port = INSTANCE_PORT_BASE + gpu_index
+        port = instance_default_port(kind, gpu_indices)
     if instance_id in used_ids:
         return None
     if port in used_ports:
-        port = INSTANCE_PORT_BASE + gpu_index
+        port = instance_default_port(kind, gpu_indices)
         while port in used_ports:
             port += 1
     used_ids.add(instance_id)
     used_ports.add(port)
-    return {"id": instance_id, "gpu_index": gpu_index, "mode": mode, "enabled": bool(raw.get("enabled", False)), "port": port}
+    return {
+        "id": instance_id,
+        "kind": kind,
+        "gpu_indices": gpu_indices,
+        "gpu_index": gpu_index,
+        "mode": mode,
+        "enabled": bool(raw.get("enabled", False)),
+        "port": port,
+    }
 
 def normalize_instances(rows):
     if not isinstance(rows, list):
@@ -1955,6 +2030,20 @@ def normalize_instances(rows):
     clean = []
     for row in rows:
         inst = normalize_instance(row, used_ids, used_ports)
+        if inst is not None:
+            clean.append(inst)
+    count = detect_gpu_count_runtime()
+    existing_ids = {inst["id"] for inst in clean}
+    for gpu_idx in range(count):
+        iid = f"GPU{gpu_idx}"
+        if iid in existing_ids:
+            continue
+        inst = normalize_instance({"id": iid, "kind": "single", "gpu_indices": [gpu_idx], "mode": "vllm/default", "enabled": False, "port": INSTANCE_PORT_BASE + gpu_idx}, used_ids, used_ports)
+        if inst is not None:
+            clean.append(inst)
+            existing_ids.add(inst["id"])
+    if count == 2 and "PAIR0_1" not in existing_ids:
+        inst = normalize_instance({"id": "PAIR0_1", "kind": "dual", "gpu_indices": [0, 1], "mode": DEFAULT_MODE if DEFAULT_MODE in DUAL_GPU_MODES else "vllm/dual", "enabled": DEFAULT_MODE in DUAL_GPU_MODES, "port": PAIR_INSTANCE_PORT_BASE}, used_ids, used_ports)
         if inst is not None:
             clean.append(inst)
     if not clean:
@@ -2017,15 +2106,16 @@ def write_instance_artifacts(instance):
     os.makedirs(paths["dir"], exist_ok=True)
     with open(paths["env"], "w", encoding="utf-8") as f:
         f.write(f"PORT={int(instance['port'])}\n")
-        f.write(f"CUDA_VISIBLE_DEVICES={int(instance['gpu_index'])}\n")
+        f.write("CUDA_VISIBLE_DEVICES=" + ",".join(str(int(idx)) for idx in (instance.get("gpu_indices") or [instance["gpu_index"]])) + "\n")
     override = (
         "services:\n"
         f"  {spec['service']}:\n"
         f"    container_name: {instance_container_name(instance)}\n"
         "    labels:\n"
         f"      club3090.instance_id: \"{instance['id']}\"\n"
+        f"      club3090.kind: \"{instance['kind']}\"\n"
         f"      club3090.mode: \"{instance['mode']}\"\n"
-        f"      club3090.gpu_index: \"{instance['gpu_index']}\"\n"
+        f"      club3090.gpu_indices: \"{','.join(str(int(idx)) for idx in instance.get('gpu_indices') or [instance['gpu_index']])}\"\n"
     )
     with open(paths["override"], "w", encoding="utf-8") as f:
         f.write(override)
@@ -2071,8 +2161,9 @@ def update_instance(instance_id, mode=None, enabled=None):
         if row["id"] != str(instance_id or "").strip().upper():
             continue
         if mode is not None:
-            if mode not in SINGLE_GPU_MODES:
-                raise ValueError("Only single-GPU presets may be assigned to GPU instances")
+            valid_modes = DUAL_GPU_MODES if row.get("kind") == "dual" else SINGLE_GPU_MODES
+            if mode not in valid_modes:
+                raise ValueError("Selected preset type does not match this instance")
             row["mode"] = mode
         if enabled is not None:
             row["enabled"] = bool(enabled)
@@ -2083,16 +2174,61 @@ def update_instance(instance_id, mode=None, enabled=None):
     write_instances_config(rows)
     return get_instance(updated["id"])
 
+def save_pair_instance(gpu_indices, mode=None, enabled=None):
+    pair = normalize_pair_indices(gpu_indices)
+    if not pair:
+        raise ValueError("Select exactly two distinct GPUs for a dual preset pair")
+    pair_id = pair_instance_id(pair)
+    rows = read_instances_config()
+    existing = None
+    for row in rows:
+        if row["id"] == pair_id:
+            existing = row
+            break
+    if existing is None:
+        rows.append({
+            "id": pair_id,
+            "kind": "dual",
+            "gpu_indices": pair,
+            "mode": mode if mode in DUAL_GPU_MODES else "vllm/dual",
+            "enabled": bool(enabled),
+            "port": instance_default_port("dual", pair),
+        })
+    else:
+        if mode is not None:
+            if mode not in DUAL_GPU_MODES:
+                raise ValueError("Dual GPU pairs must use a dual preset")
+            existing["mode"] = mode
+        if enabled is not None:
+            existing["enabled"] = bool(enabled)
+    write_instances_config(rows)
+    return get_instance(pair_id)
+
+def delete_pair_instance(instance_id):
+    parsed = parse_instance_identifier(instance_id)
+    if not parsed or parsed.get("kind") != "dual":
+        raise ValueError("Only dual GPU pair groups can be removed")
+    rows = read_instances_config()
+    remaining = [row for row in rows if row["id"] != parsed["id"]]
+    if len(remaining) == len(rows):
+        raise ValueError("Pair group not found")
+    try:
+        stop_instance(parsed["id"])
+    except Exception:
+        pass
+    write_instances_config(remaining)
+    return instances_snapshot()
+
 def primary_instance():
     rows = read_instances_config()
     if not rows:
         return None
     running = [inst for inst in rows if port_open(int(inst["port"]), timeout=0.08)]
     if running:
-        return sorted(running, key=lambda d: d["gpu_index"])[0]
+        return sorted(running, key=lambda d: (len(d.get("gpu_indices") or [d["gpu_index"]]), d["gpu_index"], d["id"]))[0]
     enabled = [inst for inst in rows if inst.get("enabled")]
     if enabled:
-        return sorted(enabled, key=lambda d: d["gpu_index"])[0]
+        return sorted(enabled, key=lambda d: (len(d.get("gpu_indices") or [d["gpu_index"]]), d["gpu_index"], d["id"]))[0]
     return None
 
 def boot_enabled_instances():
@@ -2108,12 +2244,6 @@ def boot_enabled_instances():
             started += 1
         except Exception as e:
             outputs.append(f"{inst['id']} failed: {e}")
-    if started == 0 and DEFAULT_MODE not in SINGLE_GPU_MODES:
-        try:
-            outputs.append("no enabled per-GPU instances; starting legacy default mode")
-            outputs.append(run_switch(DEFAULT_MODE, allow_fallback=False)[-800:])
-        except Exception as e:
-            outputs.append(f"legacy default failed: {e}")
     log_control("BOOT instances: " + " || ".join(outputs))
     return outputs
 
@@ -2124,32 +2254,29 @@ def mode_gpu_indices(mode, gpu_count=None):
         count = int(gpu_count if gpu_count is not None else detect_gpu_count_runtime())
     except Exception:
         count = 0
-    return list(range(min(max(count, 0), 2)))
+    return [idx for idx in range(max(count, 0))][:2]
 
 def running_dual_mode():
-    for mode in DUAL_GPU_MODES:
-        port = MODES.get(mode)
-        if port and port_open(port, timeout=0.08):
-            return mode
-    mode = read_active_mode_file()
-    if mode in DUAL_GPU_MODES:
-        port = MODES.get(mode)
-        if port and port_open(port, timeout=0.08):
-            return mode
-    return None
+    rows = [inst for inst in read_instances_config() if inst.get("kind") == "dual" and port_open(int(inst["port"]), timeout=0.08)]
+    if not rows:
+        return None
+    rows.sort(key=lambda d: (d["gpu_indices"], d["id"]))
+    return rows[0]["mode"]
 
-def stop_global_mode():
-    log_control("GLOBAL mode stop requested")
-    p = subprocess.run(["bash", "scripts/switch.sh", "--down"], cwd=CLUB3090_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=300)
-    out = (p.stdout or "")[-4000:]
-    log_control(f"GLOBAL mode stop rc={p.returncode}: {out}")
-    return p.returncode, out
+def running_dual_instances():
+    rows = [inst for inst in read_instances_config() if inst.get("kind") == "dual" and port_open(int(inst["port"]), timeout=0.08)]
+    rows.sort(key=lambda d: (d.get("gpu_indices") or [], d["id"]))
+    return rows
 
-def stop_instances_for_gpu_indices(indices):
-    results = []
+def stop_overlapping_instances(indices, exclude_ids=None):
     wanted = {int(idx) for idx in (indices or [])}
+    excluded = {str(x or "").strip().upper() for x in (exclude_ids or [])}
+    results = []
     for inst in read_instances_config():
-        if int(inst.get("gpu_index", -1)) not in wanted:
+        if inst["id"] in excluded:
+            continue
+        inst_indices = {int(idx) for idx in (inst.get("gpu_indices") or [inst.get("gpu_index", -1)])}
+        if not wanted.intersection(inst_indices):
             continue
         if not port_open(int(inst["port"]), timeout=0.08):
             continue
@@ -2157,21 +2284,43 @@ def stop_instances_for_gpu_indices(indices):
         results.append({"id": inst["id"], "rc": rc, "output": out[-1200:]})
     return results
 
+def stop_global_mode():
+    stopped = stop_overlapping_instances([idx for inst in running_dual_instances() for idx in inst.get("gpu_indices") or []])
+    return 0, "\n".join((row.get("output") or "") for row in stopped)[-4000:]
+
+def stop_instances_for_gpu_indices(indices):
+    return stop_overlapping_instances(indices)
+
 def instance_assignment(instance, dual_mode=None):
-    dual_mode = dual_mode or running_dual_mode()
-    gpu_idx = int(instance.get("gpu_index", -1))
-    if dual_mode and gpu_idx in mode_gpu_indices(dual_mode):
+    gpu_indices = [int(idx) for idx in (instance.get("gpu_indices") or [instance.get("gpu_index", -1)])]
+    if instance.get("kind") == "dual":
+        if port_open(int(instance["port"]), timeout=0.08):
+            return {
+                "scope": "pair",
+                "mode": str(instance.get("mode") or "vllm/dual"),
+                "text": f"GPUs {', '.join(str(idx) for idx in gpu_indices)} are running the dual preset {instance['mode']}",
+                "override": False,
+            }
         return {
-            "scope": "global",
-            "mode": dual_mode,
-            "text": f"GPU {gpu_idx} is currently occupied by the global dual preset {dual_mode}",
-            "override": True,
+            "scope": "pair",
+            "mode": str(instance.get("mode") or "vllm/dual"),
+            "text": f"GPUs {', '.join(str(idx) for idx in gpu_indices)} are reserved for dual preset {instance['mode']}",
+            "override": False,
         }
+    for pair in running_dual_instances():
+        pair_indices = {int(idx) for idx in pair.get("gpu_indices") or []}
+        if set(gpu_indices).intersection(pair_indices):
+            return {
+                "scope": "pair",
+                "mode": pair["mode"],
+                "text": f"GPU {gpu_indices[0]} is currently occupied by dual pair {pair['id']} running {pair['mode']}",
+                "override": True,
+            }
     mode = str(instance.get("mode") or "vllm/default")
     return {
         "scope": "per-gpu",
         "mode": mode,
-        "text": f"GPU {gpu_idx} is assigned to the per-GPU preset {mode}",
+        "text": f"GPU {gpu_indices[0]} is assigned to the per-GPU preset {mode}",
         "override": False,
     }
 
@@ -2181,7 +2330,9 @@ def instance_snapshot(instance):
     assigned = instance_assignment(instance)
     return {
         "id": instance["id"],
+        "kind": instance.get("kind", "single"),
         "gpu_index": instance["gpu_index"],
+        "gpu_indices": list(instance.get("gpu_indices") or [instance["gpu_index"]]),
         "mode": instance["mode"],
         "enabled": bool(instance.get("enabled")),
         "port": int(instance["port"]),
@@ -2189,6 +2340,7 @@ def instance_snapshot(instance):
         "running": running,
         "ready_url": instance_ready_url(instance),
         "proxy_prefix": f"/{instance['id']}",
+        "display_name": instance["id"] if instance.get("kind") != "dual" else f"Pair {', '.join(str(idx) for idx in instance.get('gpu_indices') or [])}",
         "assignment_scope": assigned["scope"],
         "assignment_mode": assigned["mode"],
         "assignment_text": assigned["text"],
@@ -3421,8 +3573,8 @@ def apply_preset(body, preset_name, max_token_cap):
 def parse_instance_path(path):
     parsed = urlsplit(path)
     parts = [p for p in parsed.path.split("/") if p]
-    if parts and re.fullmatch(r"GPU[0-9]+", parts[0].upper()):
-        instance_id = parts[0].upper()
+    if parts and parse_instance_identifier(parts[0]):
+        instance_id = parse_instance_identifier(parts[0])["id"]
         trimmed = "/" + "/".join(parts[1:]) if len(parts) > 1 else "/"
         if parsed.query:
             trimmed += "?" + parsed.query
@@ -3530,6 +3682,55 @@ renderGroups=function(groups){ensureGroupUi();const grid=$('groupsGrid');if(!gri
 ensureUsersUi();ensureGroupUi();resetUserForm();resetGroupForm();
 const _v413RefreshStatus=refreshStatus;refreshStatus=async function(){await _v413RefreshStatus();ensureV413Layout();if(!selectedScope)selectedScope=selectedInstance||'GPU0';renderInstances(getInstanceList());renderPresetScopeTabs();updateScopedCards();if(lastStatus&&lastStatus.server_config)renderAudit(lastStatus.server_config)}
 ensureV413Layout();if(!selectedScope)selectedScope=selectedInstance||'GPU0';setScope(selectedScope,false);
+selectedGroupName=selectedGroupName||'';
+function scopeItems(){const items=getInstanceList().slice();items.sort((a,b)=>{const ak=a.kind==='dual'?1:0;const bk=b.kind==='dual'?1:0;if(ak!==bk)return ak-bk;const ai=(a.gpu_indices||[a.gpu_index])[0]||0;const bi=(b.gpu_indices||[b.gpu_index])[0]||0;return ai-bi||String(a.id).localeCompare(String(b.id))});return items}
+function singleScopeItems(){return scopeItems().filter(x=>x.kind!=='dual')}
+function pairScopeItems(){return scopeItems().filter(x=>x.kind==='dual')}
+function gpuCount(){return Number((lastStatus&&lastStatus.gpu_count)||0)}
+function canonicalPairId(a,b){const nums=[Number(a),Number(b)].filter(x=>Number.isInteger(x)&&x>=0).sort((x,y)=>x-y);if(nums.length!==2||nums[0]===nums[1])return'';return `PAIR${nums[0]}_${nums[1]}`}
+function exactTwoPairTarget(){return pairScopeItems().find(x=>JSON.stringify((x.gpu_indices||[]).slice().sort((a,b)=>a-b))==='[0,1]')||null}
+function currentScopeInstance(strict=false){if(currentScope()==='GLOBAL')return strict?null:exactTwoPairTarget();return scopeItems().find(x=>x.id===currentScope())||singleScopeItems()[0]||pairScopeItems()[0]||null}
+function currentScopeKind(){const inst=currentScopeInstance(true);return inst?inst.kind:(currentScope()==='GLOBAL'?'global':'single')}
+function dockerLogTarget(){return currentScopeInstance(false)||scopeItems()[0]||null}
+function scopeLabel(inst){if(!inst)return'Global';return inst.kind==='dual'?`Pair ${(inst.gpu_indices||[]).join(' + ')}`:inst.id}
+function scopeAllowsSinglePresets(){const inst=currentScopeInstance(true);return !!inst&&inst.kind!=='dual'}
+function scopeAllowsDualPresets(){const inst=currentScopeInstance(false);return !!inst&&inst.kind==='dual'}
+function setEditorState(editorId,introId,open){const ed=$(editorId),intro=$(introId);if(ed)ed.classList.toggle('open',!!open);if(intro)intro.classList.toggle('hidden',!!open)}
+function openUserEditor(){ensureUsersUi();setEditorState('userEditor','userIntro',true)}
+function openGroupEditor(){ensureGroupUi();setEditorState('groupEditor','groupIntro',true)}
+ensureUsersUi=function(){const tabs=document.querySelector('.tabs');if(tabs&&!document.getElementById('usersTabBtn')){const b=document.createElement('button');b.className='tab';b.id='usersTabBtn';b.textContent='Users';b.onclick=(ev)=>tab(ev,'users');tabs.insertBefore(b,tabs.querySelector('.tab[onclick*="metrics"]')||null)}const main=document.querySelector('main.container');if(!main)return;let section=$('users');if(!section){section=document.createElement('section');section.id='users';section.className='tabpane content-tab';main.insertBefore(section,document.getElementById('metrics'))}if(section.dataset.v414Users!=='1'){section.dataset.v414Users='1';section.innerHTML=`<div class="panel"><div class="panel-head"><h2>User Accounts</h2><button class="add-preset-btn" title="New user" aria-label="New user" onclick="resetUserForm(false)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none"/></svg></button></div><div class="preset-intro" id="userIntro">Manage per-user API keys, access scopes, and Codex-style scored budgets. The configured list stays visible while the editor is collapsed.</div><div class="preset-editor" id="userEditor"><div class="formgrid"><label>User name<input id="userName" placeholder="client_a" /></label><label>Allowed targets<input id="userTargets" placeholder="*, legacy, GPU0, GPU1" /></label><label>Groups<input id="userGroups" placeholder="starter, premium" /></label><label>5h score budget<input id="userScore5h" type="number" step="0.1" placeholder="unlimited" /></label><label>Weekly score budget<input id="userScoreWeek" type="number" step="0.1" placeholder="unlimited" /></label><label>Max tokens / message<input id="userMaxTokensMsg" type="number" step="1" placeholder="unlimited" /></label><label>Max tool calls / message<input id="userMaxToolsMsg" type="number" step="1" placeholder="unlimited" /></label><label>Input token weight<input id="userInputTokenWeight" type="number" step="0.001" placeholder="default" /></label><label>Output token weight<input id="userOutputTokenWeight" type="number" step="0.001" placeholder="default" /></label><label>Tool-call weight<input id="userToolCallWeight" type="number" step="0.001" placeholder="default" /></label><label>Thinking-second weight<input id="userThinkingSecondWeight" type="number" step="0.001" placeholder="default" /></label><label>Enabled<select id="userEnabled"><option value="true">Enabled</option><option value="false">Disabled</option></select></label></div><div class="preset-form-actions"><button class="btn green" onclick="saveUserForm()">Save User</button><button class="btn red" onclick="resetUserForm(true)">Cancel</button></div></div><div class="msg" id="usersMsg"></div><div class="panel" style="margin-top:12px"><h2>Configured Users</h2><div id="usersGrid" class="api-grid"></div></div></div>`}}
+resetUserForm=function(collapse=true){ensureUsersUi();selectedUserName='';$('userName').disabled=false;$('userName').value='';$('userTargets').value='*';$('userGroups').value='';$('userScore5h').value='';$('userScoreWeek').value='';$('userMaxTokensMsg').value='';$('userMaxToolsMsg').value='';$('userInputTokenWeight').value='';$('userOutputTokenWeight').value='';$('userToolCallWeight').value='';$('userThinkingSecondWeight').value='';$('userEnabled').value='true';setEditorState('userEditor','userIntro',!collapse);setUsersMsg('')}
+collectUserForm=function(){function val(id){return ($(id)&&$(id).value||'').trim()}return{name:val('userName'),allowed_targets:val('userTargets').split(',').map(x=>x.trim()).filter(Boolean),groups:val('userGroups').split(',').map(x=>x.trim()).filter(Boolean),enabled:$('userEnabled').value==='true',generate_api_key:!selectedUserName,limits:{score_per_5h:parseQuotaNumber('userScore5h'),score_per_week:parseQuotaNumber('userScoreWeek'),max_tokens_per_message:parseQuotaNumber('userMaxTokensMsg'),max_tool_calls_per_message:parseQuotaNumber('userMaxToolsMsg'),input_token_weight:parseQuotaNumber('userInputTokenWeight'),output_token_weight:parseQuotaNumber('userOutputTokenWeight'),tool_call_weight:parseQuotaNumber('userToolCallWeight'),thinking_second_weight:parseQuotaNumber('userThinkingSecondWeight')}}}
+editUser=function(name){const user=(lastStatus&&lastStatus.users||[]).find(u=>u.name===name);if(!user)return;ensureUsersUi();selectedUserName=name;$('userName').disabled=true;$('userName').value=user.name;$('userTargets').value=(user.allowed_targets||[]).join(', ');$('userGroups').value=(user.groups||[]).join(', ');$('userScore5h').value=user.limits.score_per_5h??'';$('userScoreWeek').value=user.limits.score_per_week??'';$('userMaxTokensMsg').value=user.limits.max_tokens_per_message??'';$('userMaxToolsMsg').value=user.limits.max_tool_calls_per_message??'';$('userInputTokenWeight').value=user.limits.input_token_weight??'';$('userOutputTokenWeight').value=user.limits.output_token_weight??'';$('userToolCallWeight').value=user.limits.tool_call_weight??'';$('userThinkingSecondWeight').value=user.limits.thinking_second_weight??'';$('userEnabled').value=String(!!user.enabled);openUserEditor()}
+renderUsers=function(users){ensureUsersUi();const grid=$('usersGrid');if(!grid)return;users=users||[];if(selectedUserName&&!users.some(u=>u.name===selectedUserName))selectedUserName='';grid.innerHTML=users.map(u=>`<div class="api-card"><div class="api-card-head"><h3>${u.name}<br><span class="label">${u.enabled?'enabled':'disabled'} · access ${(u.effective_allowed_targets||u.allowed_targets||[]).join(', ')||'*'}</span></h3><span class="preset-actions"><button class="iconbtn" title="Edit" onclick="editUser('${u.name}')">✏️</button><button class="iconbtn" title="Reset key" onclick="resetUserKey('${u.name}')">🔑</button><button class="iconbtn" title="Delete" onclick="deleteUserByName('${u.name}')">❌</button></span></div><p>Groups: ${(u.groups||[]).join(', ')||'none'}</p><p>Last 5h: ${quotaWindowText((u.usage||{}).window_5h)}</p><p>Last week: ${quotaWindowText((u.usage||{}).window_week)}</p><p class="label">Direct budgets · ${quotaBudgetLine(u.limits||{})}</p><p class="label">Direct weights · ${quotaWeightLine(u.limits||{})}</p><p class="label">Effective budgets · ${quotaBudgetLine(u.effective_limits||{})}</p><p class="label">Effective weights · ${quotaWeightLine(u.effective_limits||{})}</p></div>`).join('')||'<div class="value">No API users configured yet.</div>'}
+ensureGroupUi=function(){ensureUsersUi();const users=$('users');if(!users)return;let panel=$('groupsPanel');if(!panel){panel=document.createElement('div');panel.className='panel';panel.id='groupsPanel';users.appendChild(panel)}if(panel.dataset.v414Groups!=='1'){panel.dataset.v414Groups='1';panel.innerHTML=`<div class="panel-head"><h2>User Groups / Plans</h2><button class="add-preset-btn" title="New group" aria-label="New group" onclick="resetGroupForm(false)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none"/></svg></button></div><div class="preset-intro" id="groupIntro">Define reusable plans that carry scored budgets, per-message caps, and access scopes. The configured list stays visible while the editor is collapsed.</div><div class="preset-editor" id="groupEditor"><div class="formgrid"><label>Group name<input id="groupName" placeholder="starter" /></label><label>Description<input id="groupDescription" placeholder="Shared plan description" /></label><label>Allowed targets<input id="groupTargets" placeholder="*, legacy, GPU0, GPU1" /></label><label>5h score budget<input id="groupScore5h" type="number" step="0.1" placeholder="unlimited" /></label><label>Weekly score budget<input id="groupScoreWeek" type="number" step="0.1" placeholder="unlimited" /></label><label>Max tokens / message<input id="groupMaxTokensMsg" type="number" step="1" placeholder="unlimited" /></label><label>Max tool calls / message<input id="groupMaxToolsMsg" type="number" step="1" placeholder="unlimited" /></label><label>Input token weight<input id="groupInputTokenWeight" type="number" step="0.001" placeholder="default" /></label><label>Output token weight<input id="groupOutputTokenWeight" type="number" step="0.001" placeholder="default" /></label><label>Tool-call weight<input id="groupToolCallWeight" type="number" step="0.001" placeholder="default" /></label><label>Thinking-second weight<input id="groupThinkingSecondWeight" type="number" step="0.001" placeholder="default" /></label><label>Enabled<select id="groupEnabled"><option value="true">Enabled</option><option value="false">Disabled</option></select></label></div><div class="preset-form-actions"><button class="btn green" onclick="saveGroupForm()">Save Group</button><button class="btn red" onclick="resetGroupForm(true)">Cancel</button></div></div><div class="msg" id="groupsMsg"></div><div class="panel" style="margin-top:12px"><h2>Configured Groups</h2><div id="groupsGrid" class="api-grid"></div></div>`}}
+resetGroupForm=function(collapse=true){ensureGroupUi();selectedGroupName='';$('groupName').disabled=false;$('groupName').value='';$('groupDescription').value='';$('groupTargets').value='*';$('groupScore5h').value='';$('groupScoreWeek').value='';$('groupMaxTokensMsg').value='';$('groupMaxToolsMsg').value='';$('groupInputTokenWeight').value='';$('groupOutputTokenWeight').value='';$('groupToolCallWeight').value='';$('groupThinkingSecondWeight').value='';$('groupEnabled').value='true';setEditorState('groupEditor','groupIntro',!collapse);setGroupsMsg('')}
+collectGroupForm=function(){function val(id){return ($(id)&&$(id).value||'').trim()}return{name:val('groupName'),description:val('groupDescription'),allowed_targets:val('groupTargets').split(',').map(x=>x.trim()).filter(Boolean),enabled:$('groupEnabled').value==='true',limits:{score_per_5h:parseQuotaNumber('groupScore5h'),score_per_week:parseQuotaNumber('groupScoreWeek'),max_tokens_per_message:parseQuotaNumber('groupMaxTokensMsg'),max_tool_calls_per_message:parseQuotaNumber('groupMaxToolsMsg'),input_token_weight:parseQuotaNumber('groupInputTokenWeight'),output_token_weight:parseQuotaNumber('groupOutputTokenWeight'),tool_call_weight:parseQuotaNumber('groupToolCallWeight'),thinking_second_weight:parseQuotaNumber('groupThinkingSecondWeight')}}}
+editGroup=function(name){const group=(lastStatus&&lastStatus.groups||[]).find(g=>g.name===name);if(!group)return;ensureGroupUi();selectedGroupName=name;$('groupName').disabled=true;$('groupName').value=group.name;$('groupDescription').value=group.description||'';$('groupTargets').value=(group.allowed_targets||[]).join(', ');$('groupScore5h').value=group.limits.score_per_5h??'';$('groupScoreWeek').value=group.limits.score_per_week??'';$('groupMaxTokensMsg').value=group.limits.max_tokens_per_message??'';$('groupMaxToolsMsg').value=group.limits.max_tool_calls_per_message??'';$('groupInputTokenWeight').value=group.limits.input_token_weight??'';$('groupOutputTokenWeight').value=group.limits.output_token_weight??'';$('groupToolCallWeight').value=group.limits.tool_call_weight??'';$('groupThinkingSecondWeight').value=group.limits.thinking_second_weight??'';$('groupEnabled').value=String(!!group.enabled);openGroupEditor()}
+renderGroups=function(groups){ensureGroupUi();const grid=$('groupsGrid');if(!grid)return;groups=groups||[];if(selectedGroupName&&!groups.some(g=>g.name===selectedGroupName))selectedGroupName='';grid.innerHTML=groups.map(g=>`<div class="api-card"><div class="api-card-head"><h3>${g.name}<br><span class="label">${g.enabled?'enabled':'disabled'} · access ${(g.allowed_targets||[]).join(', ')||'*'}</span></h3><span class="preset-actions"><button class="iconbtn" title="Edit" onclick="editGroup('${g.name}')">✏️</button><button class="iconbtn" title="Delete" onclick="deleteGroupByName('${g.name}')">❌</button></span></div><p>${g.description||'No description'}</p><p class="label">Configured budgets · ${quotaBudgetLine(g.limits||{})}</p><p class="label">Configured weights · ${quotaWeightLine(g.limits||{})}</p><p class="label">Resolved budgets · ${quotaBudgetLine(g.resolved_limits||g.limits||{})}</p><p class="label">Resolved weights · ${quotaWeightLine(g.resolved_limits||g.limits||{})}</p></div>`).join('')||'<div class="value">No groups configured yet.</div>'}
+function ensureAccessPolicyCard(){const card=findPanelByHeading('system','Access Policy');if(!card)return;if(card.dataset.v414Policy!=='1'){card.dataset.v414Policy='1';card.innerHTML=`<h2>Access Policy</h2><div class="actions" id="accessPolicyRow"><label class="label"><input type="checkbox" id="auditAllowAnonymousProxy" onchange="mirrorAuthToggles(this.checked)"> allow requests without per-user API keys</label><button class="btn blue" onclick="saveAuthSettings()">Save Policy</button></div><div class="value smallgap" style="margin-top:10px" id="auditPolicyText">-</div>`}}
+function ensureMachineButtons(){const systemCard=findPanelByHeading('system','System');if(!systemCard)return;const rows=[...systemCard.querySelectorAll('.actions')];const wolBtn=[...systemCard.querySelectorAll('button')].find(btn=>(btn.textContent||'').includes('Wake-on-LAN'));const row=systemCard.querySelector('.machine-row');if(wolBtn&&row&&!row.contains(wolBtn))row.prepend(wolBtn);rows.forEach(actions=>{if(actions!==row&&!actions.querySelector('button'))actions.remove()})}
+function allPairChoices(){const count=gpuCount(),pairs=[];for(let a=0;a<count;a+=1){for(let b=a+1;b<count;b+=1)pairs.push([a,b])}return pairs}
+function ensurePairManager(){const panel=findPanelByHeading('system','Instances');if(!panel)return;let bar=$('pairManagerBar');if(!bar){bar=document.createElement('div');bar.id='pairManagerBar';bar.className='actions';const summary=$('instanceSummary');if(summary&&summary.parentNode===panel)summary.insertAdjacentElement('afterend',bar)}const pair=currentScopeInstance(true);const showDelete=!!pair&&pair.kind==='dual';const existing=new Set(pairScopeItems().map(x=>x.id));const quickAdds=allPairChoices().filter(([a,b])=>!existing.has(canonicalPairId(a,b))).map(([a,b])=>`<button class="btn blue" onclick="createPairGroup(${a},${b})">Add Pair ${a}+${b}</button>`).join('');bar.style.margin='8px 0 10px';bar.innerHTML=gpuCount()>1?`${quickAdds||''}<button class="btn blue" onclick="createPairGroup()">Custom Pair Group</button>${showDelete?`<button class="btn red" onclick="deleteCurrentPairGroup()">Delete ${scopeLabel(pair)}</button>`:''}`:''}
+function ensureV414Layout(){ensureV413Layout();ensureUsersUi();ensureGroupUi();ensureAccessPolicyCard();ensureMachineButtons();ensurePairManager()}
+renderAudit=function(cfg){cfg=cfg||{};ensureV414Layout();const adminPort=(lastStatus&&lastStatus.admin_port)||8008;const proxyPort=(lastStatus&&lastStatus.proxy_port)||8009;const adminPath=(cfg.admin_path)||'/admin';const online=!!cfg.online_enabled;const authOptional=!!cfg.allow_proxy_without_api_key;const localEnabled=!!cfg.local_api_enabled;const localPort=cfg.local_api_port||10881;if($('auditAdminEndpoint'))$('auditAdminEndpoint').innerHTML=`:${adminPort}${adminPath}`;if($('auditProxyEndpoint'))$('auditProxyEndpoint').innerHTML=`:${proxyPort}`;if($('auditExposure'))$('auditExposure').textContent=online?'online through proxy/admin only':'local/private only';if($('auditLocalApi'))$('auditLocalApi').textContent=localEnabled?`127.0.0.1:${localPort}`:'disabled';if($('auditSummary'))$('auditSummary').innerHTML='Audit entries capture admin actions, proxy authentication outcomes, quota denials, API usage, group changes, and user-management events. Use the shared log viewer below to inspect either Docker runtime logs or the audit log stream.';if($('auditPolicyText'))$('auditPolicyText').innerHTML=`Proxy API keys are currently <b>${authOptional?'optional':'required'}</b>. Admin UI remains under <code>:${adminPort}${adminPath}</code>.`;mirrorAuthToggles(authOptional)}
+saveAuthSettings=async function(){const allow=!!(($('auditAllowAnonymousProxy')&&$('auditAllowAnonymousProxy').checked)||($('allowAnonymousProxy')&&$('allowAnonymousProxy').checked));mirrorAuthToggles(allow);try{const r=await fetch('/admin/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'save_server_config',allow_proxy_without_api_key:allow})});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'config failed');if(j.server_config)renderAudit(j.server_config);setAuditMsg('Saved access policy');await refreshStatus()}catch(e){alert('Access policy failed: '+e)}}
+setScope=function(scope,reconnect=true){const ids=new Set(scopeItems().map(x=>x.id));selectedScope=scope==='GLOBAL'?'GLOBAL':(ids.has(scope)?scope:(singleScopeItems()[0]?.id||pairScopeItems()[0]?.id||'GLOBAL'));if(selectedScope!=='GLOBAL')selectedInstance=selectedScope;renderInstances(getInstanceList());renderPresetScopeTabs();updateScopedCards();applyLogVisibility();if(reconnect&&currentLogSource==='docker'){clearLog();connectLogs()}}
+renderInstances=function(instances){ensureV414Layout();const tabs=$('instanceTabs');const summary=$('instanceSummary');const btn=$('instanceEnableBtn');const panel=findPanelByHeading('system','Instances');if(!tabs||!summary||!panel)return;instances=scopeItems();if(!selectedScope||!(selectedScope==='GLOBAL'||instances.some(x=>x.id===selectedScope)))selectedScope=singleScopeItems()[0]?.id||pairScopeItems()[0]?.id||'GLOBAL';const tabsHtml=singleScopeItems().map(x=>`<button class="subtab ${x.id===currentScope()?'active':''}" onclick="setScope('${x.id}')">${x.id}${x.running?' • on':' • off'}</button>`).join('')+pairScopeItems().map(x=>`<button class="subtab ${x.id===currentScope()?'active':''}" onclick="setScope('${x.id}')">Pair ${(x.gpu_indices||[]).join('+')}${x.running?' • on':' • off'}</button>`).join('')+`<button class="subtab ${scopeIsGlobal()?'active':''}" onclick="setScope('GLOBAL')">Global</button>`;tabs.innerHTML=tabsHtml;ensurePairManager();const target=currentScopeInstance(false);const actionButtons=[...panel.querySelectorAll('.actions .btn')].filter(x=>x.id!=='instanceEnableBtn'&&!x.closest('#pairManagerBar'));if(scopeIsGlobal()&&target&&gpuCount()===2){summary.innerHTML=`Global scope controls the only dual pair <code>${target.id}</code> on GPUs ${(target.gpu_indices||[]).join(', ')} · mode ${target.mode} · port ${target.port} · proxy <code>${target.proxy_prefix}/</code>`;if(btn){btn.disabled=false;btn.textContent=target.enabled?'Disable Boot Autostart':'Enable Boot Autostart'}actionButtons.forEach(x=>x.disabled=false)}else if(scopeIsGlobal()){summary.innerHTML='Global scope selected. Host-wide controls still apply below. Create or choose a dual pair tab to manage arbitrary two-GPU dual presets.';if(btn){btn.disabled=true;btn.textContent='Select a GPU or Pair Scope'}actionButtons.forEach(x=>x.disabled=true)}else if(target){summary.innerHTML=`${scopeLabel(target)} · ${target.assignment_text} · port ${target.port} · ${target.running?'running':'stopped'} · proxy <code>${target.proxy_prefix}/</code> · ${target.enabled?'autostart enabled':'autostart disabled'}`;if(btn){btn.disabled=false;btn.textContent=target.enabled?'Disable Boot Autostart':'Enable Boot Autostart'}actionButtons.forEach(x=>x.disabled=false)}else{summary.textContent='No GPU instances configured';if(btn){btn.disabled=true;btn.textContent='Boot autostart unavailable'}actionButtons.forEach(x=>x.disabled=true)}if($('logInstanceLabel'))$('logInstanceLabel').textContent=currentLogLabel()}
+renderPresetScopeTabs=function(){const tabs=$('presetScopeTabs');const summary=$('presetScopeSummary');if(!tabs||!summary)return;tabs.innerHTML=singleScopeItems().map(x=>`<button class="subtab ${x.id===currentScope()?'active':''}" onclick="setScope('${x.id}')">${x.id}</button>`).join('')+pairScopeItems().map(x=>`<button class="subtab ${x.id===currentScope()?'active':''}" onclick="setScope('${x.id}')">Pair ${(x.gpu_indices||[]).join('+')}</button>`).join('')+`<button class="subtab ${scopeIsGlobal()?'active':''}" onclick="setScope('GLOBAL')">Global</button>`;const exactGlobal=currentScopeInstance(false);if(scopeIsGlobal()&&exactGlobal&&gpuCount()===2)summary.innerHTML=`Global scope targets the only dual pair <code>${exactGlobal.id}</code>. Dual preset buttons below will apply to GPUs ${(exactGlobal.gpu_indices||[]).join(', ')}.`;else if(scopeIsGlobal())summary.innerHTML='Global scope selected. Single-GPU presets are disabled here. Choose or create a dual pair tab to apply dual presets.';else if(currentScopeInstance(true))summary.innerHTML=`Targeting ${scopeLabel(currentScopeInstance(true))} · ${currentScopeInstance(true).assignment_text} · proxy <code>${currentScopeInstance(true).proxy_prefix}/</code>`;else summary.textContent='No preset scope available';document.querySelectorAll('#singlePresetCard .actions .btn').forEach(btn=>btn.disabled=!scopeAllowsSinglePresets());document.querySelectorAll('#dualPresetCard .actions .btn').forEach(btn=>btn.disabled=!scopeAllowsDualPresets())}
+updateScopedCards=function(){const target=currentScopeInstance(false);if($('profileScopeNote'))$('profileScopeNote').innerHTML=scopeIsGlobal()?'Global scope: these profile buttons apply host-wide defaults for the full server.':`${scopeLabel(target)} scope: ${target?target.assignment_text:'select a scope to continue'}`;if($('powerScopeNote'))$('powerScopeNote').innerHTML=scopeIsGlobal()?'Global scope: power and cooling controls below affect the whole host.':`${scopeLabel(target)} scope: using the selected runtime context while keeping host-level power controls in sync.`;renderLogSourcePanel()}
+currentLogLabel=function(){if(currentLogSource==='audit')return 'source: audit';const cur=dockerLogTarget();return 'instance: '+((cur&&cur.id)||'primary')}
+connectLogs=function(){if(logEs){try{logEs.close()}catch(e){}}let url='/admin/audit-stream';if(currentLogSource!=='audit'){const cur=dockerLogTarget();const qs=cur?`?instance=${encodeURIComponent(cur.id)}`:'';url='/admin/logs'+qs}logEs=new EventSource(url);logEs.onopen=()=>appendLog(currentLogSource==='audit'?'--- audit stream connected ---':'--- log connected ---');logEs.onmessage=e=>appendLog(e.data.replaceAll('\\u0000','\n'));logEs.onerror=()=>appendLog(currentLogSource==='audit'?'--- audit stream disconnected; retrying ---':'--- log disconnected; retrying ---')}
+powerAction=async function(a){const cur=currentScopeInstance(false);const needsTarget=['stop_container','start_instance','restart_instance','toggle_enabled'].includes(a);if(needsTarget&&!cur){alert('Select a GPU or Pair scope first.');return}if(a==='stop_container'&&!confirm(`Stop ${scopeLabel(cur)} now?`))return;try{await post('/admin/power',{action:a,instance_id:cur?cur.id:null,enabled:cur?!cur.enabled:undefined})}catch(e){alert(e)}}
+instanceAction=async function(a){await powerAction(a)}
+toggleInstanceEnabled=async function(){const cur=currentScopeInstance(false);if(!cur){alert('Select a GPU or Pair scope first.');return}try{await post('/admin/power',{action:'toggle_enabled',instance_id:cur.id,enabled:!cur.enabled})}catch(e){alert(e)}}
+async function createPairGroup(first=null,second=null){if(gpuCount()<2){alert('At least two GPUs are required to create a dual pair.');return}let a=first,b=second;if(a===null||b===null){a=prompt(`First GPU index (0-${Math.max(gpuCount()-1,0)}):`,'0');if(a===null)return;b=prompt(`Second GPU index (0-${Math.max(gpuCount()-1,0)}):`,'1');if(b===null)return}const id=canonicalPairId(a,b);if(!id){alert('Select two distinct GPU indices.');return}try{const r=await fetch('/admin/instances',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'save_pair',gpu_indices:[Number(a),Number(b)],mode:'vllm/dual',enabled:false})});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'pair save failed');setInstanceMsg(`Saved pair group ${id}`);await refreshStatus();setScope(id,false)}catch(e){alert('Pair group failed: '+e)}}
+async function deleteCurrentPairGroup(){const cur=currentScopeInstance(true);if(!cur||cur.kind!=='dual'){alert('Select a dual pair scope first.');return}if(!confirm(`Delete pair group ${cur.id}?`))return;try{const r=await fetch('/admin/instances',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'delete_pair',instance_id:cur.id})});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'pair delete failed');setInstanceMsg(`Deleted pair group ${cur.id}`);await refreshStatus();setScope('GLOBAL',false)}catch(e){alert('Pair delete failed: '+e)}}
+switchMode=async function(m){const cur=currentScopeInstance(true);if(!cur||cur.kind==='dual'){alert('Select a single GPU tab to apply a single-GPU preset.');return}const blockingPair=pairScopeItems().find(x=>x.running&&(x.gpu_indices||[]).includes(Number(cur.gpu_index)));const warning=blockingPair?`\n\nWarning: GPU ${cur.gpu_index} is currently occupied by ${blockingPair.id} running ${blockingPair.mode}. Continuing will stop that pair and replace it with ${m} on ${cur.id}.`:'';if(confirm(`Assign ${m} to ${cur.id} and start it?${warning}`))try{await post('/admin/switch',{instance_id:cur.id,mode:m})}catch(e){alert(e)}}
+async function switchDualMode(m){const cur=currentScopeInstance(false);if(!cur||cur.kind!=='dual'){alert('Choose a dual pair tab, or use Global on an exactly-two-GPU server, before applying a dual preset.');return}if(confirm(`Apply dual preset ${m} to ${cur.id} on GPUs ${(cur.gpu_indices||[]).join(', ')}? This will stop overlapping runtimes that already use those GPUs.`))try{await post('/admin/switch',{instance_id:cur.id,mode:m})}catch(e){alert(e)}}
+tab=function(e,n){activeTabName=n;document.querySelectorAll('.tabpane').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));const pane=$(n);if(pane)pane.classList.add('active');if(e&&e.target)e.target.classList.add('active');if(n==='logs'){}applyLogVisibility();clearLog();connectLogs();setTimeout(()=>{if(!searchState.active&&$('autoscroll').checked)$('log').scrollTop=$('log').scrollHeight},0)}
+refreshStatus=async function(){try{ensureV414Layout();const r=await fetch('/admin/status',{cache:'no-store'});const j=await r.json();lastStatus=j;if(j.ui_config&&typeof j.ui_config.show_global_logs==='boolean'){showGlobalLogs=j.ui_config.show_global_logs;if($('showGlobalLogs'))$('showGlobalLogs').checked=showGlobalLogs}$('summary').textContent=`${j.active_mode} · ${j.container||'no container'} · ${j.power.profile||'balanced'} · GPUs ${j.gpu_count??0}`;$('mode').textContent=`${j.active_mode} / ${j.active_port}`;$('container').textContent=j.container||'none';$('services').textContent=`vLLM=${j.vllm_service}, control=${j.control_service}, console=${j.console_service}`;$('req').textContent=`total=${j.metrics.total_requests}, active=${j.metrics.active_requests}, fail=${j.metrics.failed_requests}, queue=${j.metrics.queued_requests}`;$('last').textContent=`${j.metrics.last_status||'-'} latency=${j.metrics.last_latency_s??'-'}s ttft=${j.metrics.last_ttft_s??'-'}s tps=${j.metrics.last_tokens_per_second??'-'}`;$('uptime').textContent=fmtUptime(j.uptime_seconds);renderGpuCards(j.gpus);$('powerbox').textContent=`profile=${j.power.profile}, GPU=${j.power.gpu}, CPU=${j.power.cpu}, fans=${j.power.fans}, container=${j.power.container}, idle=${j.power.idle_for_seconds}s`;$('optToggle').textContent=j.power.optimizations_enabled?'Disable Power Optimizations':'Enable Power Optimizations';$('fanToggle').textContent=j.power.fan_manual_override?'Reset Fans to Default':'Set Fans to Max';renderMetrics(j);renderPresetCatalog(j.presets);renderUsers(j.users||[]);renderGroups(j.groups||[]);renderAudit(j.server_config||{});renderInstances(j.instances||[]);renderPresetScopeTabs();updateScopedCards();renderLogSourcePanel();applyLogVisibility()}catch(e){setMsg('Status error: '+e)}}
+ensureV414Layout();resetUserForm(true);resetGroupForm(true);if(!selectedScope)selectedScope=singleScopeItems()[0]?.id||pairScopeItems()[0]?.id||'GLOBAL';setScope(selectedScope,false);
 </script></body></html>
 """
 class CommonMixin:
@@ -3589,8 +3790,8 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                 m = dict(metrics)
             ap = active_port()
             cfg = read_server_config()
-            dual_mode = running_dual_mode()
-            self.send_json({"active_mode":active_mode(),"active_port":ap,"container":current_container(),"club3090_dir":CLUB3090_DIR,"uptime_seconds":int(time.time()-startup_time),"vllm_service":service_status("club3090-vllm.service"),"control_service":service_status("club3090-control.service"),"caddy_service":service_status("club3090-caddy.service") if cfg.get("https_enabled", False) else "disabled","console_service":service_status("club3090-console-log.service"),"metrics":m,"recent_requests":list(recent_requests),"gpus":gpu_stats(),"power":power_status(),"system":system_stats(),"series":list(series_points),"ui_config":read_ui_config(),"presets":preset_catalog(),"gpu_count":detect_gpu_count_runtime(),"instances":instances_snapshot(),"single_gpu_modes":list(SINGLE_GPU_MODES),"dual_gpu_modes":list(DUAL_GPU_MODES),"running_dual_mode":dual_mode,"running_dual_gpu_indices":mode_gpu_indices(dual_mode),"users":list_users_public(),"groups":list_groups_public(),"server_config":cfg,"local_api":{"enabled":cfg.get("local_api_enabled", False),"port":cfg.get("local_api_port", LOCAL_API_PORT)},"admin_port":ADMIN_PORT,"proxy_port":PROXY_PORT})
+            dual_rows = [instance_snapshot(inst) for inst in running_dual_instances()]
+            self.send_json({"active_mode":active_mode(),"active_port":ap,"container":current_container(),"club3090_dir":CLUB3090_DIR,"uptime_seconds":int(time.time()-startup_time),"vllm_service":service_status("club3090-vllm.service"),"control_service":service_status("club3090-control.service"),"caddy_service":service_status("club3090-caddy.service") if cfg.get("https_enabled", False) else "disabled","console_service":service_status("club3090-console-log.service"),"metrics":m,"recent_requests":list(recent_requests),"gpus":gpu_stats(),"power":power_status(),"system":system_stats(),"series":list(series_points),"ui_config":read_ui_config(),"presets":preset_catalog(),"gpu_count":detect_gpu_count_runtime(),"instances":instances_snapshot(),"single_gpu_modes":list(SINGLE_GPU_MODES),"dual_gpu_modes":list(DUAL_GPU_MODES),"running_dual_mode":(dual_rows[0]["mode"] if dual_rows else None),"running_dual_gpu_indices":(dual_rows[0]["gpu_indices"] if dual_rows else []),"running_dual_instances":dual_rows,"users":list_users_public(),"groups":list_groups_public(),"server_config":cfg,"local_api":{"enabled":cfg.get("local_api_enabled", False),"port":cfg.get("local_api_port", LOCAL_API_PORT)},"admin_port":ADMIN_PORT,"proxy_port":PROXY_PORT})
             return
         if path == "/admin/logs":
             self.close_connection = False
@@ -3614,7 +3815,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             self.send_json({"ok": True, "presets": preset_catalog()})
             return
         if path == "/admin/instances":
-            self.send_json({"ok": True, "instances": instances_snapshot(), "single_gpu_modes": list(SINGLE_GPU_MODES), "dual_gpu_modes": list(DUAL_GPU_MODES), "running_dual_mode": running_dual_mode()})
+            self.send_json({"ok": True, "instances": instances_snapshot(), "single_gpu_modes": list(SINGLE_GPU_MODES), "dual_gpu_modes": list(DUAL_GPU_MODES), "running_dual_instances": [instance_snapshot(inst) for inst in running_dual_instances()]})
             return
         if path == "/admin/users":
             self.send_json({"ok": True, "users": list_users_public(), "groups": list_groups_public(), "server_config": read_server_config()})
@@ -3652,20 +3853,24 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                     target = get_instance(instance_id)
                     if not target:
                         raise ValueError(f"Unknown instance: {instance_id}")
-                    dual_mode = running_dual_mode()
-                    if dual_mode and int(target.get("gpu_index", -1)) in mode_gpu_indices(dual_mode):
-                        stop_global_mode()
+                    valid_modes = DUAL_GPU_MODES if target.get("kind") == "dual" else SINGLE_GPU_MODES
+                    if mode not in valid_modes:
+                        raise ValueError("Preset type does not match the selected instance scope")
+                    stopped = stop_overlapping_instances(target.get("gpu_indices") or [target.get("gpu_index")])
                     updated = update_instance(instance_id, mode=mode, enabled=True)
                     result = start_instance(updated["id"], wait=True)
-                    log_audit("admin_switch_mode", instance=updated["id"], mode=mode)
-                    self.send_json({"ok": True, "instance": instance_snapshot(updated), "mode": mode, "output": result.get("output", ""), "running_dual_mode": running_dual_mode()})
+                    log_audit("admin_switch_mode", instance=updated["id"], mode=mode, stopped_instances=[row["id"] for row in stopped])
+                    self.send_json({"ok": True, "instance": instance_snapshot(updated), "mode": mode, "output": result.get("output", ""), "stopped_instances": stopped, "instances": instances_snapshot(), "running_dual_instances": [instance_snapshot(inst) for inst in running_dual_instances()]})
                 else:
-                    if mode not in DUAL_GPU_MODES:
-                        raise ValueError("Global switching is only supported for dual-GPU presets")
-                    stopped = stop_instances_for_gpu_indices(mode_gpu_indices(mode))
-                    output = run_switch(mode, allow_fallback=False)
-                    log_audit("admin_switch_mode_global", mode=mode, stopped_instances=[row["id"] for row in stopped])
-                    self.send_json({"ok": True, "mode": mode, "output": output, "stopped_instances": stopped, "running_dual_mode": running_dual_mode(), "instances": instances_snapshot()})
+                    pairs = [inst for inst in read_instances_config() if inst.get("kind") == "dual"]
+                    if len(pairs) != 1:
+                        raise ValueError("Select a specific dual pair scope before applying a dual preset")
+                    target = pairs[0]
+                    stopped = stop_overlapping_instances(target.get("gpu_indices") or [target.get("gpu_index")])
+                    updated = update_instance(target["id"], mode=mode, enabled=True)
+                    result = start_instance(updated["id"], wait=True)
+                    log_audit("admin_switch_mode_pair_default", instance=updated["id"], mode=mode, stopped_instances=[row["id"] for row in stopped])
+                    self.send_json({"ok": True, "instance": instance_snapshot(updated), "mode": mode, "output": result.get("output", ""), "stopped_instances": stopped, "instances": instances_snapshot(), "running_dual_instances": [instance_snapshot(inst) for inst in running_dual_instances()]})
             except Exception as e:
                 self.send_json({"ok": False, "error": str(e)}, 500)
             return
@@ -3746,6 +3951,24 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                 cfg = write_ui_config(data)
                 log_audit("admin_ui_config", keys=sorted(list((data or {}).keys())))
                 self.send_json({"ok": True, "ui_config": cfg})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path == "/admin/instances":
+            try:
+                data = self.read_json_body()
+                action = str(data.get("action") or "").strip()
+                if action == "save_pair":
+                    instance = save_pair_instance(data.get("gpu_indices") or [], mode=data.get("mode"), enabled=data.get("enabled"))
+                    log_audit("admin_pair_saved", instance=instance["id"], gpu_indices=instance.get("gpu_indices") or [], mode=instance.get("mode"))
+                    self.send_json({"ok": True, "instance": instance_snapshot(instance), "instances": instances_snapshot(), "running_dual_instances": [instance_snapshot(inst) for inst in running_dual_instances()]})
+                    return
+                if action == "delete_pair":
+                    instances = delete_pair_instance(data.get("instance_id"))
+                    log_audit("admin_pair_deleted", instance=str(data.get("instance_id") or "").strip().upper())
+                    self.send_json({"ok": True, "instances": instances, "running_dual_instances": [instance_snapshot(inst) for inst in running_dual_instances()]})
+                    return
+                raise ValueError("Invalid instances action")
             except Exception as e:
                 self.send_json({"ok": False, "error": str(e)}, 500)
             return
