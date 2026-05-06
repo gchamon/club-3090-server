@@ -654,6 +654,36 @@ configure_online_exposure() {
   write_network_state "${firewall_manager}" "$([[ "${opened_upnp}" -eq 1 ]] && echo true || echo false)" "${ONLINE_TLS_EFFECTIVE_ENABLED}" >/dev/null 2>&1 || true
 }
 
+ensure_local_control_access() {
+  local firewall_manager="none"
+  local opened_fw=0
+
+  echo "Ensuring local/LAN access for ports ${ADMIN_PORT} (admin) and ${PROXY_PORT} (proxy)..."
+
+  if command -v ufw >/dev/null 2>&1; then
+    "${SUDO[@]}" ufw allow "${ADMIN_PORT}"/tcp >/dev/null 2>&1 || true
+    "${SUDO[@]}" ufw allow "${PROXY_PORT}"/tcp >/dev/null 2>&1 || true
+    opened_fw=1
+    firewall_manager="ufw"
+  elif command -v firewall-cmd >/dev/null 2>&1 && "${SUDO[@]}" firewall-cmd --state >/dev/null 2>&1; then
+    "${SUDO[@]}" firewall-cmd --permanent --add-port="${ADMIN_PORT}"/tcp >/dev/null 2>&1 || true
+    "${SUDO[@]}" firewall-cmd --permanent --add-port="${PROXY_PORT}"/tcp >/dev/null 2>&1 || true
+    "${SUDO[@]}" firewall-cmd --reload >/dev/null 2>&1 || true
+    opened_fw=1
+    firewall_manager="firewalld"
+  elif command -v iptables >/dev/null 2>&1; then
+    "${SUDO[@]}" iptables -C INPUT -p tcp --dport "${ADMIN_PORT}" -j ACCEPT >/dev/null 2>&1 || "${SUDO[@]}" iptables -I INPUT -p tcp --dport "${ADMIN_PORT}" -j ACCEPT >/dev/null 2>&1 || true
+    "${SUDO[@]}" iptables -C INPUT -p tcp --dport "${PROXY_PORT}" -j ACCEPT >/dev/null 2>&1 || "${SUDO[@]}" iptables -I INPUT -p tcp --dport "${PROXY_PORT}" -j ACCEPT >/dev/null 2>&1 || true
+    opened_fw=1
+    firewall_manager="iptables"
+  fi
+
+  if [[ "${opened_fw}" -eq 0 ]]; then
+    echo "WARNING: No supported firewall manager was configured automatically. Admin and proxy ports may still need manual allow rules." >&2
+  fi
+  write_network_state "${firewall_manager}" "false" "${ONLINE_TLS_EFFECTIVE_ENABLED}" >/dev/null 2>&1 || true
+}
+
 log_step "Preparing dependencies for ${PRETTY_NAME:-${ID:-unknown}} (${OS_FAMILY})"
 
 if ! command -v systemctl >/dev/null 2>&1; then
@@ -5576,6 +5606,7 @@ configure_networking_and_frontend() {
   if [[ "${ONLINE_EFFECTIVE_ENABLED}" == "true" ]]; then
     configure_online_exposure
   else
+    ensure_local_control_access
     close_runtime_exposure
   fi
 }
