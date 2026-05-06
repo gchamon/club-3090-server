@@ -1,7 +1,7 @@
 ﻿#!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="2026-05-06.v4.32"
+SCRIPT_VERSION="2026-05-06.v4.33"
 
 # club-3090 headless server/control installer
 # Install:
@@ -789,6 +789,7 @@ import urllib.request
 
 CLUB3090_DIR = os.environ.get("CLUB3090_DIR", "/opt/ai/club-3090")
 CONTROL_DIR = "/opt/club3090-control"
+SCRIPT_VERSION = os.environ.get("CLUB3090_SCRIPT_VERSION", "unknown")
 ACTIVE_MODE_FILE = os.path.join(CONTROL_DIR, "active_mode")
 LAST_GOOD_MODE_FILE = os.path.join(CONTROL_DIR, "last_good_mode")
 CONTROL_LOG_FILE = os.path.join(CONTROL_DIR, "control.log")
@@ -5433,6 +5434,7 @@ Wants=network-online.target
 Type=simple
 Environment=CLUB3090_DIR=${CLUB3090_DIR}
 Environment=DEFAULT_MODE=${DEFAULT_MODE}
+Environment=CLUB3090_SCRIPT_VERSION=${SCRIPT_VERSION}
 Environment=CLUB3090_ADMIN_PORT=${ADMIN_PORT}
 Environment=CLUB3090_PROXY_PORT=${PROXY_PORT}
 Environment=CLUB3090_LOCAL_API_PORT=${LOCAL_API_PORT}
