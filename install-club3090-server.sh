@@ -1,7 +1,7 @@
 ﻿#!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="2026-05-06.v4.38"
+SCRIPT_VERSION="2026-05-06.v4.39"
 
 # club-3090 headless server/control installer
 # Install:
@@ -177,6 +177,7 @@ CONTROL_PY="${CONTROL_DIR}/control.py"
 FOLLOW_SH="${CONTROL_DIR}/follow-vllm-log.sh"
 START_SH="${CONTROL_DIR}/start-vllm-last-mode.sh"
 HEADLESS_X_SH="${CONTROL_DIR}/prepare-headless-x.sh"
+HEADLESS_X_V213_SH="${CONTROL_DIR}/prepare-headless-x-v213.sh"
 ACTIVE_MODE_FILE="${CONTROL_DIR}/active_mode"
 BASH_BIN="${BASH_BIN:-$(command -v bash || true)}"
 PYTHON_BIN="${PYTHON_BIN:-$(command -v python3 || true)}"
@@ -760,6 +761,7 @@ if [[ "${ACTION}" == "update" ]]; then
   "${SUDO[@]}" systemctl stop club3090-control.service 2>/dev/null || true
   "${SUDO[@]}" systemctl stop club3090-caddy.service 2>/dev/null || true
   "${SUDO[@]}" systemctl stop club3090-headless-x.service 2>/dev/null || true
+  "${SUDO[@]}" systemctl stop club3090-headless-x-v213.service 2>/dev/null || true
   log_done "Old services stopped"
 fi
 
@@ -3787,31 +3789,89 @@ def restore_gpu_fans_auto(indices=None):
     return batch_results + retry_results + [f"auto restore success={success}/{len(assignments)}"]
 
 
-def set_gpu_fans_v42_compat(speed=None, auto=False):
-    # Exact v4.2 compatibility path for fan control testing.
+def wait_for_nvidia_display_v213_compat(display=":99", timeout=10):
+    # Exact v2.12/v2.13 behavior: rely on DISPLAY only, with no explicit "-c"
+    # control-display argument.
+    deadline = time.time() + timeout
+    env = os.environ.copy()
+    env["DISPLAY"] = display
+    env.pop("XAUTHORITY", None)
+    last = "display not ready"
+    while time.time() < deadline:
+        try:
+            p = subprocess.run(["nvidia-settings", "-q", "gpus"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=3, env=env)
+            last = (p.stdout or "").strip()
+            if p.returncode == 0:
+                return True, last
+        except Exception as e:
+            last = str(e)
+        time.sleep(0.5)
+    return False, last
+
+
+def ensure_headless_x_running_v213_compat():
+    # Exact v2.12/v2.13 TEST FANS path: start the legacy isolated headless-X
+    # service and wait for nvidia-settings to come up on DISPLAY=:99.
+    if not nvidia_settings_available():
+        return False, "nvidia-settings not found"
+    display = os.environ.get("CLUB3090_FAN_DISPLAY", ":99")
+    if shutil.which("systemctl"):
+        legacy_rc, _legacy_out = run_cmd(["systemctl", "is-active", "club3090-headless-x-v213.service"], timeout=5)
+        ok, msg = wait_for_nvidia_display_v213_compat(display, timeout=1)
+        if ok and legacy_rc == 0:
+            return True, "legacy headless X already ready"
+        run_cmd(["systemctl", "stop", "club3090-headless-x.service"], timeout=10)
+        run_cmd(["systemctl", "stop", "club3090-headless-x-v213.service"], timeout=10)
+        rc, out = run_cmd(["systemctl", "start", "club3090-headless-x-v213.service"], timeout=20)
+        ok, msg = wait_for_nvidia_display_v213_compat(display, timeout=12)
+        if ok:
+            return True, "started club3090-headless-x-v213.service"
+        return False, f"headless X not ready after start rc={rc}: {out[-800:]} / {msg}"
+    return False, "systemctl unavailable; cannot start headless X"
+
+
+def run_nvidia_settings_v213_compat(args):
+    if not nvidia_settings_available():
+        return 127, "nvidia-settings not found"
+    display = os.environ.get("CLUB3090_FAN_DISPLAY", ":99")
+    ok, msg = ensure_headless_x_running_v213_compat()
+    if not ok:
+        return 126, msg
+    env = os.environ.copy()
+    env["DISPLAY"] = display
+    env.pop("XAUTHORITY", None)
+    try:
+        p = subprocess.run(["nvidia-settings"] + args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15, env=env)
+        return p.returncode, (p.stdout or "").strip()
+    except Exception as e:
+        return 999, str(e)
+
+
+def set_gpu_fans_v213_compat(speed=None, auto=False):
+    # Exact v2.12/v2.13 compatibility path for TEST FANS.
     results = []
     indices = gpu_indices()
     if auto:
         attrs = []
         for gpu_idx in indices:
             attrs += ["-a", f"[gpu:{gpu_idx}]/GPUFanControlState=0"]
-        rc, out = run_nvidia_settings(attrs, explicit_display=False)
-        results.append(f"v4.2 compat fans auto gpus={indices}: rc={rc} {out[-1200:]}")
+        rc, out = run_nvidia_settings_v213_compat(attrs)
+        results.append(f"nvidia-settings fans auto gpus={indices}: rc={rc} {out[-1200:]}")
         with metrics_lock:
             power_state["fans"] = "auto" if rc == 0 else "auto_failed"
-            power_state["last_action"] = "fans_auto_v42_test"
+            power_state["last_action"] = "fans_auto_v213_test"
             power_state["last_error"] = " | ".join([r for r in results if "rc=0" not in r])[-1000:]
-        log_control("FANS v4.2 auto: " + " || ".join(results))
+        log_control("FANS v2.13 auto: " + " || ".join(results))
         return results
 
     if speed is None:
         targets = fan_targets_from_temps()
         target = max(targets.values()) if targets else 70
-        mode_label = "manual_curve_v42_test"
+        mode_label = "manual_curve_v213_test"
     else:
         targets = {idx: int(speed) for idx in indices}
         target = int(speed)
-        mode_label = "manual_max_v42_test" if target >= FAN_MAX_SPEED else "manual_fixed_v42_test"
+        mode_label = "manual_max_v213_test" if target >= FAN_MAX_SPEED else "manual_fixed_v213_test"
 
     target = max(0, min(100, int(target)))
     attrs = []
@@ -3820,13 +3880,13 @@ def set_gpu_fans_v42_compat(speed=None, auto=False):
     for fan_idx in range(0, 8):
         attrs += ["-a", f"[fan:{fan_idx}]/GPUTargetFanSpeed={target}"]
 
-    rc, out = run_nvidia_settings(attrs, explicit_display=False)
-    results.append(f"v4.2 compat fans target={target} gpu_targets={targets}: rc={rc} {out[-1600:]}")
+    rc, out = run_nvidia_settings_v213_compat(attrs)
+    results.append(f"nvidia-settings fans target={target} gpu_targets={targets}: rc={rc} {out[-1600:]}")
     with metrics_lock:
         power_state["fans"] = mode_label if rc == 0 else "manual_failed"
-        power_state["last_action"] = "fans_set_v42_test"
+        power_state["last_action"] = "fans_set_v213_test"
         power_state["last_error"] = " | ".join([r for r in results if "rc=0" not in r])[-1200:]
-    log_control("FANS v4.2 set: " + " || ".join(results))
+    log_control("FANS v2.13 set: " + " || ".join(results))
     return results
 
 
@@ -4347,7 +4407,7 @@ HTML = r"""<!doctype html>
 :root{color-scheme:dark;--bg:#0b0f14;--panel:#121923;--line:#273243;--text:#e8eef7;--muted:#9dafc3;--blue:#72c7ff;--green:#2fc46b;--red:#ff5b6c;--amber:#ffcb6b;--orange:#ff8a2a;--field:#081018;--cyan:#7dd3fc;--turquoise:#26d6c6}*{box-sizing:border-box}html,body{min-height:100%;margin:0}body{font-family:system-ui,-apple-system,Segoe UI,Arial,sans-serif;background:var(--bg);color:var(--text);overflow-y:auto;overflow-x:hidden}header{position:sticky;top:0;z-index:10;padding:10px 12px;background:#111925f7;backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}.top{display:flex;justify-content:space-between;align-items:center;gap:8px}.brand{font-size:18px;font-weight:800}.pill{color:var(--muted);font-size:12px;border:1px solid var(--line);border-radius:999px;padding:4px 8px;background:#0a1119;margin-top:4px}.tabs,.subtabs{display:flex;gap:6px;overflow-x:auto}.tabs{padding-top:10px}.subtabs{margin-bottom:10px}.tab,.subtab,.btn{border:1px solid #34445a;background:#1b2635;color:#eef4ff;border-radius:10px;padding:9px 11px;font-size:13px;cursor:pointer;white-space:nowrap}.tab.active,.subtab.active{background:#203149;border-color:#3d6fa3}.btn:disabled{opacity:.5;cursor:not-allowed}.green{background:#113d25;border-color:#2c8a54}.turquoise{background:#079c9c;border-color:#4df5e8;color:#041316}.red{background:#4a1118;border-color:#8a2b35}.amber{background:#4a3511;border-color:#8a652b}.orange{background:#c45512;border-color:#ffae42;color:#fff}.blue{background:#12314d;border-color:#2a72a8}.purple{background:#4b1f75;border-color:#9460df;color:#fff}.default-profile{background:#1d5f96;border-color:#78c7ff;color:#fff}.container{display:flex;flex-direction:column;gap:10px;padding:10px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:12px;box-shadow:0 8px 30px #0004;margin-bottom:10px}.panel h2{font-size:14px;margin:0 0 10px}.chartgrid + .panel{margin-top:10px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.stat{background:#0b1119;border:1px solid #222d3c;border-radius:10px;padding:8px}.label{color:var(--muted);font-size:11px}.value{font-weight:700;font-size:13px;overflow-wrap:anywhere}.actions{display:flex;gap:7px;flex-wrap:wrap}.tabpane{display:none}.tabpane.active{display:block}.metricpane{display:none}.metricpane.active{display:block}.logs{min-height:0;display:flex;flex-direction:column;margin-bottom:0}.loghead{display:flex;justify-content:space-between;align-items:center;padding-bottom:7px;gap:10px}.logheadchecks{display:flex;align-items:center;gap:12px;white-space:nowrap}.log{width:100%;height:clamp(360px,calc(100dvh - 430px),560px);min-height:320px;resize:vertical;white-space:pre-wrap;overflow-wrap:anywhere;background:#030608;color:#a5ffa5;border:1px solid #26313f;border-radius:12px;padding:12px;font-family:Consolas,monospace;font-size:12px;line-height:1.35}.log-card-hidden{display:none!important}.logs-tab .container{min-height:calc(100dvh - 108px)}.logs-tab .logs.panel{height:calc(100dvh - 252px);min-height:500px;margin-bottom:0}.logs-tab .log{height:auto;min-height:0;flex:1;resize:none}.logs-tab .content-tab{display:none!important}.logtools{display:none}.logs-tab .logtools,.audit-tab .logtools{display:block;margin-bottom:10px}.logtools h2{display:block;margin:0 0 10px}.logtools .searchbox{display:flex}.searchbox{display:flex;align-items:center;gap:6px;flex-wrap:nowrap;width:100%}.searchbox input{flex:1 1 auto;min-width:80px;background:var(--field);color:var(--text);border:1px solid #2c3a4f;border-radius:9px;padding:9px}.chartgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.gpu-chartgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.chart{height:145px;background:#081018;border:1px solid #213044;border-radius:12px;padding:8px}.chart.tall{height:220px}canvas{width:100%;height:100%}.msg{color:var(--amber);font-size:12px;min-height:18px;padding-top:6px}.smallgap{margin-bottom:5px}.gpu-cards{display:grid;grid-template-columns:1fr;gap:10px}.gpu-card{background:#101722;border:1px solid #26313f;border-radius:14px;padding:12px}.gpu-title{font-weight:800;color:#d9ecff;margin-bottom:10px;border-bottom:1px solid #26313f;padding-bottom:7px}.gpu-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.gpu-section-title{color:#9dafc3;font-size:12px;text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px}.gpu-line{display:flex;justify-content:space-between;gap:8px;font-size:13px;padding:2px 0}.meter{height:7px;background:#081018;border-radius:99px;overflow:hidden;margin-top:5px}.meter span{display:block;height:100%;background:#2fc46b}.coregrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(90px,1fr));gap:6px}.storage-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px}.storage-section{display:flex;flex-direction:column;gap:10px}.storage-card.user-facing{background:#10243a;border-color:#2a72a8}.storage-card{background:#0b1119;border:1px solid #243144;border-radius:12px;padding:10px;min-width:0}.storage-title{font-weight:800;color:#d9ecff;margin-bottom:6px;overflow-wrap:anywhere}.storage-meta{color:#9dafc3;font-size:12px;margin-bottom:6px;overflow-wrap:anywhere}.storage-sizes{display:grid;grid-template-columns:minmax(85px,.8fr) minmax(85px,.8fr) minmax(95px,.9fr);gap:6px;margin-bottom:8px}.storage-sizes .stat{padding:6px}.diskbar{height:8px;background:#081018;border-radius:99px;overflow:hidden;width:100%;margin-bottom:3px;margin-top:3px}.diskbar span{display:block;height:100%;background:#72c7ff}.netgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px}.temp-blue{color:#60a5fa}.temp-green{color:#2fc46b}.temp-yellow{color:#ffde59}.temp-orange{color:#ff8a2a}.temp-red{color:#ff5b6c}.temp-crimson{color:#dc143c;font-weight:900}.machine-row{margin-top:7px}.api-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:8px}.api-card{background:#0b1119;border:1px solid #243144;border-radius:12px;padding:10px}.api-card h3{font-size:13px;margin:0 0 6px;color:#d9ecff}.api-card p{margin:0;color:var(--muted);font-size:12px;line-height:1.35}.api-card-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.preset-actions{display:flex;gap:4px}.iconbtn{border:1px solid #34445a;background:#182231;color:#eef4ff;border-radius:8px;padding:5px 7px;cursor:pointer}.preset-editor{display:none}.preset-editor.open{display:block}.formgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}.formgrid label{display:flex;flex-direction:column;gap:4px;color:var(--muted);font-size:12px}.formgrid input,.formgrid select{background:var(--field);color:var(--text);border:1px solid #2c3a4f;border-radius:9px;padding:8px}.preset-help{color:var(--muted);font-size:12px;line-height:1.35;margin-bottom:10px}.profile-balanced{background:#0faeb0;border-color:#5ff5e8;color:#031516}.panel-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:10px}.panel-head h2{margin:0}.add-preset-btn{width:30px;height:30px;border-radius:999px;border:1px solid #55ee91;background:#128a45;color:#fff;display:inline-flex;align-items:center;justify-content:center;padding:0;box-shadow:none}.add-preset-btn:hover{background:#18a957}.add-preset-btn svg{width:15px;height:15px;stroke:#fff;stroke-width:3;stroke-linecap:round}.preset-form-actions{display:flex;justify-content:center;gap:18px;margin-top:14px}.preset-intro{color:var(--muted);font-size:13px;line-height:1.45;margin:4px 0 2px}.preset-intro.hidden{display:none}.busy-note{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:12px;line-height:1.35}.spinner{width:12px;height:12px;border:2px solid #34445a;border-top-color:var(--blue);border-radius:999px;animation:club3090-spin .8s linear infinite;flex:0 0 auto}.instance-panel-busy{border-color:#35506d}.instance-panel-busy .subtabs,.instance-panel-busy .actions,.instance-panel-busy .value{opacity:.82}@keyframes club3090-spin{to{transform:rotate(360deg)}}@media(max-width:900px){.chartgrid{grid-template-columns:1fr}.gpu-chartgrid{grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.grid{grid-template-columns:1fr 1fr}.gpu-grid{grid-template-columns:1fr}.log{height:clamp(320px,calc(100dvh - 410px),520px)}.logs-tab .logs.panel{height:calc(100dvh - 250px);min-height:500px}.logs-tab .log{height:auto;min-height:0}}
 </style></head><body><header><div class="top"><div><div class="brand">club-3090 Control &bull; __SCRIPT_VERSION__</div><div class="pill" id="summary">loading...</div></div></div><div class="tabs"><button class="tab active" onclick="tab(event,'overview')">Main</button><button class="tab" onclick="tab(event,'system')">System</button><button class="tab" onclick="tab(event,'presets')">Presets</button><button class="tab" id="usersTabBtn" onclick="tab(event,'users')">Users</button><button class="tab" onclick="tab(event,'metrics')">Metrics</button><button class="tab" onclick="tab(event,'logs')">Logs</button></div></header>
 <main class="container"><section id="overview" class="tabpane content-tab active"><div class="panel"><h2>Status</h2><div class="grid"><div class="stat"><div class="label">Mode</div><div class="value" id="mode">-</div></div><div class="stat"><div class="label">Container</div><div class="value" id="container">-</div></div><div class="stat"><div class="label">Requests</div><div class="value" id="req">-</div></div><div class="stat"><div class="label">Last</div><div class="value" id="last">-</div></div><div class="stat"><div class="label">Power</div><div class="value" id="powerbox">-</div></div><div class="stat"><div class="label">Uptime</div><div class="value" id="uptime">-</div></div></div><div class="msg" id="msg"></div></div><div id="gpuCards" class="gpu-cards"></div></section>
-<section id="system" class="tabpane content-tab"><div class="panel"><h2>Services</h2><div class="value" id="services">-</div></div><div class="panel"><h2>Audit Overview</h2><div class="grid"><div class="stat"><div class="label">Admin UI</div><div class="value" id="auditAdminEndpoint">-</div></div><div class="stat"><div class="label">Proxy</div><div class="value" id="auditProxyEndpoint">-</div></div><div class="stat"><div class="label">Exposure</div><div class="value" id="auditExposure">-</div></div><div class="stat"><div class="label">Local Automation</div><div class="value" id="auditLocalApi">-</div></div></div><div class="value smallgap" id="auditSummary">-</div><div class="msg" id="auditMsg"></div></div><div class="panel"><h2>Access Policy</h2><div class="actions" id="accessPolicyRow"><label class="label"><input type="checkbox" id="auditAllowAnonymousProxy" onchange="mirrorAuthToggles(this.checked)"> allow requests without per-user API keys</label><button class="btn blue" onclick="saveAuthSettings()">Save Policy</button></div><div class="value smallgap" style="margin-top:10px" id="auditPolicyText">-</div></div><div class="panel"><h2>Instances</h2><div class="subtabs" id="instanceTabs"></div><div class="value smallgap" id="instanceSummary">-</div><div class="actions"><button class="btn blue" onclick="instanceAction('start_instance')">Start</button><button class="btn amber" onclick="instanceAction('restart_instance')">Restart</button><button class="btn red" onclick="instanceAction('stop_container')">Stop</button><button class="btn green" id="instanceEnableBtn" onclick="toggleInstanceEnabled()">Disable Boot Autostart</button></div><div class="msg" id="instanceMsg"></div></div><div class="panel"><h2>System</h2><div class="actions"><button class="btn amber" onclick="wol()">Wake-on-LAN</button></div><div class="actions machine-row"><button class="btn red" onclick="machineAction('reboot')">Restart Machine</button><button class="btn red" onclick="machineAction('shutdown')">Shutdown Machine</button></div></div><div class="panel"><h2>Profiles</h2><div class="actions"><button class="btn green" onclick="profile('eco')">Eco</button><button class="btn profile-balanced" onclick="profile('balanced')">Balanced</button><button class="btn default-profile" onclick="profile('default')">Default</button><button class="btn orange" onclick="profile('turbo')">Turbo</button></div></div><div class="panel"><h2>Power + Cooling</h2><div class="actions"><button class="btn green" id="optToggle" onclick="togglePowerOptimizations()">Disable Power Optimizations</button><button class="btn green" id="fanToggle" onclick="toggleFansMax()">Set Fans to Max</button><button class="btn amber" id="fanTestToggle" onclick="testFansV42()">TEST FANS</button></div></div></section>
+<section id="system" class="tabpane content-tab"><div class="panel"><h2>Services</h2><div class="value" id="services">-</div></div><div class="panel"><h2>Audit Overview</h2><div class="grid"><div class="stat"><div class="label">Admin UI</div><div class="value" id="auditAdminEndpoint">-</div></div><div class="stat"><div class="label">Proxy</div><div class="value" id="auditProxyEndpoint">-</div></div><div class="stat"><div class="label">Exposure</div><div class="value" id="auditExposure">-</div></div><div class="stat"><div class="label">Local Automation</div><div class="value" id="auditLocalApi">-</div></div></div><div class="value smallgap" id="auditSummary">-</div><div class="msg" id="auditMsg"></div></div><div class="panel"><h2>Access Policy</h2><div class="actions" id="accessPolicyRow"><label class="label"><input type="checkbox" id="auditAllowAnonymousProxy" onchange="mirrorAuthToggles(this.checked)"> allow requests without per-user API keys</label><button class="btn blue" onclick="saveAuthSettings()">Save Policy</button></div><div class="value smallgap" style="margin-top:10px" id="auditPolicyText">-</div></div><div class="panel"><h2>Instances</h2><div class="subtabs" id="instanceTabs"></div><div class="value smallgap" id="instanceSummary">-</div><div class="actions"><button class="btn blue" onclick="instanceAction('start_instance')">Start</button><button class="btn amber" onclick="instanceAction('restart_instance')">Restart</button><button class="btn red" onclick="instanceAction('stop_container')">Stop</button><button class="btn green" id="instanceEnableBtn" onclick="toggleInstanceEnabled()">Disable Boot Autostart</button></div><div class="msg" id="instanceMsg"></div></div><div class="panel"><h2>System</h2><div class="actions"><button class="btn amber" onclick="wol()">Wake-on-LAN</button></div><div class="actions machine-row"><button class="btn red" onclick="machineAction('reboot')">Restart Machine</button><button class="btn red" onclick="machineAction('shutdown')">Shutdown Machine</button></div></div><div class="panel"><h2>Profiles</h2><div class="actions"><button class="btn green" onclick="profile('eco')">Eco</button><button class="btn profile-balanced" onclick="profile('balanced')">Balanced</button><button class="btn default-profile" onclick="profile('default')">Default</button><button class="btn orange" onclick="profile('turbo')">Turbo</button></div></div><div class="panel"><h2>Power + Cooling</h2><div class="actions"><button class="btn green" id="optToggle" onclick="togglePowerOptimizations()">Disable Power Optimizations</button><button class="btn green" id="fanToggle" onclick="toggleFansMax()">Set Fans to Max</button><button class="btn amber" id="fanTestToggle" onclick="testFansLegacy()">TEST FANS</button></div></div></section>
 <section id="presets" class="tabpane content-tab"><div class="panel"><h2>Per-Instance Docker Presets</h2><div class="preset-help">Assign a single-card preset to the currently selected GPU instance. Each instance gets its own GPU binding, docker override, port, and proxy prefix such as <code>:8009/GPU0/</code>.</div><div class="actions"><button class="btn blue" onclick="switchMode('vllm/default')">default</button><button class="btn blue" onclick="switchMode('vllm/long-vision')">long-vision</button><button class="btn blue" onclick="switchMode('vllm/long-text')">long-text</button><button class="btn blue" onclick="switchMode('vllm/bounded-thinking')">bounded-thinking</button><button class="btn blue" onclick="switchMode('vllm/tools-text')">tools-text</button><button class="btn blue" onclick="switchMode('vllm/minimal')">minimal</button><button class="btn blue" onclick="switchMode('llamacpp/default')">llamacpp-default</button><button class="btn blue" onclick="switchMode('llamacpp/concurrent')">llamacpp-concurrent</button></div></div><div class="panel"><h2>API Presets</h2><div class="preset-help">Default presets are locked. Custom presets are exposed as <code>:8009/v1/&lt;name&gt;</code> and <code>:8009/&lt;name&gt;</code>. Both forms work with <code>short-</code> and <code>concise-</code> prefixes.</div><div id="apiPresetGrid" class="api-grid"></div></div><div class="panel"><div class="panel-head"><h2>Custom Preset Templates</h2><button class="add-preset-btn" title="Create preset" aria-label="Create preset" onclick="openPresetEditor()"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none"/></svg></button></div><div id="presetIntro" class="preset-intro">Create custom endpoint templates for different workloads or clients. Each preset saves generation parameters like temperature, sampling, thinking mode, penalties, and token limits, then exposes them as custom OpenAI-compatible endpoints such as <code>:8009/v1/my_preset</code> and <code>:8009/my_preset</code>. Short and concise prefixes work with custom presets too.</div><div id="presetEditor" class="preset-editor"><div class="formgrid"><label>Endpoint name<input id="presetName" placeholder="my_coding" /></label><label>Description<input id="presetDescription" placeholder="What this preset is for" /></label><label>Temperature<input id="presetTemperature" type="number" step="0.01" placeholder="0.7" /></label><label>Top P<input id="presetTopP" type="number" step="0.01" placeholder="0.95" /></label><label>Top K<input id="presetTopK" type="number" step="1" placeholder="20" /></label><label>Min P<input id="presetMinP" type="number" step="0.01" placeholder="0" /></label><label>Thinking<select id="presetThinking"><option value="false">Disabled</option><option value="true">Enabled</option></select></label><label>Preserve Thinking<select id="presetPreserveThinking"><option value="false">No</option><option value="true">Yes</option></select></label><label>Repetition penalty<input id="presetRepetitionPenalty" type="number" step="0.01" placeholder="1.0" /></label><label>Presence penalty<input id="presetPresencePenalty" type="number" step="0.01" placeholder="0" /></label><label>Frequency penalty<input id="presetFrequencyPenalty" type="number" step="0.01" placeholder="0" /></label><label>Max context / prompt tokens<input id="presetMaxCtx" type="number" step="1" placeholder="truncate_prompt_tokens" /></label><label>Max reply tokens<input id="presetMaxTokens" type="number" step="1" placeholder="max_tokens" /></label><label>Seed<input id="presetSeed" type="number" step="1" placeholder="optional" /></label><label>Min reply tokens<input id="presetMinTokens" type="number" step="1" placeholder="min_tokens" /></label><label>Logprobs<input id="presetLogprobs" type="number" step="1" placeholder="optional" /></label><label>Top logprobs<input id="presetTopLogprobs" type="number" step="1" placeholder="optional" /></label><label>Length penalty<input id="presetLengthPenalty" type="number" step="0.01" placeholder="optional" /></label><label>Ignore EOS<select id="presetIgnoreEos"><option value="">Default</option><option value="false">No</option><option value="true">Yes</option></select></label><label>Skip special tokens<select id="presetSkipSpecial"><option value="">Default</option><option value="true">Yes</option><option value="false">No</option></select></label><label>Include stop text<select id="presetIncludeStop"><option value="">Default</option><option value="false">No</option><option value="true">Yes</option></select></label><label>Stop strings<input id="presetStop" placeholder="one per line or comma-separated" /></label></div><div class="preset-form-actions"><button id="presetSaveBtn" class="btn green" onclick="savePresetFromForm()">💾 Save</button><button class="btn red" onclick="closePresetEditor()">❌ Cancel</button></div></div></div></section>
 <section id="users" class="tabpane content-tab"></section>
 <section id="metrics" class="tabpane content-tab"><div class="panel"><h2>Metrics</h2><div class="subtabs"><button class="subtab active" onclick="metricTab(event,'mMain')">Main</button><button class="subtab" onclick="metricTab(event,'mGpu')">GPUs</button><button class="subtab" onclick="metricTab(event,'mRam')">RAM</button><button class="subtab" onclick="metricTab(event,'mCpu')">CPU</button><button class="subtab" onclick="metricTab(event,'mSystem')">System</button><button class="subtab" onclick="metricTab(event,'mNetwork')">Network</button></div><div id="mMain" class="metricpane active"><div class="chartgrid"><div class="chart"><canvas id="cGpu"></canvas></div><div class="chart"><canvas id="cMem"></canvas></div><div class="chart"><canvas id="cLatency"></canvas></div><div class="chart"><canvas id="cTps"></canvas></div></div></div><div id="mGpu" class="metricpane"><div id="gpuMetricCharts" class="gpu-chartgrid"></div></div><div id="mRam" class="metricpane"><div id="ramInfo" class="value smallgap"></div><div class="chartgrid"><div class="chart tall"><canvas id="cRam"></canvas></div></div></div><div id="mCpu" class="metricpane"><div class="chartgrid"><div class="chart"><canvas id="cCpu"></canvas></div></div><div id="cpuCores" class="coregrid"></div></div><div id="mSystem" class="metricpane"><div class="chartgrid"><div class="chart"><canvas id="cSystemUtil"></canvas></div></div><div class="panel"><h2>System Information</h2><div id="systemInfo" class="value"></div></div><div class="panel"><h2>Storage</h2><div id="diskInfo"></div></div></div><div id="mNetwork" class="metricpane"><div id="netInfo" class="netgrid"></div><div class="chartgrid"><div class="chart"><canvas id="cNetDown"></canvas></div><div class="chart"><canvas id="cNetUp"></canvas></div></div></div></div></section>
@@ -4491,7 +4551,7 @@ function profileDescription(p){const d={eco:'Eco profile: lower GPU power limits
 profile=async function(p){if(!confirm(profileDescription(p)+'\n\nApply this profile now?'))return;try{await post('/admin/profile',{profile:p},`/admin/profile ${p}`)}catch(e){alert(e)}}
 togglePowerOptimizations=async function(){const enable=$('optToggle')&&$('optToggle').textContent.includes('Enable');try{await post('/admin/power',{action:enable?'enable_optimizations':'disable_optimizations',instance_id:scopeIsGlobal()?'GLOBAL':(currentScopeInstance(false)&&currentScopeInstance(false).id)||null},`/admin/power ${enable?'enable_optimizations':'disable_optimizations'}`)}catch(e){alert(e)}}
 toggleFansMax=async function(){const reset=$('fanToggle')&&$('fanToggle').textContent.includes('Reset');const cur=currentScopeInstance(false);const instanceId=scopeIsGlobal()?'GLOBAL':(cur&&cur.id)||null;try{await post('/admin/power',{action:reset?'fans_auto':'fans_max',instance_id:instanceId},`/admin/power ${reset?'fans_auto':'fans_max'} ${instanceId||'host'}`)}catch(e){alert(e)}}
-testFansV42=async function(){const cur=currentScopeInstance(false);const instanceId=scopeIsGlobal()?'GLOBAL':(cur&&cur.id)||null;try{await post('/admin/power',{action:'fans_test_v42',instance_id:instanceId},`/admin/power fans_test_v42 ${instanceId||'host'}`)}catch(e){alert(e)}}
+testFansLegacy=async function(){const cur=currentScopeInstance(false);const instanceId=scopeIsGlobal()?'GLOBAL':(cur&&cur.id)||null;try{await post('/admin/power',{action:'fans_test_legacy',instance_id:instanceId},`/admin/power fans_test_legacy ${instanceId||'host'}`)}catch(e){alert(e)}}
 tab=function(e,n){activeTabName=n;document.querySelectorAll('.tabpane').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));const pane=$(n);if(pane)pane.classList.add('active');if(e&&e.target)e.target.classList.add('active');if(n==='logs'){}applyLogVisibility();clearLog();connectLogs();setTimeout(()=>{if(!searchState.active&&$('autoscroll').checked)$('log').scrollTop=$('log').scrollHeight},0)}
 refreshStatus=async function(){try{ensureV414Layout();const r=await fetch('/admin/status',{cache:'no-store'});const j=await r.json();lastStatus=j;if(j.ui_config&&typeof j.ui_config.show_global_logs==='boolean'){showGlobalLogs=j.ui_config.show_global_logs;if($('showGlobalLogs'))$('showGlobalLogs').checked=showGlobalLogs}$('summary').textContent=`${j.active_mode} · ${j.container||'no container'} · ${j.power.profile||'balanced'} · GPUs ${j.gpu_count??0}`;$('mode').textContent=`${j.active_mode} / ${j.active_port}`;$('container').textContent=j.container||'none';$('services').textContent=`vLLM=${j.vllm_service}, control=${j.control_service}, console=${j.console_service}`;$('req').textContent=`total=${j.metrics.total_requests}, active=${j.metrics.active_requests}, fail=${j.metrics.failed_requests}, queue=${j.metrics.queued_requests}`;$('last').textContent=`${j.metrics.last_status||'-'} latency=${j.metrics.last_latency_s??'-'}s ttft=${j.metrics.last_ttft_s??'-'}s tps=${j.metrics.last_tokens_per_second??'-'}`;$('uptime').textContent=fmtUptime(j.uptime_seconds);renderGpuCards(j.gpus);$('powerbox').textContent=`profile=${j.power.profile}, GPU=${j.power.gpu}, CPU=${j.power.cpu}, fans=${j.power.fans}, container=${j.power.container}, idle=${j.power.idle_for_seconds}s`;$('optToggle').textContent=j.power.optimizations_enabled?'Disable Power Optimizations':'Enable Power Optimizations';$('fanToggle').textContent=j.power.fan_manual_override?'Reset Fans to Default':'Set Fans to Max';renderMetrics(j);renderPresetCatalog(j.presets);renderUsers(j.users||[]);renderGroups(j.groups||[]);renderAudit(j.server_config||{});renderInstances(j.instances||[]);renderPresetScopeTabs();updateScopedCards();renderLogSourcePanel();applyLogVisibility()}catch(e){setMsg('Status error: '+e)}}
 function applyDirectoryPayload(j){if(!lastStatus)lastStatus={};if(Array.isArray(j.users)){lastStatus.users=j.users;renderUsers(j.users)}if(Array.isArray(j.groups)){lastStatus.groups=j.groups;renderGroups(j.groups)}if(j.server_config){lastStatus.server_config=j.server_config;renderAudit(j.server_config)}}
@@ -4760,8 +4820,8 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                     out = {"fans": set_fan_max_toggle(True, instance_id=instance_id)}
                 elif action == "fans_auto":
                     out = {"fans": set_fan_max_toggle(False, instance_id=instance_id)}
-                elif action == "fans_test_v42":
-                    out = {"fans": set_gpu_fans_v42_compat(speed=FAN_MAX_SPEED, auto=False)}
+                elif action == "fans_test_legacy":
+                    out = {"fans": set_gpu_fans_v213_compat(speed=FAN_MAX_SPEED, auto=False)}
                 else:
                     raise ValueError("Invalid power action")
                 log_audit("admin_power_action", action=action, instance=instance_id)
@@ -5396,6 +5456,83 @@ exec /usr/bin/Xorg :${DISPLAY_NUM}   -config "${CONFIG}"   -noreset   -nolisten 
 HEADLESSX
 "${SUDO[@]}" chmod +x "${HEADLESS_X_SH}"
 
+"${SUDO[@]}" tee "${HEADLESS_X_V213_SH}" >/dev/null <<'HEADLESSXV213'
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG=/etc/X11/club3090-headless-xorg-v213.conf
+DISPLAY_NUM="${CLUB3090_FAN_DISPLAY_NUM:-99}"
+LOGFILE=/var/log/club3090-headless-xorg-v213.log
+
+mkdir -p /etc/X11 /var/log
+
+# Exact v2.13-era headless X helper used only by TEST FANS.
+# It keeps the original "do not steal outputs" hardening that restored working
+# manual fan control after the v2.12 introduction.
+if command -v nvidia-xconfig >/dev/null 2>&1; then
+  nvidia-xconfig     --enable-all-gpus     --cool-bits=28     --allow-empty-initial-configuration     --use-display-device=None     --virtual=1280x720     --xconfig="${CONFIG}" >/tmp/club3090-nvidia-xconfig-v213.log 2>&1 || true
+fi
+
+if [[ -s "${CONFIG}" ]]; then
+  PY_PATCH_BIN="$(command -v python || command -v python3 || true)"
+  if [[ -n "${PY_PATCH_BIN}" ]]; then
+    "${PY_PATCH_BIN}" - "${CONFIG}" <<'PYXCONF' || true
+import re, sys
+path = sys.argv[1]
+text = open(path, encoding='utf-8', errors='ignore').read()
+text = re.sub(r'(?im)^\s*Option\s+"ConnectedMonitor".*
+?', '', text)
+text = re.sub(r'(?im)^\s*Option\s+"UseDisplayDevice".*
+?', '', text)
+def patch(sec):
+    if re.search(r'(?im)^\s*Driver\s+"nvidia"', sec):
+        if 'AllowEmptyInitialConfiguration' not in sec:
+            sec = sec.rstrip() + '
+    Option "AllowEmptyInitialConfiguration" "true"
+'
+        if 'Coolbits' not in sec and 'CoolBits' not in sec:
+            sec = sec.rstrip() + '
+    Option "Coolbits" "28"
+'
+        sec = sec.rstrip() + '
+    Option "UseDisplayDevice" "None"
+'
+    return sec
+text = re.sub(r'(?is)Section\s+"Device".*?EndSection', lambda m: patch(m.group(0)), text)
+open(path, 'w', encoding='utf-8').write(text)
+PYXCONF
+  fi
+fi
+
+if [[ ! -s "${CONFIG}" ]]; then
+  cat > "${CONFIG}" <<'XCONF'
+Section "ServerLayout"
+    Identifier "club3090-headless"
+    Screen 0 "Screen0"
+EndSection
+
+Section "Device"
+    Identifier "Device0"
+    Driver "nvidia"
+    Option "AllowEmptyInitialConfiguration" "true"
+    Option "Coolbits" "28"
+    Option "UseDisplayDevice" "None"
+EndSection
+
+Section "Screen"
+    Identifier "Screen0"
+    Device "Device0"
+    SubSection "Display"
+        Virtual 1280 720
+    EndSubSection
+EndSection
+XCONF
+fi
+
+exec /usr/bin/Xorg :${DISPLAY_NUM}   -config "${CONFIG}"   -noreset   -nolisten tcp   -ac   -novtswitch   -sharevts   +extension GLX +extension RANDR +extension RENDER   -logfile "${LOGFILE}"
+HEADLESSXV213
+"${SUDO[@]}" chmod +x "${HEADLESS_X_V213_SH}"
+
 "${SUDO[@]}" tee "${START_SH}" >/dev/null <<'STARTVLLM'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -5546,6 +5683,7 @@ log_done "Server configuration refreshed"
 
 log_step "Validating generated control files"
 "${SUDO[@]}" "${BASH_BIN}" -n "${HEADLESS_X_SH}"
+"${SUDO[@]}" "${BASH_BIN}" -n "${HEADLESS_X_V213_SH}"
 "${SUDO[@]}" "${PYTHON_BIN}" -m py_compile "${CONTROL_PY}"
 # Structural validation: catch missing helper functions before replacing a working service.
 "${SUDO[@]}" "${PYTHON_BIN}" - "${CONTROL_PY}" <<'PYVERIFY'
@@ -5615,6 +5753,24 @@ After=multi-user.target
 [Service]
 Type=simple
 ExecStart=${HEADLESS_X_SH}
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+  "${SUDO[@]}" tee /etc/systemd/system/club3090-headless-x-v213.service >/dev/null <<UNIT
+[Unit]
+Description=club-3090 legacy private headless Xorg for TEST FANS
+ConditionKernelCommandLine=club3090.server=1
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/bash ${HEADLESS_X_V213_SH}
 Restart=always
 RestartSec=5
 StandardOutput=journal
@@ -5738,6 +5894,7 @@ UNIT
 enable_managed_units() {
   "${SUDO[@]}" systemctl enable club3090-vllm.service
   "${SUDO[@]}" systemctl disable club3090-headless-x.service 2>/dev/null || true
+  "${SUDO[@]}" systemctl disable club3090-headless-x-v213.service 2>/dev/null || true
   "${SUDO[@]}" systemctl enable club3090-control.service
   "${SUDO[@]}" systemctl enable club3090-console-log.service
   if [[ "${ONLINE_TLS_EFFECTIVE_ENABLED}" == "true" ]]; then
@@ -5832,6 +5989,7 @@ else
   echo "Local user API: disabled by default, enable with --local-automation"
 fi
 echo "Fan Control: private on-demand Xorg :99 via club3090-headless-x.service"
+echo "Fan Test: legacy v2.13 Xorg :99 via club3090-headless-x-v213.service"
 echo "Club dir:  ${CLUB3090_DIR}"
 echo "Detected OS: ${PRETTY_NAME:-${ID:-unknown}} (${OS_FAMILY})"
 echo "GPUs:      ${GPU_COUNT} detected"
