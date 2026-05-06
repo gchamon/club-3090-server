@@ -1,7 +1,7 @@
 ﻿#!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="2026-05-06.v4.27"
+SCRIPT_VERSION="2026-05-06.v4.28"
 
 # club-3090 headless server/control installer
 # Install:
@@ -892,8 +892,9 @@ GPU_IDLE_LOCK_CLOCKS = os.environ.get("CLUB3090_GPU_IDLE_LOCK_CLOCKS", "210,900"
 GPU_ACTIVE_LOCK_CLOCKS = os.environ.get("CLUB3090_GPU_ACTIVE_LOCK_CLOCKS", "")
 CPU_ACTIVE_GOVERNOR = os.environ.get("CLUB3090_CPU_ACTIVE_GOVERNOR", "performance")
 CPU_IDLE_GOVERNOR = os.environ.get("CLUB3090_CPU_IDLE_GOVERNOR", "powersave")
-FAN_CURVE = [(30, 0), (35, 20), (40, 30), (45, 50), (50, 60), (55, 70), (60, 80), (65, 90)]
+FAN_CURVE = [(30, 35), (35, 40), (40, 45), (45, 55), (50, 65), (55, 75), (60, 85), (65, 95)]
 FAN_MAX_SPEED = int(os.environ.get("CLUB3090_FAN_MAX_SPEED", "100"))
+FAN_MIN_SAFE_SPEED = int(os.environ.get("CLUB3090_FAN_MIN_SAFE_SPEED", "35"))
 WOL_MAC = os.environ.get("CLUB3090_WOL_MAC", "")
 WOL_BROADCAST = os.environ.get("CLUB3090_WOL_BROADCAST", "255.255.255.255")
 PERFORMANCE_PROFILES = {
@@ -3556,8 +3557,8 @@ def parse_gpu_fan_speeds():
 def fan_speed_for_temp(temp_c):
     for threshold, speed in FAN_CURVE:
         if temp_c < threshold:
-            return speed
-    return 100
+            return max(FAN_MIN_SAFE_SPEED, int(speed))
+    return max(FAN_MIN_SAFE_SPEED, 100)
 
 
 def fan_targets_from_temps():
@@ -3686,6 +3687,22 @@ def run_nvidia_assignment_batch(assignments):
     return rc, [f"batch rc={rc} assignments={assignments}: {text[-1500:]}"]
 
 
+def restore_gpu_fans_auto(indices=None):
+    available_indices = gpu_indices()
+    if indices is None:
+        indices = list(available_indices)
+    else:
+        indices = [int(idx) for idx in indices if int(idx) in available_indices]
+    if not indices:
+        return ["no GPU targets selected for auto restore"]
+    assignments = [f"[gpu:{gpu_idx}]/GPUFanControlState=0" for gpu_idx in indices]
+    batch_rc, batch_results = run_nvidia_assignment_batch(assignments)
+    if batch_rc == 0:
+        return batch_results
+    success, retry_results = run_nvidia_assignments(assignments)
+    return batch_results + retry_results + [f"auto restore success={success}/{len(assignments)}"]
+
+
 def verify_manual_fan_target(target_gpu_indices, target_speed, timeout=3.0):
     if target_speed is None:
         return False, {}
@@ -3747,7 +3764,7 @@ def set_gpu_fans(speed=None, auto=False, indices=None):
         target = int(speed)
         mode_label = "manual_max" if target >= FAN_MAX_SPEED else "manual_fixed"
 
-    target = max(0, min(100, int(target)))
+    target = max(FAN_MIN_SAFE_SPEED, min(100, int(target)))
     mapped_fans = fan_indices_for_gpu_targets(indices, available_gpu_indices=available_indices, fan_indices=fan_objects)
     if not mapped_fans:
         guessed_fans = fan_objects or list(range(0, max(2, min(8, len(available_indices) * 2))))
@@ -3795,6 +3812,9 @@ def set_gpu_fans(speed=None, auto=False, indices=None):
         legacy_verified, legacy_observed = verify_manual_fan_target(indices, target, timeout=4.0)
         results.append(f"fan legacy verify target={target} observed={legacy_observed}: rc={0 if legacy_verified else 1}")
         ok = (legacy_batch_rc == 0 or legacy_fan_success > 0 or legacy_verified)
+    if not ok:
+        failover_results = restore_gpu_fans_auto(indices)
+        results.extend([f"manual failover -> {line}" for line in failover_results])
     with metrics_lock:
         power_state["fans"] = mode_label if ok else "manual_failed"
         power_state["last_action"] = "fans_set"
@@ -4036,7 +4056,7 @@ def power_status():
     with metrics_lock:
         idle_for = int(time.time() - last_inference_time)
         fan_curve_text = ", ".join([f"<{temp}C={speed}%" for temp, speed in FAN_CURVE]) + ", >=65C=100%"
-        return {**power_state, "profile": current_profile, "idle_for_seconds": idle_for, "idle_power_after_seconds": POWER_IDLE_AFTER_SECONDS, "container_stop_after_seconds": CONTAINER_STOP_AFTER_SECONDS, "gpu_active_power_limit_w": GPU_ACTIVE_POWER_LIMIT_W, "gpu_idle_power_limit_w": GPU_IDLE_POWER_LIMIT_W, "gpu_idle_lock_clocks": GPU_IDLE_LOCK_CLOCKS, "cpu_active_governor": CPU_ACTIVE_GOVERNOR, "cpu_idle_governor": CPU_IDLE_GOVERNOR, "optimizations_enabled": power_optimizations_enabled, "fan_manual_override": fan_manual_override, "fan_curve": fan_curve_text}
+        return {**power_state, "profile": current_profile, "idle_for_seconds": idle_for, "idle_power_after_seconds": POWER_IDLE_AFTER_SECONDS, "container_stop_after_seconds": CONTAINER_STOP_AFTER_SECONDS, "gpu_active_power_limit_w": GPU_ACTIVE_POWER_LIMIT_W, "gpu_idle_power_limit_w": GPU_IDLE_POWER_LIMIT_W, "gpu_idle_lock_clocks": GPU_IDLE_LOCK_CLOCKS, "cpu_active_governor": CPU_ACTIVE_GOVERNOR, "cpu_idle_governor": CPU_IDLE_GOVERNOR, "optimizations_enabled": power_optimizations_enabled, "fan_manual_override": fan_manual_override, "fan_curve": fan_curve_text, "fan_min_safe_speed": FAN_MIN_SAFE_SPEED}
 
 def wait_for_port(port, timeout=20):
     deadline = time.time() + timeout
@@ -5385,6 +5405,7 @@ Environment=CLUB3090_GPU_IDLE_LOCK_CLOCKS=210,900
 Environment=CLUB3090_CPU_ACTIVE_GOVERNOR=performance
 Environment=CLUB3090_CPU_IDLE_GOVERNOR=powersave
 Environment=CLUB3090_FAN_MAX_SPEED=100
+Environment=CLUB3090_FAN_MIN_SAFE_SPEED=35
 Environment=CLUB3090_WOL_MAC=
 Environment=CLUB3090_WOL_BROADCAST=255.255.255.255
 ExecStart=${CONTROL_PY}
@@ -5551,11 +5572,30 @@ restart_runtime_services_if_booted() {
   if ! grep -q 'club3090.server=1' /proc/cmdline; then
     return 0
   fi
-  "${SUDO[@]}" systemctl restart club3090-control.service || true
+  restart_unit_with_timeout club3090-control.service || true
   if [[ "${ONLINE_TLS_EFFECTIVE_ENABLED}" == "true" ]]; then
-    "${SUDO[@]}" systemctl restart club3090-caddy.service || true
+    restart_unit_with_timeout club3090-caddy.service || true
   fi
-  "${SUDO[@]}" systemctl restart club3090-console-log.service || true
+  restart_unit_with_timeout club3090-console-log.service || true
+}
+
+restart_unit_with_timeout() {
+  local unit="$1"
+  local timeout_seconds="${2:-20}"
+  local rc=0
+  if command -v timeout >/dev/null 2>&1; then
+    "${SUDO[@]}" timeout "${timeout_seconds}"s systemctl restart "${unit}" || rc=$?
+  else
+    "${SUDO[@]}" systemctl restart "${unit}" || rc=$?
+  fi
+  if [[ "${rc}" == "124" ]]; then
+    echo "WARN: timed out restarting ${unit} after ${timeout_seconds}s; continuing" >&2
+    if "${SUDO[@]}" systemctl --help 2>/dev/null | grep -q -- '--no-block'; then
+      "${SUDO[@]}" systemctl restart --no-block "${unit}" >/dev/null 2>&1 || true
+    fi
+    return 0
+  fi
+  return "${rc}"
 }
 
 if [[ "${ACTION}" == "install" ]]; then
