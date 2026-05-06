@@ -1,7 +1,7 @@
 ﻿#!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="2026-05-06.v4.33"
+SCRIPT_VERSION="2026-05-06.v4.34"
 
 # club-3090 headless server/control installer
 # Install:
@@ -3894,7 +3894,7 @@ def set_cpu_governor(governor):
     return results
 
 
-def apply_gpu_idle_power():
+def apply_gpu_idle_power(skip_fans=False):
     if not power_optimizations_enabled:
         return ["power optimizations disabled"]
     results = []
@@ -3903,7 +3903,8 @@ def apply_gpu_idle_power():
     for cmd in (["nvidia-smi", "-pm", "1"], ["nvidia-smi", "-pl", str(GPU_IDLE_POWER_LIMIT_W)], ["nvidia-smi", "-lgc", GPU_IDLE_LOCK_CLOCKS]):
         rc, out = run_cmd(cmd, timeout=20)
         results.append(f"{' '.join(cmd)}: rc={rc} {out[-500:]}")
-    results += apply_fan_curve_once()
+    if not skip_fans:
+        results += apply_fan_curve_once()
     with metrics_lock:
         power_state["gpu"] = "idle"
         power_state["last_action"] = "gpu_idle"
@@ -3912,7 +3913,7 @@ def apply_gpu_idle_power():
     return results
 
 
-def apply_gpu_active_power():
+def apply_gpu_active_power(skip_fans=False):
     if not power_optimizations_enabled:
         return ["power optimizations disabled"]
     results = []
@@ -3924,7 +3925,8 @@ def apply_gpu_active_power():
     for cmd in cmds:
         rc, out = run_cmd(cmd, timeout=20)
         results.append(f"{' '.join(cmd)}: rc={rc} {out[-500:]}")
-    results += apply_fan_curve_once()
+    if not skip_fans:
+        results += apply_fan_curve_once()
     with metrics_lock:
         power_state["gpu"] = "active"
         power_state["last_action"] = "gpu_active"
@@ -3973,7 +3975,7 @@ def ensure_vllm_running_for_request(instance_id=None):
     with metrics_lock:
         last_inference_time = time.time()
     apply_cpu_active_power()
-    apply_gpu_active_power()
+    apply_gpu_active_power(skip_fans=True)
     target = get_instance(instance_id) if instance_id else primary_instance()
     if target is None:
         mode = active_mode()
@@ -4112,7 +4114,7 @@ def run_switch(mode, allow_fallback=True):
         env["READY_URL"] = ready_url_for_mode(target_mode)
         env["PORT"] = str(int(MODES[target_mode]))
         apply_cpu_active_power()
-        apply_gpu_active_power()
+        apply_gpu_active_power(skip_fans=True)
         log_control(f"SWITCH {label} cleanup before mode={target_mode}")
         cleanup_msg = cleanup_vllm_containers()
         log_control(f"SWITCH {label} start mode={target_mode} port={env['PORT']} ready_url={env['READY_URL']}")
@@ -5135,6 +5137,16 @@ def serve(server, label="server"):
     log_control(f"{label} listening on {sock[0]}:{sock[1]}")
     server.serve_forever()
 
+def startup_power_primer():
+    try:
+        apply_cpu_active_power()
+    except Exception as e:
+        log_control(f"STARTUP cpu power primer error: {e}")
+    try:
+        apply_gpu_active_power(skip_fans=True)
+    except Exception as e:
+        log_control(f"STARTUP gpu power primer error: {e}")
+
 def main():
     os.makedirs(CONTROL_DIR, exist_ok=True)
     os.makedirs(INSTANCES_DIR, exist_ok=True)
@@ -5151,8 +5163,6 @@ def main():
         write_active_mode(DEFAULT_MODE)
     read_instances_config()
     log_control("control service starting")
-    apply_cpu_active_power()
-    apply_gpu_active_power()
     threading.Thread(target=idle_watchdog, daemon=True).start()
     threading.Thread(target=metrics_collector, daemon=True).start()
     cfg = read_server_config()
@@ -5163,6 +5173,7 @@ def main():
         threading.Thread(target=serve, args=(local_api_server, "local-api"), daemon=True).start()
     proxy_server = build_server(PROXY_BIND_PORT, ProxyHandler, PROXY_BIND_HOST)
     threading.Thread(target=serve, args=(proxy_server, "proxy"), daemon=True).start()
+    threading.Thread(target=startup_power_primer, daemon=True).start()
     serve(admin_server, "admin")
 
 if __name__ == "__main__":
