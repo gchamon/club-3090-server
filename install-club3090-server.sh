@@ -1,7 +1,7 @@
 ﻿#!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="2026-05-05.v4.25"
+SCRIPT_VERSION="2026-05-05.v4.26"
 
 # club-3090 headless server/control installer
 # Install:
@@ -2358,11 +2358,9 @@ def legacy_global_disable_mode():
 def legacy_global_enabled():
     file_mode = read_active_mode_file()
     legacy_mode = detect_legacy_dual_mode()
-    return bool(
-        file_mode in DUAL_GPU_MODES
-        or legacy_mode in DUAL_GPU_MODES
-        or DEFAULT_MODE in DUAL_GPU_MODES
-    )
+    if file_mode:
+        return file_mode in DUAL_GPU_MODES
+    return legacy_mode in DUAL_GPU_MODES
 
 def is_legacy_global_instance_id(instance_id):
     return (
@@ -3530,6 +3528,31 @@ def gpu_indices():
     return [0, 1]
 
 
+def parse_gpu_fan_speeds():
+    speeds = {}
+    if not shutil.which("nvidia-smi"):
+        return speeds
+    rc, out = run_cmd(["nvidia-smi", "--query-gpu=index,fan.speed", "--format=csv,noheader,nounits"], timeout=6)
+    if rc != 0:
+        return speeds
+    for line in out.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 2:
+            continue
+        try:
+            idx = int(parts[0])
+        except Exception:
+            continue
+        raw_speed = parts[1].split()[0]
+        if not raw_speed or raw_speed.upper() == "N/A":
+            continue
+        try:
+            speeds[idx] = int(float(raw_speed))
+        except Exception:
+            continue
+    return speeds
+
+
 def fan_speed_for_temp(temp_c):
     for threshold, speed in FAN_CURVE:
         if temp_c < threshold:
@@ -3598,6 +3621,78 @@ def run_nvidia_settings(args):
         return 999, str(e)
 
 
+def discover_nvidia_fan_indices():
+    if not nvidia_settings_available():
+        return []
+    rc, out = run_nvidia_settings(["-q", "fans"])
+    if rc != 0:
+        return []
+    found = []
+    for match in re.finditer(r"\[fan:(\d+)\]", out or "", re.IGNORECASE):
+        idx = int(match.group(1))
+        if idx not in found:
+            found.append(idx)
+    return found
+
+
+def fan_indices_for_gpu_targets(target_gpu_indices, available_gpu_indices=None, fan_indices=None):
+    fan_list = sorted({int(idx) for idx in (fan_indices or [])})
+    if not fan_list:
+        return []
+    gpu_list = [int(idx) for idx in (available_gpu_indices or gpu_indices())]
+    if not gpu_list:
+        return fan_list
+    target_list = [int(idx) for idx in (target_gpu_indices or []) if int(idx) in gpu_list]
+    if not target_list or len(target_list) >= len(gpu_list):
+        return fan_list
+    chunk = max(1, (len(fan_list) + len(gpu_list) - 1) // len(gpu_list))
+    mapping = {}
+    cursor = 0
+    for pos, gpu_idx in enumerate(gpu_list):
+        remaining_gpus = len(gpu_list) - pos
+        remaining_fans = len(fan_list) - cursor
+        if remaining_fans <= 0:
+            mapping[gpu_idx] = []
+            continue
+        take = remaining_fans if remaining_gpus == 1 else min(chunk, remaining_fans)
+        mapping[gpu_idx] = fan_list[cursor:cursor + take]
+        cursor += take
+    selected = []
+    for gpu_idx in target_list:
+        selected.extend(mapping.get(gpu_idx, []))
+    return selected
+
+
+def run_nvidia_assignments(assignments):
+    results = []
+    success = 0
+    for assignment in assignments:
+        rc, out = run_nvidia_settings(["-a", assignment])
+        text = (out or "").strip()
+        if rc == 0:
+            success += 1
+        results.append(f"{assignment}: rc={rc} {text[-500:]}")
+    return success, results
+
+
+def verify_manual_fan_target(target_gpu_indices, target_speed, timeout=3.0):
+    if target_speed is None:
+        return False, {}
+    wanted = {int(idx) for idx in (target_gpu_indices or [])}
+    if not wanted:
+        return False, {}
+    deadline = time.time() + float(timeout)
+    last = {}
+    threshold = max(0, int(target_speed) - 15)
+    while time.time() < deadline:
+        speeds = parse_gpu_fan_speeds()
+        last = {idx: speeds.get(idx) for idx in wanted if idx in speeds}
+        if last and all(speed is not None and int(speed) >= threshold for speed in last.values()):
+            return True, last
+        time.sleep(0.4)
+    return False, last
+
+
 def set_gpu_fans(speed=None, auto=False, indices=None):
     # Headless fan control path: private Xorg :99 + nvidia-settings + CoolBits.
     results = []
@@ -3614,16 +3709,15 @@ def set_gpu_fans(speed=None, auto=False, indices=None):
         indices = [idx for idx in clean if idx in available_indices]
     if not indices:
         return ["no GPU targets selected"]
+    fan_objects = discover_nvidia_fan_indices()
     if auto:
-        attrs = []
-        for gpu_idx in indices:
-            attrs += ["-a", f"[gpu:{gpu_idx}]/GPUFanControlState=0"]
-        rc, out = run_nvidia_settings(attrs)
-        results.append(f"nvidia-settings fans auto gpus={indices}: rc={rc} {out[-1200:]}")
+        assignments = [f"[gpu:{gpu_idx}]/GPUFanControlState=0" for gpu_idx in indices]
+        success, results = run_nvidia_assignments(assignments)
+        ok = success == len(assignments)
         with metrics_lock:
-            power_state["fans"] = "auto" if rc == 0 else "auto_failed"
+            power_state["fans"] = "auto" if ok else "auto_failed"
             power_state["last_action"] = "fans_auto"
-            power_state["last_error"] = " | ".join([r for r in results if "rc=0" not in r])[-1000:]
+            power_state["last_error"] = "" if ok else " | ".join([r for r in results if "rc=0" not in r])[-1000:]
         log_control("FANS auto: " + " || ".join(results))
         return results
 
@@ -3640,21 +3734,33 @@ def set_gpu_fans(speed=None, auto=False, indices=None):
         mode_label = "manual_max" if target >= FAN_MAX_SPEED else "manual_fixed"
 
     target = max(0, min(100, int(target)))
-    attrs = []
-    for gpu_idx in indices:
-        attrs += ["-a", f"[gpu:{gpu_idx}]/GPUFanControlState=1"]
-    # Set a generous range of global fan objects. Invalid fan indices are harmless;
-    # nvidia-settings reports them and continues applying valid ones. 0-7 covers
-    # two GPUs with up to four exposed fan controllers each.
-    for fan_idx in range(0, 8):
-        attrs += ["-a", f"[fan:{fan_idx}]/GPUTargetFanSpeed={target}"]
+    enable_assignments = [f"[gpu:{gpu_idx}]/GPUFanControlState=1" for gpu_idx in indices]
+    enable_success, enable_results = run_nvidia_assignments(enable_assignments)
+    results.extend(enable_results)
 
-    rc, out = run_nvidia_settings(attrs)
-    results.append(f"nvidia-settings fans target={target} gpu_targets={targets}: rc={rc} {out[-1600:]}")
+    direct_assignments = [f"[gpu:{gpu_idx}]/GPUTargetFanSpeed={target}" for gpu_idx in indices]
+    direct_success, direct_results = run_nvidia_assignments(direct_assignments)
+    results.extend(direct_results)
+
+    mapped_fans = fan_indices_for_gpu_targets(indices, available_gpu_indices=available_indices, fan_indices=fan_objects)
+    if not mapped_fans and not direct_success:
+        guessed_fans = fan_objects or list(range(0, max(2, min(8, len(available_indices) * 2))))
+        mapped_fans = fan_indices_for_gpu_targets(indices, available_gpu_indices=available_indices, fan_indices=guessed_fans)
+        if not mapped_fans and len(indices) >= len(available_indices):
+            mapped_fans = guessed_fans
+    fan_assignments = [f"[fan:{fan_idx}]/GPUTargetFanSpeed={target}" for fan_idx in mapped_fans]
+    fan_success = 0
+    if fan_assignments:
+        fan_success, fan_results = run_nvidia_assignments(fan_assignments)
+        results.extend(fan_results)
+
+    verified, observed = verify_manual_fan_target(indices, target)
+    results.append(f"fan verify target={target} observed={observed}: rc={0 if verified else 1}")
+    ok = enable_success == len(enable_assignments) and (direct_success > 0 or fan_success > 0 or verified)
     with metrics_lock:
-        power_state["fans"] = mode_label if rc == 0 else "manual_failed"
+        power_state["fans"] = mode_label if ok else "manual_failed"
         power_state["last_action"] = "fans_set"
-        power_state["last_error"] = " | ".join([r for r in results if "rc=0" not in r])[-1200:]
+        power_state["last_error"] = "" if ok else " | ".join([r for r in results if "rc=0" not in r])[-1200:]
     log_control("FANS set: " + " || ".join(results))
     return results
 
@@ -4380,6 +4486,14 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                 mode = data.get("mode")
                 if mode not in MODES:
                     raise ValueError("Invalid mode")
+                if is_legacy_global_instance_id(instance_id):
+                    if mode not in DUAL_GPU_MODES:
+                        raise ValueError("Preset type does not match the selected instance scope")
+                    rc, stop_msg = stop_legacy_global_instance()
+                    result = run_switch(mode)
+                    log_audit("admin_switch_mode_legacy_global", instance="GLOBAL", mode=mode, stop_rc=rc)
+                    self.send_json({"ok": True, "instance": legacy_global_instance_snapshot(), "mode": mode, "output": (stop_msg + "\n" + result)[-12000:], "stopped_instances": ([{"id": "GLOBAL", "rc": rc, "output": stop_msg[-1200:]}] if stop_msg else []), "instances": instances_snapshot(), "running_dual_instances": running_dual_instance_snapshots()})
+                    return
                 if instance_id:
                     target = get_instance(instance_id)
                     if not target:
@@ -5472,4 +5586,3 @@ echo "Version:   ${SCRIPT_VERSION}"
 echo "Online:    $([[ "${ONLINE_EFFECTIVE_ENABLED}" == "true" ]] && echo enabled || echo disabled)"
 echo "HTTPS:     $([[ "${ONLINE_TLS_EFFECTIVE_ENABLED}" == "true" ]] && echo enabled || echo disabled)"
 echo "Preset path styles supported: ${URL_SCHEME}://SERVER:${PROXY_PORT}/v1/<preset>/chat/completions, ${URL_SCHEME}://SERVER:${PROXY_PORT}/<preset>/v1/chat/completions, and per-GPU prefixes like ${URL_SCHEME}://SERVER:${PROXY_PORT}/GPU0/v1/<preset>/chat/completions"
-
