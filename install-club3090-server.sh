@@ -1,7 +1,7 @@
 ﻿#!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="2026-05-06.v4.39"
+SCRIPT_VERSION="2026-05-06.v4.40"
 
 # club-3090 headless server/control installer
 # Install:
@@ -942,6 +942,7 @@ power_optimizations_enabled = True
 fan_manual_override = False
 fan_curve_pause_until = 0.0
 power_state = {"gpu":"unknown", "cpu":"unknown", "container":"running", "fans":"auto", "power_optimizations":"enabled", "last_action":"startup", "last_error":""}
+cooling_scope_instance_id = "GLOBAL"
 
 def log_control(message):
     os.makedirs(CONTROL_DIR, exist_ok=True)
@@ -3594,11 +3595,29 @@ def fan_speed_for_temp(temp_c):
     return max(FAN_MIN_SAFE_SPEED, 100)
 
 
-def fan_targets_from_temps():
-    temps = parse_gpu_temps()
-    if not temps:
-        return {idx: 70 for idx in gpu_indices()}
-    return {idx: fan_speed_for_temp(temp) for idx, temp in temps}
+def normalize_gpu_target_indices(indices=None):
+    available = gpu_indices()
+    if indices is None:
+        return list(available)
+    clean = []
+    for idx in indices:
+        try:
+            clean.append(int(idx))
+        except Exception:
+            pass
+    return [idx for idx in clean if idx in available]
+
+
+def fan_targets_from_temps(indices=None):
+    target_indices = normalize_gpu_target_indices(indices)
+    if not target_indices:
+        return {}
+    targets = {idx: 70 for idx in target_indices}
+    wanted = set(target_indices)
+    for idx, temp in parse_gpu_temps():
+        if idx in wanted:
+            targets[idx] = fan_speed_for_temp(temp)
+    return targets
 
 
 def wait_for_nvidia_display(display=":99", timeout=10, explicit_display=True):
@@ -3609,11 +3628,7 @@ def wait_for_nvidia_display(display=":99", timeout=10, explicit_display=True):
     last = "display not ready"
     while time.time() < deadline:
         try:
-            cmd = ["nvidia-settings"]
-            if explicit_display:
-                cmd += ["-c", display]
-            cmd += ["-q", "gpus"]
-            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=3, env=env)
+            p = subprocess.run(["nvidia-settings", "-q", "gpus"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=3, env=env)
             last = (p.stdout or "").strip()
             if p.returncode == 0:
                 return True, last
@@ -3632,58 +3647,28 @@ def tail_text_file(path, max_lines=40):
         return ""
 
 
-def start_headless_x_direct(display=":99"):
-    display_num = str(display).lstrip(":") or "99"
-    log_file = "/var/log/club3090-headless-xorg.log"
-    config_file = "/etc/X11/club3090-headless-xorg.conf"
-    run_cmd(["systemctl", "stop", "club3090-headless-x.service"], timeout=10)
-    try:
-        subprocess.Popen(
-            [
-                "/usr/bin/Xorg",
-                f":{display_num}",
-                "-config", config_file,
-                "-noreset",
-                "-nolisten", "tcp",
-                "-ac",
-                "-novtswitch",
-                "-sharevts",
-                "+extension", "GLX",
-                "+extension", "RANDR",
-                "+extension", "RENDER",
-                "-logfile", log_file,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL,
-            close_fds=True,
-        )
-        return True, f"started direct Xorg on :{display_num}"
-    except Exception as e:
-        return False, str(e)
-
-
 def ensure_headless_x_running(explicit_display=True):
-    # Manual NVIDIA fan control needs an NVIDIA X control display. This service
-    # starts a private headless Xorg on :99 with CoolBits enabled and no TCP listener.
+    # Default fan control now follows the proven v2.13 headless-X flow: rely on
+    # DISPLAY=:99, use the private systemd-managed Xorg, and avoid explicit "-c"
+    # control-display overrides or direct Xorg fallback launches.
     if not nvidia_settings_available():
         return False, "nvidia-settings not found"
     display = os.environ.get("CLUB3090_FAN_DISPLAY", ":99")
-    ok, msg = wait_for_nvidia_display(display, timeout=1, explicit_display=explicit_display)
-    if ok:
-        return True, "headless X already ready"
     if shutil.which("systemctl"):
+        current_rc, _current_out = run_cmd(["systemctl", "is-active", "club3090-headless-x.service"], timeout=5)
+        ok, msg = wait_for_nvidia_display(display, timeout=1, explicit_display=explicit_display)
+        if ok and current_rc == 0:
+            return True, "headless X already ready"
+        # Ensure the default path always recreates its own X display rather than
+        # attaching to the legacy TEST FANS service.
+        run_cmd(["systemctl", "stop", "club3090-headless-x-v213.service"], timeout=10)
+        run_cmd(["systemctl", "stop", "club3090-headless-x.service"], timeout=10)
         rc, out = run_cmd(["systemctl", "start", "club3090-headless-x.service"], timeout=20)
         ok, msg = wait_for_nvidia_display(display, timeout=12, explicit_display=explicit_display)
         if ok:
             return True, "started club3090-headless-x.service"
-        direct_ok, direct_msg = start_headless_x_direct(display)
-        if direct_ok:
-            ok, msg = wait_for_nvidia_display(display, timeout=12, explicit_display=explicit_display)
-            if ok:
-                return True, f"started direct Xorg fallback after systemd path failed"
         xlog = tail_text_file("/var/log/club3090-headless-xorg.log", max_lines=60)
-        return False, f"headless X not ready after start rc={rc}: {out[-800:]} / {msg} / direct={direct_msg} / xlog={xlog[-2000:]}"
+        return False, f"headless X not ready after start rc={rc}: {out[-800:]} / {msg} / xlog={xlog[-2000:]}"
     return False, "systemctl unavailable; cannot start headless X"
 
 
@@ -3699,10 +3684,7 @@ def run_nvidia_settings(args, explicit_display=True):
     # Xorg is started with -ac by our private service, so no XAUTHORITY is needed.
     env.pop("XAUTHORITY", None)
     try:
-        cmd = ["nvidia-settings"]
-        if explicit_display:
-            cmd += ["-c", display]
-        p = subprocess.run(cmd + args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15, env=env)
+        p = subprocess.run(["nvidia-settings"] + args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15, env=env)
         return p.returncode, (p.stdout or "").strip()
     except Exception as e:
         return 999, str(e)
@@ -3912,16 +3894,7 @@ def set_gpu_fans(speed=None, auto=False, indices=None):
     # Headless fan control path: private Xorg :99 + nvidia-settings + CoolBits.
     results = []
     available_indices = gpu_indices()
-    if indices is None:
-        indices = list(available_indices)
-    else:
-        clean = []
-        for idx in indices:
-            try:
-                clean.append(int(idx))
-            except Exception:
-                pass
-        indices = [idx for idx in clean if idx in available_indices]
+    indices = normalize_gpu_target_indices(indices)
     if not indices:
         return ["no GPU targets selected"]
     fan_objects = discover_nvidia_fan_indices()
@@ -3940,7 +3913,7 @@ def set_gpu_fans(speed=None, auto=False, indices=None):
         return results
 
     if speed is None:
-        targets = fan_targets_from_temps()
+        targets = fan_targets_from_temps(indices)
         # Be deliberately aggressive: use the hottest-card target for all detected
         # fan controllers. This avoids ambiguous fan<->GPU mapping issues on dual
         # 3090 cards and matches the cooling priority.
@@ -4009,12 +3982,15 @@ def set_gpu_fans(speed=None, auto=False, indices=None):
     log_control("FANS set: " + " || ".join(results))
     return results
 
-def apply_fan_curve_once():
+def apply_fan_curve_once(indices=None):
     if fan_manual_override or not power_optimizations_enabled:
         return []
     if time.time() < fan_curve_pause_until:
         return [f"fan curve paused for {int(fan_curve_pause_until-time.time())}s"]
-    return set_gpu_fans(speed=None, auto=False)
+    target_indices = normalize_gpu_target_indices(indices if indices is not None else current_cooling_target_indices())
+    if not target_indices:
+        return ["no GPU targets selected for fan curve"]
+    return set_gpu_fans(speed=None, auto=False, indices=target_indices)
 
 def run_cmd(cmd, timeout=15):
     try:
@@ -4050,17 +4026,33 @@ def set_cpu_governor(governor):
     return results
 
 
-def apply_gpu_idle_power(skip_fans=False):
+def run_nvidia_smi_for_indices(commands, indices=None, timeout=20, max_tail=500):
+    targets = normalize_gpu_target_indices(indices)
+    if not targets:
+        return ["no GPU targets selected"]
+    results = []
+    for gpu_idx in targets:
+        for args in commands:
+            cmd = ["nvidia-smi", "-i", str(gpu_idx)] + list(args)
+            rc, out = run_cmd(cmd, timeout=timeout)
+            results.append(f"{' '.join(cmd)}: rc={rc} {out[-max_tail:]}")
+    return results
+
+
+def apply_gpu_idle_power(skip_fans=False, indices=None):
     if not power_optimizations_enabled:
         return ["power optimizations disabled"]
     results = []
     if not shutil.which("nvidia-smi"):
         return ["nvidia-smi not found"]
-    for cmd in (["nvidia-smi", "-pm", "1"], ["nvidia-smi", "-pl", str(GPU_IDLE_POWER_LIMIT_W)], ["nvidia-smi", "-lgc", GPU_IDLE_LOCK_CLOCKS]):
-        rc, out = run_cmd(cmd, timeout=20)
-        results.append(f"{' '.join(cmd)}: rc={rc} {out[-500:]}")
+    cmds = [["-pm", "1"], ["-pl", str(GPU_IDLE_POWER_LIMIT_W)]]
+    if GPU_IDLE_LOCK_CLOCKS:
+        cmds.append(["-lgc", GPU_IDLE_LOCK_CLOCKS])
+    else:
+        cmds.append(["-rgc"])
+    results.extend(run_nvidia_smi_for_indices(cmds, indices=indices, timeout=20, max_tail=500))
     if not skip_fans:
-        results += apply_fan_curve_once()
+        results += apply_fan_curve_once(indices=indices)
     with metrics_lock:
         power_state["gpu"] = "idle"
         power_state["last_action"] = "gpu_idle"
@@ -4069,20 +4061,18 @@ def apply_gpu_idle_power(skip_fans=False):
     return results
 
 
-def apply_gpu_active_power(skip_fans=False):
+def apply_gpu_active_power(skip_fans=False, indices=None):
     if not power_optimizations_enabled:
         return ["power optimizations disabled"]
     results = []
     if not shutil.which("nvidia-smi"):
         return ["nvidia-smi not found"]
-    cmds = [["nvidia-smi", "-pm", "1"], ["nvidia-smi", "-rgc"], ["nvidia-smi", "-pl", str(GPU_ACTIVE_POWER_LIMIT_W)]]
+    cmds = [["-pm", "1"], ["-rgc"], ["-pl", str(GPU_ACTIVE_POWER_LIMIT_W)]]
     if GPU_ACTIVE_LOCK_CLOCKS:
-        cmds.append(["nvidia-smi", "-lgc", GPU_ACTIVE_LOCK_CLOCKS])
-    for cmd in cmds:
-        rc, out = run_cmd(cmd, timeout=20)
-        results.append(f"{' '.join(cmd)}: rc={rc} {out[-500:]}")
+        cmds.append(["-lgc", GPU_ACTIVE_LOCK_CLOCKS])
+    results.extend(run_nvidia_smi_for_indices(cmds, indices=indices, timeout=20, max_tail=500))
     if not skip_fans:
-        results += apply_fan_curve_once()
+        results += apply_fan_curve_once(indices=indices)
     with metrics_lock:
         power_state["gpu"] = "active"
         power_state["last_action"] = "gpu_active"
@@ -4131,7 +4121,7 @@ def ensure_vllm_running_for_request(instance_id=None):
     with metrics_lock:
         last_inference_time = time.time()
     apply_cpu_active_power()
-    apply_gpu_active_power(skip_fans=True)
+    apply_gpu_active_power(skip_fans=True, indices=fan_target_gpu_indices(instance_id))
     target = get_instance(instance_id) if instance_id else primary_instance()
     if target is None:
         mode = active_mode()
@@ -4165,14 +4155,15 @@ def idle_watchdog():
             with metrics_lock:
                 idle_for = now - last_inference_time
                 active = metrics.get("active_requests", 0)
+            target_indices = current_cooling_target_indices()
             if active == 0 and idle_for >= POWER_IDLE_AFTER_SECONDS and not idle_power_applied:
                 apply_cpu_idle_power()
-                apply_gpu_idle_power()
+                apply_gpu_idle_power(indices=target_indices)
                 idle_power_applied = True
             if active == 0 and idle_for >= CONTAINER_STOP_AFTER_SECONDS and not container_stopped:
                 stop_vllm_container("idle_timeout")
                 apply_cpu_idle_power()
-                apply_gpu_idle_power()
+                apply_gpu_idle_power(indices=target_indices)
                 container_stopped = True
             if active > 0 or idle_for < POWER_IDLE_AFTER_SECONDS:
                 idle_power_applied = False
@@ -4181,23 +4172,21 @@ def idle_watchdog():
             if power_optimizations_enabled and not fan_manual_override:
                 # Refresh manual fan curve periodically even while idle; Linux/NVIDIA
                 # auto fan behavior can leave 3090 fans off until temps are too high.
-                apply_fan_curve_once()
+                apply_fan_curve_once(indices=target_indices)
         except Exception as e:
             log_control(f"POWER watchdog error: {e}")
         time.sleep(15)
 
 
 
-def reset_gpu_power_defaults():
+def reset_gpu_power_defaults(indices=None):
     results = []
     if not shutil.which("nvidia-smi"):
         return ["nvidia-smi not found"]
-    for cmd in (["nvidia-smi", "-rgc"], ["nvidia-smi", "-pm", "0"]):
-        rc, out = run_cmd(cmd, timeout=20)
-        results.append(f"{' '.join(cmd)}: rc={rc} {out[-700:]}")
+    results.extend(run_nvidia_smi_for_indices((["-rgc"], ["-pm", "0"]), indices=indices, timeout=20, max_tail=700))
     # Reset fans to automatic too; disabling optimizations should put the system
     # back under default NVIDIA control as much as Linux allows.
-    results += set_gpu_fans(auto=True)
+    results += set_gpu_fans(auto=True, indices=indices)
     with metrics_lock:
         power_state["gpu"] = "default"
         power_state["fans"] = "auto"
@@ -4207,16 +4196,35 @@ def reset_gpu_power_defaults():
     return results
 
 
-def set_power_optimizations(enabled):
-    global power_optimizations_enabled, fan_curve_pause_until
+def normalize_cooling_scope_instance_id(instance_id=None):
+    raw = str(instance_id or "").strip().upper()
+    if raw in ("", "GLOBAL"):
+        return "GLOBAL"
+    instance = get_instance(raw)
+    if instance:
+        return str(instance.get("id") or "GLOBAL").strip().upper()
+    parsed = parse_instance_identifier(raw)
+    if parsed:
+        return str(parsed.get("id") or "GLOBAL").strip().upper()
+    return "GLOBAL"
+
+
+def current_cooling_target_indices():
+    return fan_target_gpu_indices(cooling_scope_instance_id)
+
+
+def set_power_optimizations(enabled, instance_id=None):
+    global power_optimizations_enabled, fan_curve_pause_until, cooling_scope_instance_id
+    cooling_scope_instance_id = normalize_cooling_scope_instance_id(instance_id)
+    target_indices = current_cooling_target_indices()
     power_optimizations_enabled = bool(enabled)
     with metrics_lock:
         power_state["power_optimizations"] = "enabled" if power_optimizations_enabled else "disabled"
     if power_optimizations_enabled:
         fan_curve_pause_until = 0.0
-        return {"cpu": apply_cpu_active_power(), "gpu": apply_gpu_active_power(), "fans": apply_fan_curve_once()}
+        return {"cpu": apply_cpu_active_power(), "gpu": apply_gpu_active_power(indices=target_indices), "fans": apply_fan_curve_once(indices=target_indices)}
     fan_curve_pause_until = time.time() + 10**9
-    return {"cpu": set_cpu_governor("performance"), "gpu": reset_gpu_power_defaults()}
+    return {"cpu": set_cpu_governor("performance"), "gpu": reset_gpu_power_defaults(indices=target_indices)}
 
 
 def fan_target_gpu_indices(instance_id=None):
@@ -4225,11 +4233,11 @@ def fan_target_gpu_indices(instance_id=None):
         return gpu_indices()
     instance = get_instance(raw)
     if instance:
-        return [int(idx) for idx in (instance.get("gpu_indices") or [instance.get("gpu_index", 0)])]
+        return normalize_gpu_target_indices(instance.get("gpu_indices") or [instance.get("gpu_index", 0)])
     parsed = parse_instance_identifier(raw)
     if parsed:
-        return [int(idx) for idx in (parsed.get("gpu_indices") or [])]
-    return gpu_indices()
+        return normalize_gpu_target_indices(parsed.get("gpu_indices") or [])
+    return normalize_gpu_target_indices()
 
 def set_fan_max_toggle(enable, instance_id=None):
     global fan_manual_override, fan_curve_pause_until
@@ -4245,7 +4253,7 @@ def power_status():
     with metrics_lock:
         idle_for = int(time.time() - last_inference_time)
         fan_curve_text = ", ".join([f"<{temp}C={speed}%" for temp, speed in FAN_CURVE]) + ", >=65C=100%"
-        return {**power_state, "profile": current_profile, "idle_for_seconds": idle_for, "idle_power_after_seconds": POWER_IDLE_AFTER_SECONDS, "container_stop_after_seconds": CONTAINER_STOP_AFTER_SECONDS, "gpu_active_power_limit_w": GPU_ACTIVE_POWER_LIMIT_W, "gpu_idle_power_limit_w": GPU_IDLE_POWER_LIMIT_W, "gpu_idle_lock_clocks": GPU_IDLE_LOCK_CLOCKS, "cpu_active_governor": CPU_ACTIVE_GOVERNOR, "cpu_idle_governor": CPU_IDLE_GOVERNOR, "optimizations_enabled": power_optimizations_enabled, "fan_manual_override": fan_manual_override, "fan_curve": fan_curve_text, "fan_min_safe_speed": FAN_MIN_SAFE_SPEED}
+        return {**power_state, "profile": current_profile, "idle_for_seconds": idle_for, "idle_power_after_seconds": POWER_IDLE_AFTER_SECONDS, "container_stop_after_seconds": CONTAINER_STOP_AFTER_SECONDS, "gpu_active_power_limit_w": GPU_ACTIVE_POWER_LIMIT_W, "gpu_idle_power_limit_w": GPU_IDLE_POWER_LIMIT_W, "gpu_idle_lock_clocks": GPU_IDLE_LOCK_CLOCKS, "cpu_active_governor": CPU_ACTIVE_GOVERNOR, "cpu_idle_governor": CPU_IDLE_GOVERNOR, "optimizations_enabled": power_optimizations_enabled, "fan_manual_override": fan_manual_override, "fan_curve": fan_curve_text, "fan_min_safe_speed": FAN_MIN_SAFE_SPEED, "cooling_scope": cooling_scope_instance_id, "cooling_gpu_indices": current_cooling_target_indices()}
 
 def wait_for_port(port, timeout=20):
     deadline = time.time() + timeout
@@ -4784,17 +4792,18 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                 data = self.read_json_body()
                 action = data.get("action")
                 instance_id = data.get("instance_id")
+                target_indices = fan_target_gpu_indices(instance_id)
                 log_control(f"POWER action requested action={action} instance={instance_id}")
                 if action == "active":
-                    out = {"cpu": apply_cpu_active_power(), "gpu": apply_gpu_active_power()}
+                    out = {"cpu": apply_cpu_active_power(), "gpu": apply_gpu_active_power(indices=target_indices)}
                 elif action == "idle_clocks":
-                    out = {"cpu": apply_cpu_idle_power(), "gpu": apply_gpu_idle_power()}
+                    out = {"cpu": apply_cpu_idle_power(), "gpu": apply_gpu_idle_power(indices=target_indices)}
                 elif action == "stop_container":
                     if is_legacy_global_instance_id(instance_id):
                         rc, msg = stop_legacy_global_instance()
                     else:
                         rc, msg = stop_vllm_container("manual_admin", instance_id=instance_id)
-                    out = {"container_stop_rc": rc, "container_stop_output": msg, "cpu": apply_cpu_idle_power(), "gpu": apply_gpu_idle_power()}
+                    out = {"container_stop_rc": rc, "container_stop_output": msg, "cpu": apply_cpu_idle_power(), "gpu": apply_gpu_idle_power(indices=target_indices)}
                 elif action == "start_instance":
                     out = start_legacy_global_instance(wait=True) if is_legacy_global_instance_id(instance_id) else start_instance(instance_id, wait=True)
                 elif action == "restart_instance":
@@ -4813,9 +4822,9 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                         inst = update_instance(instance_id, enabled=enabled)
                         out = {"instance": instance_snapshot(inst)}
                 elif action == "disable_optimizations":
-                    out = set_power_optimizations(False)
+                    out = set_power_optimizations(False, instance_id=instance_id)
                 elif action == "enable_optimizations":
-                    out = set_power_optimizations(True)
+                    out = set_power_optimizations(True, instance_id=instance_id)
                 elif action == "fans_max":
                     out = {"fans": set_fan_max_toggle(True, instance_id=instance_id)}
                 elif action == "fans_auto":
@@ -5350,35 +5359,27 @@ set -euo pipefail
 CONFIG=/etc/X11/club3090-headless-xorg.conf
 DISPLAY_NUM="${CLUB3090_FAN_DISPLAY_NUM:-99}"
 LOGFILE=/var/log/club3090-headless-xorg.log
-HEADLESS_MODE="${CLUB3090_HEADLESS_X_MODE:-none}"
 
 mkdir -p /etc/X11 /var/log
 
-# Build a private NVIDIA X control display for fan control only.
-# Critical safety options:
-#   UseDisplayDevice=None  -> do not light up or take over physical monitors.
-#   -novtswitch/-sharevts  -> do not jump the user away from the active TTY.
-# This config is separate from the desktop X config.
+# Stable v2.13-era headless X helper used by the default fan-control path.
+# It keeps the proven "do not steal outputs" behavior that restored working
+# manual fan control on headless systems.
 if command -v nvidia-xconfig >/dev/null 2>&1; then
   nvidia-xconfig     --enable-all-gpus     --cool-bits=28     --allow-empty-initial-configuration     --use-display-device=None     --virtual=1280x720     --xconfig="${CONFIG}" >/tmp/club3090-nvidia-xconfig.log 2>&1 || true
 fi
 
-# Harden generated configs or create a minimal fallback. We intentionally add
-# UseDisplayDevice=None to every NVIDIA Device section to avoid grabbing real outputs.
 if [[ -s "${CONFIG}" ]]; then
   PY_PATCH_BIN="$(command -v python || command -v python3 || true)"
   if [[ -n "${PY_PATCH_BIN}" ]]; then
-    "${PY_PATCH_BIN}" - "${CONFIG}" "${HEADLESS_MODE}" <<'PYXCONF' || true
+    "${PY_PATCH_BIN}" - "${CONFIG}" <<'PYXCONF' || true
 import re, sys
 path = sys.argv[1]
-headless_mode = (sys.argv[2] if len(sys.argv) > 2 else "dfp").strip().lower()
 text = open(path, encoding='utf-8', errors='ignore').read()
-# Remove any generated ConnectedMonitor / UseDisplayDevice lines that could bind real outputs.
 text = re.sub(r'(?im)^\s*Option\s+"ConnectedMonitor".*
 ?', '', text)
 text = re.sub(r'(?im)^\s*Option\s+"UseDisplayDevice".*
 ?', '', text)
-# Add UseDisplayDevice None in every Device section using the nvidia driver.
 def patch(sec):
     if re.search(r'(?im)^\s*Driver\s+"nvidia"', sec):
         if 'AllowEmptyInitialConfiguration' not in sec:
@@ -5389,37 +5390,11 @@ def patch(sec):
             sec = sec.rstrip() + '
     Option "Coolbits" "28"
 '
-        if headless_mode == "dfp":
-            sec = sec.rstrip() + '
-    Option "ConnectedMonitor" "DFP"
-'
-        else:
-            sec = sec.rstrip() + '
+        sec = sec.rstrip() + '
     Option "UseDisplayDevice" "None"
 '
     return sec
 text = re.sub(r'(?is)Section\s+"Device".*?EndSection', lambda m: patch(m.group(0)), text)
-def patch_screen(sec):
-    if 'AllowEmptyInitialConfiguration' not in sec:
-        sec = sec.rstrip() + '
-    Option "AllowEmptyInitialConfiguration" "true"
-'
-    if headless_mode == "dfp":
-        sec = sec.rstrip() + '
-    Option "UseDisplayDevice" "DFP"
-'
-    else:
-        sec = sec.rstrip() + '
-    Option "UseDisplayDevice" "None"
-'
-    if not re.search(r'(?is)SubSection\s+"Display".*?Virtual\s+\d+\s+\d+.*?EndSubSection', sec):
-        sec = sec.rstrip() + '
-    SubSection "Display"
-        Virtual 1280 720
-    EndSubSection
-'
-    return sec
-text = re.sub(r'(?is)Section\s+"Screen".*?EndSection', lambda m: patch_screen(m.group(0)), text)
 open(path, 'w', encoding='utf-8').write(text)
 PYXCONF
   fi
@@ -5443,8 +5418,6 @@ EndSection
 Section "Screen"
     Identifier "Screen0"
     Device "Device0"
-    Option "AllowEmptyInitialConfiguration" "true"
-    Option "UseDisplayDevice" "None"
     SubSection "Display"
         Virtual 1280 720
     EndSubSection
