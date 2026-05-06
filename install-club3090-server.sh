@@ -1,7 +1,7 @@
 ﻿#!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="2026-05-06.v4.28"
+SCRIPT_VERSION="2026-05-06.v4.29"
 
 # club-3090 headless server/control installer
 # Install:
@@ -5383,8 +5383,8 @@ write_control_units() {
 [Unit]
 Description=club-3090 proxy and admin control panel
 ConditionKernelCommandLine=club3090.server=1
-After=club3090-vllm.service network-online.target
-Wants=club3090-vllm.service network-online.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -5440,8 +5440,8 @@ UNIT
 [Unit]
 Description=club-3090 console docker log follower
 ConditionKernelCommandLine=club3090.server=1
-After=club3090-vllm.service docker.service
-Wants=club3090-vllm.service
+After=docker.service
+Wants=docker.service
 
 [Service]
 Type=simple
@@ -5568,34 +5568,24 @@ configure_networking_and_frontend() {
   fi
 }
 
-restart_runtime_services_if_booted() {
+start_control_plane_services_if_booted() {
   if ! grep -q 'club3090.server=1' /proc/cmdline; then
     return 0
   fi
-  restart_unit_with_timeout club3090-control.service || true
+  start_unit_nonblocking club3090-control.service
   if [[ "${ONLINE_TLS_EFFECTIVE_ENABLED}" == "true" ]]; then
-    restart_unit_with_timeout club3090-caddy.service || true
+    start_unit_nonblocking club3090-caddy.service
   fi
-  restart_unit_with_timeout club3090-console-log.service || true
+  start_unit_nonblocking club3090-console-log.service
 }
 
-restart_unit_with_timeout() {
+start_unit_nonblocking() {
   local unit="$1"
-  local timeout_seconds="${2:-20}"
-  local rc=0
-  if command -v timeout >/dev/null 2>&1; then
-    "${SUDO[@]}" timeout "${timeout_seconds}"s systemctl restart "${unit}" || rc=$?
-  else
-    "${SUDO[@]}" systemctl restart "${unit}" || rc=$?
-  fi
-  if [[ "${rc}" == "124" ]]; then
-    echo "WARN: timed out restarting ${unit} after ${timeout_seconds}s; continuing" >&2
-    if "${SUDO[@]}" systemctl --help 2>/dev/null | grep -q -- '--no-block'; then
-      "${SUDO[@]}" systemctl restart --no-block "${unit}" >/dev/null 2>&1 || true
-    fi
+  if "${SUDO[@]}" systemctl --help 2>/dev/null | grep -q -- '--no-block'; then
+    "${SUDO[@]}" systemctl start --no-block "${unit}" >/dev/null 2>&1 || true
     return 0
   fi
-  return "${rc}"
+  "${SUDO[@]}" systemctl start "${unit}" >/dev/null 2>&1 || true
 }
 
 if [[ "${ACTION}" == "install" ]]; then
@@ -5609,8 +5599,8 @@ if [[ "${ACTION}" == "install" ]]; then
   enable_managed_units
   log_step "Configuring networking and frontend exposure"
   configure_networking_and_frontend
-  log_step "Restarting runtime-facing services when server boot mode is active"
-  restart_runtime_services_if_booted
+  log_step "Starting control-plane services when server boot mode is active"
+  start_control_plane_services_if_booted
   log_done "Install actions completed"
 
   echo
@@ -5629,8 +5619,8 @@ else
   enable_managed_units
   log_step "Refreshing networking and frontend exposure"
   configure_networking_and_frontend
-  log_step "Restarting control-plane services if the server boot flag is active"
-  restart_runtime_services_if_booted
+  log_step "Starting control-plane services if the server boot flag is active"
+  start_control_plane_services_if_booted
   log_done "Update actions completed"
   echo
   echo "Updated club-3090 multi-instance control plane, proxy, metrics UI, console log follower, and boot unit."
