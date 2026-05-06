@@ -1,7 +1,7 @@
 ﻿#!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="2026-05-05.v4.23"
+SCRIPT_VERSION="2026-05-05.v4.23.1"
 
 # club-3090 headless server/control installer
 # Install:
@@ -5475,4 +5475,3 @@ echo "Version:   ${SCRIPT_VERSION}"
 echo "Online:    $([[ "${ONLINE_EFFECTIVE_ENABLED}" == "true" ]] && echo enabled || echo disabled)"
 echo "HTTPS:     $([[ "${ONLINE_TLS_EFFECTIVE_ENABLED}" == "true" ]] && echo enabled || echo disabled)"
 echo "Preset path styles supported: ${URL_SCHEME}://SERVER:${PROXY_PORT}/v1/<preset>/chat/completions, ${URL_SCHEME}://SERVER:${PROXY_PORT}/<preset>/v1/chat/completions, and per-GPU prefixes like ${URL_SCHEME}://SERVER:${PROXY_PORT}/GPU0/v1/<preset>/chat/completions"
-
