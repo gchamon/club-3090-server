@@ -1,7 +1,7 @@
 ﻿#!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="2026-05-06.v4.36"
+SCRIPT_VERSION="2026-05-06.v4.38"
 
 # club-3090 headless server/control installer
 # Install:
@@ -3621,6 +3621,46 @@ def wait_for_nvidia_display(display=":99", timeout=10, explicit_display=True):
     return False, last
 
 
+def tail_text_file(path, max_lines=40):
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+        return "".join(lines[-max_lines:]).strip()
+    except Exception:
+        return ""
+
+
+def start_headless_x_direct(display=":99"):
+    display_num = str(display).lstrip(":") or "99"
+    log_file = "/var/log/club3090-headless-xorg.log"
+    config_file = "/etc/X11/club3090-headless-xorg.conf"
+    run_cmd(["systemctl", "stop", "club3090-headless-x.service"], timeout=10)
+    try:
+        subprocess.Popen(
+            [
+                "/usr/bin/Xorg",
+                f":{display_num}",
+                "-config", config_file,
+                "-noreset",
+                "-nolisten", "tcp",
+                "-ac",
+                "-novtswitch",
+                "-sharevts",
+                "+extension", "GLX",
+                "+extension", "RANDR",
+                "+extension", "RENDER",
+                "-logfile", log_file,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            close_fds=True,
+        )
+        return True, f"started direct Xorg on :{display_num}"
+    except Exception as e:
+        return False, str(e)
+
+
 def ensure_headless_x_running(explicit_display=True):
     # Manual NVIDIA fan control needs an NVIDIA X control display. This service
     # starts a private headless Xorg on :99 with CoolBits enabled and no TCP listener.
@@ -3635,7 +3675,13 @@ def ensure_headless_x_running(explicit_display=True):
         ok, msg = wait_for_nvidia_display(display, timeout=12, explicit_display=explicit_display)
         if ok:
             return True, "started club3090-headless-x.service"
-        return False, f"headless X not ready after start rc={rc}: {out[-800:]} / {msg}"
+        direct_ok, direct_msg = start_headless_x_direct(display)
+        if direct_ok:
+            ok, msg = wait_for_nvidia_display(display, timeout=12, explicit_display=explicit_display)
+            if ok:
+                return True, f"started direct Xorg fallback after systemd path failed"
+        xlog = tail_text_file("/var/log/club3090-headless-xorg.log", max_lines=60)
+        return False, f"headless X not ready after start rc={rc}: {out[-800:]} / {msg} / direct={direct_msg} / xlog={xlog[-2000:]}"
     return False, "systemctl unavailable; cannot start headless X"
 
 
@@ -5244,6 +5290,7 @@ set -euo pipefail
 CONFIG=/etc/X11/club3090-headless-xorg.conf
 DISPLAY_NUM="${CLUB3090_FAN_DISPLAY_NUM:-99}"
 LOGFILE=/var/log/club3090-headless-xorg.log
+HEADLESS_MODE="${CLUB3090_HEADLESS_X_MODE:-none}"
 
 mkdir -p /etc/X11 /var/log
 
@@ -5261,9 +5308,10 @@ fi
 if [[ -s "${CONFIG}" ]]; then
   PY_PATCH_BIN="$(command -v python || command -v python3 || true)"
   if [[ -n "${PY_PATCH_BIN}" ]]; then
-    "${PY_PATCH_BIN}" - "${CONFIG}" <<'PYXCONF' || true
+    "${PY_PATCH_BIN}" - "${CONFIG}" "${HEADLESS_MODE}" <<'PYXCONF' || true
 import re, sys
 path = sys.argv[1]
+headless_mode = (sys.argv[2] if len(sys.argv) > 2 else "dfp").strip().lower()
 text = open(path, encoding='utf-8', errors='ignore').read()
 # Remove any generated ConnectedMonitor / UseDisplayDevice lines that could bind real outputs.
 text = re.sub(r'(?im)^\s*Option\s+"ConnectedMonitor".*
@@ -5281,11 +5329,37 @@ def patch(sec):
             sec = sec.rstrip() + '
     Option "Coolbits" "28"
 '
-        sec = sec.rstrip() + '
+        if headless_mode == "dfp":
+            sec = sec.rstrip() + '
+    Option "ConnectedMonitor" "DFP"
+'
+        else:
+            sec = sec.rstrip() + '
     Option "UseDisplayDevice" "None"
 '
     return sec
 text = re.sub(r'(?is)Section\s+"Device".*?EndSection', lambda m: patch(m.group(0)), text)
+def patch_screen(sec):
+    if 'AllowEmptyInitialConfiguration' not in sec:
+        sec = sec.rstrip() + '
+    Option "AllowEmptyInitialConfiguration" "true"
+'
+    if headless_mode == "dfp":
+        sec = sec.rstrip() + '
+    Option "UseDisplayDevice" "DFP"
+'
+    else:
+        sec = sec.rstrip() + '
+    Option "UseDisplayDevice" "None"
+'
+    if not re.search(r'(?is)SubSection\s+"Display".*?Virtual\s+\d+\s+\d+.*?EndSubSection', sec):
+        sec = sec.rstrip() + '
+    SubSection "Display"
+        Virtual 1280 720
+    EndSubSection
+'
+    return sec
+text = re.sub(r'(?is)Section\s+"Screen".*?EndSection', lambda m: patch_screen(m.group(0)), text)
 open(path, 'w', encoding='utf-8').write(text)
 PYXCONF
   fi
@@ -5309,6 +5383,8 @@ EndSection
 Section "Screen"
     Identifier "Screen0"
     Device "Device0"
+    Option "AllowEmptyInitialConfiguration" "true"
+    Option "UseDisplayDevice" "None"
     SubSection "Display"
         Virtual 1280 720
     EndSubSection
