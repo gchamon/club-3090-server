@@ -1,7 +1,7 @@
 ﻿#!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="2026-05-06.v4.30"
+SCRIPT_VERSION="2026-05-06.v4.31"
 
 # club-3090 headless server/control installer
 # Install:
@@ -5576,7 +5576,6 @@ configure_networking_and_frontend() {
   if [[ "${ONLINE_EFFECTIVE_ENABLED}" == "true" ]]; then
     configure_online_exposure
   else
-    close_tracked_online_exposure
     close_runtime_exposure
   fi
 }
