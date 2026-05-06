@@ -1,7 +1,7 @@
 ﻿#!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="2026-05-06.v4.29"
+SCRIPT_VERSION="2026-05-06.v4.30"
 
 # club-3090 headless server/control installer
 # Install:
@@ -5090,9 +5090,18 @@ class ProxyHandler(CommonMixin, BaseHTTPRequestHandler):
             total_tokens = max(int(response_usage.get("tokens") or 0), int(response_usage.get("input_tokens") or 0) + int(response_usage.get("output_tokens") or 0))
             log_control(f"REQ user={(auth_context.get('user_name') or 'anonymous')} instance={target_id} status={status} latency={latency}s preset={preset_name or 'raw'} path={self.path} upstream={upstream_path} input_tokens={int(response_usage.get('input_tokens') or 0)} output_tokens={int(response_usage.get('output_tokens') or 0)} total_tokens={total_tokens} tool_calls={int(response_usage.get('tool_calls') or 0)}")
 
-def serve(port, handler, bind="0.0.0.0"):
+def build_server(port, handler, bind="0.0.0.0"):
     server = ThreadingHTTPServer((bind, port), handler)
     server.daemon_threads = True
+    return server
+
+def serve(server, label="server"):
+    sock = None
+    try:
+        sock = server.socket.getsockname()
+    except Exception:
+        sock = ("?", "?")
+    log_control(f"{label} listening on {sock[0]}:{sock[1]}")
     server.serve_forever()
 
 def main():
@@ -5116,10 +5125,14 @@ def main():
     threading.Thread(target=idle_watchdog, daemon=True).start()
     threading.Thread(target=metrics_collector, daemon=True).start()
     cfg = read_server_config()
-    threading.Thread(target=serve, args=(ADMIN_BIND_PORT, AdminHandler, ADMIN_BIND_HOST), daemon=True).start()
+    admin_server = build_server(ADMIN_BIND_PORT, AdminHandler, ADMIN_BIND_HOST)
     if cfg.get("local_api_enabled", False):
-        threading.Thread(target=serve, args=(int(cfg.get("local_api_port", LOCAL_API_PORT)), LocalApiHandler, "127.0.0.1"), daemon=True).start()
-    serve(PROXY_BIND_PORT, ProxyHandler, PROXY_BIND_HOST)
+        local_api_port = int(cfg.get("local_api_port", LOCAL_API_PORT))
+        local_api_server = build_server(local_api_port, LocalApiHandler, "127.0.0.1")
+        threading.Thread(target=serve, args=(local_api_server, "local-api"), daemon=True).start()
+    proxy_server = build_server(PROXY_BIND_PORT, ProxyHandler, PROXY_BIND_HOST)
+    threading.Thread(target=serve, args=(proxy_server, "proxy"), daemon=True).start()
+    serve(admin_server, "admin")
 
 if __name__ == "__main__":
     main()
