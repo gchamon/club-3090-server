@@ -1,7 +1,7 @@
 ﻿#!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="2026-05-06.v4.41"
+SCRIPT_VERSION="2026-05-06.v4.42"
 
 # club-3090 headless server/control installer
 # Install:
@@ -916,6 +916,11 @@ LOG_BOOTSTRAP_MARKER = os.environ.get("CLUB3090_LOG_BOOTSTRAP_MARKER", "Applicat
 LOG_TAIL_MAX_BYTES = int(os.environ.get("CLUB3090_LOG_TAIL_MAX_BYTES", "102400"))
 runtime_log_watchers = {}
 runtime_log_watchers_lock = threading.Lock()
+latest_gpu_rows = []
+latest_system_snapshot = {"memory": {}, "cpu": {"cores": []}, "disks": [], "network": {}, "info": {}}
+latest_metrics_collected_at = 0.0
+disk_stats_cache = {"value": [], "time": 0.0}
+system_info_cache = {"value": {}, "time": 0.0}
 
 POWER_IDLE_AFTER_SECONDS = int(os.environ.get("CLUB3090_POWER_IDLE_AFTER_SECONDS", "600"))
 CONTAINER_STOP_AFTER_SECONDS = int(os.environ.get("CLUB3090_CONTAINER_STOP_AFTER_SECONDS", "3600"))
@@ -943,6 +948,7 @@ fan_manual_override = False
 fan_curve_pause_until = 0.0
 power_state = {"gpu":"unknown", "cpu":"unknown", "container":"running", "fans":"auto", "power_optimizations":"enabled", "last_action":"startup", "last_error":""}
 cooling_scope_instance_id = "GLOBAL"
+fan_curve_resume_token = 0
 
 def log_control(message):
     os.makedirs(CONTROL_DIR, exist_ok=True)
@@ -3326,7 +3332,7 @@ def disk_stats():
     return rows[:128]
 
 
-def system_info():
+def system_info(gpu_rows=None):
     def read_first(path):
         try:
             return open(path, 'r', encoding='utf-8', errors='ignore').read().strip()
@@ -3352,7 +3358,8 @@ def system_info():
         pass
     gpu_names=[]
     try:
-        gpu_names=[g.get('name') for g in gpu_stats() if isinstance(g,dict) and g.get('name')]
+        source_rows = gpu_rows if gpu_rows is not None else gpu_stats()
+        gpu_names=[g.get('name') for g in source_rows if isinstance(g,dict) and g.get('name')]
     except Exception:
         pass
     return {
@@ -3444,8 +3451,32 @@ def network_stats():
     return {'local_ip':local_ip(),'public_ip':public_ip(),'rx_kbps':round(total_rx,1),'tx_kbps':round(total_tx,1),'interfaces':ifaces}
 
 
-def system_stats():
-    return {'memory':memory_stats(),'cpu':cpu_stats(),'disks':disk_stats(),'network':network_stats(),'info':system_info()}
+def cached_disk_stats(max_age=15):
+    now = time.time()
+    cached = disk_stats_cache
+    if cached.get("value") and now - float(cached.get("time", 0) or 0) < max(1.0, float(max_age or 15)):
+        return cached.get("value") or []
+    value = disk_stats()
+    disk_stats_cache["value"] = value
+    disk_stats_cache["time"] = now
+    return value
+
+
+def cached_system_info(gpu_rows=None, max_age=30):
+    now = time.time()
+    cached = system_info_cache
+    cached_value = cached.get("value") if isinstance(cached.get("value"), dict) else {}
+    gpu_names = ", ".join([g.get("name") for g in (gpu_rows or []) if isinstance(g, dict) and g.get("name")])
+    if cached_value and now - float(cached.get("time", 0) or 0) < max(1.0, float(max_age or 30)):
+        return {**cached_value, "gpus": gpu_names or cached_value.get("gpus", "unknown")}
+    value = system_info(gpu_rows=gpu_rows)
+    system_info_cache["value"] = value
+    system_info_cache["time"] = now
+    return value
+
+
+def system_stats(gpu_rows=None):
+    return {'memory':memory_stats(),'cpu':cpu_stats(),'disks':cached_disk_stats(),'network':network_stats(),'info':cached_system_info(gpu_rows)}
 
 def estimate_tokens_from_stream_bytes(raw):
     text = raw.decode("utf-8", errors="ignore") if isinstance(raw, (bytes, bytearray)) else str(raw)
@@ -3466,7 +3497,8 @@ def estimate_tokens_from_stream_bytes(raw):
     return max(0, int(chars / 4)) if chars else (max(1, len(text)//4) if text else 0)
 
 def build_series_point():
-    gpus = gpu_stats(); sysinfo = system_stats()
+    global latest_gpu_rows, latest_system_snapshot, latest_metrics_collected_at
+    gpus = gpu_stats(); sysinfo = system_stats(gpu_rows=gpus)
     util=[]; mem=[]; temps=[]; watts=[]; gpu_points=[]
     for g in gpus:
         if "error" in g: continue
@@ -3479,6 +3511,9 @@ def build_series_point():
     with metrics_lock:
         point={"t":int(time.time()),"gpu_util":round(sum(util)/len(util),1) if util else 0,"mem_pct":round(sum(mem)/len(mem),1) if mem else 0,"temp_c":round(max(temps),1) if temps else 0,"power_w":round(sum(watts),1) if watts else 0,"ram_pct":round(ram_pct,1),"cpu_pct":round(cpu_pct,1),"disk_pct":round(disk_pct,1),"system_util_pct":round((cpu_pct+ram_pct+(sum(util)/len(util) if util else 0))/3,1),"net_rx_kbps":round(rx_kbps,1),"net_tx_kbps":round(tx_kbps,1),"gpus":gpu_points,"cpu_cores":(sysinfo.get('cpu') or {}).get('cores',[]),"active_requests":metrics.get("active_requests",0),"latency_s":metrics.get("last_latency_s") or 0,"ttft_s":metrics.get("last_ttft_s") or 0,"tps":metrics.get("last_tokens_per_second") or 0}
         series_points.append(point)
+        latest_gpu_rows = gpus
+        latest_system_snapshot = sysinfo
+        latest_metrics_collected_at = time.time()
     return point
 
 def metrics_collector():
@@ -3487,7 +3522,21 @@ def metrics_collector():
             build_series_point()
         except Exception as e:
             log_control(f"metrics collector error: {e}")
-        time.sleep(3)
+        time.sleep(1)
+
+
+def get_latest_runtime_snapshot(force_refresh=False):
+    with metrics_lock:
+        gpus = latest_gpu_rows
+        system = latest_system_snapshot
+        collected_at = latest_metrics_collected_at
+    if force_refresh or not collected_at:
+        build_series_point()
+        with metrics_lock:
+            gpus = latest_gpu_rows
+            system = latest_system_snapshot
+            collected_at = latest_metrics_collected_at
+    return gpus, system, collected_at
 
 def wake_on_lan(mac=None, broadcast=None):
     mac = (mac or WOL_MAC or "").replace("-", ":").strip()
@@ -4285,16 +4334,43 @@ def reset_gpu_power_defaults():
     return results
 
 
+def cancel_pending_fan_curve_resume():
+    global fan_curve_resume_token
+    fan_curve_resume_token += 1
+    return fan_curve_resume_token
+
+
+def schedule_fan_curve_resume(indices=None, delay=1.0):
+    target_indices = [int(idx) for idx in (indices or [])]
+    token = cancel_pending_fan_curve_resume()
+    def worker():
+        global fan_curve_pause_until
+        time.sleep(max(0.0, float(delay or 0.0)))
+        if token != fan_curve_resume_token:
+            return
+        if fan_manual_override or not power_optimizations_enabled:
+            return
+        fan_curve_pause_until = 0.0
+        resume_targets = target_indices or fan_target_gpu_indices(cooling_scope_instance_id)
+        if not resume_targets:
+            log_control("FANS auto-resume skipped: no GPU targets selected")
+            return
+        results = set_gpu_fans(speed=None, auto=False, indices=resume_targets)
+        log_control("FANS auto-resume: " + " || ".join(results))
+    threading.Thread(target=worker, name="club3090-fan-resume", daemon=True).start()
+
+
 def set_power_optimizations(enabled, instance_id=None):
     global power_optimizations_enabled, fan_curve_pause_until, cooling_scope_instance_id
     if instance_id is not None:
         cooling_scope_instance_id = str(instance_id or "GLOBAL").strip().upper() or "GLOBAL"
+    cancel_pending_fan_curve_resume()
     power_optimizations_enabled = bool(enabled)
     with metrics_lock:
         power_state["power_optimizations"] = "enabled" if power_optimizations_enabled else "disabled"
     if power_optimizations_enabled:
         fan_curve_pause_until = 0.0
-        return {"cpu": apply_cpu_active_power(), "gpu": apply_gpu_active_power(), "fans": apply_fan_curve_once()}
+        return {"cpu": apply_cpu_active_power(), "gpu": apply_gpu_active_power(skip_fans=True), "fans": apply_fan_curve_once()}
     fan_curve_pause_until = time.time() + 10**9
     return {"cpu": set_cpu_governor("performance"), "gpu": reset_gpu_power_defaults()}
 
@@ -4312,14 +4388,22 @@ def fan_target_gpu_indices(instance_id=None):
     return gpu_indices()
 
 def set_fan_max_toggle(enable, instance_id=None):
-    global fan_manual_override, fan_curve_pause_until
+    global fan_manual_override, fan_curve_pause_until, cooling_scope_instance_id
+    if instance_id is not None:
+        cooling_scope_instance_id = str(instance_id or "GLOBAL").strip().upper() or "GLOBAL"
     target_indices = fan_target_gpu_indices(instance_id)
+    cancel_pending_fan_curve_resume()
     fan_manual_override = bool(enable)
     if fan_manual_override:
         fan_curve_pause_until = 0.0
         return set_gpu_fans(speed=FAN_MAX_SPEED, auto=False, indices=target_indices)
-    fan_curve_pause_until = time.time() + 300
-    return set_gpu_fans(auto=True, indices=target_indices)
+    fan_curve_pause_until = time.time() + (1 if power_optimizations_enabled else 0)
+    results = set_gpu_fans(auto=True, indices=target_indices)
+    if power_optimizations_enabled:
+        schedule_fan_curve_resume(indices=target_indices, delay=1.0)
+    else:
+        fan_curve_pause_until = 0.0
+    return results
 
 def power_status():
     with metrics_lock:
@@ -4657,6 +4741,11 @@ setShowGlobalLogs=async function(v){showGlobalLogs=!!v;applyLogVisibility();queu
 function activeTabButton(name){return [...document.querySelectorAll('.tab')].find(btn=>(btn.getAttribute('onclick')||'').includes(`'${name}'`)||btn.id===`${name}TabBtn`)||null}
 function hydrateUiState(cfg){if(uiStateHydrated)return;const cached=readCachedUiState(),state={...cached,...(cfg||{})};activeTabName=normalizeTabName(state.active_tab||activeTabName);currentLogSource=state.current_log_source==='audit'?'audit':'docker';showGlobalLogs=typeof state.show_global_logs==='boolean'?state.show_global_logs:showGlobalLogs;const ids=new Set(scopeItems().map(x=>x.id));const candidate=state.selected_scope||selectedScope||'GLOBAL';selectedScope=candidate==='GLOBAL'?'GLOBAL':(ids.has(candidate)?candidate:(singleScopeItems()[0]?.id||pairScopeItems()[0]?.id||'GLOBAL'));if(selectedScope!=='GLOBAL')selectedInstance=selectedScope;uiStateHydrated=true}
 legacyGlobalPair=function(){return(lastStatus&&lastStatus.legacy_global_instance)||null}
+let powerCoolingBusyState={active:false,message:''};
+function syncPowerCoolingBusyState(){const panel=findPanelByHeading('system','Power + Cooling');if(!panel)return;panel.classList.toggle('instance-panel-busy',!!powerCoolingBusyState.active);[...panel.querySelectorAll('button,input,select,textarea')].forEach(el=>{if(powerCoolingBusyState.active)el.setAttribute('disabled','disabled');else el.removeAttribute('disabled')})}
+function setPowerCoolingBusy(active,message=''){powerCoolingBusyState={active:!!active,message:message||''};syncPowerCoolingBusyState()}
+async function withPowerCoolingBusy(message,fn){setPowerCoolingBusy(true,message);try{return await fn()}finally{setPowerCoolingBusy(false)}}
+function redrawMetricsSoon(){if(!lastStatus)return;renderMetrics(lastStatus);requestAnimationFrame(()=>{if(lastStatus)renderMetrics(lastStatus)})}
 function syncInstancesBusyState(){const panel=findPanelByHeading('system','Instances');if(!panel)return;panel.classList.toggle('instance-panel-busy',!!instanceBusyState.active);[...panel.querySelectorAll('button,input,select,textarea')].forEach(el=>{if(instanceBusyState.active)el.setAttribute('disabled','disabled');else if(el.id!=='gpuPairingEnabled'||gpuCount()>=2)el.removeAttribute('disabled')});const note=$('pairingBusyNote');if(note){const msg=instanceBusyState.message||(gpuCount()===2?'Keep disabled if you want Global to keep behaving like the shared two-GPU runtime.':'Enable this to manage arbitrary dual-GPU pair groups.');note.innerHTML=instanceBusyState.active?`<span class="spinner" aria-hidden="true"></span>${msg}`:msg}}
 function setInstancesBusy(active,message=''){instanceBusyState={active:!!active,message:message||''};syncInstancesBusyState()}
 ensureAccessPolicyCard=function(){const card=findPanelByHeading('system','Access Policy');if(!card)return;if(card.dataset.v414Policy!=='1'){card.dataset.v414Policy='1';card.innerHTML=`<h2>Access Policy</h2><div class="actions" id="accessPolicyRow"><label class="label"><input type="checkbox" id="auditAllowAnonymousProxy" onchange="mirrorAuthToggles(this.checked)"> allow requests without per-user API keys</label><button class="btn blue" onclick="saveAuthSettings()">Save Policy</button></div><div class="value smallgap" style="margin-top:10px" id="auditPolicyText">-</div>`}}
@@ -4665,7 +4754,7 @@ ensureMachineButtons=function(){const systemCard=findPanelByHeading('system','Sy
 allPairChoices=function(){const count=gpuCount(),pairs=[];for(let a=0;a<count;a+=1){for(let b=a+1;b<count;b+=1)pairs.push([a,b])}return pairs}
 function ensurePairingToggle(){const panel=findPanelByHeading('system','Instances');if(!panel)return;let row=$('pairingToggleRow');if(!row){row=document.createElement('div');row.id='pairingToggleRow';row.className='actions';const tabs=$('instanceTabs');if(tabs&&tabs.parentNode===panel)tabs.insertAdjacentElement('beforebegin',row)}const count=gpuCount();const enabled=pairingEnabled();const busy=!!instanceBusyState.active;const hint=busy?(instanceBusyState.message||'Applying GPU pairing setting...'):(count===2?'Keep disabled if you want Global to keep behaving like the shared two-GPU runtime.':'Enable this to manage arbitrary dual-GPU pair groups.');row.innerHTML=`<label class="label"><input type="checkbox" id="gpuPairingEnabled" ${enabled?'checked':''} ${count<2||busy?'disabled':''} onchange="saveGpuPairingSetting(this.checked)"> Enable GPU Pairing</label><span class="label busy-note" id="pairingBusyNote">${busy?`<span class="spinner" aria-hidden="true"></span>${hint}`:hint}</span>`}
 ensurePairManager=function(){const panel=findPanelByHeading('system','Instances');if(!panel)return;let bar=$('pairManagerBar');if(!bar){bar=document.createElement('div');bar.id='pairManagerBar';bar.className='actions';const summary=$('instanceSummary');if(summary&&summary.parentNode===panel)summary.insertAdjacentElement('afterend',bar)}if(!pairingEnabled()||gpuCount()<2){bar.innerHTML='';return}const pair=currentScopeInstance(true);const showDelete=!!pair&&pair.kind==='dual';const existing=new Set(pairScopeItems().map(x=>x.id));const quickAdds=allPairChoices().filter(([a,b])=>!existing.has(canonicalPairId(a,b))).map(([a,b])=>`<button class="btn blue" onclick="createPairGroup(${a},${b})">Add Pair ${a}+${b}</button>`).join('');bar.style.margin='8px 0 10px';bar.innerHTML=`${quickAdds||''}<button class="btn purple" onclick="createPairGroup()">Custom Pair Group</button>${showDelete?`<button class="btn red" onclick="deleteCurrentPairGroup()">Delete ${scopeLabel(pair)}</button>`:''}`}
-ensureV414Layout=function(){ensureV413Layout();ensureUsersUi();ensureGroupUi();ensureAccessPolicyCard();ensureAuditOverviewCard();ensureMachineButtons();ensurePairingToggle();ensurePairManager();syncInstancesBusyState()}
+ensureV414Layout=function(){ensureV413Layout();ensureUsersUi();ensureGroupUi();ensureAccessPolicyCard();ensureAuditOverviewCard();ensureMachineButtons();ensurePairingToggle();ensurePairManager();syncInstancesBusyState();syncPowerCoolingBusyState()}
 const logCache = Object.create(null);let statusRefreshPromise = null;let logConnectToken = 0;
 function renderLogSourcePanel(){if($('logSourceDocker'))$('logSourceDocker').classList.toggle('active',currentLogSource==='docker');if($('logSourceAudit'))$('logSourceAudit').classList.toggle('active',currentLogSource==='audit');if(!$('logsSourceSummary'))return;if(currentLogSource==='audit'){$('logsSourceSummary').innerHTML='Audit logs selected. The shared live log viewer follows <code>/opt/club3090-control/audit.log</code>.';return}$('logsSourceSummary').innerHTML=scopeIsGlobal()&&legacyGlobalDualScope()?'Docker logs selected. The shared live log viewer follows the active global dual runtime.':'Docker logs selected. The shared live log viewer follows the currently selected GPU instance.'}
 currentLogHeading=function(){return currentLogSource==='audit'?(activeTabName==='logs'?'Audit Logs - Full View':'Audit Logs'):(activeTabName==='logs'?'Docker Logs - Full View':'Docker Logs')}
@@ -4686,12 +4775,18 @@ setCurrentLogSource=function(source){currentLogSource=source==='audit'?'audit':'
 setShowGlobalLogs=async function(v){showGlobalLogs=!!v;applyLogVisibility();queueUiStateSave({show_global_logs:showGlobalLogs});connectLogs(false)}
 setScope=function(scope,reconnect=true){const ids=new Set(scopeItems().map(x=>x.id));selectedScope=scope==='GLOBAL'?'GLOBAL':(ids.has(scope)?scope:(singleScopeItems()[0]?.id||pairScopeItems()[0]?.id||'GLOBAL'));if(selectedScope!=='GLOBAL')selectedInstance=selectedScope;renderInstances(getInstanceList());renderPresetScopeTabs();updateScopedCards();applyLogVisibility();queueUiStateSave();if(reconnect)connectLogs(true)}
 post=async function(path,obj,label=''){const requestLabel=label||`${path} ${JSON.stringify(obj||{})}`;syntheticLog(`request sent: ${requestLabel}`);try{const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj||{})});const text=await r.text();let payload=null;try{payload=JSON.parse(text)}catch(e){}if(!r.ok||(payload&&payload.ok===false))throw new Error((payload&&payload.error)||text||`${path} failed`);syntheticLog(`request finished: ${requestLabel}`);appendLog(`----- admin result -----\n${adminResultText(payload,text)}\n------------------------`);refreshStatus().catch(()=>{});return payload||text}catch(e){syntheticLog(`request failed: ${requestLabel} | ${e.message||e}`);appendLog(`----- admin error -----\n${e.message||e}\n-----------------------`);refreshStatus().catch(()=>{});throw e}}
+draw=function(id,data,key,label,color){const c=$(id);if(!c)return;const host=c.parentElement;const cssW=Math.max(c.clientWidth,(host&&host.clientWidth)||0,320);const cssH=Math.max(c.clientHeight,(host&&host.clientHeight)||0,145);const dpr=devicePixelRatio||1,w=c.width=cssW*dpr,h=c.height=cssH*dpr;const ctx=c.getContext('2d');ctx.clearRect(0,0,w,h);ctx.fillStyle=color||'#9dafc3';ctx.font=`${11*dpr}px system-ui`;ctx.fillText(label,8*dpr,14*dpr);if(!data.length)return;const vals=data.map(x=>Number(x[key]||0)),max=Math.max(1,...vals)*1.1;ctx.strokeStyle=color;ctx.lineWidth=2*dpr;ctx.beginPath();vals.forEach((v,i)=>{const x=(i/(vals.length-1||1))*w,y=h-(v/max)*(h-24*dpr)-4*dpr;i?ctx.lineTo(x,y):ctx.moveTo(x,y)});ctx.stroke();ctx.fillStyle='#e8eef7';ctx.fillText(String(vals[vals.length-1]||0),Math.max(8*dpr,w-72*dpr),14*dpr)}
+const baseRenderMetrics=renderMetrics;renderMetrics=function(j){baseRenderMetrics(j);const s=j.series||[];const holder=$('gpuMetricCharts');if(holder&&j.gpus){const cats=[{key:'util',suffix:'Util',label:'util %',color:'#72c7ff'},{key:'mem_pct',suffix:'Mem',label:'VRAM %',color:'#2fc46b'},{key:'temp',suffix:'Temp',label:'core temp °C',color:'#ffde59'},{key:'power',suffix:'Power',label:'power W',color:'#ff5b6c'},{key:'fan',suffix:'Fan',label:'fan %',color:'#a855f7'}];holder.innerHTML=cats.map(cat=>j.gpus.map(g=>`<div class="chart"><canvas id="cGpu${g.index}${cat.suffix}"></canvas></div>`).join('')).join('');cats.forEach(cat=>j.gpus.forEach(g=>drawGpuSeries(`cGpu${g.index}${cat.suffix}`,s,g.index,cat.key,`GPU${g.index} ${cat.label}`,cat.color)))}}
+metricTab=function(e,n){document.querySelectorAll('.metricpane').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.subtab').forEach(x=>x.classList.remove('active'));const pane=$(n);if(pane)pane.classList.add('active');if(e&&e.target)e.target.classList.add('active');redrawMetricsSoon();refreshStatus().catch(()=>{})}
+togglePowerOptimizations=async function(){const enable=$('optToggle')&&$('optToggle').textContent.includes('Enable');const instanceId=scopeIsGlobal()?'GLOBAL':(currentScopeInstance(false)&&currentScopeInstance(false).id)||null;try{await withPowerCoolingBusy(enable?'Applying power optimizations...':'Disabling power optimizations...',()=>post('/admin/power',{action:enable?'enable_optimizations':'disable_optimizations',instance_id:instanceId},`/admin/power ${enable?'enable_optimizations':'disable_optimizations'}`))}catch(e){alert(e)}}
+toggleFansMax=async function(){const reset=$('fanToggle')&&$('fanToggle').textContent.includes('Reset');const cur=currentScopeInstance(false);const instanceId=scopeIsGlobal()?'GLOBAL':(cur&&cur.id)||null;try{await withPowerCoolingBusy(reset?'Resetting fans to default...':'Setting fans to max...',()=>post('/admin/power',{action:reset?'fans_auto':'fans_max',instance_id:instanceId},`/admin/power ${reset?'fans_auto':'fans_max'} ${instanceId||'host'}`))}catch(e){alert(e)}}
+testFansLegacy=async function(){const cur=currentScopeInstance(false);const instanceId=scopeIsGlobal()?'GLOBAL':(cur&&cur.id)||null;try{await withPowerCoolingBusy('Running legacy fan test...',()=>post('/admin/power',{action:'fans_test_legacy',instance_id:instanceId},`/admin/power fans_test_legacy ${instanceId||'host'}`))}catch(e){alert(e)}}
 function syncActiveTabDisplay(){document.querySelectorAll('.tabpane').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));const pane=$(activeTabName);if(pane)pane.classList.add('active');const btn=activeTabButton(activeTabName);if(btn)btn.classList.add('active');applyLogVisibility()}
-function activateTab(name,firstRender=false){activeTabName=normalizeTabName(name);syncActiveTabDisplay();if(activeTabName==='logs'||showGlobalLogs||firstRender)connectLogs(false);queueUiStateSave();setTimeout(()=>{if(!searchState.active&&$('autoscroll').checked&&$('log'))$('log').scrollTop=$('log').scrollHeight},0)}
+function activateTab(name,firstRender=false){activeTabName=normalizeTabName(name);syncActiveTabDisplay();if(activeTabName==='logs'||showGlobalLogs||firstRender)connectLogs(false);if(activeTabName==='metrics'){redrawMetricsSoon();refreshStatus().catch(()=>{})}queueUiStateSave();setTimeout(()=>{if(!searchState.active&&$('autoscroll').checked&&$('log'))$('log').scrollTop=$('log').scrollHeight},0)}
 tab=function(e,n){activateTab(n,false)}
 refreshStatus=async function(){if(statusRefreshPromise)return statusRefreshPromise;statusRefreshPromise=(async()=>{try{ensureV414Layout();const r=await fetch('/admin/status',{cache:'no-store'});if(!r.ok)throw new Error(`status fetch failed (${r.status})`);const j=await r.json();const metrics=j.metrics||{},power=j.power||{};lastStatus=j;hydrateUiState(j.ui_config||{});if($('showGlobalLogs'))$('showGlobalLogs').checked=!!showGlobalLogs;$('summary').textContent=`${j.active_mode} | ${j.container||'no container'} | ${power.profile||'balanced'} | GPUs ${j.gpu_count??0}`;$('mode').textContent=`${j.active_mode} / ${j.active_port}`;$('container').textContent=j.container||'none';$('services').textContent=`vLLM=${j.vllm_service}, control=${j.control_service}, console=${j.console_service}`;$('req').textContent=`total=${metrics.total_requests??0}, active=${metrics.active_requests??0}, fail=${metrics.failed_requests??0}, queue=${metrics.queued_requests??0}`;$('last').textContent=`${metrics.last_status||'-'} latency=${metrics.last_latency_s??'-'}s ttft=${metrics.last_ttft_s??'-'}s tps=${metrics.last_tokens_per_second??'-'}`;$('uptime').textContent=fmtUptime(j.uptime_seconds);renderGpuCards(j.gpus);$('powerbox').textContent=`profile=${power.profile||'-'}, GPU=${power.gpu||'-'}, CPU=${power.cpu||'-'}, fans=${power.fans||'-'}, container=${power.container||'-'}, idle=${power.idle_for_seconds??0}s`;$('optToggle').textContent=power.optimizations_enabled?'Disable Power Optimizations':'Enable Power Optimizations';$('fanToggle').textContent=power.fan_manual_override?'Reset Fans to Default':'Set Fans to Max';renderMetrics(j);renderPresetCatalog(j.presets);renderUsers(j.users||[]);renderGroups(j.groups||[]);renderAudit(j.server_config||{});renderInstances(j.instances||[]);renderPresetScopeTabs();updateScopedCards();syncActiveTabDisplay();if(activeTabName==='logs'||showGlobalLogs)connectLogs(false);setMsg('')}catch(e){setMsg('Status error: '+e)}finally{statusRefreshPromise=null}})();return statusRefreshPromise}
 function clearLegacyPollers(){const marker=window.setInterval(()=>{},60000);window.clearInterval(marker);for(let id=1;id<marker;id+=1)window.clearInterval(id)}
-function bootAdminUi(){clearLegacyPollers();ensureV414Layout();resetUserForm(true);resetGroupForm(true);if(!selectedScope)selectedScope=singleScopeItems()[0]?.id||pairScopeItems()[0]?.id||'GLOBAL';setScope(selectedScope,false);refreshStatus().catch(()=>{});if(statusPollTimer)clearInterval(statusPollTimer);statusPollTimer=setInterval(()=>{refreshStatus()},2000);window.addEventListener('beforeunload',()=>{if(logEs){try{logEs.close()}catch(e){}}})}
+function bootAdminUi(){clearLegacyPollers();ensureV414Layout();resetUserForm(true);resetGroupForm(true);if(!selectedScope)selectedScope=singleScopeItems()[0]?.id||pairScopeItems()[0]?.id||'GLOBAL';setScope(selectedScope,false);refreshStatus().catch(()=>{});if(statusPollTimer)clearInterval(statusPollTimer);statusPollTimer=setInterval(()=>{refreshStatus()},1000);window.addEventListener('beforeunload',()=>{if(logEs){try{logEs.close()}catch(e){}}})}
 bootAdminUi()
 </script></body></html>
 """
@@ -4761,7 +4856,8 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             cfg = read_server_config()
             dual_rows = running_dual_instance_snapshots()
             legacy_dual_mode = detect_legacy_dual_mode()
-            self.send_json({"active_mode":active_mode(),"active_port":ap,"container":current_container(),"club3090_dir":CLUB3090_DIR,"script_version":SCRIPT_VERSION,"uptime_seconds":int(time.time()-startup_time),"vllm_service":service_status("club3090-vllm.service"),"control_service":service_status("club3090-control.service"),"caddy_service":service_status("club3090-caddy.service") if cfg.get("https_enabled", False) else "disabled","console_service":service_status("club3090-console-log.service"),"metrics":m,"recent_requests":list(recent_requests),"gpus":gpu_stats(),"power":power_status(),"system":system_stats(),"series":list(series_points),"ui_config":read_ui_config(),"presets":preset_catalog(),"gpu_count":detect_gpu_count_runtime(),"instances":instances_snapshot(),"legacy_global_instance":legacy_global_instance_snapshot(),"single_gpu_modes":list(SINGLE_GPU_MODES),"dual_gpu_modes":list(DUAL_GPU_MODES),"running_dual_mode":(dual_rows[0]["mode"] if dual_rows else legacy_dual_mode),"running_dual_gpu_indices":(dual_rows[0]["gpu_indices"] if dual_rows else ([0, 1] if legacy_dual_mode else [])),"running_dual_instances":dual_rows,"users":list_users_public(),"groups":list_groups_public(),"server_config":cfg,"local_api":{"enabled":cfg.get("local_api_enabled", False),"port":cfg.get("local_api_port", LOCAL_API_PORT)},"admin_port":ADMIN_PORT,"proxy_port":PROXY_PORT})
+            gpus_snapshot, system_snapshot, _ = get_latest_runtime_snapshot()
+            self.send_json({"active_mode":active_mode(),"active_port":ap,"container":current_container(),"club3090_dir":CLUB3090_DIR,"script_version":SCRIPT_VERSION,"uptime_seconds":int(time.time()-startup_time),"vllm_service":service_status("club3090-vllm.service"),"control_service":service_status("club3090-control.service"),"caddy_service":service_status("club3090-caddy.service") if cfg.get("https_enabled", False) else "disabled","console_service":service_status("club3090-console-log.service"),"metrics":m,"recent_requests":list(recent_requests),"gpus":gpus_snapshot,"power":power_status(),"system":system_snapshot,"series":list(series_points),"ui_config":read_ui_config(),"presets":preset_catalog(),"gpu_count":detect_gpu_count_runtime(),"instances":instances_snapshot(),"legacy_global_instance":legacy_global_instance_snapshot(),"single_gpu_modes":list(SINGLE_GPU_MODES),"dual_gpu_modes":list(DUAL_GPU_MODES),"running_dual_mode":(dual_rows[0]["mode"] if dual_rows else legacy_dual_mode),"running_dual_gpu_indices":(dual_rows[0]["gpu_indices"] if dual_rows else ([0, 1] if legacy_dual_mode else [])),"running_dual_instances":dual_rows,"users":list_users_public(),"groups":list_groups_public(),"server_config":cfg,"local_api":{"enabled":cfg.get("local_api_enabled", False),"port":cfg.get("local_api_port", LOCAL_API_PORT)},"admin_port":ADMIN_PORT,"proxy_port":PROXY_PORT})
             return
         if path == "/admin/logs":
             self.close_connection = False
@@ -5049,12 +5145,11 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             instance, container = resolve_runtime_log_container(requested)
             if not container:
                 try:
-                    if not waiting_sent or last_container:
-                        self.send_sse_event("reset", {"text": "no running club-3090 runtime container found; waiting...\n"})
+                    if not waiting_sent:
+                        text = f"\n[log stream] {last_container} is no longer running; waiting for the next runtime container...\n" if last_container else "no running club-3090 runtime container found; waiting...\n"
+                        self.send_sse_event("append", {"text": text})
                         waiting_sent = True
                         last_container = ""
-                        client_generation = -1
-                        client_seq = 0
                     else:
                         self.send_sse_comment()
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
@@ -5402,6 +5497,10 @@ def main():
         write_active_mode(DEFAULT_MODE)
     read_instances_config()
     log_control("control service starting")
+    try:
+        build_series_point()
+    except Exception as e:
+        log_control(f"initial metrics snapshot error: {e}")
     threading.Thread(target=idle_watchdog, daemon=True).start()
     threading.Thread(target=metrics_collector, daemon=True).start()
     cfg = read_server_config()
