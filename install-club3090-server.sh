@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="2026-05-07.v4.49"
+SCRIPT_VERSION="2026-05-07.v4.50"
 
 # club-3090 headless server/control installer
 # Install:
@@ -4100,21 +4100,25 @@ def wait_for_nvidia_display(display=":99", timeout=10):
 
 
 def ensure_headless_x_running():
-    # Canonical manual fan-control path: keep a single private headless Xorg
-    # service for NVIDIA control on DISPLAY=:99 and drive all fan actions through it.
+    # Canonical working manual fan-control path: a private headless Xorg on :99
+    # plus nvidia-settings using DISPLAY only.
     if not nvidia_settings_available():
         return False, "nvidia-settings not found"
     display = os.environ.get("CLUB3090_FAN_DISPLAY", ":99")
-    ok, msg = wait_for_nvidia_display(display, timeout=1)
-    if ok:
-        return True, "headless X already ready"
     if shutil.which("systemctl"):
+        service_rc, _service_out = run_cmd(["systemctl", "is-active", "club3090-headless-x.service"], timeout=5)
+        ok, msg = wait_for_nvidia_display(display, timeout=1)
+        if ok and service_rc == 0:
+            return True, "headless X already ready"
         run_cmd(["systemctl", "stop", "club3090-headless-x.service"], timeout=10)
         rc, out = run_cmd(["systemctl", "start", "club3090-headless-x.service"], timeout=20)
         ok, msg = wait_for_nvidia_display(display, timeout=12)
         if ok:
             return True, "started club3090-headless-x.service"
         return False, f"headless X not ready after start rc={rc}: {out[-800:]} / {msg}"
+    ok, msg = wait_for_nvidia_display(display, timeout=1)
+    if ok:
+        return True, "headless X already ready"
     return False, "systemctl unavailable; cannot start headless X"
 
 
@@ -4235,7 +4239,7 @@ def verify_manual_fan_target(target_gpu_indices, target_speed, timeout=3.0):
 
 
 def set_gpu_fans(speed=None, auto=False, indices=None):
-    # Canonical scoped fan-control path using the private headless-X / nvidia-settings flow.
+    # Canonical scoped fan-control path using the working private headless-X / nvidia-settings flow.
     results = []
     available_indices = gpu_indices()
     if indices is None:
@@ -4760,8 +4764,3756 @@ def parse_instance_path(path):
         return instance_id, trimmed
     return None, path
 
-HTML = r"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>club-3090 Control</title><style>:root{color-scheme:dark;--bg:#0b0f14;--panel:#121923;--line:#273243;--text:#e8eef7;--muted:#9dafc3;--blue:#72c7ff;--green:#2fc46b;--red:#ff5b6c;--amber:#ffcb6b;--orange:#ff8a2a;--field:#081018;--cyan:#7dd3fc;--turquoise:#26d6c6}*{box-sizing:border-box}body,html{min-height:100%;margin:0}body{font-family:system-ui,-apple-system,Segoe UI,Arial,sans-serif;background:var(--bg);color:var(--text);overflow-y:auto;overflow-x:hidden}header{position:sticky;top:0;z-index:10;padding:10px 12px;background:#111925f7;backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}.top{display:flex;justify-content:space-between;align-items:center;gap:8px}.brand{font-size:18px;font-weight:800}.pill{color:var(--muted);font-size:12px;border:1px solid var(--line);border-radius:999px;padding:4px 8px;background:#0a1119;margin-top:4px}.subtabs,.tabs{display:flex;gap:6px;overflow-x:auto}.tabs{padding-top:10px}.subtabs{margin-bottom:10px}.btn,.subtab,.tab{border:1px solid #34445a;background:#1b2635;color:#eef4ff;border-radius:10px;padding:9px 11px;font-size:13px;cursor:pointer;white-space:nowrap}.subtab.active,.tab.active{background:#203149;border-color:#3d6fa3}.btn:disabled{opacity:.5;cursor:not-allowed}.green{background:#113d25;border-color:#2c8a54}.turquoise{background:#079c9c;border-color:#4df5e8;color:#041316}.red{background:#4a1118;border-color:#8a2b35}.amber{background:#4a3511;border-color:#8a652b}.orange{background:#c45512;border-color:#ffae42;color:#fff}.blue{background:#12314d;border-color:#2a72a8}.purple{background:#4b1f75;border-color:#9460df;color:#fff}.default-profile{background:#1d5f96;border-color:#78c7ff;color:#fff}.container{display:flex;flex-direction:column;gap:10px;padding:10px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:12px;box-shadow:0 8px 30px #0004;margin-bottom:10px}.panel h2{font-size:14px;margin:0 0 10px}.chartgrid+.panel{margin-top:10px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.stat{background:#0b1119;border:1px solid #222d3c;border-radius:10px;padding:8px}.label{color:var(--muted);font-size:11px}label.label{display:inline-flex;align-items:center;gap:8px}label.label input[type=checkbox]{margin:0;flex:0 0 auto}.value{font-weight:700;font-size:13px;overflow-wrap:anywhere}.value-subline{display:block;margin-top:4px;color:var(--muted);font-size:12px;font-weight:600;line-height:1.35}.actions{display:flex;gap:7px;flex-wrap:wrap}.hidden{display:none!important}.tabpane{display:none}.tabpane.active{display:block}.metricpane{display:none}.metricpane.active{display:block}.logs{min-height:0;display:flex;flex-direction:column;margin-bottom:0}.loghead{display:flex;justify-content:space-between;align-items:center;padding-bottom:7px;gap:10px}.logheadchecks{display:flex;align-items:center;gap:12px;white-space:nowrap}.log{width:100%;height:clamp(360px,calc(100dvh - 430px),560px);min-height:320px;resize:vertical;white-space:pre-wrap;overflow-wrap:anywhere;background:#030608;color:#a5ffa5;border:1px solid #26313f;border-radius:12px;padding:12px;font-family:Consolas,monospace;font-size:12px;line-height:1.35}.log-card-hidden{display:none!important}.logs-tab .container{min-height:calc(100dvh - 108px)}.logs-tab .logs.panel{height:calc(100dvh - 252px);min-height:500px;margin-bottom:0}.logs-tab .log{height:auto;min-height:0;flex:1;resize:none}.logs-tab .content-tab{display:none!important}.logtools{display:none}.audit-tab .logtools,.logs-tab .logtools{display:block;margin-bottom:10px}.logtools h2{display:block;margin:0 0 10px}.logtools .searchbox{display:flex}.searchbox{display:flex;align-items:center;gap:6px;flex-wrap:nowrap;width:100%}.searchbox input{flex:1 1 auto;min-width:80px;background:var(--field);color:var(--text);border:1px solid #2c3a4f;border-radius:9px;padding:9px}.chartgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.gpu-chartgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.chart{height:145px;background:#081018;border:1px solid #213044;border-radius:12px;padding:8px}.chart.tall{height:220px}canvas{width:100%;height:100%}.msg{color:var(--amber);font-size:12px;min-height:18px;padding-top:6px}.smallgap{margin-bottom:5px}#auditSummary{margin-top:10px}.gpu-cards{display:grid;grid-template-columns:1fr;gap:10px}.gpu-card{background:#101722;border:1px solid #26313f;border-radius:14px;padding:12px}.gpu-title{font-weight:800;color:#d9ecff;margin-bottom:10px;border-bottom:1px solid #26313f;padding-bottom:7px}.gpu-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.gpu-section-title{color:#9dafc3;font-size:12px;text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px}.gpu-line{display:flex;justify-content:space-between;gap:8px;font-size:13px;padding:2px 0}.meter{height:7px;background:#081018;border-radius:99px;overflow:hidden;margin-top:5px}.meter span{display:block;height:100%;background:#2fc46b}.coregrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(90px,1fr));gap:6px}.storage-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px}.storage-section{display:flex;flex-direction:column;gap:10px}.storage-card.user-facing{background:#10243a;border-color:#2a72a8}.storage-card{background:#0b1119;border:1px solid #243144;border-radius:12px;padding:10px;min-width:0}.storage-title{font-weight:800;color:#d9ecff;margin-bottom:6px;overflow-wrap:anywhere}.storage-meta{color:#9dafc3;font-size:12px;margin-bottom:6px;overflow-wrap:anywhere}.storage-sizes{display:grid;grid-template-columns:minmax(85px,0.8fr) minmax(85px,0.8fr) minmax(95px,0.9fr);gap:6px;margin-bottom:8px}.storage-sizes .stat{padding:6px}.diskbar{height:8px;background:#081018;border-radius:99px;overflow:hidden;width:100%;margin-bottom:3px;margin-top:3px}.diskbar span{display:block;height:100%;background:#72c7ff}.netgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px}.temp-blue{color:#60a5fa}.temp-green{color:#2fc46b}.temp-yellow{color:#ffde59}.temp-orange{color:#ff8a2a}.temp-red{color:#ff5b6c}.temp-crimson{color:#dc143c;font-weight:900}.machine-row{margin-top:7px}.api-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:8px}.api-card{background:#0b1119;border:1px solid #243144;border-radius:12px;padding:10px}.api-card h3{font-size:13px;margin:0 0 6px;color:#d9ecff}.api-card p{margin:0;color:var(--muted);font-size:12px;line-height:1.35}.api-card-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.preset-actions{display:flex;gap:4px}.iconbtn{border:1px solid #34445a;background:#182231;color:#eef4ff;border-radius:8px;padding:5px 7px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px}.iconbtn svg{width:16px;height:16px;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}.preset-editor{display:none}.preset-editor.open{display:block}.formgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}.formgrid label{display:flex;flex-direction:column;gap:4px;color:var(--muted);font-size:12px}.formgrid input,.formgrid select{background:var(--field);color:var(--text);border:1px solid #2c3a4f;border-radius:9px;padding:8px}.preset-help{color:var(--muted);font-size:12px;line-height:1.35;margin-bottom:10px}.profile-balanced{background:#0faeb0;border-color:#5ff5e8;color:#031516}.panel-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:10px}.panel-head h2{margin:0}.add-preset-btn{width:30px;height:30px;border-radius:999px;border:1px solid #55ee91;background:#128a45;color:#fff;display:inline-flex;align-items:center;justify-content:center;padding:0;box-shadow:none}.add-preset-btn:hover{background:#18a957}.add-preset-btn svg{width:15px;height:15px;stroke:#fff;stroke-width:3;stroke-linecap:round}.preset-form-actions{display:flex;justify-content:center;gap:18px;margin-top:14px}.preset-intro{color:var(--muted);font-size:13px;line-height:1.45;margin:4px 0 2px}.preset-intro.hidden{display:none}.scope-strip{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:0 0 10px}.scope-strip .subtabs{margin:0}.club-modal{position:fixed;inset:0;background:rgba(2,7,14,.82);display:flex;align-items:center;justify-content:center;padding:16px;z-index:1000}.club-modal-card{width:min(720px,100%);background:#101824;border:1px solid #31455f;border-radius:14px;box-shadow:0 20px 70px rgba(0,0,0,.45);padding:14px}.modal-keybox{width:100%;min-height:120px;resize:vertical;border:1px solid #31455f;border-radius:10px;background:#07101a;color:#d9ecff;padding:10px;font:600 13px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace}.busy-note{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:12px;line-height:1.35}.spinner{width:12px;height:12px;border:2px solid #34445a;border-top-color:var(--blue);border-radius:999px;animation:.8s linear infinite club3090-spin;flex:0 0 auto}.instance-panel-busy{border-color:#35506d}.instance-panel-busy .actions,.instance-panel-busy .subtabs,.instance-panel-busy .value{opacity:.82}@keyframes club3090-spin{to{transform:rotate(360deg)}}@media (max-width:900px){.chartgrid{grid-template-columns:1fr}.gpu-chartgrid{grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.grid{grid-template-columns:1fr 1fr}.gpu-grid{grid-template-columns:1fr}.log{height:clamp(320px,calc(100dvh - 410px),520px)}.logs-tab .logs.panel{height:calc(100dvh - 250px);min-height:500px}.logs-tab .log{height:auto;min-height:0}}</style></head><body><header><div class="top"><div><div class="brand">club-3090 Control &bull; __SCRIPT_VERSION__</div><div class="pill" id="summary">loading...</div></div></div><div class="tabs"><button class="tab active" onclick="tab(event, 'overview')">Main</button><button class="tab" onclick="tab(event, 'system')">System</button><button class="tab" onclick="tab(event, 'presets')">Presets</button><button class="tab" id="usersTabBtn" onclick="tab(event, 'users')">Users</button><button class="tab" onclick="tab(event, 'metrics')">Metrics</button><button class="tab" onclick="tab(event, 'logs')">Logs</button></div></header><main class="container"><section id="overview" class="tabpane content-tab active"><div class="panel"><h2>Status</h2><div class="grid"><div class="stat"><div class="label">Mode</div><div class="value" id="mode">-</div></div><div class="stat"><div class="label">Container</div><div class="value" id="container">-</div></div><div class="stat"><div class="label">Requests</div><div class="value" id="req">-</div></div><div class="stat"><div class="label">Uptime</div><div class="value" id="uptime">-</div></div><div class="stat"><div class="label">Power</div><div class="value" id="powerbox">-</div></div><div class="stat"><div class="label">Last</div><div class="value" id="last">-</div></div></div><div class="msg" id="msg"></div></div><div id="gpuCards" class="gpu-cards"></div></section><section id="system" class="tabpane content-tab"><div class="panel"><h2>Services</h2><div class="value" id="services">-</div></div><div class="panel"><h2>Audit Overview</h2><div class="grid"><div class="stat"><div class="label">Admin UI</div><div class="value" id="auditAdminEndpoint">-</div></div><div class="stat"><div class="label">Proxy</div><div class="value" id="auditProxyEndpoint">-</div></div><div class="stat"><div class="label">Exposure</div><div class="value" id="auditExposure">-</div></div><div class="stat"><div class="label">Local Automation</div><div class="value" id="auditLocalApi">-</div></div></div><div class="value smallgap" id="auditSummary">-</div><div class="msg" id="auditMsg"></div></div><div class="panel"><h2>Access Policy</h2><div class="actions" id="accessPolicyRow"><label class="label"><input type="checkbox" id="auditAllowAnonymousProxy" onchange="mirrorAuthToggles(this.checked)"> allow requests without per-user API keys</label><button class="btn blue" onclick="saveAuthSettings()">Save Policy</button></div><div class="value smallgap" style="margin-top: 10px" id="auditPolicyText">-</div></div><div class="panel"><h2>Instances</h2><div class="subtabs" id="instanceTabs"></div><div class="value smallgap" id="instanceSummary">-</div><div class="actions"><button class="btn blue" onclick="instanceAction('start_instance')">Start</button><button class="btn amber" onclick="instanceAction('restart_instance')">Restart</button><button class="btn red" onclick="instanceAction('stop_container')">Stop</button><button class="btn green" id="instanceEnableBtn" onclick="toggleInstanceEnabled()">Disable Boot Autostart</button></div><div class="msg" id="instanceMsg"></div></div><div class="panel"><h2>System</h2><div class="actions"><button class="btn amber" onclick="wol()">Wake-on-LAN</button></div><div class="actions machine-row"><button class="btn red" onclick="machineAction('reboot')">Restart Machine</button><button class="btn red" onclick="machineAction('shutdown')">Shutdown Machine</button></div></div><div class="panel"><h2>Profiles</h2><div class="actions"><button class="btn green" onclick="profile('eco')">Eco</button><button class="btn profile-balanced" onclick="profile('balanced')">Balanced</button><button class="btn default-profile" onclick="profile('default')">Default</button><button class="btn orange" onclick="profile('turbo')">Turbo</button></div></div><div class="panel"><h2>Power + Cooling</h2><div class="actions"><button class="btn green" id="optToggle" onclick="togglePowerOptimizations()">Disable Power Optimizations</button><button class="btn green" id="fanToggle" onclick="toggleFansMax()">Set Fans to Max</button></div></div></section><section id="presets" class="tabpane content-tab"><div class="panel"><h2>Per-Instance Docker Presets</h2><div class="preset-help">Assign a single-card preset to the currently selected GPU instance. Each instance gets its own GPU binding, docker override, port, and proxy prefix such as <code>:8009/GPU0/</code>.</div><div class="actions"><button class="btn blue" onclick="switchMode('vllm/default')">default</button><button class="btn blue" onclick="switchMode('vllm/long-vision')">long-vision</button><button class="btn blue" onclick="switchMode('vllm/long-text')">long-text</button><button class="btn blue" onclick="switchMode('vllm/bounded-thinking')">bounded-thinking</button><button class="btn blue" onclick="switchMode('vllm/tools-text')">tools-text</button><button class="btn blue" onclick="switchMode('vllm/minimal')">minimal</button><button class="btn blue" onclick="switchMode('llamacpp/default')">llamacpp-default</button><button class="btn blue" onclick="switchMode('llamacpp/concurrent')">llamacpp-concurrent</button></div></div><div class="panel"><h2>API Presets</h2><div class="preset-help">Default presets are locked. Custom presets are exposed as <code>:8009/v1/&lt;name&gt;</code> and <code>:8009/&lt;name&gt;</code>. Both forms work with <code>short-</code> and <code>concise-</code> prefixes.</div><div id="apiPresetGrid" class="api-grid"></div></div><div class="panel"><div class="panel-head"><h2>Custom Preset Templates</h2><button class="add-preset-btn" title="Create preset" aria-label="Create preset" onclick="openPresetEditor()"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none"/></svg></button></div><div id="presetIntro" class="preset-intro">Create custom endpoint templates for different workloads or clients. Each preset saves generation parameters like temperature, sampling, thinking mode, penalties, and token limits, then exposes them as custom OpenAI-compatible endpoints such as <code>:8009/v1/my_preset</code> and <code>:8009/my_preset</code>. Short and concise prefixes work with custom presets too.</div><div id="presetEditor" class="preset-editor"><div class="formgrid"><label>Endpoint name<input id="presetName" placeholder="my_coding"></label><label>Description<input id="presetDescription" placeholder="What this preset is for"></label><label>Temperature<input id="presetTemperature" type="number" step="0.01" placeholder="0.7"></label><label>Top P<input id="presetTopP" type="number" step="0.01" placeholder="0.95"></label><label>Top K<input id="presetTopK" type="number" step="1" placeholder="20"></label><label>Min P<input id="presetMinP" type="number" step="0.01" placeholder="0"></label><label>Thinking<select id="presetThinking"><option value="false">Disabled</option><option value="true">Enabled</option></select></label><label>Preserve Thinking<select id="presetPreserveThinking"><option value="false">No</option><option value="true">Yes</option></select></label><label>Repetition penalty<input id="presetRepetitionPenalty" type="number" step="0.01" placeholder="1.0"></label><label>Presence penalty<input id="presetPresencePenalty" type="number" step="0.01" placeholder="0"></label><label>Frequency penalty<input id="presetFrequencyPenalty" type="number" step="0.01" placeholder="0"></label><label>Max context / prompt tokens<input id="presetMaxCtx" type="number" step="1" placeholder="truncate_prompt_tokens"></label><label>Max reply tokens<input id="presetMaxTokens" type="number" step="1" placeholder="max_tokens"></label><label>Seed<input id="presetSeed" type="number" step="1" placeholder="optional"></label><label>Min reply tokens<input id="presetMinTokens" type="number" step="1" placeholder="min_tokens"></label><label>Logprobs<input id="presetLogprobs" type="number" step="1" placeholder="optional"></label><label>Top logprobs<input id="presetTopLogprobs" type="number" step="1" placeholder="optional"></label><label>Length penalty<input id="presetLengthPenalty" type="number" step="0.01" placeholder="optional"></label><label>Ignore EOS<select id="presetIgnoreEos"><option value="">Default</option><option value="false">No</option><option value="true">Yes</option></select></label><label>Skip special tokens<select id="presetSkipSpecial"><option value="">Default</option><option value="true">Yes</option><option value="false">No</option></select></label><label>Include stop text<select id="presetIncludeStop"><option value="">Default</option><option value="false">No</option><option value="true">Yes</option></select></label><label>Stop strings<input id="presetStop" placeholder="one per line or comma-separated"></label></div><div class="preset-form-actions"><button id="presetSaveBtn" class="btn green" onclick="savePresetFromForm()">💾 Save</button><button class="btn red" onclick="closePresetEditor()">❌ Cancel</button></div></div></div></section><section id="users" class="tabpane content-tab"></section><section id="metrics" class="tabpane content-tab"><div class="panel"><h2>Metrics</h2><div class="subtabs"><button class="subtab active" onclick="metricTab(event, 'mMain')">Main</button><button class="subtab" onclick="metricTab(event, 'mGpu')">GPUs</button><button class="subtab" onclick="metricTab(event, 'mRam')">RAM</button><button class="subtab" onclick="metricTab(event, 'mCpu')">CPU</button><button class="subtab" onclick="metricTab(event, 'mSystem')">System</button><button class="subtab" onclick="metricTab(event, 'mNetwork')">Network</button></div><div id="mMain" class="metricpane active"><div class="chartgrid"><div class="chart"><canvas id="cGpu"></canvas></div><div class="chart"><canvas id="cMem"></canvas></div><div class="chart"><canvas id="cLatency"></canvas></div><div class="chart"><canvas id="cTps"></canvas></div></div></div><div id="mGpu" class="metricpane"><div id="gpuMetricCharts" class="gpu-chartgrid"></div></div><div id="mRam" class="metricpane"><div id="ramInfo" class="value smallgap"></div><div class="chartgrid"><div class="chart tall"><canvas id="cRam"></canvas></div></div></div><div id="mCpu" class="metricpane"><div class="chartgrid"><div class="chart"><canvas id="cCpu"></canvas></div></div><div id="cpuCores" class="coregrid"></div></div><div id="mSystem" class="metricpane"><div class="chartgrid"><div class="chart"><canvas id="cSystemUtil"></canvas></div></div><div class="panel"><h2>System Information</h2><div id="systemInfo" class="value"></div></div><div class="panel"><h2>Storage</h2><div id="diskInfo"></div></div></div><div id="mNetwork" class="metricpane"><div id="netInfo" class="netgrid"></div><div class="chartgrid"><div class="chart"><canvas id="cNetDown"></canvas></div><div class="chart"><canvas id="cNetUp"></canvas></div></div></div></div></section><section id="logs" class="tabpane"></section><section class="panel logtools"><h2>Log Management</h2><div class="searchbox"><button class="btn" id="searchPrev" onclick="previousMatch()" disabled="disabled">⏪</button><input id="searchQuery" placeholder="Search log text" onkeydown="if (event.key === 'Enter') runSearchOrNext();"><button class="btn" id="searchNext" onclick="runSearchOrNext()">🔍</button><span style="border-left: 1px solid #34445a; height: 28px"></span><button class="btn" id="refreshBtn" onclick="refreshStatus()">♻️</button><button class="btn" id="clearBtn" onclick="clearOrCancelLog()">🗑️</button></div></section><section class="logs panel"><div class="loghead"><h2 id="logTitle">Docker Logs</h2><div class="logheadchecks"><span class="label" id="logInstanceLabel">instance: primary</span><label class="label"><input type="checkbox" id="showGlobalLogs" checked="checked" onchange="setShowGlobalLogs(this.checked)"> show globally</label><label class="label"><input type="checkbox" id="autoscroll" checked="checked"> auto-scroll</label></div></div><textarea id="log" class="log" readonly="readonly" wrap="soft">
-Connecting...</textarea></section></main><script>const searchState={active:!1,query:"",matches:[],index:-1,prevAutoscroll:!0};let lastStatus=null,activeTabName="overview",showGlobalLogs=!0;function $(e){return document.getElementById(e)}function setMsg(e){$("msg").textContent=e||""}function clearLog(){$("log").value=""}function appendLog(e){const t=$("log");t.value+=e+"\n",t.value.length>9e5&&(t.value=t.value.slice(-75e4)),searchState.active?recalculateMatches(!1):$("autoscroll").checked&&(t.scrollTop=t.scrollHeight)}function clearOrCancelLog(){searchState.active?cancelSearch():clearLog()}function recalculateMatches(e=!0){const t=$("searchQuery").value;if(!searchState.active||!t)return;const n=$("log").value.toLowerCase(),a=t.toLowerCase();let s=0,o=[];for(;a;){const e=n.indexOf(a,s);if(e<0)break;o.push(e),s=e+a.length}searchState.matches=o,o.length?searchState.index=e?Math.min(Math.max(searchState.index,0),o.length-1):0:searchState.index=-1,updateSearchUI(!1)}function runSearchOrNext(){if(searchState.active&&searchState.matches.length)return void nextMatch();$("searchQuery").value&&(searchState.prevAutoscroll=$("autoscroll").checked,searchState.active=!0,$("autoscroll").checked=!1,$("autoscroll").disabled=!0,recalculateMatches(!1),searchState.matches.length?gotoMatch(0):updateSearchUI(!1))}function gotoMatch(e){if(!searchState.matches.length)return;searchState.index=(e+searchState.matches.length)%searchState.matches.length;const t=searchState.matches[searchState.index],n=t+searchState.query.length,a=$("log");a.focus(),a.setSelectionRange(t,n);const s=a.value.slice(0,t).split("\n").length-1;a.scrollTop=Math.max(0,16*s-a.clientHeight/2),updateSearchUI(!1)}function nextMatch(){searchState.active&&searchState.matches.length&&gotoMatch(searchState.index+1)}function previousMatch(){searchState.active&&searchState.matches.length&&gotoMatch(searchState.index-1)}function cancelSearch(){searchState.active=!1,searchState.query="",searchState.matches=[],searchState.index=-1,$("searchQuery").value="",$("autoscroll").disabled=!1,$("autoscroll").checked=searchState.prevAutoscroll,$("log").setSelectionRange($("log").selectionStart,$("log").selectionStart),updateSearchUI(!0)}function updateSearchUI(e){searchState.active?(searchState.query=$("searchQuery").value,$("searchPrev").disabled=searchState.matches.length<2,$("searchNext").textContent=searchState.matches.length>1?"⏩":"🔍",$("refreshBtn").disabled=!0,$("refreshBtn").textContent=searchState.matches.length?`${searchState.index+1}/${searchState.matches.length}`:"0/0",$("clearBtn").textContent="❌"):($("searchPrev").disabled=!0,$("searchNext").textContent="🔍",$("refreshBtn").disabled=!1,$("refreshBtn").textContent="♻️",$("clearBtn").textContent="🗑️")}function fmtUptime(e){return e=Number(e||0),Math.floor(e/3600)+"h "+Math.floor(e%3600/60)+"m"}function mibToGiB(e){return(Number(e||0)/1024).toFixed(2)}function inferGpuStatus(e){const t=Number(e.util_pct||0);return lastStatus&&lastStatus.metrics&&lastStatus.metrics.active_requests>0?t>20?"Token Generation":"Prompt Processing":t>5?"Active":"Idle"}function tempClass(e){return(e=Number(e||0))<35?"temp-blue":e<50?"temp-green":e<60?"temp-yellow":e<70?"temp-orange":e<80?"temp-red":"temp-crimson"}function tempColor(e){return(e=Number(e||0))<35?"#60a5fa":e<50?"#2fc46b":e<60?"#ffde59":e<70?"#ff8a2a":e<80?"#ff5b6c":"#dc143c"}function tempLabel(e){return`${e||"N/A"} °C${Number(e||0)>=80?" ⚠️":""}`}function renderGpuCards(e){e&&e.length?$("gpuCards").innerHTML=e.map(e=>e.error?`<div class="gpu-card">${e.error}</div>`:`<div class="gpu-card"><div class="gpu-title">GPU ${e.index} - ${e.name||"RTX 3090"}${e.vendor?" ("+e.vendor+")":""}</div><div class="gpu-grid"><div><div class="gpu-section-title">Temperature</div><div class="gpu-line"><span>Core</span><b class="${tempClass(e.temp_c)}">${tempLabel(e.temp_c)}</b></div></div><div><div class="gpu-section-title">VRAM</div><div class="gpu-line"><span>Free</span><b>${mibToGiB(e.mem_free_mib)} GB</b></div><div class="gpu-line"><span>Used</span><b>${mibToGiB(e.mem_used_mib)} GB</b></div><div class="gpu-line"><span>Max</span><b>${mibToGiB(e.mem_total_mib)} GB</b></div><div class="meter"><span style="width:${Number(e.mem_pct||0)}%"></span></div></div><div><div class="gpu-section-title">Power</div><div class="gpu-line"><span>Draw</span><b>${e.power_w||"N/A"} W</b></div><div class="gpu-line"><span>Max Power</span><b>${e.power_limit_w||"N/A"} W</b></div></div><div><div class="gpu-section-title">Fans</div><div class="gpu-line"><span>Speed</span><b>${e.fan_pct||"N/A"}%</b></div></div><div><div class="gpu-section-title">Clocks</div><div class="gpu-line"><span>Core</span><b>${e.core_clock_mhz||"N/A"} MHz</b></div><div class="gpu-line"><span>Mem</span><b>${e.mem_clock_mhz||"N/A"} MHz</b></div></div><div><div class="gpu-section-title">Usage</div><div class="gpu-line"><span>Load</span><b>${e.util_pct||"N/A"}%</b></div><div class="gpu-line"><span>Status</span><b>${inferGpuStatus(e)}</b></div></div></div></div>`).join(""):$("gpuCards").innerHTML='<div class="panel">No GPU data</div>'}let editingPresetName=null;function presetParamSummary(e){e=e||{};const t=[];if(["temperature","top_p","top_k","min_p","presence_penalty","frequency_penalty","repetition_penalty","length_penalty","max_tokens","max_completion_tokens","min_tokens","truncate_prompt_tokens","seed","logprobs","top_logprobs"].forEach(n=>{void 0!==e[n]&&null!==e[n]&&""!==e[n]&&t.push(`${n}: ${e[n]}`)}),void 0!==e.ignore_eos&&t.push("ignore_eos: "+(e.ignore_eos?"on":"off")),void 0!==e.skip_special_tokens&&t.push("skip special: "+(e.skip_special_tokens?"on":"off")),void 0!==e.include_stop_str_in_output&&t.push("include stop: "+(e.include_stop_str_in_output?"on":"off")),void 0!==e.stop&&t.push(`stop: ${Array.isArray(e.stop)?e.stop.join("|"):e.stop}`),e.chat_template_kwargs){const n=e.chat_template_kwargs;void 0!==n.enable_thinking&&t.push("thinking: "+(n.enable_thinking?"on":"off")),n.preserve_thinking&&t.push("preserve thinking: on")}return t.join(", ")||"No explicit parameters"}function renderPresetCatalog(e){const t=$("apiPresetGrid");if(!t||!e)return;const n=[...e.defaults||[],...e.custom||[]];t.innerHTML=n.map(e=>{const t=e.locked;return`<div class="api-card"><div class="api-card-head"><h3>${e.endpoint}<br><span class="label">${e.endpoint_alt||"/"+e.name}</span></h3>${t?'<span class="label">default</span>':`<span class="preset-actions"><button class="iconbtn" title="Edit" onclick="editPreset('${e.name}')">✏️</button><button class="iconbtn" title="Delete" onclick="deletePreset('${e.name}')">❌</button></span>`}</div><p>${e.description||""}</p><p class="label">${presetParamSummary(e.params)}</p></div>`}).join("")+'<div class="api-card"><h3>/v1/short-* / /short-* and /v1/concise-* / /concise-*</h3><p>Prefix any default or custom preset to cap replies: short = 4096 tokens, concise = 512 tokens. Presets work both under /v1/name and /name for clients that append /v1 automatically.</p></div>'}function openPresetEditor(e){editingPresetName=e&&e.name?e.name:null,$("presetEditor").classList.add("open"),$("presetIntro")&&$("presetIntro").classList.add("hidden"),$("presetSaveBtn").textContent=editingPresetName?"💾 Save changes":"💾 Save",$("presetName").disabled=!!editingPresetName,$("presetName").value=e?.name||"",$("presetDescription").value=e?.description||"";const t=e?.params||{},n=t.chat_template_kwargs||{};$("presetTemperature").value=t.temperature??"",$("presetTopP").value=t.top_p??"",$("presetTopK").value=t.top_k??"",$("presetMinP").value=t.min_p??"",$("presetThinking").value=String(!!n.enable_thinking),$("presetPreserveThinking").value=String(!!n.preserve_thinking),$("presetRepetitionPenalty").value=t.repetition_penalty??"",$("presetPresencePenalty").value=t.presence_penalty??"",$("presetFrequencyPenalty").value=t.frequency_penalty??"",$("presetMaxCtx").value=t.truncate_prompt_tokens??"",$("presetMaxTokens").value=t.max_tokens??"",$("presetSeed").value=t.seed??"",$("presetMinTokens").value=t.min_tokens??"",$("presetLogprobs").value=t.logprobs??"",$("presetTopLogprobs").value=t.top_logprobs??"",$("presetLengthPenalty").value=t.length_penalty??"",$("presetIgnoreEos").value=void 0===t.ignore_eos?"":String(!!t.ignore_eos),$("presetSkipSpecial").value=void 0===t.skip_special_tokens?"":String(!!t.skip_special_tokens),$("presetIncludeStop").value=void 0===t.include_stop_str_in_output?"":String(!!t.include_stop_str_in_output),$("presetStop").value=Array.isArray(t.stop)?t.stop.join("\n"):t.stop??"",$("presetEditor").scrollIntoView({behavior:"smooth",block:"center"})}function closePresetEditor(){editingPresetName=null,$("presetEditor").classList.remove("open"),$("presetIntro")&&$("presetIntro").classList.remove("hidden")}function collectPresetForm(){function e(e){return $(e).value.trim()}const t={description:e("presetDescription"),enable_thinking:"true"===$("presetThinking").value,preserve_thinking:"true"===$("presetPreserveThinking").value};[["temperature","presetTemperature"],["top_p","presetTopP"],["top_k","presetTopK"],["min_p","presetMinP"],["repetition_penalty","presetRepetitionPenalty"],["presence_penalty","presetPresencePenalty"],["frequency_penalty","presetFrequencyPenalty"],["truncate_prompt_tokens","presetMaxCtx"],["max_tokens","presetMaxTokens"],["seed","presetSeed"],["min_tokens","presetMinTokens"],["logprobs","presetLogprobs"],["top_logprobs","presetTopLogprobs"],["length_penalty","presetLengthPenalty"]].forEach(([n,a])=>{const s=function(t){const n=e(t);return""===n?void 0:Number(n)}(a);Number.isFinite(s)&&(t[n]=s)}),[["ignore_eos","presetIgnoreEos"],["skip_special_tokens","presetSkipSpecial"],["include_stop_str_in_output","presetIncludeStop"]].forEach(([n,a])=>{const s=e(a);""!==s&&(t[n]="true"===s)});const n=e("presetStop");return n&&(t.stop=n),t}async function savePresetFromForm(){const e=editingPresetName||$("presetName").value.trim();try{const t=await fetch("/admin/presets",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"save",name:e,preset:collectPresetForm()})}),n=await t.json();if(!t.ok||!n.ok)throw new Error(n.error||"save failed");renderPresetCatalog(n.presets),closePresetEditor(),setMsg("Saved preset "+e),await refreshStatus()}catch(e){alert("Preset save failed: "+e)}}function editPreset(e){const t=(lastStatus?.presets?.custom||[]).find(t=>t.name===e);t&&openPresetEditor(t)}async function deletePreset(e){if(confirm("Delete custom preset "+e+"?"))try{const t=await fetch("/admin/presets",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"delete",name:e})}),n=await t.json();if(!t.ok||!n.ok)throw new Error(n.error||"delete failed");renderPresetCatalog(n.presets),setMsg("Deleted preset "+e),await refreshStatus()}catch(e){alert("Preset delete failed: "+e)}}function draw(e,t,n,a,s){const o=$(e);if(!o)return;const r=o.getContext("2d"),i=devicePixelRatio||1,l=o.width=o.clientWidth*i,c=o.height=o.clientHeight*i;if(r.clearRect(0,0,l,c),r.fillStyle=s||"#9dafc3",r.font=11*i+"px system-ui",r.fillText(a,8*i,14*i),!t.length)return;const u=t.map(e=>Number(e[n]||0)),d=1.1*Math.max(1,...u);r.strokeStyle=s,r.lineWidth=2*i,r.beginPath(),u.forEach((e,t)=>{const n=t/(u.length-1||1)*l,a=c-e/d*(c-24*i)-4*i;t?r.lineTo(n,a):r.moveTo(n,a)}),r.stroke(),r.fillStyle="#e8eef7",r.fillText(String(u[u.length-1]||0),l-62*i,14*i)}function drawGpuSeries(e,t,n,a,s,o){draw(e,t.map(e=>{const t=(e.gpus||[]).find(e=>String(e.index)===String(n));return{[a]:t?Number(t[a]||0):0}}),a,s,o)}function renderMetrics(e){const t=e.series||[];draw("cGpu",t,"gpu_util","GPU util %","#72c7ff"),draw("cMem",t,"mem_pct","VRAM %","#2fc46b"),draw("cLatency",t,"latency_s","Latency s","#ffcb6b"),draw("cTps",t,"tps","TPS est","#ff5b6c"),draw("cRam",t,"ram_pct","System RAM %","#2fc46b"),draw("cCpu",t,"cpu_pct","CPU total %","#72c7ff"),draw("cSystemUtil",t,"system_util_pct","System utilization %","#a78bfa"),draw("cNetDown",t,"net_rx_kbps","Download kbps","#2fc46b"),draw("cNetUp",t,"net_tx_kbps","Upload kbps","#72c7ff"),$("ramInfo")&&($("ramInfo").textContent=e.system&&e.system.memory?`Used ${mibToGiB(e.system.memory.used_mib)} / ${mibToGiB(e.system.memory.total_mib)} GB (${e.system.memory.used_pct}%)`:"");const n=e.system&&e.system.cpu&&e.system.cpu.cores||[];$("cpuCores")&&($("cpuCores").innerHTML=n.map(e=>`<div class="stat"><div class="label">Core ${e.core}</div><div class="value">${e.usage_pct}%</div><div class="meter"><span style="width:${e.usage_pct}%"></span></div></div>`).join(""));const a=e.system&&e.system.disks||[];function s(e){if(e.error)return`<div class="storage-card"><div class="storage-title">Error</div><div class="value">${e.error}</div></div>`;const t=`${e.path||e.source||e.name||"disk"}${e.label?" — "+e.label:""}`,n=`${e.model||""} ${e.transport?"· "+e.transport:""} · ${e.type||"-"} / ${e.partition_type||"-"} · ${e.fs||"-"} · ${e.mount||"not mounted"}${e.usage_basis?" · "+e.usage_basis:""}`,a=e=>null==e?"Unknown":`${e} GB`,s=a(e.free_gib),o=a(e.used_gib),r=a(e.total_gib),i=null===e.used_pct||void 0===e.used_pct?0:Number(e.used_pct||0),l=null===e.used_pct||void 0===e.used_pct?"usage unknown":`${i}% used`;return`<div class="${e.user_facing?"storage-card user-facing":"storage-card"}"><div class="storage-title">${t}</div><div class="storage-meta">${n}</div><div class="storage-sizes"><div class="stat"><div class="label">Free</div><div class="value">${s}</div></div><div class="stat"><div class="label">Used</div><div class="value">${o}</div></div><div class="stat"><div class="label">Total</div><div class="value">${r}</div></div></div><div class="diskbar"><span style="width:${i}%"></span></div><div class="label">${l}</div></div>`}if($("diskInfo")){const e=a.filter(e=>"disk"===e.kind||"disk"===e.type),t=a.filter(e=>!("disk"===e.kind||"disk"===e.type));$("diskInfo").innerHTML=`<div class="storage-section"><div class="panel"><h2>Disks</h2><div class="storage-list">${e.map(s).join("")||'<div class="value">No physical disks found</div>'}</div></div><div class="panel"><h2>Volumes</h2><div class="storage-list">${t.map(s).join("")||'<div class="value">No volumes found</div>'}</div></div></div>`}const o=e.system&&e.system.network||{};$("netInfo")&&($("netInfo").innerHTML=`<div class="stat"><div class="label">Local IP</div><div class="value">${o.local_ip||"unknown"}</div></div><div class="stat"><div class="label">Internet IP</div><div class="value">${o.public_ip||"unknown"}</div></div><div class="stat"><div class="label">Download</div><div class="value">${o.rx_kbps||0} kbps</div></div><div class="stat"><div class="label">Upload</div><div class="value">${o.tx_kbps||0} kbps</div></div>`);const r=e.system&&e.system.info||{};$("systemInfo")&&($("systemInfo").innerHTML=`OS: ${r.os||"unknown"}<br>Kernel: ${r.kernel||"unknown"}<br>Host: ${r.hostname||"unknown"}<br>User: ${r.username||"unknown"}<br>Machine: ${r.machine||"unknown"}<br>CPU: ${r.cpu_model||"unknown"}<br>Board/Product: ${r.board||"-"} / ${r.product||"-"}<br>BIOS: ${r.bios||"-"}<br>GPUs: ${r.gpus||"unknown"}`);const i=$("gpuMetricCharts");if(i&&e.gpus){const n=[{key:"util",suffix:"Util",label:"util %",color:"#72c7ff"},{key:"mem_pct",suffix:"Mem",label:"VRAM %",color:"#2fc46b"},{key:"temp",suffix:"Temp",label:"core temp °C",color:"#ffde59"},{key:"power",suffix:"Power",label:"power W",color:"#ff5b6c"}];i.innerHTML=n.map(t=>e.gpus.map(e=>`<div class="chart"><canvas id="cGpu${e.index}${t.suffix}"></canvas></div>`).join("")).join(""),n.forEach(n=>e.gpus.forEach(e=>{const a=n.color,s=`GPU${e.index} ${n.label}`;drawGpuSeries(`cGpu${e.index}${n.suffix}`,t,e.index,n.key,s,a)}))}}let selectedInstance="GPU0",logEs=null,selectedUserName="",selectedOverviewInstanceId="",selectedLogInstanceId="";function escapeHtml(e){return String(e??"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#39;")}function svgIcon(e){return"edit"===e?'<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4l10-10-4-4L4 16v4zM14 6l4 4" fill="none"/></svg>':"key"===e?'<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 7a4 4 0 1 0 0 8a4 4 0 0 0 0-8Zm0 0h6m-2 0v3m-3 0h6" fill="none"/></svg>':"reset"===e?'<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66M20 4v6h-6" fill="none"/></svg>':"delete"===e?'<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M9 7V5h6v2m-7 3v7m4-7v7m4-7v7M7 7l1 12h8l1-12" fill="none"/></svg>':"copy"===e?'<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 9h10v10H9zM5 15H4V5h10v1" fill="none"/></svg>':""}function renderIconButton({title:e,action:t,icon:n,className:a=""}){return`<button class="${`iconbtn ${a}`.trim()}" title="${escapeHtml(e)}" aria-label="${escapeHtml(e)}" onclick="${t}">${svgIcon(n)}</button>`}async function copyTextValue(e){const t=String(e||"");if(!t)return!1;if(navigator.clipboard&&navigator.clipboard.writeText)try{return await navigator.clipboard.writeText(t),!0}catch(e){}const n=document.createElement("textarea");n.value=t,n.setAttribute("readonly","readonly"),n.style.position="fixed",n.style.opacity="0",document.body.appendChild(n),n.focus(),n.select();let a=!1;try{a=document.execCommand("copy")}catch(e){a=!1}return n.remove(),a}function ensureApiKeyModal(){if($("apiKeyModal"))return;const e=document.createElement("div");e.id="apiKeyModal",e.className="club-modal hidden",e.innerHTML=`<div class="club-modal-card" role="dialog" aria-modal="true" aria-labelledby="apiKeyModalTitle"><div class="panel-head"><h2 id="apiKeyModalTitle">API Key</h2><button class="iconbtn" title="Close" aria-label="Close" onclick="closeApiKeyModal()">${svgIcon("delete")}</button></div><div class="preset-help" id="apiKeyModalHint">Use Copy to place the key on the clipboard.</div><textarea id="apiKeyModalValue" class="modal-keybox" readonly wrap="off"></textarea><div class="preset-form-actions"><button class="btn amber" onclick="copyApiKeyModalValue()">Copy</button><button class="btn blue" onclick="closeApiKeyModal()">Close</button></div><div class="msg" id="apiKeyModalMsg"></div></div>`,e.addEventListener("click",t=>{t.target===e&&closeApiKeyModal()}),document.body.appendChild(e)}function openApiKeyModal(e,t,n=""){ensureApiKeyModal(),$("apiKeyModalTitle").textContent=e||"API Key",$("apiKeyModalHint").textContent=n||"Use Copy to place the key on the clipboard.",$("apiKeyModalValue").value=t||"",$("apiKeyModalMsg").textContent="",$("apiKeyModal").classList.remove("hidden")}function closeApiKeyModal(){ensureApiKeyModal(),$("apiKeyModal").classList.add("hidden")}async function copyApiKeyModalValue(){ensureApiKeyModal();const e=await copyTextValue($("apiKeyModalValue").value||"");$("apiKeyModalMsg").textContent=e?"Copied API key to clipboard.":"Copy failed on this browser."}function setInstanceMsg(e){$("instanceMsg")&&($("instanceMsg").textContent=e||"")}function getInstanceList(){return lastStatus&&lastStatus.instances||[]}function setUsersMsg(e){$("usersMsg")&&($("usersMsg").textContent=e||"")}async function saveUserForm(){try{const e=await fetch("/admin/users",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"save",user:collectUserForm()})}),t=await e.json();if(!e.ok||!t.ok)throw new Error(t.error||"save failed");t.api_key&&openApiKeyModal("API key for "+t.user.name,t.api_key,"This key is now stored so it can be viewed again from the user card."),resetUserForm(),setUsersMsg("Saved user "+t.user.name),await refreshStatus()}catch(e){alert("User save failed: "+e)}}async function showUserApiKey(e){try{const t=await fetch("/admin/users",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"show_key",name:e})}),n=await t.json();if(!t.ok||!n.ok)throw new Error(n.error||"show failed");openApiKeyModal("API key for "+e,n.api_key,"Use Copy to place the current key on the clipboard.")}catch(e){alert("API key lookup failed: "+e)}}async function resetUserKey(e){if(confirm("Reset API key for "+e+"?"))try{const t=await fetch("/admin/users",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"reset_key",name:e})}),n=await t.json();if(!t.ok||!n.ok)throw new Error(n.error||"reset failed");openApiKeyModal("New API key for "+e,n.api_key,"The previous key is no longer valid. Use Copy if you need to share the replacement key."),setUsersMsg("Reset API key for "+e),await refreshStatus()}catch(e){alert("API key reset failed: "+e)}}async function deleteUserByName(e){if(confirm("Delete user "+e+"?"))try{const t=await fetch("/admin/users",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"delete",name:e})}),n=await t.json();if(!t.ok||!n.ok)throw new Error(n.error||"delete failed");selectedUserName===e&&resetUserForm(),setUsersMsg("Deleted user "+e),await refreshStatus()}catch(e){alert("User delete failed: "+e)}}let currentLogSource="docker";function setAuditMsg(e){$("auditMsg")&&($("auditMsg").textContent=e||"")}function mirrorAuthToggles(e){$("auditAllowAnonymousProxy")&&($("auditAllowAnonymousProxy").checked=!!e)}let selectedGroupName="";function setGroupsMsg(e){$("groupsMsg")&&($("groupsMsg").textContent=e||"")}function findPanelByHeading(e,t){return[...document.querySelectorAll(`#${e} .panel`)].find(e=>{const n=e.querySelector(".panel-head h2,h2");return(n&&n.textContent||"").trim()===t})||null}let selectedScope="GPU0";function currentScope(){return selectedScope||selectedInstance||"GPU0"}function scopeIsGlobal(){return"GLOBAL"===currentScope()}function ensureV413Layout(){const e=document.querySelector(".tabs"),t=e&&e.querySelector('.tab[onclick*="audit"]'),n=e&&e.querySelector('.tab[onclick*="logs"]');t&&t.remove(),e&&n&&e.appendChild(n);const a=$("system"),s=$("presets"),o=$("logs"),r=$("audit");if(a&&r){const e=findPanelByHeading("audit","Access Policy");e&&!e.dataset.v413Moved&&(e.dataset.v413Moved="1",a.insertBefore(e,a.children[1]||null));const t=findPanelByHeading("audit","Audit Overview");t&&o&&!t.dataset.v413Moved&&(t.dataset.v413Moved="1",o.insertBefore(t,o.firstChild||null));const n=findPanelByHeading("audit","Global Controls");n&&n.remove();const s=findPanelByHeading("audit","Audit Stream");s&&s.remove(),0!==r.childElementCount&&r.querySelector(".panel")||r.remove()}const i=findPanelByHeading("system","Access Policy");if(i){const e=[...i.querySelectorAll("button")].find(e=>(e.textContent||"").includes("Open Users Management"));e&&e.remove()}const l=[...document.querySelectorAll("#presets .panel")].find(e=>{const t=e.querySelector(".panel-head h2,h2");return t&&((t.textContent||"").includes("Per-Instance Docker Presets")||(t.textContent||"").includes("Single GPU Docker Presets"))});if(l){l.id="singlePresetCard";const e=l.querySelector("h2");e&&(e.textContent="Single GPU Docker Presets")}const c=[...document.querySelectorAll("#presets .panel .panel-head h2")].find(e=>"Custom Preset Templates"===(e.textContent||"").trim());if(c&&(c.textContent="Custom Configuration Endpoints"),s&&!$("presetScopePanel")){const e=document.createElement("div");e.className="panel",e.id="presetScopePanel",e.innerHTML='<h2>GPU Scope</h2><div class="subtabs" id="presetScopeTabs"></div><div class="value smallgap" id="presetScopeSummary">-</div>',s.insertBefore(e,s.firstChild||null)}if(s&&!$("dualPresetCard")){const e=document.createElement("div");e.className="panel",e.id="dualPresetCard",e.innerHTML='<h2>Dual GPU Docker Presets</h2><div class="preset-help">Apply a dual-GPU runtime across the first two detected cards. Use Global scope for these presets.</div><div class="actions"><button class="btn blue" onclick="switchDualMode(\'vllm/dual\')">dual</button><button class="btn blue" onclick="switchDualMode(\'vllm/dual-turbo\')">dual-turbo</button><button class="btn blue" onclick="switchDualMode(\'vllm/dual-dflash\')">dual-dflash</button><button class="btn blue" onclick="switchDualMode(\'vllm/dual-dflash-noviz\')">dual-dflash-noviz</button></div>';const t=$("singlePresetCard");t&&t.parentNode===s?s.insertBefore(e,t.nextSibling):s.insertBefore(e,s.children[1]||null)}if(o&&!$("logsSourcePanel")){const e=document.createElement("div");e.className="panel",e.id="logsSourcePanel",e.innerHTML='<h2>Log Sources</h2><div class="subtabs"><button class="subtab" id="logSourceDocker" onclick="setCurrentLogSource(\'docker\')">Docker Logs</button><button class="subtab" id="logSourceAudit" onclick="setCurrentLogSource(\'audit\')">Audit Logs</button></div><div class="value smallgap" id="logsSourceSummary">-</div>',o.appendChild(e)}const u=findPanelByHeading("system","Profiles");if(u&&!$("profileScopeNote")){const e=document.createElement("div");e.className="preset-help",e.id="profileScopeNote",u.insertBefore(e,u.querySelector(".actions")||u.firstChild)}const d=findPanelByHeading("system","Power + Cooling");if(d&&!$("powerScopeNote")){const e=document.createElement("div");e.className="preset-help",e.id="powerScopeNote",d.insertBefore(e,d.querySelector(".actions")||d.firstChild)}}function quotaLimitText(e,t=""){return null==e||""===e?"unlimited":`${e}${t}`}function quotaWeightText(e){return null==e||""===e?"default":String(Number(e).toFixed(3)).replace(/\.?0+$/,"")}function quotaWindowText(e){return`${(e=e||{}).requests||0} msgs · score ${Number(e.score||0).toFixed(1)} · in ${e.input_tokens||0} · out ${e.output_tokens||0} · tools ${e.tool_calls||0} · thinking ${Number(e.thinking_seconds||0).toFixed(1)}s`}function quotaWeightLine(e){return`in ${quotaWeightText((e=e||{}).input_token_weight)} · out ${quotaWeightText(e.output_token_weight)} · tools ${quotaWeightText(e.tool_call_weight)} · thinking ${quotaWeightText(e.thinking_second_weight)}`}function quotaBudgetLine(e){return`5h ${quotaLimitText((e=e||{}).score_per_5h)} · week ${quotaLimitText(e.score_per_week)} · /msg tokens ${quotaLimitText(e.max_tokens_per_message)} · /msg tools ${quotaLimitText(e.max_tool_calls_per_message)}`}function parseQuotaNumber(e){const t=$(e);if(!t)return null;const n=t.value.trim();return""===n?null:Number(n)}function scopeItems(){const e=getInstanceList().slice();return e.sort((e,t)=>{const n="dual"===e.kind?1:0,a="dual"===t.kind?1:0;if(n!==a)return n-a;return((e.gpu_indices||[e.gpu_index])[0]||0)-((t.gpu_indices||[t.gpu_index])[0]||0)||String(e.id).localeCompare(String(t.id))}),e}function singleScopeItems(){return scopeItems().filter(e=>"dual"!==e.kind)}function pairScopeItems(){return scopeItems().filter(e=>"dual"===e.kind)}function gpuCount(){return Number(lastStatus&&lastStatus.gpu_count||0)}function canonicalPairId(e,t){const n=[Number(e),Number(t)].filter(e=>Number.isInteger(e)&&e>=0).sort((e,t)=>e-t);return 2!==n.length||n[0]===n[1]?"":`PAIR${n[0]}_${n[1]}`}function exactTwoPairTarget(){return pairScopeItems().find(e=>"[0,1]"===JSON.stringify((e.gpu_indices||[]).slice().sort((e,t)=>e-t)))||null}function currentScopeInstance(e=!1){return"GLOBAL"===currentScope()?e?null:exactTwoPairTarget():scopeItems().find(e=>e.id===currentScope())||singleScopeItems()[0]||pairScopeItems()[0]||null}function currentScopeKind(){const e=currentScopeInstance(!0);return e?e.kind:"GLOBAL"===currentScope()?"global":"single"}function dockerLogTarget(){return trackedLogRuntime()||currentScopeInstance(!1)||scopeItems()[0]||null}function scopeLabel(e){return e?"dual"===e.kind?`Pair ${(e.gpu_indices||[]).join(" + ")}`:e.id:"Global"}function scopeAllowsSinglePresets(){const e=currentScopeInstance(!0);return!!e&&"dual"!==e.kind}function scopeAllowsDualPresets(){const e=currentScopeInstance(!1);return!!e&&"dual"===e.kind}function runtimeTrackingItems(){const e=Object.values(lastStatus&&lastStatus.instance_runtime_metrics||{}).filter(e=>e&&e.running);return e.sort((e,t)=>{const n=Array.isArray(e.gpu_indices)?e.gpu_indices:[],a=Array.isArray(t.gpu_indices)?t.gpu_indices:[];return(n[0]??999)-(a[0]??999)||n.length-a.length||String(e.id||e.instance_id||"").localeCompare(String(t.id||t.instance_id||""))}),e}function normalizeTrackedRuntimeId(e){const t=runtimeTrackingItems();if(!t.length)return"";const n=String(e||"").trim().toUpperCase();if(n){const e=t.find(e=>String(e.id||e.instance_id).toUpperCase()===n);if(e)return String(e.id||e.instance_id)}return String(t[0].id||t[0].instance_id)}function trackedOverviewRuntime(){const e=normalizeTrackedRuntimeId(selectedOverviewInstanceId);return e?(selectedOverviewInstanceId=e,runtimeTrackingItems().find(t=>String(t.id||t.instance_id)===String(e))||null):null}function trackedLogRuntime(){const e=normalizeTrackedRuntimeId(selectedLogInstanceId);return e?(selectedLogInstanceId=e,runtimeTrackingItems().find(t=>String(t.id||t.instance_id)===String(e))||null):null}function setOverviewTrackedInstance(e){selectedOverviewInstanceId=normalizeTrackedRuntimeId(e),renderOverviewTracker(),lastStatus&&renderOverviewStatus(lastStatus)}function setLogTrackedInstance(e){selectedLogInstanceId=normalizeTrackedRuntimeId(e),renderLogTracker(),applyLogVisibility(),connectLogs(!0)}function formatCtxTokens(e){const t=Number(e||0);return!Number.isFinite(t)||t<=0?"-":t>=1e6?`${(t/1e6).toFixed(2).replace(/\.?0+$/,"")}M`:t>=1e3?`${(t/1e3).toFixed(t>=1e5?0:1).replace(/\.?0+$/,"")}K`:String(Math.round(t))}function formatNumber(e,t=2){const n=Number(e);return Number.isFinite(n)?n.toFixed(t).replace(/\.?0+$/,""):"-"}function formatLastStatusCard(e,t){const n=e||{},a=[n.last_status??t.last_status??"-"],s=n.last_latency_s??t.last_latency_s,o=n.last_ttft_s??t.last_ttft_s,r=n.last_tokens_per_second??t.last_tokens_per_second;null!=s&&a.push(`latency=${formatNumber(s,3)}s`),null!=o&&a.push(`ttft=${formatNumber(o,3)}s`),null!==n.last_prefill_s&&void 0!==n.last_prefill_s&&a.push(`prefill~=${formatNumber(n.last_prefill_s,3)}s`),null!=r&&a.push(`tk/s=${formatNumber(r,2)}`);const i=[];null!==n.gpu_kv_cache_usage_pct&&void 0!==n.gpu_kv_cache_usage_pct?i.push(`kv=${formatNumber(n.gpu_kv_cache_usage_pct,1)}% / ${formatCtxTokens(n.ctx_size_tokens)} ctx`):n.ctx_size_tokens&&i.push(`ctx=${formatCtxTokens(n.ctx_size_tokens)}`);const l=n.speculative||{},c=[];null!==l.drafted_tokens&&void 0!==l.drafted_tokens&&c.push(`drafted=${l.drafted_tokens}`),null!==l.accept_rate_pct&&void 0!==l.accept_rate_pct&&c.push(`accept=${formatNumber(l.accept_rate_pct,1)}%`),null!==l.accepted_tokens&&void 0!==l.accepted_tokens&&null!==l.draft_tokens&&void 0!==l.draft_tokens&&c.push(`accepted=${l.accepted_tokens}/${l.draft_tokens}`),null!==l.mean_acceptance_length&&void 0!==l.mean_acceptance_length&&c.push(`avg=${formatNumber(l.mean_acceptance_length,2)}`),null!==l.system_efficiency_pct&&void 0!==l.system_efficiency_pct&&c.push(`eff=${formatNumber(l.system_efficiency_pct,1)}%`);const u=[`<div>${a.join(" &middot; ")}</div>`];return i.length&&u.push(`<div class="value-subline">${i.join(" &middot; ")}</div>`),c.length&&u.push(`<div class="value-subline">spec ${c.join(" &middot; ")}</div>`),u.join("")}function formatRequestCard(e,t){const n=`total=${t.total_requests??0}, active=${t.active_requests??0}, fail=${t.failed_requests??0}, queue=${t.queued_requests??0}`;if(!e)return n;const a=[];return null!==e.running_requests&&void 0!==e.running_requests&&a.push(`run=${e.running_requests}`),null!==e.waiting_requests&&void 0!==e.waiting_requests&&a.push(`wait=${e.waiting_requests}`),null!==e.pending_requests&&void 0!==e.pending_requests&&a.push(`pending=${e.pending_requests}`),a.length?`${n}<div class="value-subline">instance ${a.join(" &middot; ")}</div>`:n}function renderOverviewTracker(){const e=findPanelByHeading("overview","Status");if(!e)return;let t=$("overviewTrackerRow");if(!t){t=document.createElement("div"),t.id="overviewTrackerRow",t.className="scope-strip";const n=e.querySelector(".grid");e.insertBefore(t,n||e.querySelector(".msg")||null)}const n=runtimeTrackingItems();if(n.length<=1)return t.innerHTML="",void t.classList.add("hidden");t.classList.remove("hidden");const a=normalizeTrackedRuntimeId(selectedOverviewInstanceId);selectedOverviewInstanceId=a,t.innerHTML=`<span class="label">Track instance</span><div class="subtabs">${n.map(e=>`<button class="subtab ${String(e.id||e.instance_id)===a?"active":""}" onclick="setOverviewTrackedInstance('${String(e.id||e.instance_id)}')">${escapeHtml(String(e.id||e.instance_id))}</button>`).join("")}</div>`}function renderLogTracker(){const e=document.querySelector(".logs.panel");if(!e)return;let t=$("logTrackerRow");t||(t=document.createElement("div"),t.id="logTrackerRow",t.className="scope-strip",e.insertBefore(t,$("log")||e.lastChild||null));const n=runtimeTrackingItems();if("audit"===currentLogSource||n.length<=1)return t.innerHTML="",void t.classList.add("hidden");t.classList.remove("hidden");const a=normalizeTrackedRuntimeId(selectedLogInstanceId);selectedLogInstanceId=a,t.innerHTML=`<span class="label">Track instance</span><div class="subtabs">${n.map(e=>`<button class="subtab ${String(e.id||e.instance_id)===a?"active":""}" onclick="setLogTrackedInstance('${String(e.id||e.instance_id)}')">${escapeHtml(String(e.id||e.instance_id))}</button>`).join("")}</div>`}function renderOverviewStatus(e){const t=e&&e.metrics||{},n=e&&e.power||{},a=trackedOverviewRuntime();$("summary")&&($("summary").textContent=a?`${a.id||a.instance_id} | ${a.mode||e.active_mode} | ${a.container||"no container"} | ${n.profile||"balanced"} | GPUs ${e.gpu_count??0}`:`${e.active_mode} | ${e.container||"no container"} | ${n.profile||"balanced"} | GPUs ${e.gpu_count??0}`),$("mode")&&($("mode").textContent=`${a?.mode||e.active_mode} / ${a?.port||e.active_port}`),$("container")&&($("container").textContent=a?.container||e.container||"none"),$("req")&&($("req").innerHTML=formatRequestCard(a,t)),$("last")&&($("last").innerHTML=formatLastStatusCard(a,t)),$("uptime")&&($("uptime").textContent=fmtUptime(e.uptime_seconds)),$("powerbox")&&($("powerbox").textContent=`profile=${n.profile||"-"}, GPU=${n.gpu||"-"}, CPU=${n.cpu||"-"}, fans=${n.fans||"-"}, container=${n.container||"-"}, idle=${n.idle_for_seconds??0}s`),renderOverviewTracker()}function setEditorState(e,t,n){const a=$(e),s=$(t);a&&a.classList.toggle("open",!!n),s&&s.classList.toggle("hidden",!!n)}function openUserEditor(){ensureUsersUi(),setEditorState("userEditor","userIntro",!0)}function openGroupEditor(){ensureGroupUi(),setEditorState("groupEditor","groupIntro",!0)}async function createPairGroup(e=null,t=null){if(gpuCount()<2)return void alert("At least two GPUs are required to create a dual pair.");let n=e,a=t;if(null===n||null===a){if(n=prompt(`First GPU index (0-${Math.max(gpuCount()-1,0)}):`,"0"),null===n)return;if(a=prompt(`Second GPU index (0-${Math.max(gpuCount()-1,0)}):`,"1"),null===a)return}const s=canonicalPairId(n,a);if(s)try{const e=await fetch("/admin/instances",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"save_pair",gpu_indices:[Number(n),Number(a)],mode:"vllm/dual",enabled:!1})}),t=await e.json();if(!e.ok||!t.ok)throw new Error(t.error||"pair save failed");setInstanceMsg(`Saved pair group ${s}`),await refreshStatus(),setScope(s,!1)}catch(e){alert("Pair group failed: "+e)}else alert("Select two distinct GPU indices.")}async function deleteCurrentPairGroup(){const e=currentScopeInstance(!0);if(e&&"dual"===e.kind){if(confirm(`Delete pair group ${e.id}?`))try{const t=await fetch("/admin/instances",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"delete_pair",instance_id:e.id})}),n=await t.json();if(!t.ok||!n.ok)throw new Error(n.error||"pair delete failed");setInstanceMsg(`Deleted pair group ${e.id}`),await refreshStatus(),setScope("GLOBAL",!1)}catch(e){alert("Pair delete failed: "+e)}}else alert("Select a dual pair scope first.")}async function switchDualMode(e){const t=currentScopeInstance(!1);if(t&&"dual"===t.kind){if(confirm(`Apply dual preset ${e} to ${t.id} on GPUs ${(t.gpu_indices||[]).join(", ")}? This will stop overlapping runtimes that already use those GPUs.`))try{await post("/admin/switch",{instance_id:t.id,mode:e})}catch(e){alert(e)}}else alert("Choose a dual pair tab, or use Global on an exactly-two-GPU server, before applying a dual preset.")}function profileDescription(e){return{eco:"Eco profile: lower GPU power limits, lower idle clocks, powersave CPU governor, faster idle/container stop timers.",balanced:"Balanced profile: normal server profile with 280W active GPU cap, idle downclocking after 10 minutes, and container stop after 1 hour.",default:"Default profile: keeps the 280W safety GPU cap but removes idle clock locking, uses schedutil CPU while active, and keeps standard idle timers.",turbo:"Turbo profile: higher GPU power allowance, performance CPU governor, relaxed idle timers, and minimal downclocking. Use when performance matters more than power."}[e]||"Apply profile?"}function applyDirectoryPayload(e){lastStatus||(lastStatus={}),Array.isArray(e.users)&&(lastStatus.users=e.users,renderUsers(e.users)),Array.isArray(e.groups)&&(lastStatus.groups=e.groups,renderGroups(e.groups)),e.server_config&&(lastStatus.server_config=e.server_config,renderAudit(e.server_config))}ensureUsersUi=function(){const e=document.querySelector(".tabs");if(e&&!document.getElementById("usersTabBtn")){const t=document.createElement("button");t.className="tab",t.id="usersTabBtn",t.textContent="Users",t.onclick=e=>tab(e,"users"),e.insertBefore(t,e.querySelector('.tab[onclick*="metrics"]')||null)}const t=document.querySelector("main.container");if(!t)return;let n=$("users");n||(n=document.createElement("section"),n.id="users",n.className="tabpane content-tab",t.insertBefore(n,document.getElementById("metrics"))),"1"!==n.dataset.v414Users&&(n.dataset.v414Users="1",n.innerHTML='<div class="panel"><div class="panel-head"><h2>User Accounts</h2><button class="add-preset-btn" title="New user" aria-label="New user" onclick="resetUserForm(false)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none"/></svg></button></div><div class="preset-intro" id="userIntro">Manage per-user API keys, access scopes, and Codex-style scored budgets. The configured list stays visible while the editor is collapsed.</div><div class="preset-editor" id="userEditor"><div class="formgrid"><label>User name<input id="userName" placeholder="client_a" /></label><label>Allowed targets<input id="userTargets" placeholder="*, legacy, GPU0, GPU1" /></label><label>Groups<input id="userGroups" placeholder="starter, premium" /></label><label>5h score budget<input id="userScore5h" type="number" step="0.1" placeholder="unlimited" /></label><label>Weekly score budget<input id="userScoreWeek" type="number" step="0.1" placeholder="unlimited" /></label><label>Max tokens / message<input id="userMaxTokensMsg" type="number" step="1" placeholder="unlimited" /></label><label>Max tool calls / message<input id="userMaxToolsMsg" type="number" step="1" placeholder="unlimited" /></label><label>Input token weight<input id="userInputTokenWeight" type="number" step="0.001" placeholder="default" /></label><label>Output token weight<input id="userOutputTokenWeight" type="number" step="0.001" placeholder="default" /></label><label>Tool-call weight<input id="userToolCallWeight" type="number" step="0.001" placeholder="default" /></label><label>Thinking-second weight<input id="userThinkingSecondWeight" type="number" step="0.001" placeholder="default" /></label><label>Enabled<select id="userEnabled"><option value="true">Enabled</option><option value="false">Disabled</option></select></label></div><div class="preset-form-actions"><button class="btn green" onclick="saveUserForm()">Save User</button><button class="btn red" onclick="resetUserForm(true)">Cancel</button></div></div><div class="msg" id="usersMsg"></div><div class="panel" style="margin-top:12px"><h2>Configured Users</h2><div id="usersGrid" class="api-grid"></div></div></div>')},resetUserForm=function(e=!0){ensureUsersUi(),selectedUserName="",$("userName").disabled=!1,$("userName").value="",$("userTargets").value="*",$("userGroups").value="",$("userScore5h").value="",$("userScoreWeek").value="",$("userMaxTokensMsg").value="",$("userMaxToolsMsg").value="",$("userInputTokenWeight").value="",$("userOutputTokenWeight").value="",$("userToolCallWeight").value="",$("userThinkingSecondWeight").value="",$("userEnabled").value="true",setEditorState("userEditor","userIntro",!e),setUsersMsg("")},collectUserForm=function(){function e(e){return($(e)&&$(e).value||"").trim()}return{name:e("userName"),allowed_targets:e("userTargets").split(",").map(e=>e.trim()).filter(Boolean),groups:e("userGroups").split(",").map(e=>e.trim()).filter(Boolean),enabled:"true"===$("userEnabled").value,generate_api_key:!selectedUserName,limits:{score_per_5h:parseQuotaNumber("userScore5h"),score_per_week:parseQuotaNumber("userScoreWeek"),max_tokens_per_message:parseQuotaNumber("userMaxTokensMsg"),max_tool_calls_per_message:parseQuotaNumber("userMaxToolsMsg"),input_token_weight:parseQuotaNumber("userInputTokenWeight"),output_token_weight:parseQuotaNumber("userOutputTokenWeight"),tool_call_weight:parseQuotaNumber("userToolCallWeight"),thinking_second_weight:parseQuotaNumber("userThinkingSecondWeight")}}},editUser=function(e){const t=(lastStatus&&lastStatus.users||[]).find(t=>t.name===e);t&&(ensureUsersUi(),selectedUserName=e,$("userName").disabled=!0,$("userName").value=t.name,$("userTargets").value=(t.allowed_targets||[]).join(", "),$("userGroups").value=(t.groups||[]).join(", "),$("userScore5h").value=t.limits.score_per_5h??"",$("userScoreWeek").value=t.limits.score_per_week??"",$("userMaxTokensMsg").value=t.limits.max_tokens_per_message??"",$("userMaxToolsMsg").value=t.limits.max_tool_calls_per_message??"",$("userInputTokenWeight").value=t.limits.input_token_weight??"",$("userOutputTokenWeight").value=t.limits.output_token_weight??"",$("userToolCallWeight").value=t.limits.tool_call_weight??"",$("userThinkingSecondWeight").value=t.limits.thinking_second_weight??"",$("userEnabled").value=String(!!t.enabled),openUserEditor())},renderUsers=function(e){ensureUsersUi();const t=$("usersGrid");t&&(e=e||[],selectedUserName&&!e.some(e=>e.name===selectedUserName)&&(selectedUserName=""),t.innerHTML=e.map(e=>{const t=[renderIconButton({title:"Edit",action:`editUser('${e.name}')`,icon:"edit"}),renderIconButton({title:e.api_key_available?"Show API key":"Show API key unavailable",action:`showUserApiKey('${e.name}')`,icon:"key"}),renderIconButton({title:"Reset API key",action:`resetUserKey('${e.name}')`,icon:"reset"}),renderIconButton({title:"Delete",action:`deleteUserByName('${e.name}')`,icon:"delete"})].join("");return`<div class="api-card"><div class="api-card-head"><h3>${e.name}<br><span class="label">${e.enabled?"enabled":"disabled"} &middot; access ${(e.effective_allowed_targets||e.allowed_targets||[]).join(", ")||"*"}</span></h3><span class="preset-actions">${t}</span></div><p>Groups: ${(e.groups||[]).join(", ")||"none"}</p><p>API key: ${e.has_api_key?e.api_key_available?"stored and viewable":"legacy key, reset once to store it":"not issued yet"}</p><p>Last 5h: ${quotaWindowText((e.usage||{}).window_5h)}</p><p>Last week: ${quotaWindowText((e.usage||{}).window_week)}</p><p class="label">Direct budgets &middot; ${quotaBudgetLine(e.limits||{})}</p><p class="label">Direct weights &middot; ${quotaWeightLine(e.limits||{})}</p><p class="label">Effective budgets &middot; ${quotaBudgetLine(e.effective_limits||{})}</p><p class="label">Effective weights &middot; ${quotaWeightLine(e.effective_limits||{})}</p></div>`}).join("")||'<div class="value">No API users configured yet.</div>')},ensureGroupUi=function(){ensureUsersUi();const e=$("users");if(!e)return;let t=$("groupsPanel");t||(t=document.createElement("div"),t.className="panel",t.id="groupsPanel",e.appendChild(t)),"1"!==t.dataset.v414Groups&&(t.dataset.v414Groups="1",t.innerHTML='<div class="panel-head"><h2>User Groups / Plans</h2><button class="add-preset-btn" title="New group" aria-label="New group" onclick="resetGroupForm(false)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none"/></svg></button></div><div class="preset-intro" id="groupIntro">Define reusable plans that carry scored budgets, per-message caps, and access scopes. The configured list stays visible while the editor is collapsed.</div><div class="preset-editor" id="groupEditor"><div class="formgrid"><label>Group name<input id="groupName" placeholder="starter" /></label><label>Description<input id="groupDescription" placeholder="Shared plan description" /></label><label>Allowed targets<input id="groupTargets" placeholder="*, legacy, GPU0, GPU1" /></label><label>5h score budget<input id="groupScore5h" type="number" step="0.1" placeholder="unlimited" /></label><label>Weekly score budget<input id="groupScoreWeek" type="number" step="0.1" placeholder="unlimited" /></label><label>Max tokens / message<input id="groupMaxTokensMsg" type="number" step="1" placeholder="unlimited" /></label><label>Max tool calls / message<input id="groupMaxToolsMsg" type="number" step="1" placeholder="unlimited" /></label><label>Input token weight<input id="groupInputTokenWeight" type="number" step="0.001" placeholder="default" /></label><label>Output token weight<input id="groupOutputTokenWeight" type="number" step="0.001" placeholder="default" /></label><label>Tool-call weight<input id="groupToolCallWeight" type="number" step="0.001" placeholder="default" /></label><label>Thinking-second weight<input id="groupThinkingSecondWeight" type="number" step="0.001" placeholder="default" /></label><label>Enabled<select id="groupEnabled"><option value="true">Enabled</option><option value="false">Disabled</option></select></label></div><div class="preset-form-actions"><button class="btn green" onclick="saveGroupForm()">Save Group</button><button class="btn red" onclick="resetGroupForm(true)">Cancel</button></div></div><div class="msg" id="groupsMsg"></div><div class="panel" style="margin-top:12px"><h2>Configured Groups</h2><div id="groupsGrid" class="api-grid"></div></div>')},resetGroupForm=function(e=!0){ensureGroupUi(),selectedGroupName="",$("groupName").disabled=!1,$("groupName").value="",$("groupDescription").value="",$("groupTargets").value="*",$("groupScore5h").value="",$("groupScoreWeek").value="",$("groupMaxTokensMsg").value="",$("groupMaxToolsMsg").value="",$("groupInputTokenWeight").value="",$("groupOutputTokenWeight").value="",$("groupToolCallWeight").value="",$("groupThinkingSecondWeight").value="",$("groupEnabled").value="true",setEditorState("groupEditor","groupIntro",!e),setGroupsMsg("")},collectGroupForm=function(){function e(e){return($(e)&&$(e).value||"").trim()}return{name:e("groupName"),description:e("groupDescription"),allowed_targets:e("groupTargets").split(",").map(e=>e.trim()).filter(Boolean),enabled:"true"===$("groupEnabled").value,limits:{score_per_5h:parseQuotaNumber("groupScore5h"),score_per_week:parseQuotaNumber("groupScoreWeek"),max_tokens_per_message:parseQuotaNumber("groupMaxTokensMsg"),max_tool_calls_per_message:parseQuotaNumber("groupMaxToolsMsg"),input_token_weight:parseQuotaNumber("groupInputTokenWeight"),output_token_weight:parseQuotaNumber("groupOutputTokenWeight"),tool_call_weight:parseQuotaNumber("groupToolCallWeight"),thinking_second_weight:parseQuotaNumber("groupThinkingSecondWeight")}}},editGroup=function(e){const t=(lastStatus&&lastStatus.groups||[]).find(t=>t.name===e);t&&(ensureGroupUi(),selectedGroupName=e,$("groupName").disabled=!0,$("groupName").value=t.name,$("groupDescription").value=t.description||"",$("groupTargets").value=(t.allowed_targets||[]).join(", "),$("groupScore5h").value=t.limits.score_per_5h??"",$("groupScoreWeek").value=t.limits.score_per_week??"",$("groupMaxTokensMsg").value=t.limits.max_tokens_per_message??"",$("groupMaxToolsMsg").value=t.limits.max_tool_calls_per_message??"",$("groupInputTokenWeight").value=t.limits.input_token_weight??"",$("groupOutputTokenWeight").value=t.limits.output_token_weight??"",$("groupToolCallWeight").value=t.limits.tool_call_weight??"",$("groupThinkingSecondWeight").value=t.limits.thinking_second_weight??"",$("groupEnabled").value=String(!!t.enabled),openGroupEditor())},renderGroups=function(e){ensureGroupUi();const t=$("groupsGrid");t&&(e=e||[],selectedGroupName&&!e.some(e=>e.name===selectedGroupName)&&(selectedGroupName=""),t.innerHTML=e.map(e=>`<div class="api-card"><div class="api-card-head"><h3>${e.name}<br><span class="label">${e.enabled?"enabled":"disabled"} · access ${(e.allowed_targets||[]).join(", ")||"*"}</span></h3><span class="preset-actions"><button class="iconbtn" title="Edit" onclick="editGroup('${e.name}')">✏️</button><button class="iconbtn" title="Delete" onclick="deleteGroupByName('${e.name}')">❌</button></span></div><p>${e.description||"No description"}</p><p class="label">Configured budgets · ${quotaBudgetLine(e.limits||{})}</p><p class="label">Configured weights · ${quotaWeightLine(e.limits||{})}</p><p class="label">Resolved budgets · ${quotaBudgetLine(e.resolved_limits||e.limits||{})}</p><p class="label">Resolved weights · ${quotaWeightLine(e.resolved_limits||e.limits||{})}</p></div>`).join("")||'<div class="value">No groups configured yet.</div>')},renderAudit=function(e){e=e||{},ensureV414Layout();const t=lastStatus&&lastStatus.admin_port||8008,n=lastStatus&&lastStatus.proxy_port||8009,a=e.admin_path||"/admin",s=!!e.online_enabled,o=!!e.allow_proxy_without_api_key,r=!!e.local_api_enabled,i=e.local_api_port||10881;$("auditAdminEndpoint")&&($("auditAdminEndpoint").innerHTML=`:${t}${a}`),$("auditProxyEndpoint")&&($("auditProxyEndpoint").innerHTML=`:${n}`),$("auditExposure")&&($("auditExposure").textContent=s?"online through proxy/admin only":"local/private only"),$("auditLocalApi")&&($("auditLocalApi").textContent=r?`127.0.0.1:${i}`:"disabled"),$("auditSummary")&&($("auditSummary").innerHTML="Audit entries capture admin actions, proxy authentication outcomes, quota denials, API usage, group changes, and user-management events. Use the shared log viewer below to inspect either Docker runtime logs or the audit log stream."),$("auditPolicyText")&&($("auditPolicyText").innerHTML=`Proxy API keys are currently <b>${o?"optional":"required"}</b>. Admin UI remains under <code>:${t}${a}</code>.`),mirrorAuthToggles(o)},saveAuthSettings=async function(){const e=!(!$("auditAllowAnonymousProxy")||!$("auditAllowAnonymousProxy").checked);mirrorAuthToggles(e);try{const t=await fetch("/admin/users",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"save_server_config",allow_proxy_without_api_key:e})}),n=await t.json();if(!t.ok||!n.ok)throw new Error(n.error||"config failed");n.server_config&&renderAudit(n.server_config),setAuditMsg("Saved access policy"),await refreshStatus()}catch(e){alert("Access policy failed: "+e)}},renderInstances=function(e){ensureV414Layout();const t=$("instanceTabs"),n=$("instanceSummary"),a=$("instanceEnableBtn"),s=findPanelByHeading("system","Instances");if(!t||!n||!s)return;e=scopeItems(),selectedScope&&("GLOBAL"===selectedScope||e.some(e=>e.id===selectedScope))||(selectedScope=singleScopeItems()[0]?.id||pairScopeItems()[0]?.id||"GLOBAL");const o=singleScopeItems().map(e=>`<button class="subtab ${e.id===currentScope()?"active":""}" onclick="setScope('${e.id}')">${e.id}${e.running?" • on":" • off"}</button>`).join("")+pairScopeItems().map(e=>`<button class="subtab ${e.id===currentScope()?"active":""}" onclick="setScope('${e.id}')">Pair ${(e.gpu_indices||[]).join("+")}${e.running?" • on":" • off"}</button>`).join("")+`<button class="subtab ${scopeIsGlobal()?"active":""}" onclick="setScope('GLOBAL')">Global</button>`;t.innerHTML=o,ensurePairManager();const r=currentScopeInstance(!1),i=[...s.querySelectorAll(".actions .btn")].filter(e=>"instanceEnableBtn"!==e.id&&!e.closest("#pairManagerBar"));scopeIsGlobal()&&r&&2===gpuCount()?(n.innerHTML=`Global scope controls the only dual pair <code>${r.id}</code> on GPUs ${(r.gpu_indices||[]).join(", ")} · mode ${r.mode} · port ${r.port} · proxy <code>${r.proxy_prefix}/</code>`,a&&(a.disabled=!1,a.textContent=r.enabled?"Disable Boot Autostart":"Enable Boot Autostart"),i.forEach(e=>e.disabled=!1)):scopeIsGlobal()?(n.innerHTML="Global scope selected. Host-wide controls still apply below. Create or choose a dual pair tab to manage arbitrary two-GPU dual presets.",a&&(a.disabled=!0,a.textContent="Select a GPU or Pair Scope"),i.forEach(e=>e.disabled=!0)):r?(n.innerHTML=`${scopeLabel(r)} · ${r.assignment_text} · port ${r.port} · ${r.running?"running":"stopped"} · proxy <code>${r.proxy_prefix}/</code> · ${r.enabled?"autostart enabled":"autostart disabled"}`,a&&(a.disabled=!1,a.textContent=r.enabled?"Disable Boot Autostart":"Enable Boot Autostart"),i.forEach(e=>e.disabled=!1)):(n.textContent="No GPU instances configured",a&&(a.disabled=!0,a.textContent="Boot autostart unavailable"),i.forEach(e=>e.disabled=!0)),$("logInstanceLabel")&&($("logInstanceLabel").textContent=currentLogLabel())},renderPresetScopeTabs=function(){const e=$("presetScopeTabs"),t=$("presetScopeSummary");if(!e||!t)return;e.innerHTML=singleScopeItems().map(e=>`<button class="subtab ${e.id===currentScope()?"active":""}" onclick="setScope('${e.id}')">${e.id}</button>`).join("")+pairScopeItems().map(e=>`<button class="subtab ${e.id===currentScope()?"active":""}" onclick="setScope('${e.id}')">Pair ${(e.gpu_indices||[]).join("+")}</button>`).join("")+`<button class="subtab ${scopeIsGlobal()?"active":""}" onclick="setScope('GLOBAL')">Global</button>`;const n=currentScopeInstance(!1);scopeIsGlobal()&&n&&2===gpuCount()?t.innerHTML=`Global scope targets the only dual pair <code>${n.id}</code>. Dual preset buttons below will apply to GPUs ${(n.gpu_indices||[]).join(", ")}.`:scopeIsGlobal()?t.innerHTML="Global scope selected. Single-GPU presets are disabled here. Choose or create a dual pair tab to apply dual presets.":currentScopeInstance(!0)?t.innerHTML=`Targeting ${scopeLabel(currentScopeInstance(!0))} · ${currentScopeInstance(!0).assignment_text} · proxy <code>${currentScopeInstance(!0).proxy_prefix}/</code>`:t.textContent="No preset scope available",document.querySelectorAll("#singlePresetCard .actions .btn").forEach(e=>e.disabled=!scopeAllowsSinglePresets()),document.querySelectorAll("#dualPresetCard .actions .btn").forEach(e=>e.disabled=!scopeAllowsDualPresets())},updateScopedCards=function(){const e=currentScopeInstance(!1);$("profileScopeNote")&&($("profileScopeNote").innerHTML=scopeIsGlobal()?"Global scope: these profile buttons apply host-wide defaults for the full server.":`${scopeLabel(e)} scope: ${e?e.assignment_text:"select a scope to continue"}`),$("powerScopeNote")&&($("powerScopeNote").innerHTML=scopeIsGlobal()?"Global scope: power and cooling controls below affect the whole host.":`${scopeLabel(e)} scope: using the selected runtime context while keeping host-level power controls in sync.`),renderLogSourcePanel()},powerAction=async function(e){const t=currentScopeInstance(!1);if(!["stop_container","start_instance","restart_instance","toggle_enabled"].includes(e)||t){if("stop_container"!==e||confirm(`Stop ${scopeLabel(t)} now?`))try{await post("/admin/power",{action:e,instance_id:t?t.id:null,enabled:t?!t.enabled:void 0})}catch(e){alert(e)}}else alert("Select a GPU or Pair scope first.")},instanceAction=async function(e){await powerAction(e)},toggleInstanceEnabled=async function(){const e=currentScopeInstance(!1);if(e)try{await post("/admin/power",{action:"toggle_enabled",instance_id:e.id,enabled:!e.enabled})}catch(e){alert(e)}else alert("Select a GPU or Pair scope first.")},switchMode=async function(e){const t=currentScopeInstance(!0);if(!t||"dual"===t.kind)return void alert("Select a single GPU tab to apply a single-GPU preset.");const n=pairScopeItems().find(e=>e.running&&(e.gpu_indices||[]).includes(Number(t.gpu_index))),a=n?`\n\nWarning: GPU ${t.gpu_index} is currently occupied by ${n.id} running ${n.mode}. Continuing will stop that pair and replace it with ${e} on ${t.id}.`:"";if(confirm(`Assign ${e} to ${t.id} and start it?${a}`))try{await post("/admin/switch",{instance_id:t.id,mode:e})}catch(e){alert(e)}},profile=async function(e){if(confirm(profileDescription(e)+"\n\nApply this profile now?"))try{await post("/admin/profile",{profile:e},`/admin/profile ${e}`)}catch(e){alert(e)}},saveGroupForm=async function(){try{const e=await fetch("/admin/groups",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"save",group:collectGroupForm()})}),t=await e.json();if(!e.ok||!t.ok)throw new Error(t.error||"group save failed");applyDirectoryPayload(t),resetGroupForm(!0),setGroupsMsg("Saved group "+t.group.name),refreshStatus().catch(()=>{})}catch(e){alert("Group save failed: "+e)}},deleteGroupByName=async function(e){if(confirm("Delete group "+e+"?"))try{const t=await fetch("/admin/groups",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"delete",name:e})}),n=await t.json();if(!t.ok||!n.ok)throw new Error(n.error||"group delete failed");applyDirectoryPayload(n),selectedGroupName===e&&resetGroupForm(!0),setGroupsMsg("Deleted group "+e),refreshStatus().catch(()=>{})}catch(e){alert("Group delete failed: "+e)}},pairingEnabled=function(){return!!(lastStatus&&lastStatus.server_config&&lastStatus.server_config.gpu_pairing_enabled)},legacyGlobalDualScope=function(){return 2===gpuCount()&&!pairingEnabled()},singleScopeItems=function(){return scopeItems().filter(e=>"dual"!==e.kind)},pairScopeItems=function(){return pairingEnabled()?scopeItems().filter(e=>"dual"===e.kind):[]},exactTwoPairTarget=function(){return 2===gpuCount()&&scopeItems().find(e=>"PAIR0_1"===e.id)||null},currentScopeInstance=function(e=!1){return"GLOBAL"===currentScope()?legacyGlobalDualScope()?e?null:legacyGlobalPair():pairingEnabled()&&2===gpuCount()?e?null:exactTwoPairTarget():null:scopeItems().find(e=>e.id===currentScope())||singleScopeItems()[0]||pairScopeItems()[0]||null},dockerLogTarget=function(){if("audit"===currentLogSource)return null;const e=legacyGlobalPair(),t=currentScopeInstance(!1)||scopeItems()[0]||null;return scopeIsGlobal()&&legacyGlobalDualScope()||legacyGlobalDualScope()&&e&&e.running&&t&&"dual"!==t.kind&&("pair"===t.assignment_scope||t.overrides_dual_mode||!t.running)?null:t},scopeLabel=function(e){return e?"GLOBAL"===e.id?"Global Dual":"dual"===e.kind?`Pair ${(e.gpu_indices||[]).join(" + ")}`:e.id:legacyGlobalDualScope()?"Global Dual":"Global"},scopeAllowsSinglePresets=function(){const e=currentScopeInstance(!0);return!!e&&"dual"!==e.kind},scopeAllowsDualPresets=function(){if(scopeIsGlobal()&&2===gpuCount())return!0;const e=currentScopeInstance(!1);return!!e&&"dual"===e.kind};const UI_STATE_KEY="club3090-ui-state";let uiStateHydrated=!1,uiStateSaveTimer=null,instanceBusyState={active:!1,message:""},currentLogSignature="",statusPollTimer=null;function readCachedUiState(){try{return JSON.parse(localStorage.getItem(UI_STATE_KEY)||"{}")||{}}catch(e){return{}}}function writeCachedUiState(e){try{localStorage.setItem(UI_STATE_KEY,JSON.stringify(e||{}))}catch(e){}}function normalizeTabName(e){return"audit"===e?"logs":["overview","system","presets","metrics","users","logs"].includes(e)?e:"overview"}function currentUiState(){return{active_tab:normalizeTabName(activeTabName),selected_scope:selectedScope||"GLOBAL",current_log_source:"audit"===currentLogSource?"audit":"docker",show_global_logs:!!showGlobalLogs}}function queueUiStateSave(e={}){const t={...currentUiState(),...e};writeCachedUiState(t),uiStateSaveTimer&&clearTimeout(uiStateSaveTimer),uiStateSaveTimer=setTimeout(async()=>{try{await fetch("/admin/ui-config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(t)})}catch(e){}},120)}function activeTabButton(e){return[...document.querySelectorAll(".tab")].find(t=>(t.getAttribute("onclick")||"").includes(`'${e}'`)||t.id===`${e}TabBtn`)||null}function hydrateUiState(e){if(uiStateHydrated)return;const t={...readCachedUiState(),...e||{}};activeTabName=normalizeTabName(t.active_tab||activeTabName),currentLogSource="audit"===t.current_log_source?"audit":"docker",showGlobalLogs="boolean"==typeof t.show_global_logs?t.show_global_logs:showGlobalLogs;const n=new Set(scopeItems().map(e=>e.id)),a=t.selected_scope||selectedScope||"GLOBAL";selectedScope="GLOBAL"===a?"GLOBAL":n.has(a)?a:singleScopeItems()[0]?.id||pairScopeItems()[0]?.id||"GLOBAL","GLOBAL"!==selectedScope&&(selectedInstance=selectedScope),uiStateHydrated=!0}setShowGlobalLogs=async function(e){showGlobalLogs=!!e,applyLogVisibility(),queueUiStateSave({show_global_logs:showGlobalLogs});try{await fetch("/admin/ui-config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({show_global_logs:showGlobalLogs})})}catch(e){setMsg("Could not save UI config: "+e)}},legacyGlobalPair=function(){return lastStatus&&lastStatus.legacy_global_instance||null};let powerCoolingBusyState={active:!1,message:""};const STATUS_POLL_MS=1e3;function syncPowerCoolingBusyState(){const e=findPanelByHeading("system","Power + Cooling");e&&(e.classList.toggle("instance-panel-busy",!!powerCoolingBusyState.active),[...e.querySelectorAll("button,input,select,textarea")].forEach(e=>{powerCoolingBusyState.active?e.setAttribute("disabled","disabled"):e.removeAttribute("disabled")}))}function setPowerCoolingBusy(e,t=""){powerCoolingBusyState={active:!!e,message:t||""},syncPowerCoolingBusyState()}async function withPowerCoolingBusy(e,t){setPowerCoolingBusy(!0,e);try{return await t()}finally{setPowerCoolingBusy(!1)}}function redrawMetricsSoon(){lastStatus&&(renderMetrics(lastStatus),requestAnimationFrame(()=>{lastStatus&&renderMetrics(lastStatus)}))}function syncInstancesBusyState(){const e=findPanelByHeading("system","Instances");if(!e)return;e.classList.toggle("instance-panel-busy",!!instanceBusyState.active),[...e.querySelectorAll("button,input,select,textarea")].forEach(e=>{instanceBusyState.active?e.setAttribute("disabled","disabled"):("gpuPairingEnabled"!==e.id||gpuCount()>=2)&&e.removeAttribute("disabled")});const t=$("pairingBusyNote");if(t){const e=instanceBusyState.message||(2===gpuCount()?"Keep disabled if you want Global to keep behaving like the shared two-GPU runtime.":"Enable this to manage arbitrary dual-GPU pair groups.");t.innerHTML=instanceBusyState.active?`<span class="spinner" aria-hidden="true"></span>${e}`:e}}function setInstancesBusy(e,t=""){instanceBusyState={active:!!e,message:t||""},syncInstancesBusyState()}async function saveGpuPairingSetting(e){setInstancesBusy(!0,"Applying GPU pairing setting...");try{const t=await fetch("/admin/users",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"save_server_config",gpu_pairing_enabled:!!e})}),n=await t.json();if(!t.ok||!n.ok)throw new Error(n.error||"GPU pairing update failed");n.server_config&&(lastStatus||(lastStatus={}),lastStatus.server_config=n.server_config),await refreshStatus(),e||setScope("GLOBAL",!1)}catch(e){alert("GPU pairing update failed: "+e)}finally{setInstancesBusy(!1)}}function ensureAuditOverviewCard(){const e=$("system"),t=findPanelByHeading("logs","Audit Overview")||findPanelByHeading("audit","Audit Overview")||findPanelByHeading("system","Audit Overview");if(e&&t){const n=findPanelByHeading("system","Services");e.insertBefore(t,n&&n.nextSibling||e.children[1]||null)}}function ensurePairingToggle(){const e=findPanelByHeading("system","Instances");if(!e)return;let t=$("pairingToggleRow");if(!t){t=document.createElement("div"),t.id="pairingToggleRow",t.className="actions";const n=$("instanceTabs");n&&n.parentNode===e&&n.insertAdjacentElement("beforebegin",t)}const n=gpuCount(),a=pairingEnabled(),s=!!instanceBusyState.active,o=s?instanceBusyState.message||"Applying GPU pairing setting...":2===n?"Keep disabled if you want Global to keep behaving like the shared two-GPU runtime.":"Enable this to manage arbitrary dual-GPU pair groups.";t.innerHTML=`<label class="label"><input type="checkbox" id="gpuPairingEnabled" ${a?"checked":""} ${n<2||s?"disabled":""} onchange="saveGpuPairingSetting(this.checked)"> Enable GPU Pairing</label><span class="label busy-note" id="pairingBusyNote">${s?`<span class="spinner" aria-hidden="true"></span>${o}`:o}</span>`}ensureAccessPolicyCard=function(){const e=findPanelByHeading("system","Access Policy");e&&"1"!==e.dataset.v414Policy&&(e.dataset.v414Policy="1",e.innerHTML='<h2>Access Policy</h2><div class="actions" id="accessPolicyRow"><label class="label"><input type="checkbox" id="auditAllowAnonymousProxy" onchange="mirrorAuthToggles(this.checked)"> allow requests without per-user API keys</label><button class="btn blue" onclick="saveAuthSettings()">Save Policy</button></div><div class="value smallgap" style="margin-top:10px" id="auditPolicyText">-</div>')},ensureMachineButtons=function(){const e=findPanelByHeading("system","System");if(!e)return;const t=[...e.querySelectorAll(".actions")],n=[...e.querySelectorAll("button")].find(e=>(e.textContent||"").includes("Wake-on-LAN")),a=e.querySelector(".machine-row");n&&a&&!a.contains(n)&&a.prepend(n),t.forEach(e=>{e===a||e.querySelector("button")||e.remove()})},allPairChoices=function(){const e=gpuCount(),t=[];for(let n=0;n<e;n+=1)for(let a=n+1;a<e;a+=1)t.push([n,a]);return t},ensurePairManager=function(){const e=findPanelByHeading("system","Instances");if(!e)return;let t=$("pairManagerBar");if(!t){t=document.createElement("div"),t.id="pairManagerBar",t.className="actions";const n=$("instanceSummary");n&&n.parentNode===e&&n.insertAdjacentElement("afterend",t)}if(!pairingEnabled()||gpuCount()<2)return void(t.innerHTML="");const n=currentScopeInstance(!0),a=!!n&&"dual"===n.kind,s=new Set(pairScopeItems().map(e=>e.id)),o=allPairChoices().filter(([e,t])=>!s.has(canonicalPairId(e,t))).map(([e,t])=>`<button class="btn blue" onclick="createPairGroup(${e},${t})">Add Pair ${e}+${t}</button>`).join("");t.style.margin="8px 0 10px",t.innerHTML=`${o||""}<button class="btn purple" onclick="createPairGroup()">Custom Pair Group</button>${a?`<button class="btn red" onclick="deleteCurrentPairGroup()">Delete ${scopeLabel(n)}</button>`:""}`},ensureV414Layout=function(){ensureV413Layout(),ensureUsersUi(),ensureGroupUi(),ensureAccessPolicyCard(),ensureAuditOverviewCard(),ensureMachineButtons(),ensurePairingToggle(),ensurePairManager(),syncInstancesBusyState(),syncPowerCoolingBusyState()};const logCache=Object.create(null);let statusRefreshPromise=null,logConnectToken=0;function renderLogSourcePanel(){$("logSourceDocker")&&$("logSourceDocker").classList.toggle("active","docker"===currentLogSource),$("logSourceAudit")&&$("logSourceAudit").classList.toggle("active","audit"===currentLogSource),$("logsSourceSummary")&&($("logsSourceSummary").innerHTML="audit"!==currentLogSource?scopeIsGlobal()&&legacyGlobalDualScope()?"Docker logs selected. The shared live log viewer follows the active global dual runtime.":"Docker logs selected. The shared live log viewer follows the currently selected tracked instance.":"Audit logs selected. The shared live log viewer follows <code>/opt/club3090-control/audit.log</code>.")}function trimLogText(e){const t=String(e||"");return t.length>9e5?t.slice(-75e4):t}function logCacheEntry(e){return logCache[e]||(logCache[e]={text:"",loaded:!1}),logCache[e]}function renderCurrentLog(e){const t=$("log");if(!t)return;const n=logCacheEntry(e);t.value=n.loaded?n.text:"Connecting...\n",searchState.active?recalculateMatches(!0):$("autoscroll")&&$("autoscroll").checked&&(t.scrollTop=t.scrollHeight)}function replaceLogBuffer(e,t){const n=logCacheEntry(e);n.text=trimLogText(t||""),n.loaded=!0,e===currentLogSignature&&renderCurrentLog(e)}function appendLogChunk(e,t){if(!t)return;const n=logCacheEntry(e);n.text=trimLogText((n.text||"")+t),n.loaded=!0,e===currentLogSignature&&renderCurrentLog(e)}function syntheticLog(e){appendLog(`[admin-ui ${(new Date).toLocaleTimeString()}] ${e}`)}function adminResultText(e,t){let n="";if(e&&"object"==typeof e)try{n=JSON.stringify(e,null,2)}catch(e){n=""}return n||(n=String(t||"").trim()),n.length>5e3&&(n=n.slice(0,5e3)+"\n...<truncated>..."),n}function logStreamConfig(){if("audit"===currentLogSource)return{signature:"audit",url:"/admin/audit-stream?tail=4000"};const e=trackedLogRuntime(),t=e||dockerLogTarget(),n=e&&(e.id||e.instance_id)?e.id||e.instance_id:scopeIsGlobal()&&legacyGlobalDualScope()?"GLOBAL":t&&t.id;return{signature:`docker:${n||"primary"}`,url:"/admin/logs"+(n?`?instance=${encodeURIComponent(n)}`:"")}}currentLogHeading=function(){return"audit"===currentLogSource?"Audit Logs":"Docker Logs"},currentLogLabel=function(){if("audit"===currentLogSource)return"source: audit";const e=trackedLogRuntime();if(e)return"instance: "+(e.id||e.instance_id||"primary");if(scopeIsGlobal()&&legacyGlobalDualScope())return"instance: Global dual";const t=dockerLogTarget();return"instance: "+(t&&t.id||"primary")},clearLog=function(){const e=currentLogSignature||logStreamConfig().signature,t=logCacheEntry(e);t.text="",t.loaded=!0,renderCurrentLog(e)},appendLog=function(e){appendLogChunk(currentLogSignature||logStreamConfig().signature,`${e}\n`)},applyLogVisibility=function(){const e="logs"===activeTabName;document.body.classList.toggle("logs-tab",e),document.body.classList.remove("audit-tab");const t=document.querySelector(".logs.panel");t&&t.classList.toggle("log-card-hidden",!e&&!showGlobalLogs),$("logTitle")&&($("logTitle").textContent=currentLogHeading()),$("logInstanceLabel")&&($("logInstanceLabel").textContent=currentLogLabel()),renderLogSourcePanel(),renderLogTracker(),currentLogSignature&&renderCurrentLog(currentLogSignature)},connectLogs=function(e=!1){if(!("logs"===activeTabName||showGlobalLogs)&&!e)return;const t=logStreamConfig();if(!e&&logEs&&t.signature===currentLogSignature)return void renderCurrentLog(t.signature);currentLogSignature=t.signature,renderCurrentLog(t.signature);const n=++logConnectToken;if(logEs){try{logEs.close()}catch(e){}logEs=null}const a=new EventSource(t.url);logEs=a;const s=(e,n)=>{let a=null;try{a=JSON.parse(n||"{}")}catch(e){}const s=a&&"string"==typeof a.text?a.text:String(n||"").replaceAll("\\u0000","\n");"reset"===e?replaceLogBuffer(t.signature,s):appendLogChunk(t.signature,s)};a.addEventListener("reset",e=>{n===logConnectToken&&s("reset",e.data)}),a.addEventListener("append",e=>{n===logConnectToken&&s("append",e.data)}),a.onmessage=e=>{n===logConnectToken&&s("append",e.data)},a.onerror=()=>{}},setCurrentLogSource=function(e){currentLogSource="audit"===e?"audit":"docker",applyLogVisibility(),queueUiStateSave({current_log_source:currentLogSource}),connectLogs(!0)},setShowGlobalLogs=async function(e){showGlobalLogs=!!e,applyLogVisibility(),queueUiStateSave({show_global_logs:showGlobalLogs}),connectLogs(!1)},setScope=function(e,t=!0){const n=new Set(scopeItems().map(e=>e.id));selectedScope="GLOBAL"===e?"GLOBAL":n.has(e)?e:singleScopeItems()[0]?.id||pairScopeItems()[0]?.id||"GLOBAL","GLOBAL"!==selectedScope&&(selectedInstance=selectedScope),renderInstances(getInstanceList()),renderPresetScopeTabs(),updateScopedCards(),applyLogVisibility(),queueUiStateSave(),t&&connectLogs(!0)},post=async function(e,t,n=""){const a=n||`${e} ${JSON.stringify(t||{})}`;syntheticLog(`request sent: ${a}`);try{const n=await fetch(e,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(t||{})}),s=await n.text();let o=null;try{o=JSON.parse(s)}catch(e){}if(!n.ok||o&&!1===o.ok)throw new Error(o&&o.error||s||`${e} failed`);return syntheticLog(`request finished: ${a}`),appendLog(`----- admin result -----\n${adminResultText(o,s)}\n------------------------`),refreshStatus().catch(()=>{}),o||s}catch(e){throw syntheticLog(`request failed: ${a} | ${e.message||e}`),appendLog(`----- admin error -----\n${e.message||e}\n-----------------------`),refreshStatus().catch(()=>{}),e}};const baseRenderMetrics=renderMetrics;function renderEnhancedGpuMetricCharts(e){const t=$("gpuMetricCharts");if(!t||!e.gpus)return;const n=e.series||[],a=[{key:"util",suffix:"Util",label:"util %",color:"#72c7ff"},{key:"mem_pct",suffix:"Mem",label:"VRAM %",color:"#2fc46b"},{key:"temp",suffix:"Temp",label:"core temp °C",color:"#ffde59"},{key:"fan",suffix:"Fan",label:"fan %",color:"#a855f7"},{key:"power",suffix:"Power",label:"power W",color:"#ff5b6c"}];t.innerHTML=a.map(t=>e.gpus.map(e=>`<div class="chart"><canvas id="cGpu${e.index}${t.suffix}"></canvas></div>`).join("")).join(""),a.forEach(t=>e.gpus.forEach(e=>drawGpuSeries(`cGpu${e.index}${t.suffix}`,n,e.index,t.key,`GPU${e.index} ${t.label}`,t.color)))}async function wol(){const e=prompt("MAC address to wake (blank = configured default):","");if(null!==e)try{await post("/admin/wol",{mac:e})}catch(e){alert(e)}}async function machineAction(e){const t="reboot"===e?"RESTART":"SHUT DOWN";if(confirm(t+" machine now?")&&confirm("Final confirmation: "+t+" now."))try{await post("/admin/machine",{action:e})}catch(e){alert(e)}}function syncActiveTabDisplay(){document.querySelectorAll(".tabpane").forEach(e=>e.classList.remove("active")),document.querySelectorAll(".tab").forEach(e=>e.classList.remove("active"));const e=$(activeTabName);e&&e.classList.add("active");const t=activeTabButton(activeTabName);t&&t.classList.add("active"),applyLogVisibility()}function activateTab(e,t=!1){activeTabName=normalizeTabName(e),syncActiveTabDisplay(),("logs"===activeTabName||showGlobalLogs||t)&&connectLogs(!1),"metrics"===activeTabName&&(redrawMetricsSoon(),refreshStatus().catch(()=>{})),queueUiStateSave(),setTimeout(()=>{!searchState.active&&$("autoscroll").checked&&$("log")&&($("log").scrollTop=$("log").scrollHeight)},0)}function clearLegacyPollers(){const e=window.setInterval(()=>{},6e4);window.clearInterval(e);for(let t=1;t<e;t+=1)window.clearInterval(t)}function bootAdminUi(){clearLegacyPollers(),ensureV414Layout(),resetUserForm(!0),resetGroupForm(!0),selectedScope||(selectedScope=singleScopeItems()[0]?.id||pairScopeItems()[0]?.id||"GLOBAL"),setScope(selectedScope,!1),refreshStatus().catch(()=>{}),statusPollTimer&&clearInterval(statusPollTimer),statusPollTimer=setInterval(()=>{refreshStatus()},1e3),window.addEventListener("beforeunload",()=>{if(logEs)try{logEs.close()}catch(e){}})}renderMetrics=function(e){baseRenderMetrics(e),renderEnhancedGpuMetricCharts(e)},metricTab=function(e,t){document.querySelectorAll(".metricpane").forEach(e=>e.classList.remove("active")),document.querySelectorAll(".subtab").forEach(e=>e.classList.remove("active"));const n=$(t);n&&n.classList.add("active"),e&&e.target&&e.target.classList.add("active"),redrawMetricsSoon(),refreshStatus().catch(()=>{})},togglePowerOptimizations=async function(){const e=$("optToggle")&&$("optToggle").textContent.includes("Enable"),t=scopeIsGlobal()?"GLOBAL":currentScopeInstance(!1)&&currentScopeInstance(!1).id||null;try{await withPowerCoolingBusy(e?"Applying power optimizations...":"Disabling power optimizations...",()=>post("/admin/power",{action:e?"enable_optimizations":"disable_optimizations",instance_id:t},"/admin/power "+(e?"enable_optimizations":"disable_optimizations")))}catch(e){alert(e)}},toggleFansMax=async function(){const e=$("fanToggle")&&$("fanToggle").textContent.includes("Reset"),t=currentScopeInstance(!1),n=scopeIsGlobal()?"GLOBAL":t&&t.id||null;try{await withPowerCoolingBusy(e?"Resetting fans to default...":"Setting fans to max...",()=>post("/admin/power",{action:e?"fans_auto":"fans_max",instance_id:n},`/admin/power ${e?"fans_auto":"fans_max"} ${n||"host"}`))}catch(e){alert(e)}},tab=function(e,t){activateTab(t,!1)},refreshStatus=async function(){return statusRefreshPromise||(statusRefreshPromise=(async()=>{try{ensureV414Layout();const e=await fetch("/admin/status",{cache:"no-store"});if(!e.ok)throw new Error(`status fetch failed (${e.status})`);const t=await e.json(),n=(t.metrics,t.power||{});lastStatus=t,hydrateUiState(t.ui_config||{}),$("showGlobalLogs")&&($("showGlobalLogs").checked=!!showGlobalLogs),$("services").textContent=`vLLM=${t.vllm_service}, control=${t.control_service}, console=${t.console_service}`,renderOverviewStatus(t),renderGpuCards(t.gpus),$("optToggle").textContent=n.optimizations_enabled?"Disable Power Optimizations":"Enable Power Optimizations",$("fanToggle").textContent=n.fan_manual_override?"Reset Fans to Default":"Set Fans to Max",renderMetrics(t),renderPresetCatalog(t.presets),renderUsers(t.users||[]),renderGroups(t.groups||[]),renderAudit(t.server_config||{}),renderInstances(t.instances||[]),renderPresetScopeTabs(),updateScopedCards(),syncActiveTabDisplay(),("logs"===activeTabName||showGlobalLogs)&&connectLogs(!1),setMsg("")}catch(e){setMsg("Status error: "+e)}finally{statusRefreshPromise=null}})(),statusRefreshPromise)},bootAdminUi();</script></body></html>"""
+HTML = r"""<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>club-3090 Control</title>
+    <style>:root {
+  color-scheme: dark;
+  --bg: #0b0f14;
+  --panel: #121923;
+  --line: #273243;
+  --text: #e8eef7;
+  --muted: #9dafc3;
+  --blue: #72c7ff;
+  --green: #2fc46b;
+  --red: #ff5b6c;
+  --amber: #ffcb6b;
+  --orange: #ff8a2a;
+  --field: #081018;
+  --cyan: #7dd3fc;
+  --turquoise: #26d6c6;
+}
+* {
+  box-sizing: border-box;
+}
+html,
+body {
+  min-height: 100%;
+  margin: 0;
+}
+body {
+  font-family:
+    system-ui,
+    -apple-system,
+    Segoe UI,
+    Arial,
+    sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+header {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  padding: 10px 12px;
+  background: #111925f7;
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--line);
+}
+.top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+.brand {
+  font-size: 18px;
+  font-weight: 800;
+}
+.pill {
+  color: var(--muted);
+  font-size: 12px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 4px 8px;
+  background: #0a1119;
+  margin-top: 4px;
+}
+.tabs,
+.subtabs {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+}
+.tabs {
+  padding-top: 10px;
+}
+.subtabs {
+  margin-bottom: 10px;
+}
+.tab,
+.subtab,
+.btn {
+  border: 1px solid #34445a;
+  background: #1b2635;
+  color: #eef4ff;
+  border-radius: 10px;
+  padding: 9px 11px;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.tab.active,
+.subtab.active {
+  background: #203149;
+  border-color: #3d6fa3;
+}
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.green {
+  background: #113d25;
+  border-color: #2c8a54;
+}
+.turquoise {
+  background: #079c9c;
+  border-color: #4df5e8;
+  color: #041316;
+}
+.red {
+  background: #4a1118;
+  border-color: #8a2b35;
+}
+.amber {
+  background: #4a3511;
+  border-color: #8a652b;
+}
+.orange {
+  background: #c45512;
+  border-color: #ffae42;
+  color: #fff;
+}
+.blue {
+  background: #12314d;
+  border-color: #2a72a8;
+}
+.purple {
+  background: #4b1f75;
+  border-color: #9460df;
+  color: #fff;
+}
+.default-profile {
+  background: #1d5f96;
+  border-color: #78c7ff;
+  color: #fff;
+}
+.container {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px;
+}
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 12px;
+  box-shadow: 0 8px 30px #0004;
+  margin-bottom: 10px;
+}
+.panel h2 {
+  font-size: 14px;
+  margin: 0 0 10px;
+}
+.chartgrid + .panel {
+  margin-top: 10px;
+}
+.grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+.stat {
+  background: #0b1119;
+  border: 1px solid #222d3c;
+  border-radius: 10px;
+  padding: 8px;
+}
+.label {
+  color: var(--muted);
+  font-size: 11px;
+}
+label.label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+label.label input[type="checkbox"] {
+  margin: 0;
+  flex: 0 0 auto;
+}
+.value {
+  font-weight: 700;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.value-subline {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+.actions {
+  display: flex;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+.hidden {
+  display: none !important;
+}
+.tabpane {
+  display: none;
+}
+.tabpane.active {
+  display: block;
+}
+.metricpane {
+  display: none;
+}
+.metricpane.active {
+  display: block;
+}
+.logs {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 0;
+}
+.loghead {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-bottom: 7px;
+  gap: 10px;
+}
+.loghead h2 {
+  white-space: nowrap;
+}
+.logheadchecks {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  white-space: nowrap;
+}
+.log {
+  width: 100%;
+  height: clamp(360px, calc(100dvh - 430px), 560px);
+  min-height: 320px;
+  resize: vertical;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: #030608;
+  color: #a5ffa5;
+  border: 1px solid #26313f;
+  border-radius: 12px;
+  padding: 12px;
+  font-family: Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.35;
+}
+.log-card-hidden {
+  display: none !important;
+}
+.logs-tab .container {
+  min-height: calc(100dvh - 108px);
+}
+.logs-tab .logs.panel {
+  height: calc(100dvh - 252px);
+  min-height: 500px;
+  margin-bottom: 0;
+}
+.logs-tab .log {
+  height: auto;
+  min-height: 0;
+  flex: 1;
+  resize: none;
+}
+.logs-tab .content-tab {
+  display: none !important;
+}
+.logtools {
+  display: none;
+}
+.logs-tab .logtools,
+.audit-tab .logtools {
+  display: block;
+  margin-bottom: 10px;
+}
+.logtools h2 {
+  display: block;
+  margin: 0 0 10px;
+}
+.logtools .searchbox {
+  display: flex;
+}
+.searchbox {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: nowrap;
+  width: 100%;
+}
+.searchbox input {
+  flex: 1 1 auto;
+  min-width: 80px;
+  background: var(--field);
+  color: var(--text);
+  border: 1px solid #2c3a4f;
+  border-radius: 9px;
+  padding: 9px;
+}
+.chartgrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+.gpu-chartgrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.chart {
+  height: 145px;
+  background: #081018;
+  border: 1px solid #213044;
+  border-radius: 12px;
+  padding: 8px;
+}
+.chart.tall {
+  height: 220px;
+}
+canvas {
+  width: 100%;
+  height: 100%;
+}
+.msg {
+  color: var(--amber);
+  font-size: 12px;
+  min-height: 18px;
+  padding-top: 6px;
+}
+.smallgap {
+  margin-bottom: 5px;
+}
+#auditSummary {
+  margin-top: 10px;
+}
+.gpu-cards {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 10px;
+}
+.gpu-card {
+  background: #101722;
+  border: 1px solid #26313f;
+  border-radius: 14px;
+  padding: 12px;
+}
+.gpu-title {
+  font-weight: 800;
+  color: #d9ecff;
+  margin-bottom: 10px;
+  border-bottom: 1px solid #26313f;
+  padding-bottom: 7px;
+}
+.gpu-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+.gpu-section-title {
+  color: #9dafc3;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 4px;
+}
+.gpu-line {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 13px;
+  padding: 2px 0;
+}
+.meter {
+  height: 7px;
+  background: #081018;
+  border-radius: 99px;
+  overflow: hidden;
+  margin-top: 5px;
+}
+.meter span {
+  display: block;
+  height: 100%;
+  background: #2fc46b;
+}
+.coregrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(90px, 1fr));
+  gap: 6px;
+}
+.storage-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 10px;
+}
+.storage-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.storage-card.user-facing {
+  background: #10243a;
+  border-color: #2a72a8;
+}
+.storage-card {
+  background: #0b1119;
+  border: 1px solid #243144;
+  border-radius: 12px;
+  padding: 10px;
+  min-width: 0;
+}
+.storage-title {
+  font-weight: 800;
+  color: #d9ecff;
+  margin-bottom: 6px;
+  overflow-wrap: anywhere;
+}
+.storage-meta {
+  color: #9dafc3;
+  font-size: 12px;
+  margin-bottom: 6px;
+  overflow-wrap: anywhere;
+}
+.storage-sizes {
+  display: grid;
+  grid-template-columns: minmax(85px, 0.8fr) minmax(85px, 0.8fr) minmax(
+      95px,
+      0.9fr
+    );
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.storage-sizes .stat {
+  padding: 6px;
+}
+.diskbar {
+  height: 8px;
+  background: #081018;
+  border-radius: 99px;
+  overflow: hidden;
+  width: 100%;
+  margin-bottom: 3px;
+  margin-top: 3px;
+}
+.diskbar span {
+  display: block;
+  height: 100%;
+  background: #72c7ff;
+}
+.netgrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 8px;
+}
+.temp-blue {
+  color: #60a5fa;
+}
+.temp-green {
+  color: #2fc46b;
+}
+.temp-yellow {
+  color: #ffde59;
+}
+.temp-orange {
+  color: #ff8a2a;
+}
+.temp-red {
+  color: #ff5b6c;
+}
+.temp-crimson {
+  color: #dc143c;
+  font-weight: 900;
+}
+.machine-row {
+  margin-top: 7px;
+}
+.api-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 8px;
+}
+.api-card {
+  background: #0b1119;
+  border: 1px solid #243144;
+  border-radius: 12px;
+  padding: 10px;
+}
+.api-card h3 {
+  font-size: 13px;
+  margin: 0 0 6px;
+  color: #d9ecff;
+}
+.api-card p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+.api-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.preset-actions {
+  display: flex;
+  gap: 4px;
+}
+.iconbtn {
+  border: 1px solid #34445a;
+  background: #182231;
+  color: #eef4ff;
+  border-radius: 8px;
+  padding: 5px 7px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+}
+.iconbtn svg {
+  width: 16px;
+  height: 16px;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.preset-editor {
+  display: none;
+}
+.preset-editor.open {
+  display: block;
+}
+.formgrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+}
+.formgrid label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.formgrid input,
+.formgrid select {
+  background: var(--field);
+  color: var(--text);
+  border: 1px solid #2c3a4f;
+  border-radius: 9px;
+  padding: 8px;
+}
+.preset-help {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+  margin-bottom: 10px;
+}
+.profile-balanced {
+  background: #0faeb0;
+  border-color: #5ff5e8;
+  color: #031516;
+}
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.panel-head h2 {
+  margin: 0;
+}
+.add-preset-btn {
+  width: 30px;
+  height: 30px;
+  border-radius: 999px;
+  border: 1px solid #55ee91;
+  background: #128a45;
+  color: #fff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  box-shadow: none;
+}
+.add-preset-btn:hover {
+  background: #18a957;
+}
+.add-preset-btn svg {
+  width: 15px;
+  height: 15px;
+  stroke: #fff;
+  stroke-width: 3;
+  stroke-linecap: round;
+}
+.preset-form-actions {
+  display: flex;
+  justify-content: center;
+  gap: 18px;
+  margin-top: 14px;
+}
+.preset-intro {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+  margin: 4px 0 2px;
+}
+.preset-intro.hidden {
+  display: none;
+}
+.scope-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 10px;
+}
+.scope-strip .subtabs {
+  margin: 0;
+}
+.club-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(2, 7, 14, 0.82);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  z-index: 1000;
+}
+.club-modal-card {
+  width: min(720px, 100%);
+  background: #101824;
+  border: 1px solid #31455f;
+  border-radius: 14px;
+  box-shadow: 0 20px 70px rgba(0, 0, 0, 0.45);
+  padding: 14px;
+}
+.modal-keybox {
+  width: 100%;
+  min-height: 120px;
+  resize: vertical;
+  border: 1px solid #31455f;
+  border-radius: 10px;
+  background: #07101a;
+  color: #d9ecff;
+  padding: 10px;
+  font: 600 13px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+.busy-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+.spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid #34445a;
+  border-top-color: var(--blue);
+  border-radius: 999px;
+  animation: club3090-spin 0.8s linear infinite;
+  flex: 0 0 auto;
+}
+.instance-panel-busy {
+  border-color: #35506d;
+}
+.instance-panel-busy .subtabs,
+.instance-panel-busy .actions,
+.instance-panel-busy .value {
+  opacity: 0.82;
+}
+@keyframes club3090-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (max-width: 900px) {
+  .chartgrid {
+    grid-template-columns: 1fr;
+  }
+  .gpu-chartgrid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px;
+  }
+  .grid {
+    grid-template-columns: 1fr 1fr;
+  }
+  .gpu-grid {
+    grid-template-columns: 1fr;
+  }
+  .log {
+    height: clamp(320px, calc(100dvh - 410px), 520px);
+  }
+  .logs-tab .logs.panel {
+    height: calc(100dvh - 250px);
+    min-height: 500px;
+  }
+  .logs-tab .log {
+    height: auto;
+    min-height: 0;
+  }
+}</style>
+  </head>
+  <body>
+    <header>
+      <div class="top">
+        <div>
+          <div class="brand">club-3090 Control &bull; __SCRIPT_VERSION__</div>
+          <div class="pill" id="summary">loading...</div>
+        </div>
+      </div>
+      <div class="tabs">
+        <button class="tab active" onclick="tab(event, 'overview')">Main</button
+        ><button class="tab" onclick="tab(event, 'system')">System</button
+        ><button class="tab" onclick="tab(event, 'presets')">Presets</button
+        ><button class="tab" id="usersTabBtn" onclick="tab(event, 'users')">
+          Users</button
+        ><button class="tab" onclick="tab(event, 'metrics')">Metrics</button
+        ><button class="tab" onclick="tab(event, 'logs')">Logs</button>
+      </div>
+    </header>
+    <main class="container">
+      <section id="overview" class="tabpane content-tab active">
+        <div class="panel">
+          <h2>Status</h2>
+          <div class="grid">
+            <div class="stat">
+              <div class="label">Mode</div>
+              <div class="value" id="mode">-</div>
+            </div>
+            <div class="stat">
+              <div class="label">Container</div>
+              <div class="value" id="container">-</div>
+            </div>
+            <div class="stat">
+              <div class="label">Requests</div>
+              <div class="value" id="req">-</div>
+            </div>
+            <div class="stat">
+              <div class="label">Uptime</div>
+              <div class="value" id="uptime">-</div>
+            </div>
+            <div class="stat">
+              <div class="label">Power</div>
+              <div class="value" id="powerbox">-</div>
+            </div>
+            <div class="stat">
+              <div class="label">Last</div>
+              <div class="value" id="last">-</div>
+            </div>
+          </div>
+          <div class="msg" id="msg"></div>
+        </div>
+        <div id="gpuCards" class="gpu-cards"></div>
+      </section>
+      <section id="system" class="tabpane content-tab">
+        <div class="panel">
+          <h2>Services</h2>
+          <div class="value" id="services">-</div>
+        </div>
+        <div class="panel">
+          <h2>Audit Overview</h2>
+          <div class="grid">
+            <div class="stat">
+              <div class="label">Admin UI</div>
+              <div class="value" id="auditAdminEndpoint">-</div>
+            </div>
+            <div class="stat">
+              <div class="label">Proxy</div>
+              <div class="value" id="auditProxyEndpoint">-</div>
+            </div>
+            <div class="stat">
+              <div class="label">Exposure</div>
+              <div class="value" id="auditExposure">-</div>
+            </div>
+            <div class="stat">
+              <div class="label">Local Automation</div>
+              <div class="value" id="auditLocalApi">-</div>
+            </div>
+          </div>
+          <div class="value smallgap" id="auditSummary">-</div>
+          <div class="msg" id="auditMsg"></div>
+        </div>
+        <div class="panel">
+          <h2>Access Policy</h2>
+          <div class="actions" id="accessPolicyRow">
+            <label class="label"
+              ><input
+                type="checkbox"
+                id="auditAllowAnonymousProxy"
+                onchange="mirrorAuthToggles(this.checked)"
+              />
+              allow requests without per-user API keys</label
+            ><button class="btn blue" onclick="saveAuthSettings()">
+              Save Policy
+            </button>
+          </div>
+          <div
+            class="value smallgap"
+            style="margin-top: 10px"
+            id="auditPolicyText"
+          >
+            -
+          </div>
+        </div>
+        <div class="panel">
+          <h2>Instances</h2>
+          <div class="subtabs" id="instanceTabs"></div>
+          <div class="value smallgap" id="instanceSummary">-</div>
+          <div class="actions">
+            <button class="btn blue" onclick="instanceAction('start_instance')">
+              Start</button
+            ><button
+              class="btn amber"
+              onclick="instanceAction('restart_instance')"
+            >
+              Restart</button
+            ><button class="btn red" onclick="instanceAction('stop_container')">
+              Stop</button
+            ><button
+              class="btn green"
+              id="instanceEnableBtn"
+              onclick="toggleInstanceEnabled()"
+            >
+              Disable Boot Autostart
+            </button>
+          </div>
+          <div class="msg" id="instanceMsg"></div>
+        </div>
+        <div class="panel">
+          <h2>System</h2>
+          <div class="actions">
+            <button class="btn amber" onclick="wol()">Wake-on-LAN</button>
+          </div>
+          <div class="actions machine-row">
+            <button class="btn red" onclick="machineAction('reboot')">
+              Restart Machine</button
+            ><button class="btn red" onclick="machineAction('shutdown')">
+              Shutdown Machine
+            </button>
+          </div>
+        </div>
+        <div class="panel">
+          <h2>Profiles</h2>
+          <div class="actions">
+            <button class="btn green" onclick="profile('eco')">Eco</button
+            ><button class="btn profile-balanced" onclick="profile('balanced')">
+              Balanced</button
+            ><button class="btn default-profile" onclick="profile('default')">
+              Default</button
+            ><button class="btn orange" onclick="profile('turbo')">
+              Turbo
+            </button>
+          </div>
+        </div>
+        <div class="panel">
+          <h2>Power + Cooling</h2>
+          <div class="actions">
+            <button
+              class="btn green"
+              id="optToggle"
+              onclick="togglePowerOptimizations()"
+            >
+              Disable Power Optimizations</button
+            ><button class="btn green" id="fanToggle" onclick="toggleFansMax()">
+              Set Fans to Max
+            </button>
+          </div>
+        </div>
+      </section>
+      <section id="presets" class="tabpane content-tab">
+        <div class="panel">
+          <h2>Per-Instance Docker Presets</h2>
+          <div class="preset-help">
+            Assign a single-card preset to the currently selected GPU instance.
+            Each instance gets its own GPU binding, docker override, port, and
+            proxy prefix such as <code>:8009/GPU0/</code>.
+          </div>
+          <div class="actions">
+            <button class="btn blue" onclick="switchMode('vllm/default')">
+              default</button
+            ><button class="btn blue" onclick="switchMode('vllm/long-vision')">
+              long-vision</button
+            ><button class="btn blue" onclick="switchMode('vllm/long-text')">
+              long-text</button
+            ><button
+              class="btn blue"
+              onclick="switchMode('vllm/bounded-thinking')"
+            >
+              bounded-thinking</button
+            ><button class="btn blue" onclick="switchMode('vllm/tools-text')">
+              tools-text</button
+            ><button class="btn blue" onclick="switchMode('vllm/minimal')">
+              minimal</button
+            ><button class="btn blue" onclick="switchMode('llamacpp/default')">
+              llamacpp-default</button
+            ><button
+              class="btn blue"
+              onclick="switchMode('llamacpp/concurrent')"
+            >
+              llamacpp-concurrent
+            </button>
+          </div>
+        </div>
+        <div class="panel">
+          <h2>API Presets</h2>
+          <div class="preset-help">
+            Default presets are locked. Custom presets are exposed as
+            <code>:8009/v1/&lt;name&gt;</code> and
+            <code>:8009/&lt;name&gt;</code>. Both forms work with
+            <code>short-</code> and <code>concise-</code> prefixes.
+          </div>
+          <div id="apiPresetGrid" class="api-grid"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Custom Preset Templates</h2>
+            <button
+              class="add-preset-btn"
+              title="Create preset"
+              aria-label="Create preset"
+              onclick="openPresetEditor()"
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 5v14M5 12h14" fill="none" />
+              </svg>
+            </button>
+          </div>
+          <div id="presetIntro" class="preset-intro">
+            Create custom endpoint templates for different workloads or clients.
+            Each preset saves generation parameters like temperature, sampling,
+            thinking mode, penalties, and token limits, then exposes them as
+            custom OpenAI-compatible endpoints such as
+            <code>:8009/v1/my_preset</code> and <code>:8009/my_preset</code>.
+            Short and concise prefixes work with custom presets too.
+          </div>
+          <div id="presetEditor" class="preset-editor">
+            <div class="formgrid">
+              <label
+                >Endpoint name<input
+                  id="presetName"
+                  placeholder="my_coding" /></label
+              ><label
+                >Description<input
+                  id="presetDescription"
+                  placeholder="What this preset is for" /></label
+              ><label
+                >Temperature<input
+                  id="presetTemperature"
+                  type="number"
+                  step="0.01"
+                  placeholder="0.7" /></label
+              ><label
+                >Top P<input
+                  id="presetTopP"
+                  type="number"
+                  step="0.01"
+                  placeholder="0.95" /></label
+              ><label
+                >Top K<input
+                  id="presetTopK"
+                  type="number"
+                  step="1"
+                  placeholder="20" /></label
+              ><label
+                >Min P<input
+                  id="presetMinP"
+                  type="number"
+                  step="0.01"
+                  placeholder="0" /></label
+              ><label
+                >Thinking<select id="presetThinking">
+                  <option value="false">Disabled</option>
+                  <option value="true">Enabled</option>
+                </select></label
+              ><label
+                >Preserve Thinking<select id="presetPreserveThinking">
+                  <option value="false">No</option>
+                  <option value="true">Yes</option>
+                </select></label
+              ><label
+                >Repetition penalty<input
+                  id="presetRepetitionPenalty"
+                  type="number"
+                  step="0.01"
+                  placeholder="1.0" /></label
+              ><label
+                >Presence penalty<input
+                  id="presetPresencePenalty"
+                  type="number"
+                  step="0.01"
+                  placeholder="0" /></label
+              ><label
+                >Frequency penalty<input
+                  id="presetFrequencyPenalty"
+                  type="number"
+                  step="0.01"
+                  placeholder="0" /></label
+              ><label
+                >Max context / prompt tokens<input
+                  id="presetMaxCtx"
+                  type="number"
+                  step="1"
+                  placeholder="truncate_prompt_tokens" /></label
+              ><label
+                >Max reply tokens<input
+                  id="presetMaxTokens"
+                  type="number"
+                  step="1"
+                  placeholder="max_tokens" /></label
+              ><label
+                >Seed<input
+                  id="presetSeed"
+                  type="number"
+                  step="1"
+                  placeholder="optional" /></label
+              ><label
+                >Min reply tokens<input
+                  id="presetMinTokens"
+                  type="number"
+                  step="1"
+                  placeholder="min_tokens" /></label
+              ><label
+                >Logprobs<input
+                  id="presetLogprobs"
+                  type="number"
+                  step="1"
+                  placeholder="optional" /></label
+              ><label
+                >Top logprobs<input
+                  id="presetTopLogprobs"
+                  type="number"
+                  step="1"
+                  placeholder="optional" /></label
+              ><label
+                >Length penalty<input
+                  id="presetLengthPenalty"
+                  type="number"
+                  step="0.01"
+                  placeholder="optional" /></label
+              ><label
+                >Ignore EOS<select id="presetIgnoreEos">
+                  <option value="">Default</option>
+                  <option value="false">No</option>
+                  <option value="true">Yes</option>
+                </select></label
+              ><label
+                >Skip special tokens<select id="presetSkipSpecial">
+                  <option value="">Default</option>
+                  <option value="true">Yes</option>
+                  <option value="false">No</option>
+                </select></label
+              ><label
+                >Include stop text<select id="presetIncludeStop">
+                  <option value="">Default</option>
+                  <option value="false">No</option>
+                  <option value="true">Yes</option>
+                </select></label
+              ><label
+                >Stop strings<input
+                  id="presetStop"
+                  placeholder="one per line or comma-separated"
+              /></label>
+            </div>
+            <div class="preset-form-actions">
+              <button
+                id="presetSaveBtn"
+                class="btn green"
+                onclick="savePresetFromForm()"
+              >
+                💾 Save</button
+              ><button class="btn red" onclick="closePresetEditor()">
+                ❌ Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+      <section id="users" class="tabpane content-tab"></section>
+      <section id="metrics" class="tabpane content-tab">
+        <div class="panel">
+          <h2>Metrics</h2>
+          <div class="subtabs">
+            <button class="subtab active" onclick="metricTab(event, 'mMain')">
+              Main</button
+            ><button class="subtab" onclick="metricTab(event, 'mGpu')">
+              GPUs</button
+            ><button class="subtab" onclick="metricTab(event, 'mRam')">
+              RAM</button
+            ><button class="subtab" onclick="metricTab(event, 'mCpu')">
+              CPU</button
+            ><button class="subtab" onclick="metricTab(event, 'mSystem')">
+              System</button
+            ><button class="subtab" onclick="metricTab(event, 'mNetwork')">
+              Network
+            </button>
+          </div>
+          <div id="mMain" class="metricpane active">
+            <div class="chartgrid">
+              <div class="chart"><canvas id="cGpu"></canvas></div>
+              <div class="chart"><canvas id="cMem"></canvas></div>
+              <div class="chart"><canvas id="cLatency"></canvas></div>
+              <div class="chart"><canvas id="cTps"></canvas></div>
+            </div>
+          </div>
+          <div id="mGpu" class="metricpane">
+            <div id="gpuMetricCharts" class="gpu-chartgrid"></div>
+          </div>
+          <div id="mRam" class="metricpane">
+            <div id="ramInfo" class="value smallgap"></div>
+            <div class="chartgrid">
+              <div class="chart tall"><canvas id="cRam"></canvas></div>
+            </div>
+          </div>
+          <div id="mCpu" class="metricpane">
+            <div class="chartgrid">
+              <div class="chart"><canvas id="cCpu"></canvas></div>
+            </div>
+            <div id="cpuCores" class="coregrid"></div>
+          </div>
+          <div id="mSystem" class="metricpane">
+            <div class="chartgrid">
+              <div class="chart"><canvas id="cSystemUtil"></canvas></div>
+            </div>
+            <div class="panel">
+              <h2>System Information</h2>
+              <div id="systemInfo" class="value"></div>
+            </div>
+            <div class="panel">
+              <h2>Storage</h2>
+              <div id="diskInfo"></div>
+            </div>
+          </div>
+          <div id="mNetwork" class="metricpane">
+            <div id="netInfo" class="netgrid"></div>
+            <div class="chartgrid">
+              <div class="chart"><canvas id="cNetDown"></canvas></div>
+              <div class="chart"><canvas id="cNetUp"></canvas></div>
+            </div>
+          </div>
+        </div>
+      </section>
+      <section id="logs" class="tabpane"></section>
+      <section class="panel logtools">
+        <h2>Log Management</h2>
+        <div class="searchbox">
+          <button
+            class="btn"
+            id="searchPrev"
+            onclick="previousMatch()"
+            disabled
+          >
+            ⏪</button
+          ><input
+            id="searchQuery"
+            placeholder="Search log text"
+            onkeydown="if (event.key === 'Enter') runSearchOrNext();"
+          /><button class="btn" id="searchNext" onclick="runSearchOrNext()">
+            🔍</button
+          ><span style="border-left: 1px solid #34445a; height: 28px"></span
+          ><button class="btn" id="refreshBtn" onclick="refreshStatus()">
+            ♻️</button
+          ><button class="btn" id="clearBtn" onclick="clearOrCancelLog()">
+            🗑️
+          </button>
+        </div>
+      </section>
+      <section class="logs panel">
+        <div class="loghead">
+                <h2 id="logTitle">Docker Logs</h2>
+          <div class="logheadchecks">
+            <span class="label" id="logInstanceLabel">instance: primary</span
+            ><label class="label"
+              ><input
+                type="checkbox"
+                id="showGlobalLogs"
+                checked
+                onchange="setShowGlobalLogs(this.checked)"
+              />
+              show globally</label
+            ><label class="label"
+              ><input type="checkbox" id="autoscroll" checked />
+              auto-scroll</label
+            >
+          </div>
+        </div>
+        <textarea id="log" class="log" readonly wrap="soft">
+Connecting...</textarea
+        >
+      </section>
+    </main>
+    <script>// Core state and DOM helpers
+const searchState = {
+  active: false,
+  query: "",
+  matches: [],
+  index: -1,
+  prevAutoscroll: true,
+};
+let lastStatus = null;
+let activeTabName = "overview";
+let showGlobalLogs = true;
+function $(id) {
+  return document.getElementById(id);
+}
+function setMsg(t) {
+  $("msg").textContent = t || "";
+}
+
+// Log search, formatting, and GPU cards
+function clearLog() {
+  $("log").value = "";
+}
+function appendLog(t) {
+  const b = $("log");
+  b.value += t + "\n";
+  if (b.value.length > 900000) b.value = b.value.slice(-750000);
+  if (searchState.active) {
+    recalculateMatches(false);
+    return;
+  }
+  if ($("autoscroll").checked) b.scrollTop = b.scrollHeight;
+}
+function clearOrCancelLog() {
+  if (searchState.active) cancelSearch();
+  else clearLog();
+}
+function recalculateMatches(keepIndex = true) {
+  const q = $("searchQuery").value;
+  if (!searchState.active || !q) return;
+  const text = $("log").value.toLowerCase(),
+    needle = q.toLowerCase();
+  let pos = 0,
+    m = [];
+  while (needle && true) {
+    const i = text.indexOf(needle, pos);
+    if (i < 0) break;
+    m.push(i);
+    pos = i + needle.length;
+  }
+  searchState.matches = m;
+  if (!m.length) {
+    searchState.index = -1;
+  } else if (keepIndex) {
+    searchState.index = Math.min(Math.max(searchState.index, 0), m.length - 1);
+  } else {
+    searchState.index = 0;
+  }
+  updateSearchUI(false);
+}
+function runSearchOrNext() {
+  if (searchState.active && searchState.matches.length) {
+    nextMatch();
+    return;
+  }
+  const q = $("searchQuery").value;
+  if (!q) return;
+  searchState.prevAutoscroll = $("autoscroll").checked;
+  searchState.active = true;
+  $("autoscroll").checked = false;
+  $("autoscroll").disabled = true;
+  recalculateMatches(false);
+  if (searchState.matches.length) gotoMatch(0);
+  else updateSearchUI(false);
+}
+function gotoMatch(i) {
+  if (!searchState.matches.length) return;
+  searchState.index =
+    (i + searchState.matches.length) % searchState.matches.length;
+  const start = searchState.matches[searchState.index],
+    end = start + searchState.query.length;
+  const log = $("log");
+  log.focus();
+  log.setSelectionRange(start, end);
+  const lineHeight = 16;
+  const before = log.value.slice(0, start).split("\n").length - 1;
+  log.scrollTop = Math.max(0, before * lineHeight - log.clientHeight / 2);
+  updateSearchUI(false);
+}
+function nextMatch() {
+  if (!searchState.active || !searchState.matches.length) return;
+  gotoMatch(searchState.index + 1);
+}
+function previousMatch() {
+  if (!searchState.active || !searchState.matches.length) return;
+  gotoMatch(searchState.index - 1);
+}
+function cancelSearch() {
+  searchState.active = false;
+  searchState.query = "";
+  searchState.matches = [];
+  searchState.index = -1;
+  $("searchQuery").value = "";
+  $("autoscroll").disabled = false;
+  $("autoscroll").checked = searchState.prevAutoscroll;
+  $("log").setSelectionRange($("log").selectionStart, $("log").selectionStart);
+  updateSearchUI(true);
+}
+function updateSearchUI(reset) {
+  if (searchState.active) {
+    searchState.query = $("searchQuery").value;
+    $("searchPrev").disabled = searchState.matches.length < 2;
+    $("searchNext").textContent = searchState.matches.length > 1 ? "⏩" : "🔍";
+    $("refreshBtn").disabled = true;
+    $("refreshBtn").textContent = searchState.matches.length
+      ? `${searchState.index + 1}/${searchState.matches.length}`
+      : "0/0";
+    $("clearBtn").textContent = "❌";
+  } else {
+    $("searchPrev").disabled = true;
+    $("searchNext").textContent = "🔍";
+    $("refreshBtn").disabled = false;
+    $("refreshBtn").textContent = "♻️";
+    $("clearBtn").textContent = "🗑️";
+  }
+}
+function fmtUptime(s) {
+  s = Number(s || 0);
+  return Math.floor(s / 3600) + "h " + Math.floor((s % 3600) / 60) + "m";
+}
+function mibToGiB(v) {
+  return (Number(v || 0) / 1024).toFixed(2);
+}
+function inferGpuStatus(g) {
+  const u = Number(g.util_pct || 0);
+  if (
+    lastStatus &&
+    lastStatus.metrics &&
+    lastStatus.metrics.active_requests > 0
+  ) {
+    return u > 20 ? "Token Generation" : "Prompt Processing";
+  }
+  return u > 5 ? "Active" : "Idle";
+}
+function tempClass(t) {
+  t = Number(t || 0);
+  if (t < 35) return "temp-blue";
+  if (t < 50) return "temp-green";
+  if (t < 60) return "temp-yellow";
+  if (t < 70) return "temp-orange";
+  if (t < 80) return "temp-red";
+  return "temp-crimson";
+}
+function tempColor(t) {
+  t = Number(t || 0);
+  if (t < 35) return "#60a5fa";
+  if (t < 50) return "#2fc46b";
+  if (t < 60) return "#ffde59";
+  if (t < 70) return "#ff8a2a";
+  if (t < 80) return "#ff5b6c";
+  return "#dc143c";
+}
+function tempLabel(t) {
+  const warn = Number(t || 0) >= 80 ? " ⚠️" : "";
+  return `${t || "N/A"} °C${warn}`;
+}
+function renderGpuCards(gs) {
+  if (!gs || !gs.length) {
+    $("gpuCards").innerHTML = '<div class="panel">No GPU data</div>';
+    return;
+  }
+  $("gpuCards").innerHTML = gs
+    .map((g) =>
+      g.error
+        ? `<div class="gpu-card">${g.error}</div>`
+        : `<div class="gpu-card"><div class="gpu-title">GPU ${g.index} - ${g.name || "RTX 3090"}${g.vendor ? " (" + g.vendor + ")" : ""}</div><div class="gpu-grid"><div><div class="gpu-section-title">Temperature</div><div class="gpu-line"><span>Core</span><b class="${tempClass(g.temp_c)}">${tempLabel(g.temp_c)}</b></div></div><div><div class="gpu-section-title">VRAM</div><div class="gpu-line"><span>Free</span><b>${mibToGiB(g.mem_free_mib)} GB</b></div><div class="gpu-line"><span>Used</span><b>${mibToGiB(g.mem_used_mib)} GB</b></div><div class="gpu-line"><span>Max</span><b>${mibToGiB(g.mem_total_mib)} GB</b></div><div class="meter"><span style="width:${Number(g.mem_pct || 0)}%"></span></div></div><div><div class="gpu-section-title">Power</div><div class="gpu-line"><span>Draw</span><b>${g.power_w || "N/A"} W</b></div><div class="gpu-line"><span>Max Power</span><b>${g.power_limit_w || "N/A"} W</b></div></div><div><div class="gpu-section-title">Fans</div><div class="gpu-line"><span>Speed</span><b>${g.fan_pct || "N/A"}%</b></div></div><div><div class="gpu-section-title">Clocks</div><div class="gpu-line"><span>Core</span><b>${g.core_clock_mhz || "N/A"} MHz</b></div><div class="gpu-line"><span>Mem</span><b>${g.mem_clock_mhz || "N/A"} MHz</b></div></div><div><div class="gpu-section-title">Usage</div><div class="gpu-line"><span>Load</span><b>${g.util_pct || "N/A"}%</b></div><div class="gpu-line"><span>Status</span><b>${inferGpuStatus(g)}</b></div></div></div></div>`,
+    )
+    .join("");
+}
+let editingPresetName = null;
+function presetParamSummary(params) {
+  params = params || {};
+  const bits = [];
+  [
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "presence_penalty",
+    "frequency_penalty",
+    "repetition_penalty",
+    "length_penalty",
+    "max_tokens",
+    "max_completion_tokens",
+    "min_tokens",
+    "truncate_prompt_tokens",
+    "seed",
+    "logprobs",
+    "top_logprobs",
+  ].forEach((k) => {
+    if (params[k] !== undefined && params[k] !== null && params[k] !== "")
+      bits.push(`${k}: ${params[k]}`);
+  });
+  if (params.ignore_eos !== undefined)
+    bits.push(`ignore_eos: ${params.ignore_eos ? "on" : "off"}`);
+  if (params.skip_special_tokens !== undefined)
+    bits.push(`skip special: ${params.skip_special_tokens ? "on" : "off"}`);
+  if (params.include_stop_str_in_output !== undefined)
+    bits.push(
+      `include stop: ${params.include_stop_str_in_output ? "on" : "off"}`,
+    );
+  if (params.stop !== undefined)
+    bits.push(
+      `stop: ${Array.isArray(params.stop) ? params.stop.join("|") : params.stop}`,
+    );
+  if (params.chat_template_kwargs) {
+    const c = params.chat_template_kwargs;
+    if (c.enable_thinking !== undefined)
+      bits.push(`thinking: ${c.enable_thinking ? "on" : "off"}`);
+    if (c.preserve_thinking) bits.push("preserve thinking: on");
+  }
+  return bits.join(", ") || "No explicit parameters";
+}
+function renderPresetCatalog(catalog) {
+  const grid = $("apiPresetGrid");
+  if (!grid || !catalog) return;
+  const items = [...(catalog.defaults || []), ...(catalog.custom || [])];
+  grid.innerHTML =
+    items
+      .map((p) => {
+        const locked = p.locked;
+        return `<div class="api-card"><div class="api-card-head"><h3>${p.endpoint}<br><span class="label">${p.endpoint_alt || "/" + p.name}</span></h3>${locked ? '<span class="label">default</span>' : `<span class="preset-actions"><button class="iconbtn" title="Edit" onclick="editPreset('${p.name}')">✏️</button><button class="iconbtn" title="Delete" onclick="deletePreset('${p.name}')">❌</button></span>`}</div><p>${p.description || ""}</p><p class="label">${presetParamSummary(p.params)}</p></div>`;
+      })
+      .join("") +
+    `<div class="api-card"><h3>/v1/short-* / /short-* and /v1/concise-* / /concise-*</h3><p>Prefix any default or custom preset to cap replies: short = 4096 tokens, concise = 512 tokens. Presets work both under /v1/name and /name for clients that append /v1 automatically.</p></div>`;
+}
+function openPresetEditor(data) {
+  editingPresetName = data && data.name ? data.name : null;
+  $("presetEditor").classList.add("open");
+  if ($("presetIntro")) $("presetIntro").classList.add("hidden");
+  $("presetSaveBtn").textContent = editingPresetName
+    ? "💾 Save changes"
+    : "💾 Save";
+  $("presetName").disabled = !!editingPresetName;
+  $("presetName").value = data?.name || "";
+  $("presetDescription").value = data?.description || "";
+  const p = data?.params || {};
+  const c = p.chat_template_kwargs || {};
+  $("presetTemperature").value = p.temperature ?? "";
+  $("presetTopP").value = p.top_p ?? "";
+  $("presetTopK").value = p.top_k ?? "";
+  $("presetMinP").value = p.min_p ?? "";
+  $("presetThinking").value = String(!!c.enable_thinking);
+  $("presetPreserveThinking").value = String(!!c.preserve_thinking);
+  $("presetRepetitionPenalty").value = p.repetition_penalty ?? "";
+  $("presetPresencePenalty").value = p.presence_penalty ?? "";
+  $("presetFrequencyPenalty").value = p.frequency_penalty ?? "";
+  $("presetMaxCtx").value = p.truncate_prompt_tokens ?? "";
+  $("presetMaxTokens").value = p.max_tokens ?? "";
+  $("presetSeed").value = p.seed ?? "";
+  $("presetMinTokens").value = p.min_tokens ?? "";
+  $("presetLogprobs").value = p.logprobs ?? "";
+  $("presetTopLogprobs").value = p.top_logprobs ?? "";
+  $("presetLengthPenalty").value = p.length_penalty ?? "";
+  $("presetIgnoreEos").value =
+    p.ignore_eos === undefined ? "" : String(!!p.ignore_eos);
+  $("presetSkipSpecial").value =
+    p.skip_special_tokens === undefined ? "" : String(!!p.skip_special_tokens);
+  $("presetIncludeStop").value =
+    p.include_stop_str_in_output === undefined
+      ? ""
+      : String(!!p.include_stop_str_in_output);
+  $("presetStop").value = Array.isArray(p.stop)
+    ? p.stop.join("\n")
+    : (p.stop ?? "");
+  $("presetEditor").scrollIntoView({ behavior: "smooth", block: "center" });
+}
+function closePresetEditor() {
+  editingPresetName = null;
+  $("presetEditor").classList.remove("open");
+  if ($("presetIntro")) $("presetIntro").classList.remove("hidden");
+}
+function collectPresetForm() {
+  function val(id) {
+    return $(id).value.trim();
+  }
+  function num(id) {
+    const v = val(id);
+    return v === "" ? undefined : Number(v);
+  }
+  const preset = {
+    description: val("presetDescription"),
+    enable_thinking: $("presetThinking").value === "true",
+    preserve_thinking: $("presetPreserveThinking").value === "true",
+  };
+  [
+    ["temperature", "presetTemperature"],
+    ["top_p", "presetTopP"],
+    ["top_k", "presetTopK"],
+    ["min_p", "presetMinP"],
+    ["repetition_penalty", "presetRepetitionPenalty"],
+    ["presence_penalty", "presetPresencePenalty"],
+    ["frequency_penalty", "presetFrequencyPenalty"],
+    ["truncate_prompt_tokens", "presetMaxCtx"],
+    ["max_tokens", "presetMaxTokens"],
+    ["seed", "presetSeed"],
+    ["min_tokens", "presetMinTokens"],
+    ["logprobs", "presetLogprobs"],
+    ["top_logprobs", "presetTopLogprobs"],
+    ["length_penalty", "presetLengthPenalty"],
+  ].forEach(([k, id]) => {
+    const n = num(id);
+    if (Number.isFinite(n)) preset[k] = n;
+  });
+  [
+    ["ignore_eos", "presetIgnoreEos"],
+    ["skip_special_tokens", "presetSkipSpecial"],
+    ["include_stop_str_in_output", "presetIncludeStop"],
+  ].forEach(([k, id]) => {
+    const v = val(id);
+    if (v !== "") preset[k] = v === "true";
+  });
+  const stop = val("presetStop");
+  if (stop) preset.stop = stop;
+  return preset;
+}
+async function savePresetFromForm() {
+  const name = editingPresetName || $("presetName").value.trim();
+  try {
+    const r = await fetch("/admin/presets", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        action: "save",
+        name,
+        preset: collectPresetForm(),
+      }),
+    });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || "save failed");
+    renderPresetCatalog(j.presets);
+    closePresetEditor();
+    setMsg("Saved preset " + name);
+    await refreshStatus();
+  } catch (e) {
+    alert("Preset save failed: " + e);
+  }
+}
+function editPreset(name) {
+  const p = (lastStatus?.presets?.custom || []).find((x) => x.name === name);
+  if (p) openPresetEditor(p);
+}
+async function deletePreset(name) {
+  if (!confirm("Delete custom preset " + name + "?")) return;
+  try {
+    const r = await fetch("/admin/presets", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "delete", name }),
+    });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || "delete failed");
+    renderPresetCatalog(j.presets);
+    setMsg("Deleted preset " + name);
+    await refreshStatus();
+  } catch (e) {
+    alert("Preset delete failed: " + e);
+  }
+}
+
+// Base chart rendering
+function draw(id, data, key, label, color) {
+  const c = $(id);
+  if (!c) return;
+  const ctx = c.getContext("2d"),
+    dpr = devicePixelRatio || 1,
+    w = (c.width = c.clientWidth * dpr),
+    h = (c.height = c.clientHeight * dpr);
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = color || "#9dafc3";
+  ctx.font = `${11 * dpr}px system-ui`;
+  ctx.fillText(label, 8 * dpr, 14 * dpr);
+  if (!data.length) return;
+  const vals = data.map((x) => Number(x[key] || 0)),
+    max = Math.max(1, ...vals) * 1.1;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2 * dpr;
+  ctx.beginPath();
+  vals.forEach((v, i) => {
+    const x = (i / (vals.length - 1 || 1)) * w,
+      y = h - (v / max) * (h - 24 * dpr) - 4 * dpr;
+    i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+  });
+  ctx.stroke();
+  ctx.fillStyle = "#e8eef7";
+  ctx.fillText(String(vals[vals.length - 1] || 0), w - 62 * dpr, 14 * dpr);
+}
+function drawGpuSeries(id, series, index, key, label, color) {
+  const data = series.map((p) => {
+    const g = (p.gpus || []).find((x) => String(x.index) === String(index));
+    return { [key]: g ? Number(g[key] || 0) : 0 };
+  });
+  draw(id, data, key, label, color);
+}
+function renderMetrics(j) {
+  const s = j.series || [];
+  draw("cGpu", s, "gpu_util", "GPU util %", "#72c7ff");
+  draw("cMem", s, "mem_pct", "VRAM %", "#2fc46b");
+  draw("cLatency", s, "latency_s", "Latency s", "#ffcb6b");
+  draw("cTps", s, "tps", "TPS est", "#ff5b6c");
+  draw("cRam", s, "ram_pct", "System RAM %", "#2fc46b");
+  draw("cCpu", s, "cpu_pct", "CPU total %", "#72c7ff");
+  draw("cSystemUtil", s, "system_util_pct", "System utilization %", "#a78bfa");
+  draw("cNetDown", s, "net_rx_kbps", "Download kbps", "#2fc46b");
+  draw("cNetUp", s, "net_tx_kbps", "Upload kbps", "#72c7ff");
+  if ($("ramInfo"))
+    $("ramInfo").textContent =
+      j.system && j.system.memory
+        ? `Used ${mibToGiB(j.system.memory.used_mib)} / ${mibToGiB(j.system.memory.total_mib)} GB (${j.system.memory.used_pct}%)`
+        : "";
+  const cores = (j.system && j.system.cpu && j.system.cpu.cores) || [];
+  if ($("cpuCores"))
+    $("cpuCores").innerHTML = cores
+      .map(
+        (c) =>
+          `<div class="stat"><div class="label">Core ${c.core}</div><div class="value">${c.usage_pct}%</div><div class="meter"><span style="width:${c.usage_pct}%"></span></div></div>`,
+      )
+      .join("");
+  const disks = (j.system && j.system.disks) || [];
+  function storageCard(d) {
+    if (d.error)
+      return `<div class="storage-card"><div class="storage-title">Error</div><div class="value">${d.error}</div></div>`;
+    const title = `${d.path || d.source || d.name || "disk"}${d.label ? " — " + d.label : ""}`;
+    const meta = `${d.model || ""} ${d.transport ? "· " + d.transport : ""} · ${d.type || "-"} / ${d.partition_type || "-"} · ${d.fs || "-"} · ${d.mount || "not mounted"}${d.usage_basis ? " · " + d.usage_basis : ""}`;
+    const sizeText = (v) =>
+      v === null || v === undefined ? "Unknown" : `${v} GB`;
+    const free = sizeText(d.free_gib);
+    const used = sizeText(d.used_gib);
+    const total = sizeText(d.total_gib);
+    const pct =
+      d.used_pct === null || d.used_pct === undefined
+        ? 0
+        : Number(d.used_pct || 0);
+    const pctLabel =
+      d.used_pct === null || d.used_pct === undefined
+        ? "usage unknown"
+        : `${pct}% used`;
+    const cls = d.user_facing ? "storage-card user-facing" : "storage-card";
+    return `<div class="${cls}"><div class="storage-title">${title}</div><div class="storage-meta">${meta}</div><div class="storage-sizes"><div class="stat"><div class="label">Free</div><div class="value">${free}</div></div><div class="stat"><div class="label">Used</div><div class="value">${used}</div></div><div class="stat"><div class="label">Total</div><div class="value">${total}</div></div></div><div class="diskbar"><span style="width:${pct}%"></span></div><div class="label">${pctLabel}</div></div>`;
+  }
+  if ($("diskInfo")) {
+    const physical = disks.filter(
+      (d) => d.kind === "disk" || d.type === "disk",
+    );
+    const volumes = disks.filter(
+      (d) => !(d.kind === "disk" || d.type === "disk"),
+    );
+    $("diskInfo").innerHTML =
+      `<div class="storage-section"><div class="panel"><h2>Disks</h2><div class="storage-list">${physical.map(storageCard).join("") || '<div class="value">No physical disks found</div>'}</div></div><div class="panel"><h2>Volumes</h2><div class="storage-list">${volumes.map(storageCard).join("") || '<div class="value">No volumes found</div>'}</div></div></div>`;
+  }
+  const net = (j.system && j.system.network) || {};
+  if ($("netInfo"))
+    $("netInfo").innerHTML =
+      `<div class="stat"><div class="label">Local IP</div><div class="value">${net.local_ip || "unknown"}</div></div><div class="stat"><div class="label">Internet IP</div><div class="value">${net.public_ip || "unknown"}</div></div><div class="stat"><div class="label">Download</div><div class="value">${net.rx_kbps || 0} kbps</div></div><div class="stat"><div class="label">Upload</div><div class="value">${net.tx_kbps || 0} kbps</div></div>`;
+  const info = (j.system && j.system.info) || {};
+  if ($("systemInfo"))
+    $("systemInfo").innerHTML =
+      `OS: ${info.os || "unknown"}<br>Kernel: ${info.kernel || "unknown"}<br>Host: ${info.hostname || "unknown"}<br>User: ${info.username || "unknown"}<br>Machine: ${info.machine || "unknown"}<br>CPU: ${info.cpu_model || "unknown"}<br>Board/Product: ${info.board || "-"} / ${info.product || "-"}<br>BIOS: ${info.bios || "-"}<br>GPUs: ${info.gpus || "unknown"}`;
+  const holder = $("gpuMetricCharts");
+  if (holder && j.gpus) {
+    const cats = [
+      { key: "util", suffix: "Util", label: "util %", color: "#72c7ff" },
+      { key: "mem_pct", suffix: "Mem", label: "VRAM %", color: "#2fc46b" },
+      { key: "temp", suffix: "Temp", label: "core temp °C", color: "#ffde59" },
+      { key: "power", suffix: "Power", label: "power W", color: "#ff5b6c" },
+    ];
+    holder.innerHTML = cats
+      .map((cat) =>
+        j.gpus
+          .map(
+            (g) =>
+              `<div class="chart"><canvas id="cGpu${g.index}${cat.suffix}"></canvas></div>`,
+          )
+          .join(""),
+      )
+      .join("");
+    cats.forEach((cat) =>
+      j.gpus.forEach((g) => {
+        const color = cat.color;
+        const label = `GPU${g.index} ${cat.label}`;
+        drawGpuSeries(
+          `cGpu${g.index}${cat.suffix}`,
+          s,
+          g.index,
+          cat.key,
+          label,
+          color,
+        );
+      }),
+    );
+  }
+}
+
+// Shared runtime/UI state
+let selectedInstance = "GPU0";
+let logEs = null;
+let selectedUserName = "";
+let selectedOverviewInstanceId = "";
+let selectedLogInstanceId = "";
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+function svgIcon(name) {
+  if (name === "edit")
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4l10-10-4-4L4 16v4zM14 6l4 4" fill="none"/></svg>';
+  if (name === "key")
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 7a4 4 0 1 0 0 8a4 4 0 0 0 0-8Zm0 0h6m-2 0v3m-3 0h6" fill="none"/></svg>';
+  if (name === "reset")
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66M20 4v6h-6" fill="none"/></svg>';
+  if (name === "delete")
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M9 7V5h6v2m-7 3v7m4-7v7m4-7v7M7 7l1 12h8l1-12" fill="none"/></svg>';
+  if (name === "copy")
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 9h10v10H9zM5 15H4V5h10v1" fill="none"/></svg>';
+  return "";
+}
+function renderIconButton({ title, action, icon, className = "" }) {
+  const classes = `iconbtn ${className}`.trim();
+  return `<button class="${classes}" title="${escapeHtml(title)}" aria-label="${escapeHtml(title)}" onclick="${action}">${svgIcon(icon)}</button>`;
+}
+async function copyTextValue(value) {
+  const text = String(value || "");
+  if (!text) return false;
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (e) {}
+  }
+  const temp = document.createElement("textarea");
+  temp.value = text;
+  temp.setAttribute("readonly", "readonly");
+  temp.style.position = "fixed";
+  temp.style.opacity = "0";
+  document.body.appendChild(temp);
+  temp.focus();
+  temp.select();
+  let copied = false;
+  try {
+    copied = document.execCommand("copy");
+  } catch (e) {
+    copied = false;
+  }
+  temp.remove();
+  return copied;
+}
+function ensureApiKeyModal() {
+  if ($("apiKeyModal")) return;
+  const modal = document.createElement("div");
+  modal.id = "apiKeyModal";
+  modal.className = "club-modal hidden";
+  modal.innerHTML = `<div class="club-modal-card" role="dialog" aria-modal="true" aria-labelledby="apiKeyModalTitle"><div class="panel-head"><h2 id="apiKeyModalTitle">API Key</h2><button class="iconbtn" title="Close" aria-label="Close" onclick="closeApiKeyModal()">${svgIcon("delete")}</button></div><div class="preset-help" id="apiKeyModalHint">Use Copy to place the key on the clipboard.</div><textarea id="apiKeyModalValue" class="modal-keybox" readonly wrap="off"></textarea><div class="preset-form-actions"><button class="btn amber" onclick="copyApiKeyModalValue()">Copy</button><button class="btn blue" onclick="closeApiKeyModal()">Close</button></div><div class="msg" id="apiKeyModalMsg"></div></div>`;
+  modal.addEventListener("click", (event) => {
+    if (event.target === modal) closeApiKeyModal();
+  });
+  document.body.appendChild(modal);
+}
+function openApiKeyModal(title, value, hint = "") {
+  ensureApiKeyModal();
+  $("apiKeyModalTitle").textContent = title || "API Key";
+  $("apiKeyModalHint").textContent =
+    hint || "Use Copy to place the key on the clipboard.";
+  $("apiKeyModalValue").value = value || "";
+  $("apiKeyModalMsg").textContent = "";
+  $("apiKeyModal").classList.remove("hidden");
+}
+function closeApiKeyModal() {
+  ensureApiKeyModal();
+  $("apiKeyModal").classList.add("hidden");
+}
+async function copyApiKeyModalValue() {
+  ensureApiKeyModal();
+  const ok = await copyTextValue($("apiKeyModalValue").value || "");
+  $("apiKeyModalMsg").textContent = ok
+    ? "Copied API key to clipboard."
+    : "Copy failed on this browser.";
+}
+function setInstanceMsg(t) {
+  if ($("instanceMsg")) $("instanceMsg").textContent = t || "";
+}
+function getInstanceList() {
+  return (lastStatus && lastStatus.instances) || [];
+}
+function setUsersMsg(t) {
+  if ($("usersMsg")) $("usersMsg").textContent = t || "";
+}
+async function saveUserForm() {
+  try {
+    const r = await fetch("/admin/users", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "save", user: collectUserForm() }),
+    });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || "save failed");
+    if (j.api_key)
+      openApiKeyModal(
+        "API key for " + j.user.name,
+        j.api_key,
+        "This key is now stored so it can be viewed again from the user card.",
+      );
+    resetUserForm();
+    setUsersMsg("Saved user " + j.user.name);
+    await refreshStatus();
+  } catch (e) {
+    alert("User save failed: " + e);
+  }
+}
+async function showUserApiKey(name) {
+  try {
+    const r = await fetch("/admin/users", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "show_key", name }),
+    });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || "show failed");
+    openApiKeyModal(
+      "API key for " + name,
+      j.api_key,
+      "Use Copy to place the current key on the clipboard.",
+    );
+  } catch (e) {
+    alert("API key lookup failed: " + e);
+  }
+}
+async function resetUserKey(name) {
+  if (!confirm("Reset API key for " + name + "?")) return;
+  try {
+    const r = await fetch("/admin/users", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "reset_key", name }),
+    });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || "reset failed");
+    openApiKeyModal(
+      "New API key for " + name,
+      j.api_key,
+      "The previous key is no longer valid. Use Copy if you need to share the replacement key.",
+    );
+    setUsersMsg("Reset API key for " + name);
+    await refreshStatus();
+  } catch (e) {
+    alert("API key reset failed: " + e);
+  }
+}
+async function deleteUserByName(name) {
+  if (!confirm("Delete user " + name + "?")) return;
+  try {
+    const r = await fetch("/admin/users", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "delete", name }),
+    });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || "delete failed");
+    if (selectedUserName === name) resetUserForm();
+    setUsersMsg("Deleted user " + name);
+    await refreshStatus();
+  } catch (e) {
+    alert("User delete failed: " + e);
+  }
+}
+let currentLogSource = "docker";
+function setAuditMsg(t) {
+  if ($("auditMsg")) $("auditMsg").textContent = t || "";
+}
+function mirrorAuthToggles(v) {
+  if ($("auditAllowAnonymousProxy"))
+    $("auditAllowAnonymousProxy").checked = !!v;
+}
+let selectedGroupName = "";
+function setGroupsMsg(t) {
+  if ($("groupsMsg")) $("groupsMsg").textContent = t || "";
+}
+function findPanelByHeading(sectionId, heading) {
+  return (
+    [...document.querySelectorAll(`#${sectionId} .panel`)].find((panel) => {
+      const title = panel.querySelector(".panel-head h2,h2");
+      return ((title && title.textContent) || "").trim() === heading;
+    }) || null
+  );
+}
+let selectedScope = "GPU0";
+function currentScope() {
+  return selectedScope || selectedInstance || "GPU0";
+}
+function scopeIsGlobal() {
+  return currentScope() === "GLOBAL";
+}
+
+// Layout normalization
+function ensureV413Layout() {
+  const tabs = document.querySelector(".tabs");
+  const auditBtn = tabs && tabs.querySelector('.tab[onclick*=\"audit\"]');
+  const logsBtn = tabs && tabs.querySelector('.tab[onclick*=\"logs\"]');
+  if (auditBtn) auditBtn.remove();
+  if (tabs && logsBtn) tabs.appendChild(logsBtn);
+  const system = $("system");
+  const presets = $("presets");
+  const logs = $("logs");
+  const audit = $("audit");
+  if (system && audit) {
+    const accessPolicy = findPanelByHeading("audit", "Access Policy");
+    if (accessPolicy && !accessPolicy.dataset.v413Moved) {
+      accessPolicy.dataset.v413Moved = "1";
+      system.insertBefore(accessPolicy, system.children[1] || null);
+    }
+    const overview = findPanelByHeading("audit", "Audit Overview");
+    if (overview && logs && !overview.dataset.v413Moved) {
+      overview.dataset.v413Moved = "1";
+      logs.insertBefore(overview, logs.firstChild || null);
+    }
+    const globalControls = findPanelByHeading("audit", "Global Controls");
+    if (globalControls) globalControls.remove();
+    const auditStream = findPanelByHeading("audit", "Audit Stream");
+    if (auditStream) auditStream.remove();
+    if (audit.childElementCount === 0 || !audit.querySelector(".panel"))
+      audit.remove();
+  }
+  const accessCard = findPanelByHeading("system", "Access Policy");
+  if (accessCard) {
+    const openUsers = [...accessCard.querySelectorAll("button")].find((btn) =>
+      (btn.textContent || "").includes("Open Users Management"),
+    );
+    if (openUsers) openUsers.remove();
+  }
+  const singleCard = [...document.querySelectorAll("#presets .panel")].find(
+    (panel) => {
+      const h = panel.querySelector(".panel-head h2,h2");
+      return (
+        h &&
+        ((h.textContent || "").includes("Per-Instance Docker Presets") ||
+          (h.textContent || "").includes("Single GPU Docker Presets"))
+      );
+    },
+  );
+  if (singleCard) {
+    singleCard.id = "singlePresetCard";
+    const title = singleCard.querySelector("h2");
+    if (title) title.textContent = "Single GPU Docker Presets";
+  }
+  const customTitle = [
+    ...document.querySelectorAll("#presets .panel .panel-head h2"),
+  ].find((h) => (h.textContent || "").trim() === "Custom Preset Templates");
+  if (customTitle) customTitle.textContent = "Custom Configuration Endpoints";
+  if (presets && !$("presetScopePanel")) {
+    const panel = document.createElement("div");
+    panel.className = "panel";
+    panel.id = "presetScopePanel";
+    panel.innerHTML = `<h2>GPU Scope</h2><div class="subtabs" id="presetScopeTabs"></div><div class="value smallgap" id="presetScopeSummary">-</div>`;
+    presets.insertBefore(panel, presets.firstChild || null);
+  }
+  if (presets && !$("dualPresetCard")) {
+    const panel = document.createElement("div");
+    panel.className = "panel";
+    panel.id = "dualPresetCard";
+    panel.innerHTML = `<h2>Dual GPU Docker Presets</h2><div class="preset-help">Apply a dual-GPU runtime across the first two detected cards. Use Global scope for these presets.</div><div class="actions"><button class="btn blue" onclick="switchDualMode('vllm/dual')">dual</button><button class="btn blue" onclick="switchDualMode('vllm/dual-turbo')">dual-turbo</button><button class="btn blue" onclick="switchDualMode('vllm/dual-dflash')">dual-dflash</button><button class="btn blue" onclick="switchDualMode('vllm/dual-dflash-noviz')">dual-dflash-noviz</button></div>`;
+    const afterSingle = $("singlePresetCard");
+    if (afterSingle && afterSingle.parentNode === presets)
+      presets.insertBefore(panel, afterSingle.nextSibling);
+    else presets.insertBefore(panel, presets.children[1] || null);
+  }
+  if (logs && !$("logsSourcePanel")) {
+    const panel = document.createElement("div");
+    panel.className = "panel";
+    panel.id = "logsSourcePanel";
+    panel.innerHTML = `<h2>Log Sources</h2><div class="subtabs"><button class="subtab" id="logSourceDocker" onclick="setCurrentLogSource('docker')">Docker Logs</button><button class="subtab" id="logSourceAudit" onclick="setCurrentLogSource('audit')">Audit Logs</button></div><div class="value smallgap" id="logsSourceSummary">-</div>`;
+    logs.appendChild(panel);
+  }
+  const profiles = findPanelByHeading("system", "Profiles");
+  if (profiles && !$("profileScopeNote")) {
+    const note = document.createElement("div");
+    note.className = "preset-help";
+    note.id = "profileScopeNote";
+    profiles.insertBefore(
+      note,
+      profiles.querySelector(".actions") || profiles.firstChild,
+    );
+  }
+  const power = findPanelByHeading("system", "Power + Cooling");
+  if (power && !$("powerScopeNote")) {
+    const note = document.createElement("div");
+    note.className = "preset-help";
+    note.id = "powerScopeNote";
+    power.insertBefore(
+      note,
+      power.querySelector(".actions") || power.firstChild,
+    );
+  }
+}
+
+// Quota helpers and final users/groups UI
+function quotaLimitText(v, suffix = "") {
+  return v === null || v === undefined || v === ""
+    ? "unlimited"
+    : `${v}${suffix}`;
+}
+function quotaWeightText(v) {
+  return v === null || v === undefined || v === ""
+    ? "default"
+    : String(Number(v).toFixed(3)).replace(/\.?0+$/, "");
+}
+function quotaWindowText(windowData) {
+  windowData = windowData || {};
+  return `${windowData.requests || 0} msgs · score ${Number(windowData.score || 0).toFixed(1)} · in ${windowData.input_tokens || 0} · out ${windowData.output_tokens || 0} · tools ${windowData.tool_calls || 0} · thinking ${Number(windowData.thinking_seconds || 0).toFixed(1)}s`;
+}
+function quotaWeightLine(limits) {
+  limits = limits || {};
+  return `in ${quotaWeightText(limits.input_token_weight)} · out ${quotaWeightText(limits.output_token_weight)} · tools ${quotaWeightText(limits.tool_call_weight)} · thinking ${quotaWeightText(limits.thinking_second_weight)}`;
+}
+function quotaBudgetLine(limits) {
+  limits = limits || {};
+  return `5h ${quotaLimitText(limits.score_per_5h)} · week ${quotaLimitText(limits.score_per_week)} · /msg tokens ${quotaLimitText(limits.max_tokens_per_message)} · /msg tools ${quotaLimitText(limits.max_tool_calls_per_message)}`;
+}
+function parseQuotaNumber(id) {
+  const el = $(id);
+  if (!el) return null;
+  const v = el.value.trim();
+  return v === "" ? null : Number(v);
+}
+function scopeItems() {
+  const items = getInstanceList().slice();
+  items.sort((a, b) => {
+    const ak = a.kind === "dual" ? 1 : 0;
+    const bk = b.kind === "dual" ? 1 : 0;
+    if (ak !== bk) return ak - bk;
+    const ai = (a.gpu_indices || [a.gpu_index])[0] || 0;
+    const bi = (b.gpu_indices || [b.gpu_index])[0] || 0;
+    return ai - bi || String(a.id).localeCompare(String(b.id));
+  });
+  return items;
+}
+function singleScopeItems() {
+  return scopeItems().filter((x) => x.kind !== "dual");
+}
+function pairScopeItems() {
+  return scopeItems().filter((x) => x.kind === "dual");
+}
+function gpuCount() {
+  return Number((lastStatus && lastStatus.gpu_count) || 0);
+}
+function canonicalPairId(a, b) {
+  const nums = [Number(a), Number(b)]
+    .filter((x) => Number.isInteger(x) && x >= 0)
+    .sort((x, y) => x - y);
+  if (nums.length !== 2 || nums[0] === nums[1]) return "";
+  return `PAIR${nums[0]}_${nums[1]}`;
+}
+function exactTwoPairTarget() {
+  return (
+    pairScopeItems().find(
+      (x) =>
+        JSON.stringify((x.gpu_indices || []).slice().sort((a, b) => a - b)) ===
+        "[0,1]",
+    ) || null
+  );
+}
+function currentScopeInstance(strict = false) {
+  if (currentScope() === "GLOBAL") return strict ? null : exactTwoPairTarget();
+  return (
+    scopeItems().find((x) => x.id === currentScope()) ||
+    singleScopeItems()[0] ||
+    pairScopeItems()[0] ||
+    null
+  );
+}
+function currentScopeKind() {
+  const inst = currentScopeInstance(true);
+  return inst ? inst.kind : currentScope() === "GLOBAL" ? "global" : "single";
+}
+function dockerLogTarget() {
+  return trackedLogRuntime() || currentScopeInstance(false) || scopeItems()[0] || null;
+}
+function scopeLabel(inst) {
+  if (!inst) return "Global";
+  return inst.kind === "dual"
+    ? `Pair ${(inst.gpu_indices || []).join(" + ")}`
+    : inst.id;
+}
+function scopeAllowsSinglePresets() {
+  const inst = currentScopeInstance(true);
+  return !!inst && inst.kind !== "dual";
+}
+function scopeAllowsDualPresets() {
+  const inst = currentScopeInstance(false);
+  return !!inst && inst.kind === "dual";
+}
+function runtimeTrackingItems() {
+  const rows = Object.values(
+    (lastStatus && lastStatus.instance_runtime_metrics) || {},
+  ).filter((row) => row && row.running);
+  rows.sort((a, b) => {
+    const ag = Array.isArray(a.gpu_indices) ? a.gpu_indices : [];
+    const bg = Array.isArray(b.gpu_indices) ? b.gpu_indices : [];
+    return (
+      (ag[0] ?? 999) - (bg[0] ?? 999) ||
+      ag.length - bg.length ||
+      String(a.id || a.instance_id || "").localeCompare(
+        String(b.id || b.instance_id || ""),
+      )
+    );
+  });
+  return rows;
+}
+function normalizeTrackedRuntimeId(value) {
+  const rows = runtimeTrackingItems();
+  if (!rows.length) return "";
+  const candidate = String(value || "").trim().toUpperCase();
+  if (candidate) {
+    const exact = rows.find((row) => String(row.id || row.instance_id).toUpperCase() === candidate);
+    if (exact) return String(exact.id || exact.instance_id);
+  }
+  return String(rows[0].id || rows[0].instance_id);
+}
+function trackedOverviewRuntime() {
+  const id = normalizeTrackedRuntimeId(selectedOverviewInstanceId);
+  if (!id) return null;
+  selectedOverviewInstanceId = id;
+  return runtimeTrackingItems().find(
+    (row) => String(row.id || row.instance_id) === String(id),
+  ) || null;
+}
+function trackedLogRuntime() {
+  const id = normalizeTrackedRuntimeId(selectedLogInstanceId);
+  if (!id) return null;
+  selectedLogInstanceId = id;
+  return runtimeTrackingItems().find(
+    (row) => String(row.id || row.instance_id) === String(id),
+  ) || null;
+}
+function setOverviewTrackedInstance(id) {
+  selectedOverviewInstanceId = normalizeTrackedRuntimeId(id);
+  renderOverviewTracker();
+  if (lastStatus) renderOverviewStatus(lastStatus);
+}
+function setLogTrackedInstance(id) {
+  selectedLogInstanceId = normalizeTrackedRuntimeId(id);
+  renderLogTracker();
+  applyLogVisibility();
+  connectLogs(true);
+}
+function formatCtxTokens(value) {
+  const num = Number(value || 0);
+  if (!Number.isFinite(num) || num <= 0) return "-";
+  if (num >= 1000000) return `${(num / 1000000).toFixed(2).replace(/\.?0+$/, "")}M`;
+  if (num >= 1000) return `${(num / 1000).toFixed(num >= 100000 ? 0 : 1).replace(/\.?0+$/, "")}K`;
+  return String(Math.round(num));
+}
+function formatNumber(value, digits = 2) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num.toFixed(digits).replace(/\.?0+$/, "") : "-";
+}
+function formatLastStatusCard(runtime, metrics) {
+  const target = runtime || {};
+  const head = [target.last_status ?? metrics.last_status ?? "-"];
+  const latency = target.last_latency_s ?? metrics.last_latency_s;
+  const ttft = target.last_ttft_s ?? metrics.last_ttft_s;
+  const tps = target.last_tokens_per_second ?? metrics.last_tokens_per_second;
+  if (latency !== null && latency !== undefined)
+    head.push(`latency=${formatNumber(latency, 3)}s`);
+  if (ttft !== null && ttft !== undefined)
+    head.push(`ttft=${formatNumber(ttft, 3)}s`);
+  if (target.last_prefill_s !== null && target.last_prefill_s !== undefined)
+    head.push(`prefill~=${formatNumber(target.last_prefill_s, 3)}s`);
+  if (tps !== null && tps !== undefined)
+    head.push(`tk/s=${formatNumber(tps, 2)}`);
+  const detail = [];
+  if (
+    target.gpu_kv_cache_usage_pct !== null &&
+    target.gpu_kv_cache_usage_pct !== undefined
+  ) {
+    detail.push(
+      `kv=${formatNumber(target.gpu_kv_cache_usage_pct, 1)}% / ${formatCtxTokens(target.ctx_size_tokens)} ctx`,
+    );
+  } else if (target.ctx_size_tokens) {
+    detail.push(`ctx=${formatCtxTokens(target.ctx_size_tokens)}`);
+  }
+  const spec = target.speculative || {};
+  const specBits = [];
+  if (spec.drafted_tokens !== null && spec.drafted_tokens !== undefined)
+    specBits.push(`drafted=${spec.drafted_tokens}`);
+  if (spec.accept_rate_pct !== null && spec.accept_rate_pct !== undefined)
+    specBits.push(`accept=${formatNumber(spec.accept_rate_pct, 1)}%`);
+  if (
+    spec.accepted_tokens !== null &&
+    spec.accepted_tokens !== undefined &&
+    spec.draft_tokens !== null &&
+    spec.draft_tokens !== undefined
+  )
+    specBits.push(`accepted=${spec.accepted_tokens}/${spec.draft_tokens}`);
+  if (
+    spec.mean_acceptance_length !== null &&
+    spec.mean_acceptance_length !== undefined
+  )
+    specBits.push(`avg=${formatNumber(spec.mean_acceptance_length, 2)}`);
+  if (
+    spec.system_efficiency_pct !== null &&
+    spec.system_efficiency_pct !== undefined
+  )
+    specBits.push(`eff=${formatNumber(spec.system_efficiency_pct, 1)}%`);
+  const lines = [`<div>${head.join(" &middot; ")}</div>`];
+  if (detail.length) lines.push(`<div class="value-subline">${detail.join(" &middot; ")}</div>`);
+  if (specBits.length)
+    lines.push(
+      `<div class="value-subline">spec ${specBits.join(" &middot; ")}</div>`,
+    );
+  return lines.join("");
+}
+function formatRequestCard(runtime, metrics) {
+  const base = `total=${metrics.total_requests ?? 0}, active=${metrics.active_requests ?? 0}, fail=${metrics.failed_requests ?? 0}, queue=${metrics.queued_requests ?? 0}`;
+  if (!runtime) return base;
+  const tail = [];
+  if (runtime.running_requests !== null && runtime.running_requests !== undefined)
+    tail.push(`run=${runtime.running_requests}`);
+  if (runtime.waiting_requests !== null && runtime.waiting_requests !== undefined)
+    tail.push(`wait=${runtime.waiting_requests}`);
+  if (runtime.pending_requests !== null && runtime.pending_requests !== undefined)
+    tail.push(`pending=${runtime.pending_requests}`);
+  return tail.length
+    ? `${base}<div class="value-subline">instance ${tail.join(" &middot; ")}</div>`
+    : base;
+}
+function renderOverviewTracker() {
+  const panel = findPanelByHeading("overview", "Status");
+  if (!panel) return;
+  let row = $("overviewTrackerRow");
+  if (!row) {
+    row = document.createElement("div");
+    row.id = "overviewTrackerRow";
+    row.className = "scope-strip";
+    const grid = panel.querySelector(".grid");
+    panel.insertBefore(row, grid || panel.querySelector(".msg") || null);
+  }
+  const rows = runtimeTrackingItems();
+  if (rows.length <= 1) {
+    row.innerHTML = "";
+    row.classList.add("hidden");
+    return;
+  }
+  row.classList.remove("hidden");
+  const current = normalizeTrackedRuntimeId(selectedOverviewInstanceId);
+  selectedOverviewInstanceId = current;
+  row.innerHTML = `<span class="label">Track instance</span><div class="subtabs">${rows
+    .map(
+      (item) =>
+        `<button class="subtab ${String(item.id || item.instance_id) === current ? "active" : ""}" onclick="setOverviewTrackedInstance('${String(item.id || item.instance_id)}')">${escapeHtml(String(item.id || item.instance_id))}</button>`,
+    )
+    .join("")}</div>`;
+}
+function renderLogTracker() {
+  const card = document.querySelector(".logs.panel");
+  if (!card) return;
+  let row = $("logTrackerRow");
+  if (!row) {
+    row = document.createElement("div");
+    row.id = "logTrackerRow";
+    row.className = "scope-strip";
+    card.insertBefore(row, $("log") || card.lastChild || null);
+  }
+  const rows = runtimeTrackingItems();
+  if (currentLogSource === "audit" || rows.length <= 1) {
+    row.innerHTML = "";
+    row.classList.add("hidden");
+    return;
+  }
+  row.classList.remove("hidden");
+  const current = normalizeTrackedRuntimeId(selectedLogInstanceId);
+  selectedLogInstanceId = current;
+  row.innerHTML = `<span class="label">Track instance</span><div class="subtabs">${rows
+    .map(
+      (item) =>
+        `<button class="subtab ${String(item.id || item.instance_id) === current ? "active" : ""}" onclick="setLogTrackedInstance('${String(item.id || item.instance_id)}')">${escapeHtml(String(item.id || item.instance_id))}</button>`,
+    )
+    .join("")}</div>`;
+}
+function renderOverviewStatus(j) {
+  const metrics = (j && j.metrics) || {};
+  const power = (j && j.power) || {};
+  const runtime = trackedOverviewRuntime();
+  if ($("summary"))
+    $("summary").textContent = runtime
+      ? `${runtime.id || runtime.instance_id} | ${runtime.mode || j.active_mode} | ${runtime.container || "no container"} | ${power.profile || "balanced"} | GPUs ${j.gpu_count ?? 0}`
+      : `${j.active_mode} | ${j.container || "no container"} | ${power.profile || "balanced"} | GPUs ${j.gpu_count ?? 0}`;
+  if ($("mode"))
+    $("mode").textContent = `${runtime?.mode || j.active_mode} / ${runtime?.port || j.active_port}`;
+  if ($("container"))
+    $("container").textContent = runtime?.container || j.container || "none";
+  if ($("req")) $("req").innerHTML = formatRequestCard(runtime, metrics);
+  if ($("last")) $("last").innerHTML = formatLastStatusCard(runtime, metrics);
+  if ($("uptime")) $("uptime").textContent = fmtUptime(j.uptime_seconds);
+  if ($("powerbox"))
+    $("powerbox").textContent =
+      `profile=${power.profile || "-"}, GPU=${power.gpu || "-"}, CPU=${power.cpu || "-"}, fans=${power.fans || "-"}, container=${power.container || "-"}, idle=${power.idle_for_seconds ?? 0}s`;
+  renderOverviewTracker();
+}
+function setEditorState(editorId, introId, open) {
+  const ed = $(editorId),
+    intro = $(introId);
+  if (ed) ed.classList.toggle("open", !!open);
+  if (intro) intro.classList.toggle("hidden", !!open);
+}
+function openUserEditor() {
+  ensureUsersUi();
+  setEditorState("userEditor", "userIntro", true);
+}
+function openGroupEditor() {
+  ensureGroupUi();
+  setEditorState("groupEditor", "groupIntro", true);
+}
+ensureUsersUi = function () {
+  const tabs = document.querySelector(".tabs");
+  if (tabs && !document.getElementById("usersTabBtn")) {
+    const b = document.createElement("button");
+    b.className = "tab";
+    b.id = "usersTabBtn";
+    b.textContent = "Users";
+    b.onclick = (ev) => tab(ev, "users");
+    tabs.insertBefore(
+      b,
+      tabs.querySelector('.tab[onclick*="metrics"]') || null,
+    );
+  }
+  const main = document.querySelector("main.container");
+  if (!main) return;
+  let section = $("users");
+  if (!section) {
+    section = document.createElement("section");
+    section.id = "users";
+    section.className = "tabpane content-tab";
+    main.insertBefore(section, document.getElementById("metrics"));
+  }
+  if (section.dataset.v414Users !== "1") {
+    section.dataset.v414Users = "1";
+    section.innerHTML = `<div class="panel"><div class="panel-head"><h2>User Accounts</h2><button class="add-preset-btn" title="New user" aria-label="New user" onclick="resetUserForm(false)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none"/></svg></button></div><div class="preset-intro" id="userIntro">Manage per-user API keys, access scopes, and Codex-style scored budgets. The configured list stays visible while the editor is collapsed.</div><div class="preset-editor" id="userEditor"><div class="formgrid"><label>User name<input id="userName" placeholder="client_a" /></label><label>Allowed targets<input id="userTargets" placeholder="*, legacy, GPU0, GPU1" /></label><label>Groups<input id="userGroups" placeholder="starter, premium" /></label><label>5h score budget<input id="userScore5h" type="number" step="0.1" placeholder="unlimited" /></label><label>Weekly score budget<input id="userScoreWeek" type="number" step="0.1" placeholder="unlimited" /></label><label>Max tokens / message<input id="userMaxTokensMsg" type="number" step="1" placeholder="unlimited" /></label><label>Max tool calls / message<input id="userMaxToolsMsg" type="number" step="1" placeholder="unlimited" /></label><label>Input token weight<input id="userInputTokenWeight" type="number" step="0.001" placeholder="default" /></label><label>Output token weight<input id="userOutputTokenWeight" type="number" step="0.001" placeholder="default" /></label><label>Tool-call weight<input id="userToolCallWeight" type="number" step="0.001" placeholder="default" /></label><label>Thinking-second weight<input id="userThinkingSecondWeight" type="number" step="0.001" placeholder="default" /></label><label>Enabled<select id="userEnabled"><option value="true">Enabled</option><option value="false">Disabled</option></select></label></div><div class="preset-form-actions"><button class="btn green" onclick="saveUserForm()">Save User</button><button class="btn red" onclick="resetUserForm(true)">Cancel</button></div></div><div class="msg" id="usersMsg"></div><div class="panel" style="margin-top:12px"><h2>Configured Users</h2><div id="usersGrid" class="api-grid"></div></div></div>`;
+  }
+};
+resetUserForm = function (collapse = true) {
+  ensureUsersUi();
+  selectedUserName = "";
+  $("userName").disabled = false;
+  $("userName").value = "";
+  $("userTargets").value = "*";
+  $("userGroups").value = "";
+  $("userScore5h").value = "";
+  $("userScoreWeek").value = "";
+  $("userMaxTokensMsg").value = "";
+  $("userMaxToolsMsg").value = "";
+  $("userInputTokenWeight").value = "";
+  $("userOutputTokenWeight").value = "";
+  $("userToolCallWeight").value = "";
+  $("userThinkingSecondWeight").value = "";
+  $("userEnabled").value = "true";
+  setEditorState("userEditor", "userIntro", !collapse);
+  setUsersMsg("");
+};
+collectUserForm = function () {
+  function val(id) {
+    return (($(id) && $(id).value) || "").trim();
+  }
+  return {
+    name: val("userName"),
+    allowed_targets: val("userTargets")
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean),
+    groups: val("userGroups")
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean),
+    enabled: $("userEnabled").value === "true",
+    generate_api_key: !selectedUserName,
+    limits: {
+      score_per_5h: parseQuotaNumber("userScore5h"),
+      score_per_week: parseQuotaNumber("userScoreWeek"),
+      max_tokens_per_message: parseQuotaNumber("userMaxTokensMsg"),
+      max_tool_calls_per_message: parseQuotaNumber("userMaxToolsMsg"),
+      input_token_weight: parseQuotaNumber("userInputTokenWeight"),
+      output_token_weight: parseQuotaNumber("userOutputTokenWeight"),
+      tool_call_weight: parseQuotaNumber("userToolCallWeight"),
+      thinking_second_weight: parseQuotaNumber("userThinkingSecondWeight"),
+    },
+  };
+};
+editUser = function (name) {
+  const user = ((lastStatus && lastStatus.users) || []).find(
+    (u) => u.name === name,
+  );
+  if (!user) return;
+  ensureUsersUi();
+  selectedUserName = name;
+  $("userName").disabled = true;
+  $("userName").value = user.name;
+  $("userTargets").value = (user.allowed_targets || []).join(", ");
+  $("userGroups").value = (user.groups || []).join(", ");
+  $("userScore5h").value = user.limits.score_per_5h ?? "";
+  $("userScoreWeek").value = user.limits.score_per_week ?? "";
+  $("userMaxTokensMsg").value = user.limits.max_tokens_per_message ?? "";
+  $("userMaxToolsMsg").value = user.limits.max_tool_calls_per_message ?? "";
+  $("userInputTokenWeight").value = user.limits.input_token_weight ?? "";
+  $("userOutputTokenWeight").value = user.limits.output_token_weight ?? "";
+  $("userToolCallWeight").value = user.limits.tool_call_weight ?? "";
+  $("userThinkingSecondWeight").value =
+    user.limits.thinking_second_weight ?? "";
+  $("userEnabled").value = String(!!user.enabled);
+  openUserEditor();
+};
+renderUsers = function (users) {
+  ensureUsersUi();
+  const grid = $("usersGrid");
+  if (!grid) return;
+  users = users || [];
+  if (selectedUserName && !users.some((u) => u.name === selectedUserName))
+    selectedUserName = "";
+  grid.innerHTML =
+    users
+      .map((u) => {
+        const actions = [
+          renderIconButton({
+            title: "Edit",
+            action: `editUser('${u.name}')`,
+            icon: "edit",
+          }),
+          renderIconButton({
+            title: u.api_key_available ? "Show API key" : "Show API key unavailable",
+            action: `showUserApiKey('${u.name}')`,
+            icon: "key",
+          }),
+          renderIconButton({
+            title: "Reset API key",
+            action: `resetUserKey('${u.name}')`,
+            icon: "reset",
+          }),
+          renderIconButton({
+            title: "Delete",
+            action: `deleteUserByName('${u.name}')`,
+            icon: "delete",
+          }),
+        ].join("");
+        return `<div class="api-card"><div class="api-card-head"><h3>${u.name}<br><span class="label">${u.enabled ? "enabled" : "disabled"} &middot; access ${(u.effective_allowed_targets || u.allowed_targets || []).join(", ") || "*"}</span></h3><span class="preset-actions">${actions}</span></div><p>Groups: ${(u.groups || []).join(", ") || "none"}</p><p>API key: ${u.has_api_key ? (u.api_key_available ? "stored and viewable" : "legacy key, reset once to store it") : "not issued yet"}</p><p>Last 5h: ${quotaWindowText((u.usage || {}).window_5h)}</p><p>Last week: ${quotaWindowText((u.usage || {}).window_week)}</p><p class="label">Direct budgets &middot; ${quotaBudgetLine(u.limits || {})}</p><p class="label">Direct weights &middot; ${quotaWeightLine(u.limits || {})}</p><p class="label">Effective budgets &middot; ${quotaBudgetLine(u.effective_limits || {})}</p><p class="label">Effective weights &middot; ${quotaWeightLine(u.effective_limits || {})}</p></div>`;
+      })
+      .join("") || '<div class="value">No API users configured yet.</div>';
+};
+ensureGroupUi = function () {
+  ensureUsersUi();
+  const users = $("users");
+  if (!users) return;
+  let panel = $("groupsPanel");
+  if (!panel) {
+    panel = document.createElement("div");
+    panel.className = "panel";
+    panel.id = "groupsPanel";
+    users.appendChild(panel);
+  }
+  if (panel.dataset.v414Groups !== "1") {
+    panel.dataset.v414Groups = "1";
+    panel.innerHTML = `<div class="panel-head"><h2>User Groups / Plans</h2><button class="add-preset-btn" title="New group" aria-label="New group" onclick="resetGroupForm(false)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none"/></svg></button></div><div class="preset-intro" id="groupIntro">Define reusable plans that carry scored budgets, per-message caps, and access scopes. The configured list stays visible while the editor is collapsed.</div><div class="preset-editor" id="groupEditor"><div class="formgrid"><label>Group name<input id="groupName" placeholder="starter" /></label><label>Description<input id="groupDescription" placeholder="Shared plan description" /></label><label>Allowed targets<input id="groupTargets" placeholder="*, legacy, GPU0, GPU1" /></label><label>5h score budget<input id="groupScore5h" type="number" step="0.1" placeholder="unlimited" /></label><label>Weekly score budget<input id="groupScoreWeek" type="number" step="0.1" placeholder="unlimited" /></label><label>Max tokens / message<input id="groupMaxTokensMsg" type="number" step="1" placeholder="unlimited" /></label><label>Max tool calls / message<input id="groupMaxToolsMsg" type="number" step="1" placeholder="unlimited" /></label><label>Input token weight<input id="groupInputTokenWeight" type="number" step="0.001" placeholder="default" /></label><label>Output token weight<input id="groupOutputTokenWeight" type="number" step="0.001" placeholder="default" /></label><label>Tool-call weight<input id="groupToolCallWeight" type="number" step="0.001" placeholder="default" /></label><label>Thinking-second weight<input id="groupThinkingSecondWeight" type="number" step="0.001" placeholder="default" /></label><label>Enabled<select id="groupEnabled"><option value="true">Enabled</option><option value="false">Disabled</option></select></label></div><div class="preset-form-actions"><button class="btn green" onclick="saveGroupForm()">Save Group</button><button class="btn red" onclick="resetGroupForm(true)">Cancel</button></div></div><div class="msg" id="groupsMsg"></div><div class="panel" style="margin-top:12px"><h2>Configured Groups</h2><div id="groupsGrid" class="api-grid"></div></div>`;
+  }
+};
+resetGroupForm = function (collapse = true) {
+  ensureGroupUi();
+  selectedGroupName = "";
+  $("groupName").disabled = false;
+  $("groupName").value = "";
+  $("groupDescription").value = "";
+  $("groupTargets").value = "*";
+  $("groupScore5h").value = "";
+  $("groupScoreWeek").value = "";
+  $("groupMaxTokensMsg").value = "";
+  $("groupMaxToolsMsg").value = "";
+  $("groupInputTokenWeight").value = "";
+  $("groupOutputTokenWeight").value = "";
+  $("groupToolCallWeight").value = "";
+  $("groupThinkingSecondWeight").value = "";
+  $("groupEnabled").value = "true";
+  setEditorState("groupEditor", "groupIntro", !collapse);
+  setGroupsMsg("");
+};
+collectGroupForm = function () {
+  function val(id) {
+    return (($(id) && $(id).value) || "").trim();
+  }
+  return {
+    name: val("groupName"),
+    description: val("groupDescription"),
+    allowed_targets: val("groupTargets")
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean),
+    enabled: $("groupEnabled").value === "true",
+    limits: {
+      score_per_5h: parseQuotaNumber("groupScore5h"),
+      score_per_week: parseQuotaNumber("groupScoreWeek"),
+      max_tokens_per_message: parseQuotaNumber("groupMaxTokensMsg"),
+      max_tool_calls_per_message: parseQuotaNumber("groupMaxToolsMsg"),
+      input_token_weight: parseQuotaNumber("groupInputTokenWeight"),
+      output_token_weight: parseQuotaNumber("groupOutputTokenWeight"),
+      tool_call_weight: parseQuotaNumber("groupToolCallWeight"),
+      thinking_second_weight: parseQuotaNumber("groupThinkingSecondWeight"),
+    },
+  };
+};
+editGroup = function (name) {
+  const group = ((lastStatus && lastStatus.groups) || []).find(
+    (g) => g.name === name,
+  );
+  if (!group) return;
+  ensureGroupUi();
+  selectedGroupName = name;
+  $("groupName").disabled = true;
+  $("groupName").value = group.name;
+  $("groupDescription").value = group.description || "";
+  $("groupTargets").value = (group.allowed_targets || []).join(", ");
+  $("groupScore5h").value = group.limits.score_per_5h ?? "";
+  $("groupScoreWeek").value = group.limits.score_per_week ?? "";
+  $("groupMaxTokensMsg").value = group.limits.max_tokens_per_message ?? "";
+  $("groupMaxToolsMsg").value = group.limits.max_tool_calls_per_message ?? "";
+  $("groupInputTokenWeight").value = group.limits.input_token_weight ?? "";
+  $("groupOutputTokenWeight").value = group.limits.output_token_weight ?? "";
+  $("groupToolCallWeight").value = group.limits.tool_call_weight ?? "";
+  $("groupThinkingSecondWeight").value =
+    group.limits.thinking_second_weight ?? "";
+  $("groupEnabled").value = String(!!group.enabled);
+  openGroupEditor();
+};
+renderGroups = function (groups) {
+  ensureGroupUi();
+  const grid = $("groupsGrid");
+  if (!grid) return;
+  groups = groups || [];
+  if (selectedGroupName && !groups.some((g) => g.name === selectedGroupName))
+    selectedGroupName = "";
+  grid.innerHTML =
+    groups
+      .map(
+        (g) =>
+          `<div class="api-card"><div class="api-card-head"><h3>${g.name}<br><span class="label">${g.enabled ? "enabled" : "disabled"} · access ${(g.allowed_targets || []).join(", ") || "*"}</span></h3><span class="preset-actions"><button class="iconbtn" title="Edit" onclick="editGroup('${g.name}')">✏️</button><button class="iconbtn" title="Delete" onclick="deleteGroupByName('${g.name}')">❌</button></span></div><p>${g.description || "No description"}</p><p class="label">Configured budgets · ${quotaBudgetLine(g.limits || {})}</p><p class="label">Configured weights · ${quotaWeightLine(g.limits || {})}</p><p class="label">Resolved budgets · ${quotaBudgetLine(g.resolved_limits || g.limits || {})}</p><p class="label">Resolved weights · ${quotaWeightLine(g.resolved_limits || g.limits || {})}</p></div>`,
+      )
+      .join("") || '<div class="value">No groups configured yet.</div>';
+};
+
+// Audit, instances, preset scopes, and host actions
+renderAudit = function (cfg) {
+  cfg = cfg || {};
+  ensureV414Layout();
+  const adminPort = (lastStatus && lastStatus.admin_port) || 8008;
+  const proxyPort = (lastStatus && lastStatus.proxy_port) || 8009;
+  const adminPath = cfg.admin_path || "/admin";
+  const online = !!cfg.online_enabled;
+  const authOptional = !!cfg.allow_proxy_without_api_key;
+  const localEnabled = !!cfg.local_api_enabled;
+  const localPort = cfg.local_api_port || 10881;
+  if ($("auditAdminEndpoint"))
+    $("auditAdminEndpoint").innerHTML = `:${adminPort}${adminPath}`;
+  if ($("auditProxyEndpoint"))
+    $("auditProxyEndpoint").innerHTML = `:${proxyPort}`;
+  if ($("auditExposure"))
+    $("auditExposure").textContent = online
+      ? "online through proxy/admin only"
+      : "local/private only";
+  if ($("auditLocalApi"))
+    $("auditLocalApi").textContent = localEnabled
+      ? `127.0.0.1:${localPort}`
+      : "disabled";
+  if ($("auditSummary"))
+    $("auditSummary").innerHTML =
+      "Audit entries capture admin actions, proxy authentication outcomes, quota denials, API usage, group changes, and user-management events. Use the shared log viewer below to inspect either Docker runtime logs or the audit log stream.";
+  if ($("auditPolicyText"))
+    $("auditPolicyText").innerHTML =
+      `Proxy API keys are currently <b>${authOptional ? "optional" : "required"}</b>. Admin UI remains under <code>:${adminPort}${adminPath}</code>.`;
+  mirrorAuthToggles(authOptional);
+};
+saveAuthSettings = async function () {
+  const allow = !!(
+    $("auditAllowAnonymousProxy") && $("auditAllowAnonymousProxy").checked
+  );
+  mirrorAuthToggles(allow);
+  try {
+    const r = await fetch("/admin/users", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        action: "save_server_config",
+        allow_proxy_without_api_key: allow,
+      }),
+    });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || "config failed");
+    if (j.server_config) renderAudit(j.server_config);
+    setAuditMsg("Saved access policy");
+    await refreshStatus();
+  } catch (e) {
+    alert("Access policy failed: " + e);
+  }
+};
+renderInstances = function (instances) {
+  ensureV414Layout();
+  const tabs = $("instanceTabs");
+  const summary = $("instanceSummary");
+  const btn = $("instanceEnableBtn");
+  const panel = findPanelByHeading("system", "Instances");
+  if (!tabs || !summary || !panel) return;
+  instances = scopeItems();
+  if (
+    !selectedScope ||
+    !(
+      selectedScope === "GLOBAL" ||
+      instances.some((x) => x.id === selectedScope)
+    )
+  )
+    selectedScope =
+      singleScopeItems()[0]?.id || pairScopeItems()[0]?.id || "GLOBAL";
+  const tabsHtml =
+    singleScopeItems()
+      .map(
+        (x) =>
+          `<button class="subtab ${x.id === currentScope() ? "active" : ""}" onclick="setScope('${x.id}')">${x.id}${x.running ? " • on" : " • off"}</button>`,
+      )
+      .join("") +
+    pairScopeItems()
+      .map(
+        (x) =>
+          `<button class="subtab ${x.id === currentScope() ? "active" : ""}" onclick="setScope('${x.id}')">Pair ${(x.gpu_indices || []).join("+")}${x.running ? " • on" : " • off"}</button>`,
+      )
+      .join("") +
+    `<button class="subtab ${scopeIsGlobal() ? "active" : ""}" onclick="setScope('GLOBAL')">Global</button>`;
+  tabs.innerHTML = tabsHtml;
+  ensurePairManager();
+  const target = currentScopeInstance(false);
+  const actionButtons = [...panel.querySelectorAll(".actions .btn")].filter(
+    (x) => x.id !== "instanceEnableBtn" && !x.closest("#pairManagerBar"),
+  );
+  if (scopeIsGlobal() && target && gpuCount() === 2) {
+    summary.innerHTML = `Global scope controls the only dual pair <code>${target.id}</code> on GPUs ${(target.gpu_indices || []).join(", ")} · mode ${target.mode} · port ${target.port} · proxy <code>${target.proxy_prefix}/</code>`;
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = target.enabled
+        ? "Disable Boot Autostart"
+        : "Enable Boot Autostart";
+    }
+    actionButtons.forEach((x) => (x.disabled = false));
+  } else if (scopeIsGlobal()) {
+    summary.innerHTML =
+      "Global scope selected. Host-wide controls still apply below. Create or choose a dual pair tab to manage arbitrary two-GPU dual presets.";
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "Select a GPU or Pair Scope";
+    }
+    actionButtons.forEach((x) => (x.disabled = true));
+  } else if (target) {
+    summary.innerHTML = `${scopeLabel(target)} · ${target.assignment_text} · port ${target.port} · ${target.running ? "running" : "stopped"} · proxy <code>${target.proxy_prefix}/</code> · ${target.enabled ? "autostart enabled" : "autostart disabled"}`;
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = target.enabled
+        ? "Disable Boot Autostart"
+        : "Enable Boot Autostart";
+    }
+    actionButtons.forEach((x) => (x.disabled = false));
+  } else {
+    summary.textContent = "No GPU instances configured";
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "Boot autostart unavailable";
+    }
+    actionButtons.forEach((x) => (x.disabled = true));
+  }
+  if ($("logInstanceLabel"))
+    $("logInstanceLabel").textContent = currentLogLabel();
+};
+renderPresetScopeTabs = function () {
+  const tabs = $("presetScopeTabs");
+  const summary = $("presetScopeSummary");
+  if (!tabs || !summary) return;
+  tabs.innerHTML =
+    singleScopeItems()
+      .map(
+        (x) =>
+          `<button class="subtab ${x.id === currentScope() ? "active" : ""}" onclick="setScope('${x.id}')">${x.id}</button>`,
+      )
+      .join("") +
+    pairScopeItems()
+      .map(
+        (x) =>
+          `<button class="subtab ${x.id === currentScope() ? "active" : ""}" onclick="setScope('${x.id}')">Pair ${(x.gpu_indices || []).join("+")}</button>`,
+      )
+      .join("") +
+    `<button class="subtab ${scopeIsGlobal() ? "active" : ""}" onclick="setScope('GLOBAL')">Global</button>`;
+  const exactGlobal = currentScopeInstance(false);
+  if (scopeIsGlobal() && exactGlobal && gpuCount() === 2)
+    summary.innerHTML = `Global scope targets the only dual pair <code>${exactGlobal.id}</code>. Dual preset buttons below will apply to GPUs ${(exactGlobal.gpu_indices || []).join(", ")}.`;
+  else if (scopeIsGlobal())
+    summary.innerHTML =
+      "Global scope selected. Single-GPU presets are disabled here. Choose or create a dual pair tab to apply dual presets.";
+  else if (currentScopeInstance(true))
+    summary.innerHTML = `Targeting ${scopeLabel(currentScopeInstance(true))} · ${currentScopeInstance(true).assignment_text} · proxy <code>${currentScopeInstance(true).proxy_prefix}/</code>`;
+  else summary.textContent = "No preset scope available";
+  document
+    .querySelectorAll("#singlePresetCard .actions .btn")
+    .forEach((btn) => (btn.disabled = !scopeAllowsSinglePresets()));
+  document
+    .querySelectorAll("#dualPresetCard .actions .btn")
+    .forEach((btn) => (btn.disabled = !scopeAllowsDualPresets()));
+};
+updateScopedCards = function () {
+  const target = currentScopeInstance(false);
+  if ($("profileScopeNote"))
+    $("profileScopeNote").innerHTML = scopeIsGlobal()
+      ? "Global scope: these profile buttons apply host-wide defaults for the full server."
+      : `${scopeLabel(target)} scope: ${target ? target.assignment_text : "select a scope to continue"}`;
+  if ($("powerScopeNote"))
+    $("powerScopeNote").innerHTML = scopeIsGlobal()
+      ? "Global scope: power and cooling controls below affect the whole host."
+      : `${scopeLabel(target)} scope: using the selected runtime context while keeping host-level power controls in sync.`;
+  renderLogSourcePanel();
+};
+powerAction = async function (a) {
+  const cur = currentScopeInstance(false);
+  const needsTarget = [
+    "stop_container",
+    "start_instance",
+    "restart_instance",
+    "toggle_enabled",
+  ].includes(a);
+  if (needsTarget && !cur) {
+    alert("Select a GPU or Pair scope first.");
+    return;
+  }
+  if (a === "stop_container" && !confirm(`Stop ${scopeLabel(cur)} now?`))
+    return;
+  try {
+    await post("/admin/power", {
+      action: a,
+      instance_id: cur ? cur.id : null,
+      enabled: cur ? !cur.enabled : undefined,
+    });
+  } catch (e) {
+    alert(e);
+  }
+};
+instanceAction = async function (a) {
+  await powerAction(a);
+};
+toggleInstanceEnabled = async function () {
+  const cur = currentScopeInstance(false);
+  if (!cur) {
+    alert("Select a GPU or Pair scope first.");
+    return;
+  }
+  try {
+    await post("/admin/power", {
+      action: "toggle_enabled",
+      instance_id: cur.id,
+      enabled: !cur.enabled,
+    });
+  } catch (e) {
+    alert(e);
+  }
+};
+async function createPairGroup(first = null, second = null) {
+  if (gpuCount() < 2) {
+    alert("At least two GPUs are required to create a dual pair.");
+    return;
+  }
+  let a = first,
+    b = second;
+  if (a === null || b === null) {
+    a = prompt(`First GPU index (0-${Math.max(gpuCount() - 1, 0)}):`, "0");
+    if (a === null) return;
+    b = prompt(`Second GPU index (0-${Math.max(gpuCount() - 1, 0)}):`, "1");
+    if (b === null) return;
+  }
+  const id = canonicalPairId(a, b);
+  if (!id) {
+    alert("Select two distinct GPU indices.");
+    return;
+  }
+  try {
+    const r = await fetch("/admin/instances", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        action: "save_pair",
+        gpu_indices: [Number(a), Number(b)],
+        mode: "vllm/dual",
+        enabled: false,
+      }),
+    });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || "pair save failed");
+    setInstanceMsg(`Saved pair group ${id}`);
+    await refreshStatus();
+    setScope(id, false);
+  } catch (e) {
+    alert("Pair group failed: " + e);
+  }
+}
+async function deleteCurrentPairGroup() {
+  const cur = currentScopeInstance(true);
+  if (!cur || cur.kind !== "dual") {
+    alert("Select a dual pair scope first.");
+    return;
+  }
+  if (!confirm(`Delete pair group ${cur.id}?`)) return;
+  try {
+    const r = await fetch("/admin/instances", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "delete_pair", instance_id: cur.id }),
+    });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || "pair delete failed");
+    setInstanceMsg(`Deleted pair group ${cur.id}`);
+    await refreshStatus();
+    setScope("GLOBAL", false);
+  } catch (e) {
+    alert("Pair delete failed: " + e);
+  }
+}
+switchMode = async function (m) {
+  const cur = currentScopeInstance(true);
+  if (!cur || cur.kind === "dual") {
+    alert("Select a single GPU tab to apply a single-GPU preset.");
+    return;
+  }
+  const blockingPair = pairScopeItems().find(
+    (x) => x.running && (x.gpu_indices || []).includes(Number(cur.gpu_index)),
+  );
+  const warning = blockingPair
+    ? `\n\nWarning: GPU ${cur.gpu_index} is currently occupied by ${blockingPair.id} running ${blockingPair.mode}. Continuing will stop that pair and replace it with ${m} on ${cur.id}.`
+    : "";
+  if (confirm(`Assign ${m} to ${cur.id} and start it?${warning}`))
+    try {
+      await post("/admin/switch", { instance_id: cur.id, mode: m });
+    } catch (e) {
+      alert(e);
+    }
+};
+async function switchDualMode(m) {
+  const cur = currentScopeInstance(false);
+  if (!cur || cur.kind !== "dual") {
+    alert(
+      "Choose a dual pair tab, or use Global on an exactly-two-GPU server, before applying a dual preset.",
+    );
+    return;
+  }
+  if (
+    confirm(
+      `Apply dual preset ${m} to ${cur.id} on GPUs ${(cur.gpu_indices || []).join(", ")}? This will stop overlapping runtimes that already use those GPUs.`,
+    )
+  )
+    try {
+      await post("/admin/switch", { instance_id: cur.id, mode: m });
+    } catch (e) {
+      alert(e);
+    }
+}
+function profileDescription(p) {
+  const d = {
+    eco: "Eco profile: lower GPU power limits, lower idle clocks, powersave CPU governor, faster idle/container stop timers.",
+    balanced:
+      "Balanced profile: normal server profile with 280W active GPU cap, idle downclocking after 10 minutes, and container stop after 1 hour.",
+    default:
+      "Default profile: keeps the 280W safety GPU cap but removes idle clock locking, uses schedutil CPU while active, and keeps standard idle timers.",
+    turbo:
+      "Turbo profile: higher GPU power allowance, performance CPU governor, relaxed idle timers, and minimal downclocking. Use when performance matters more than power.",
+  };
+  return d[p] || "Apply profile?";
+}
+profile = async function (p) {
+  if (!confirm(profileDescription(p) + "\n\nApply this profile now?")) return;
+  try {
+    await post("/admin/profile", { profile: p }, `/admin/profile ${p}`);
+  } catch (e) {
+    alert(e);
+  }
+};
+function applyDirectoryPayload(j) {
+  if (!lastStatus) lastStatus = {};
+  if (Array.isArray(j.users)) {
+    lastStatus.users = j.users;
+    renderUsers(j.users);
+  }
+  if (Array.isArray(j.groups)) {
+    lastStatus.groups = j.groups;
+    renderGroups(j.groups);
+  }
+  if (j.server_config) {
+    lastStatus.server_config = j.server_config;
+    renderAudit(j.server_config);
+  }
+}
+saveGroupForm = async function () {
+  try {
+    const r = await fetch("/admin/groups", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "save", group: collectGroupForm() }),
+    });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || "group save failed");
+    applyDirectoryPayload(j);
+    resetGroupForm(true);
+    setGroupsMsg("Saved group " + j.group.name);
+    refreshStatus().catch(() => {});
+  } catch (e) {
+    alert("Group save failed: " + e);
+  }
+};
+deleteGroupByName = async function (name) {
+  if (!confirm("Delete group " + name + "?")) return;
+  try {
+    const r = await fetch("/admin/groups", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "delete", name }),
+    });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || "group delete failed");
+    applyDirectoryPayload(j);
+    if (selectedGroupName === name) resetGroupForm(true);
+    setGroupsMsg("Deleted group " + name);
+    refreshStatus().catch(() => {});
+  } catch (e) {
+    alert("Group delete failed: " + e);
+  }
+};
+pairingEnabled = function () {
+  return !!(
+    lastStatus &&
+    lastStatus.server_config &&
+    lastStatus.server_config.gpu_pairing_enabled
+  );
+};
+legacyGlobalDualScope = function () {
+  return gpuCount() === 2 && !pairingEnabled();
+};
+singleScopeItems = function () {
+  return scopeItems().filter((x) => x.kind !== "dual");
+};
+pairScopeItems = function () {
+  return pairingEnabled() ? scopeItems().filter((x) => x.kind === "dual") : [];
+};
+exactTwoPairTarget = function () {
+  return gpuCount() === 2
+    ? scopeItems().find((x) => x.id === "PAIR0_1") || null
+    : null;
+};
+currentScopeInstance = function (strict = false) {
+  if (currentScope() === "GLOBAL") {
+    if (legacyGlobalDualScope()) return strict ? null : legacyGlobalPair();
+    if (pairingEnabled() && gpuCount() === 2)
+      return strict ? null : exactTwoPairTarget();
+    return null;
+  }
+  return (
+    scopeItems().find((x) => x.id === currentScope()) ||
+    singleScopeItems()[0] ||
+    pairScopeItems()[0] ||
+    null
+  );
+};
+dockerLogTarget = function () {
+  if (currentLogSource === "audit") return null;
+  const legacy = legacyGlobalPair();
+  const cur = currentScopeInstance(false) || scopeItems()[0] || null;
+  if (scopeIsGlobal() && legacyGlobalDualScope()) return null;
+  if (
+    legacyGlobalDualScope() &&
+    legacy &&
+    legacy.running &&
+    cur &&
+    cur.kind !== "dual" &&
+    (cur.assignment_scope === "pair" || cur.overrides_dual_mode || !cur.running)
+  )
+    return null;
+  return cur;
+};
+scopeLabel = function (inst) {
+  if (!inst) return legacyGlobalDualScope() ? "Global Dual" : "Global";
+  if (inst.id === "GLOBAL") return "Global Dual";
+  return inst.kind === "dual"
+    ? `Pair ${(inst.gpu_indices || []).join(" + ")}`
+    : inst.id;
+};
+scopeAllowsSinglePresets = function () {
+  const inst = currentScopeInstance(true);
+  return !!inst && inst.kind !== "dual";
+};
+scopeAllowsDualPresets = function () {
+  if (scopeIsGlobal() && gpuCount() === 2) return true;
+  const inst = currentScopeInstance(false);
+  return !!inst && inst.kind === "dual";
+};
+
+// Canonical runtime UI path
+const UI_STATE_KEY = "club3090-ui-state";
+let uiStateHydrated = false;
+let uiStateSaveTimer = null;
+let instanceBusyState = { active: false, message: "" };
+let currentLogSignature = "";
+let statusPollTimer = null;
+function readCachedUiState() {
+  try {
+    return JSON.parse(localStorage.getItem(UI_STATE_KEY) || "{}") || {};
+  } catch (e) {
+    return {};
+  }
+}
+function writeCachedUiState(data) {
+  try {
+    localStorage.setItem(UI_STATE_KEY, JSON.stringify(data || {}));
+  } catch (e) {}
+}
+function normalizeTabName(name) {
+  if (name === "audit") return "logs";
+  return ["overview", "system", "presets", "metrics", "users", "logs"].includes(
+    name,
+  )
+    ? name
+    : "overview";
+}
+function currentUiState() {
+  return {
+    active_tab: normalizeTabName(activeTabName),
+    selected_scope: selectedScope || "GLOBAL",
+    current_log_source: currentLogSource === "audit" ? "audit" : "docker",
+    show_global_logs: !!showGlobalLogs,
+  };
+}
+function queueUiStateSave(extra = {}) {
+  const state = { ...currentUiState(), ...extra };
+  writeCachedUiState(state);
+  if (uiStateSaveTimer) clearTimeout(uiStateSaveTimer);
+  uiStateSaveTimer = setTimeout(async () => {
+    try {
+      await fetch("/admin/ui-config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(state),
+      });
+    } catch (e) {}
+  }, 120);
+}
+setShowGlobalLogs = async function (v) {
+  showGlobalLogs = !!v;
+  applyLogVisibility();
+  queueUiStateSave({ show_global_logs: showGlobalLogs });
+  try {
+    await fetch("/admin/ui-config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ show_global_logs: showGlobalLogs }),
+    });
+  } catch (e) {
+    setMsg("Could not save UI config: " + e);
+  }
+};
+function activeTabButton(name) {
+  return (
+    [...document.querySelectorAll(".tab")].find(
+      (btn) =>
+        (btn.getAttribute("onclick") || "").includes(`'${name}'`) ||
+        btn.id === `${name}TabBtn`,
+    ) || null
+  );
+}
+function hydrateUiState(cfg) {
+  if (uiStateHydrated) return;
+  const cached = readCachedUiState(),
+    state = { ...cached, ...(cfg || {}) };
+  activeTabName = normalizeTabName(state.active_tab || activeTabName);
+  currentLogSource = state.current_log_source === "audit" ? "audit" : "docker";
+  showGlobalLogs =
+    typeof state.show_global_logs === "boolean"
+      ? state.show_global_logs
+      : showGlobalLogs;
+  const ids = new Set(scopeItems().map((x) => x.id));
+  const candidate = state.selected_scope || selectedScope || "GLOBAL";
+  selectedScope =
+    candidate === "GLOBAL"
+      ? "GLOBAL"
+      : ids.has(candidate)
+        ? candidate
+        : singleScopeItems()[0]?.id || pairScopeItems()[0]?.id || "GLOBAL";
+  if (selectedScope !== "GLOBAL") selectedInstance = selectedScope;
+  uiStateHydrated = true;
+}
+legacyGlobalPair = function () {
+  return (lastStatus && lastStatus.legacy_global_instance) || null;
+};
+let powerCoolingBusyState = { active: false, message: "" };
+const STATUS_POLL_MS = 1000;
+function syncPowerCoolingBusyState() {
+  const panel = findPanelByHeading("system", "Power + Cooling");
+  if (!panel) return;
+  panel.classList.toggle("instance-panel-busy", !!powerCoolingBusyState.active);
+  [...panel.querySelectorAll("button,input,select,textarea")].forEach((el) => {
+    if (powerCoolingBusyState.active) el.setAttribute("disabled", "disabled");
+    else el.removeAttribute("disabled");
+  });
+}
+function setPowerCoolingBusy(active, message = "") {
+  powerCoolingBusyState = { active: !!active, message: message || "" };
+  syncPowerCoolingBusyState();
+}
+async function withPowerCoolingBusy(message, fn) {
+  setPowerCoolingBusy(true, message);
+  try {
+    return await fn();
+  } finally {
+    setPowerCoolingBusy(false);
+  }
+}
+function redrawMetricsSoon() {
+  if (!lastStatus) return;
+  renderMetrics(lastStatus);
+  requestAnimationFrame(() => {
+    if (lastStatus) renderMetrics(lastStatus);
+  });
+}
+function syncInstancesBusyState() {
+  const panel = findPanelByHeading("system", "Instances");
+  if (!panel) return;
+  panel.classList.toggle("instance-panel-busy", !!instanceBusyState.active);
+  [...panel.querySelectorAll("button,input,select,textarea")].forEach((el) => {
+    if (instanceBusyState.active) el.setAttribute("disabled", "disabled");
+    else if (el.id !== "gpuPairingEnabled" || gpuCount() >= 2)
+      el.removeAttribute("disabled");
+  });
+  const note = $("pairingBusyNote");
+  if (note) {
+    const msg =
+      instanceBusyState.message ||
+      (gpuCount() === 2
+        ? "Keep disabled if you want Global to keep behaving like the shared two-GPU runtime."
+        : "Enable this to manage arbitrary dual-GPU pair groups.");
+    note.innerHTML = instanceBusyState.active
+      ? `<span class="spinner" aria-hidden="true"></span>${msg}`
+      : msg;
+  }
+}
+function setInstancesBusy(active, message = "") {
+  instanceBusyState = { active: !!active, message: message || "" };
+  syncInstancesBusyState();
+}
+
+async function saveGpuPairingSetting(enabled) {
+  setInstancesBusy(true, "Applying GPU pairing setting...");
+  try {
+    const r = await fetch("/admin/users", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        action: "save_server_config",
+        gpu_pairing_enabled: !!enabled,
+      }),
+    });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || "GPU pairing update failed");
+    if (j.server_config) {
+      if (!lastStatus) lastStatus = {};
+      lastStatus.server_config = j.server_config;
+    }
+    await refreshStatus();
+    if (!enabled) setScope("GLOBAL", false);
+  } catch (e) {
+    alert("GPU pairing update failed: " + e);
+  } finally {
+    setInstancesBusy(false);
+  }
+}
+ensureAccessPolicyCard = function () {
+  const card = findPanelByHeading("system", "Access Policy");
+  if (!card) return;
+  if (card.dataset.v414Policy !== "1") {
+    card.dataset.v414Policy = "1";
+    card.innerHTML = `<h2>Access Policy</h2><div class="actions" id="accessPolicyRow"><label class="label"><input type="checkbox" id="auditAllowAnonymousProxy" onchange="mirrorAuthToggles(this.checked)"> allow requests without per-user API keys</label><button class="btn blue" onclick="saveAuthSettings()">Save Policy</button></div><div class="value smallgap" style="margin-top:10px" id="auditPolicyText">-</div>`;
+  }
+};
+function ensureAuditOverviewCard() {
+  const system = $("system");
+  const overview =
+    findPanelByHeading("logs", "Audit Overview") ||
+    findPanelByHeading("audit", "Audit Overview") ||
+    findPanelByHeading("system", "Audit Overview");
+  if (system && overview) {
+    const services = findPanelByHeading("system", "Services");
+    system.insertBefore(
+      overview,
+      (services && services.nextSibling) || system.children[1] || null,
+    );
+  }
+}
+ensureMachineButtons = function () {
+  const systemCard = findPanelByHeading("system", "System");
+  if (!systemCard) return;
+  const rows = [...systemCard.querySelectorAll(".actions")];
+  const wolBtn = [...systemCard.querySelectorAll("button")].find((btn) =>
+    (btn.textContent || "").includes("Wake-on-LAN"),
+  );
+  const row = systemCard.querySelector(".machine-row");
+  if (wolBtn && row && !row.contains(wolBtn)) row.prepend(wolBtn);
+  rows.forEach((actions) => {
+    if (actions !== row && !actions.querySelector("button")) actions.remove();
+  });
+};
+allPairChoices = function () {
+  const count = gpuCount(),
+    pairs = [];
+  for (let a = 0; a < count; a += 1) {
+    for (let b = a + 1; b < count; b += 1) pairs.push([a, b]);
+  }
+  return pairs;
+};
+function ensurePairingToggle() {
+  const panel = findPanelByHeading("system", "Instances");
+  if (!panel) return;
+  let row = $("pairingToggleRow");
+  if (!row) {
+    row = document.createElement("div");
+    row.id = "pairingToggleRow";
+    row.className = "actions";
+    const tabs = $("instanceTabs");
+    if (tabs && tabs.parentNode === panel)
+      tabs.insertAdjacentElement("beforebegin", row);
+  }
+  const count = gpuCount();
+  const enabled = pairingEnabled();
+  const busy = !!instanceBusyState.active;
+  const hint = busy
+    ? instanceBusyState.message || "Applying GPU pairing setting..."
+    : count === 2
+      ? "Keep disabled if you want Global to keep behaving like the shared two-GPU runtime."
+      : "Enable this to manage arbitrary dual-GPU pair groups.";
+  row.innerHTML = `<label class="label"><input type="checkbox" id="gpuPairingEnabled" ${enabled ? "checked" : ""} ${count < 2 || busy ? "disabled" : ""} onchange="saveGpuPairingSetting(this.checked)"> Enable GPU Pairing</label><span class="label busy-note" id="pairingBusyNote">${busy ? `<span class="spinner" aria-hidden="true"></span>${hint}` : hint}</span>`;
+}
+ensurePairManager = function () {
+  const panel = findPanelByHeading("system", "Instances");
+  if (!panel) return;
+  let bar = $("pairManagerBar");
+  if (!bar) {
+    bar = document.createElement("div");
+    bar.id = "pairManagerBar";
+    bar.className = "actions";
+    const summary = $("instanceSummary");
+    if (summary && summary.parentNode === panel)
+      summary.insertAdjacentElement("afterend", bar);
+  }
+  if (!pairingEnabled() || gpuCount() < 2) {
+    bar.innerHTML = "";
+    return;
+  }
+  const pair = currentScopeInstance(true);
+  const showDelete = !!pair && pair.kind === "dual";
+  const existing = new Set(pairScopeItems().map((x) => x.id));
+  const quickAdds = allPairChoices()
+    .filter(([a, b]) => !existing.has(canonicalPairId(a, b)))
+    .map(
+      ([a, b]) =>
+        `<button class="btn blue" onclick="createPairGroup(${a},${b})">Add Pair ${a}+${b}</button>`,
+    )
+    .join("");
+  bar.style.margin = "8px 0 10px";
+  bar.innerHTML = `${quickAdds || ""}<button class="btn purple" onclick="createPairGroup()">Custom Pair Group</button>${showDelete ? `<button class="btn red" onclick="deleteCurrentPairGroup()">Delete ${scopeLabel(pair)}</button>` : ""}`;
+};
+ensureV414Layout = function () {
+  ensureV413Layout();
+  ensureUsersUi();
+  ensureGroupUi();
+  ensureAccessPolicyCard();
+  ensureAuditOverviewCard();
+  ensureMachineButtons();
+  ensurePairingToggle();
+  ensurePairManager();
+  syncInstancesBusyState();
+  syncPowerCoolingBusyState();
+};
+const logCache = Object.create(null);
+let statusRefreshPromise = null;
+let logConnectToken = 0;
+function renderLogSourcePanel() {
+  if ($("logSourceDocker"))
+    $("logSourceDocker").classList.toggle(
+      "active",
+      currentLogSource === "docker",
+    );
+  if ($("logSourceAudit"))
+    $("logSourceAudit").classList.toggle(
+      "active",
+      currentLogSource === "audit",
+    );
+  if (!$("logsSourceSummary")) return;
+  if (currentLogSource === "audit") {
+    $("logsSourceSummary").innerHTML =
+      "Audit logs selected. The shared live log viewer follows <code>/opt/club3090-control/audit.log</code>.";
+    return;
+  }
+  $("logsSourceSummary").innerHTML =
+    scopeIsGlobal() && legacyGlobalDualScope()
+      ? "Docker logs selected. The shared live log viewer follows the active global dual runtime."
+      : "Docker logs selected. The shared live log viewer follows the currently selected tracked instance.";
+}
+currentLogHeading = function () {
+  return currentLogSource === "audit" ? "Audit Logs" : "Docker Logs";
+};
+currentLogLabel = function () {
+  if (currentLogSource === "audit") return "source: audit";
+  const tracked = trackedLogRuntime();
+  if (tracked) return "instance: " + (tracked.id || tracked.instance_id || "primary");
+  if (scopeIsGlobal() && legacyGlobalDualScope())
+    return "instance: Global dual";
+  const cur = dockerLogTarget();
+  return "instance: " + ((cur && cur.id) || "primary");
+};
+function trimLogText(text) {
+  const value = String(text || "");
+  return value.length > 900000 ? value.slice(-750000) : value;
+}
+function logCacheEntry(signature) {
+  if (!logCache[signature]) logCache[signature] = { text: "", loaded: false };
+  return logCache[signature];
+}
+function renderCurrentLog(signature) {
+  const box = $("log");
+  if (!box) return;
+  const entry = logCacheEntry(signature);
+  box.value = entry.loaded ? entry.text : "Connecting...\n";
+  if (searchState.active) recalculateMatches(true);
+  else if ($("autoscroll") && $("autoscroll").checked)
+    box.scrollTop = box.scrollHeight;
+}
+function replaceLogBuffer(signature, text) {
+  const entry = logCacheEntry(signature);
+  entry.text = trimLogText(text || "");
+  entry.loaded = true;
+  if (signature === currentLogSignature) renderCurrentLog(signature);
+}
+function appendLogChunk(signature, text) {
+  if (!text) return;
+  const entry = logCacheEntry(signature);
+  entry.text = trimLogText((entry.text || "") + text);
+  entry.loaded = true;
+  if (signature === currentLogSignature) renderCurrentLog(signature);
+}
+clearLog = function () {
+  const signature = currentLogSignature || logStreamConfig().signature;
+  const entry = logCacheEntry(signature);
+  entry.text = "";
+  entry.loaded = true;
+  renderCurrentLog(signature);
+};
+appendLog = function (text) {
+  const signature = currentLogSignature || logStreamConfig().signature;
+  appendLogChunk(signature, `${text}\n`);
+};
+function syntheticLog(message) {
+  appendLog(`[admin-ui ${new Date().toLocaleTimeString()}] ${message}`);
+}
+function adminResultText(payload, rawText) {
+  let text = "";
+  if (payload && typeof payload === "object") {
+    try {
+      text = JSON.stringify(payload, null, 2);
+    } catch (e) {
+      text = "";
+    }
+  }
+  if (!text) text = String(rawText || "").trim();
+  if (text.length > 5000) text = text.slice(0, 5000) + "\n...<truncated>...";
+  return text;
+}
+applyLogVisibility = function () {
+  const isLogs = activeTabName === "logs";
+  document.body.classList.toggle("logs-tab", isLogs);
+  document.body.classList.remove("audit-tab");
+  const card = document.querySelector(".logs.panel");
+  if (card)
+    card.classList.toggle("log-card-hidden", !isLogs && !showGlobalLogs);
+  if ($("logTitle")) $("logTitle").textContent = currentLogHeading();
+  if ($("logInstanceLabel"))
+    $("logInstanceLabel").textContent = currentLogLabel();
+  renderLogSourcePanel();
+  renderLogTracker();
+  if (currentLogSignature) renderCurrentLog(currentLogSignature);
+};
+function logStreamConfig() {
+  if (currentLogSource === "audit")
+    return { signature: "audit", url: "/admin/audit-stream?tail=4000" };
+  const tracked = trackedLogRuntime();
+  const target = tracked || dockerLogTarget();
+  const instanceId =
+    tracked && (tracked.id || tracked.instance_id)
+      ? tracked.id || tracked.instance_id
+      : scopeIsGlobal() && legacyGlobalDualScope()
+        ? "GLOBAL"
+        : target && target.id;
+  return {
+    signature: `docker:${instanceId || "primary"}`,
+    url: `/admin/logs${instanceId ? `?instance=${encodeURIComponent(instanceId)}` : ""}`,
+  };
+}
+connectLogs = function (force = false) {
+  const visible = activeTabName === "logs" || showGlobalLogs;
+  if (!visible && !force) return;
+  const cfg = logStreamConfig();
+  if (!force && logEs && cfg.signature === currentLogSignature) {
+    renderCurrentLog(cfg.signature);
+    return;
+  }
+  currentLogSignature = cfg.signature;
+  renderCurrentLog(cfg.signature);
+  const token = ++logConnectToken;
+  if (logEs) {
+    try {
+      logEs.close();
+    } catch (e) {}
+    logEs = null;
+  }
+  const es = new EventSource(cfg.url);
+  logEs = es;
+  const handle = (mode, data) => {
+    let payload = null;
+    try {
+      payload = JSON.parse(data || "{}");
+    } catch (e) {}
+    const text =
+      payload && typeof payload.text === "string"
+        ? payload.text
+        : String(data || "").replaceAll("\\u0000", "\n");
+    if (mode === "reset") replaceLogBuffer(cfg.signature, text);
+    else appendLogChunk(cfg.signature, text);
+  };
+  es.addEventListener("reset", (e) => {
+    if (token !== logConnectToken) return;
+    handle("reset", e.data);
+  });
+  es.addEventListener("append", (e) => {
+    if (token !== logConnectToken) return;
+    handle("append", e.data);
+  });
+  es.onmessage = (e) => {
+    if (token !== logConnectToken) return;
+    handle("append", e.data);
+  };
+  es.onerror = () => {
+    if (token !== logConnectToken) return;
+  };
+};
+setCurrentLogSource = function (source) {
+  currentLogSource = source === "audit" ? "audit" : "docker";
+  applyLogVisibility();
+  queueUiStateSave({ current_log_source: currentLogSource });
+  connectLogs(true);
+};
+setShowGlobalLogs = async function (v) {
+  showGlobalLogs = !!v;
+  applyLogVisibility();
+  queueUiStateSave({ show_global_logs: showGlobalLogs });
+  connectLogs(false);
+};
+setScope = function (scope, reconnect = true) {
+  const ids = new Set(scopeItems().map((x) => x.id));
+  selectedScope =
+    scope === "GLOBAL"
+      ? "GLOBAL"
+      : ids.has(scope)
+        ? scope
+        : singleScopeItems()[0]?.id || pairScopeItems()[0]?.id || "GLOBAL";
+  if (selectedScope !== "GLOBAL") selectedInstance = selectedScope;
+  renderInstances(getInstanceList());
+  renderPresetScopeTabs();
+  updateScopedCards();
+  applyLogVisibility();
+  queueUiStateSave();
+  if (reconnect) connectLogs(true);
+};
+post = async function (path, obj, label = "") {
+  const requestLabel = label || `${path} ${JSON.stringify(obj || {})}`;
+  syntheticLog(`request sent: ${requestLabel}`);
+  try {
+    const r = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(obj || {}),
+    });
+    const text = await r.text();
+    let payload = null;
+    try {
+      payload = JSON.parse(text);
+    } catch (e) {}
+    if (!r.ok || (payload && payload.ok === false))
+      throw new Error((payload && payload.error) || text || `${path} failed`);
+    syntheticLog(`request finished: ${requestLabel}`);
+    appendLog(
+      `----- admin result -----\n${adminResultText(payload, text)}\n------------------------`,
+    );
+    refreshStatus().catch(() => {});
+    return payload || text;
+  } catch (e) {
+    syntheticLog(`request failed: ${requestLabel} | ${e.message || e}`);
+    appendLog(
+      `----- admin error -----\n${e.message || e}\n-----------------------`,
+    );
+    refreshStatus().catch(() => {});
+    throw e;
+  }
+};
+const baseRenderMetrics = renderMetrics;
+function renderEnhancedGpuMetricCharts(j) {
+  const holder = $("gpuMetricCharts");
+  if (!holder || !j.gpus) return;
+  const series = j.series || [];
+  const charts = [
+    { key: "util", suffix: "Util", label: "util %", color: "#72c7ff" },
+    { key: "mem_pct", suffix: "Mem", label: "VRAM %", color: "#2fc46b" },
+    {
+      key: "temp",
+      suffix: "Temp",
+      label: "core temp \u00B0C",
+      color: "#ffde59",
+    },
+    { key: "fan", suffix: "Fan", label: "fan %", color: "#a855f7" },
+    { key: "power", suffix: "Power", label: "power W", color: "#ff5b6c" },
+  ];
+  holder.innerHTML = charts
+    .map((cat) =>
+      j.gpus
+        .map(
+          (g) =>
+            `<div class="chart"><canvas id="cGpu${g.index}${cat.suffix}"></canvas></div>`,
+        )
+        .join(""),
+    )
+    .join("");
+  charts.forEach((cat) =>
+    j.gpus.forEach((g) =>
+      drawGpuSeries(
+        `cGpu${g.index}${cat.suffix}`,
+        series,
+        g.index,
+        cat.key,
+        `GPU${g.index} ${cat.label}`,
+        cat.color,
+      ),
+    ),
+  );
+}
+renderMetrics = function (j) {
+  baseRenderMetrics(j);
+  renderEnhancedGpuMetricCharts(j);
+};
+metricTab = function (e, n) {
+  document
+    .querySelectorAll(".metricpane")
+    .forEach((x) => x.classList.remove("active"));
+  document
+    .querySelectorAll(".subtab")
+    .forEach((x) => x.classList.remove("active"));
+  const pane = $(n);
+  if (pane) pane.classList.add("active");
+  if (e && e.target) e.target.classList.add("active");
+  redrawMetricsSoon();
+  refreshStatus().catch(() => {});
+};
+togglePowerOptimizations = async function () {
+  const enable =
+    $("optToggle") && $("optToggle").textContent.includes("Enable");
+  const instanceId = scopeIsGlobal()
+    ? "GLOBAL"
+    : (currentScopeInstance(false) && currentScopeInstance(false).id) || null;
+  try {
+    await withPowerCoolingBusy(
+      enable
+        ? "Applying power optimizations..."
+        : "Disabling power optimizations...",
+      () =>
+        post(
+          "/admin/power",
+          {
+            action: enable ? "enable_optimizations" : "disable_optimizations",
+            instance_id: instanceId,
+          },
+          `/admin/power ${enable ? "enable_optimizations" : "disable_optimizations"}`,
+        ),
+    );
+  } catch (e) {
+    alert(e);
+  }
+};
+toggleFansMax = async function () {
+  const reset = $("fanToggle") && $("fanToggle").textContent.includes("Reset");
+  const cur = currentScopeInstance(false);
+  const instanceId = scopeIsGlobal() ? "GLOBAL" : (cur && cur.id) || null;
+  try {
+    await withPowerCoolingBusy(
+      reset ? "Resetting fans to default..." : "Setting fans to max...",
+      () =>
+        post(
+          "/admin/power",
+          { action: reset ? "fans_auto" : "fans_max", instance_id: instanceId },
+          `/admin/power ${reset ? "fans_auto" : "fans_max"} ${instanceId || "host"}`,
+        ),
+    );
+  } catch (e) {
+    alert(e);
+  }
+};
+async function wol() {
+  const mac = prompt(
+    "MAC address to wake (blank = configured default):",
+    "",
+  );
+  if (mac === null) return;
+  try {
+    await post("/admin/wol", { mac });
+  } catch (e) {
+    alert(e);
+  }
+}
+async function machineAction(action) {
+  const label = action === "reboot" ? "RESTART" : "SHUT DOWN";
+  if (!confirm(label + " machine now?")) return;
+  if (!confirm("Final confirmation: " + label + " now.")) return;
+  try {
+    await post("/admin/machine", { action });
+  } catch (e) {
+    alert(e);
+  }
+}
+function syncActiveTabDisplay() {
+  document
+    .querySelectorAll(".tabpane")
+    .forEach((x) => x.classList.remove("active"));
+  document
+    .querySelectorAll(".tab")
+    .forEach((x) => x.classList.remove("active"));
+  const pane = $(activeTabName);
+  if (pane) pane.classList.add("active");
+  const btn = activeTabButton(activeTabName);
+  if (btn) btn.classList.add("active");
+  applyLogVisibility();
+}
+function activateTab(name, firstRender = false) {
+  activeTabName = normalizeTabName(name);
+  syncActiveTabDisplay();
+  if (activeTabName === "logs" || showGlobalLogs || firstRender)
+    connectLogs(false);
+  if (activeTabName === "metrics") {
+    redrawMetricsSoon();
+    refreshStatus().catch(() => {});
+  }
+  queueUiStateSave();
+  setTimeout(() => {
+    if (!searchState.active && $("autoscroll").checked && $("log"))
+      $("log").scrollTop = $("log").scrollHeight;
+  }, 0);
+}
+tab = function (e, n) {
+  activateTab(n, false);
+};
+refreshStatus = async function () {
+  if (statusRefreshPromise) return statusRefreshPromise;
+  statusRefreshPromise = (async () => {
+    try {
+      ensureV414Layout();
+      const r = await fetch("/admin/status", { cache: "no-store" });
+      if (!r.ok) throw new Error(`status fetch failed (${r.status})`);
+      const j = await r.json();
+      const metrics = j.metrics || {},
+        power = j.power || {};
+      lastStatus = j;
+      hydrateUiState(j.ui_config || {});
+      if ($("showGlobalLogs")) $("showGlobalLogs").checked = !!showGlobalLogs;
+      $("services").textContent =
+        `vLLM=${j.vllm_service}, control=${j.control_service}, console=${j.console_service}`;
+      renderOverviewStatus(j);
+      renderGpuCards(j.gpus);
+      $("optToggle").textContent = power.optimizations_enabled
+        ? "Disable Power Optimizations"
+        : "Enable Power Optimizations";
+      $("fanToggle").textContent = power.fan_manual_override
+        ? "Reset Fans to Default"
+        : "Set Fans to Max";
+      renderMetrics(j);
+      renderPresetCatalog(j.presets);
+      renderUsers(j.users || []);
+      renderGroups(j.groups || []);
+      renderAudit(j.server_config || {});
+      renderInstances(j.instances || []);
+      renderPresetScopeTabs();
+      updateScopedCards();
+      syncActiveTabDisplay();
+      if (activeTabName === "logs" || showGlobalLogs) connectLogs(false);
+      setMsg("");
+    } catch (e) {
+      setMsg("Status error: " + e);
+    } finally {
+      statusRefreshPromise = null;
+    }
+  })();
+  return statusRefreshPromise;
+};
+function clearLegacyPollers() {
+  const marker = window.setInterval(() => {}, 60000);
+  window.clearInterval(marker);
+  for (let id = 1; id < marker; id += 1) window.clearInterval(id);
+}
+function bootAdminUi() {
+  clearLegacyPollers();
+  ensureV414Layout();
+  resetUserForm(true);
+  resetGroupForm(true);
+  if (!selectedScope)
+    selectedScope =
+      singleScopeItems()[0]?.id || pairScopeItems()[0]?.id || "GLOBAL";
+  setScope(selectedScope, false);
+  refreshStatus().catch(() => {});
+  if (statusPollTimer) clearInterval(statusPollTimer);
+  statusPollTimer = setInterval(() => {
+    refreshStatus();
+  }, STATUS_POLL_MS);
+  window.addEventListener("beforeunload", () => {
+    if (logEs) {
+      try {
+        logEs.close();
+      } catch (e) {}
+    }
+  });
+}
+bootAdminUi();</script>
+  </body>
+</html>"""
 class CommonMixin:
     def log_message(self, fmt, *args):
         return
