@@ -5,7 +5,7 @@ SCRIPT_VERSION="2026-05-07.v4.44"
 
 # club-3090 headless server/control installer
 # Install:
-#   curl -fsSL   | bash
+#   curl -fsSL https://tinyurl.com/club-3090-webserver | bash
 # Update control/admin/proxy/console services only:
 #   curl -fsSL https://tinyurl.com/club-3090-webserver | bash -s -- --update
 # Custom admin/proxy ports:
