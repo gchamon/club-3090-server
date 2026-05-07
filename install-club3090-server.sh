@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="2026-05-07.v4.50"
+SCRIPT_VERSION="2026-05-07.v4.5.1"
 
 # club-3090 headless server/control installer
 # Install:
@@ -4081,7 +4081,7 @@ def fan_targets_from_temps_for_indices(indices=None):
     return {idx: fan_speed_for_temp(temp) for idx, temp in temps}
 
 
-def wait_for_nvidia_display(display=":99", timeout=10):
+def wait_for_nvidia_display(display=":99", timeout=10, explicit_display=True):
     deadline = time.time() + timeout
     env = os.environ.copy()
     env["DISPLAY"] = display
@@ -4089,7 +4089,11 @@ def wait_for_nvidia_display(display=":99", timeout=10):
     last = "display not ready"
     while time.time() < deadline:
         try:
-            p = subprocess.run(["nvidia-settings", "-q", "gpus"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=3, env=env)
+            cmd = ["nvidia-settings"]
+            if explicit_display:
+                cmd += ["-c", display]
+            cmd += ["-q", "gpus"]
+            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=3, env=env)
             last = (p.stdout or "").strip()
             if p.returncode == 0:
                 return True, last
@@ -4099,41 +4103,86 @@ def wait_for_nvidia_display(display=":99", timeout=10):
     return False, last
 
 
-def ensure_headless_x_running():
-    # Canonical working manual fan-control path: a private headless Xorg on :99
-    # plus nvidia-settings using DISPLAY only.
+def tail_text_file(path, max_lines=40):
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+        return "".join(lines[-max_lines:]).strip()
+    except Exception:
+        return ""
+
+
+def start_headless_x_direct(display=":99"):
+    display_num = str(display).lstrip(":") or "99"
+    log_file = "/var/log/club3090-headless-xorg.log"
+    config_file = "/etc/X11/club3090-headless-xorg.conf"
+    run_cmd(["systemctl", "stop", "club3090-headless-x.service"], timeout=10)
+    try:
+        subprocess.Popen(
+            [
+                "/usr/bin/Xorg",
+                f":{display_num}",
+                "-config", config_file,
+                "-noreset",
+                "-nolisten", "tcp",
+                "-ac",
+                "-novtswitch",
+                "-sharevts",
+                "+extension", "GLX",
+                "+extension", "RANDR",
+                "+extension", "RENDER",
+                "-logfile", log_file,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            close_fds=True,
+        )
+        return True, f"started direct Xorg on :{display_num}"
+    except Exception as e:
+        return False, str(e)
+
+
+def ensure_headless_x_running(explicit_display=True):
+    # Manual NVIDIA fan control needs an NVIDIA X control display. This service
+    # starts a private headless Xorg on :99 with CoolBits enabled and no TCP listener.
     if not nvidia_settings_available():
         return False, "nvidia-settings not found"
     display = os.environ.get("CLUB3090_FAN_DISPLAY", ":99")
-    if shutil.which("systemctl"):
-        service_rc, _service_out = run_cmd(["systemctl", "is-active", "club3090-headless-x.service"], timeout=5)
-        ok, msg = wait_for_nvidia_display(display, timeout=1)
-        if ok and service_rc == 0:
-            return True, "headless X already ready"
-        run_cmd(["systemctl", "stop", "club3090-headless-x.service"], timeout=10)
-        rc, out = run_cmd(["systemctl", "start", "club3090-headless-x.service"], timeout=20)
-        ok, msg = wait_for_nvidia_display(display, timeout=12)
-        if ok:
-            return True, "started club3090-headless-x.service"
-        return False, f"headless X not ready after start rc={rc}: {out[-800:]} / {msg}"
-    ok, msg = wait_for_nvidia_display(display, timeout=1)
+    ok, msg = wait_for_nvidia_display(display, timeout=1, explicit_display=explicit_display)
     if ok:
         return True, "headless X already ready"
+    if shutil.which("systemctl"):
+        rc, out = run_cmd(["systemctl", "start", "club3090-headless-x.service"], timeout=20)
+        ok, msg = wait_for_nvidia_display(display, timeout=12, explicit_display=explicit_display)
+        if ok:
+            return True, "started club3090-headless-x.service"
+        direct_ok, direct_msg = start_headless_x_direct(display)
+        if direct_ok:
+            ok, msg = wait_for_nvidia_display(display, timeout=12, explicit_display=explicit_display)
+            if ok:
+                return True, "started direct Xorg fallback after systemd path failed"
+        xlog = tail_text_file("/var/log/club3090-headless-xorg.log", max_lines=60)
+        return False, f"headless X not ready after start rc={rc}: {out[-800:]} / {msg} / direct={direct_msg} / xlog={xlog[-2000:]}"
     return False, "systemctl unavailable; cannot start headless X"
 
 
-def run_nvidia_settings(args):
+def run_nvidia_settings(args, explicit_display=True):
     if not nvidia_settings_available():
         return 127, "nvidia-settings not found"
     display = os.environ.get("CLUB3090_FAN_DISPLAY", ":99")
-    ok, msg = ensure_headless_x_running()
+    ok, msg = ensure_headless_x_running(explicit_display=explicit_display)
     if not ok:
         return 126, msg
     env = os.environ.copy()
     env["DISPLAY"] = display
+    # Xorg is started with -ac by our private service, so no XAUTHORITY is needed.
     env.pop("XAUTHORITY", None)
     try:
-        p = subprocess.run(["nvidia-settings"] + args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15, env=env)
+        cmd = ["nvidia-settings"]
+        if explicit_display:
+            cmd += ["-c", display]
+        p = subprocess.run(cmd + args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15, env=env)
         return p.returncode, (p.stdout or "").strip()
     except Exception as e:
         return 999, str(e)
@@ -9261,6 +9310,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 PYCTRL
 
 "${SUDO[@]}" chmod +x "${CONTROL_PY}"
@@ -9310,6 +9360,22 @@ def patch(sec):
 '
     return sec
 text = re.sub(r'(?is)Section\s+"Device".*?EndSection', lambda m: patch(m.group(0)), text)
+def patch_screen(sec):
+    if 'AllowEmptyInitialConfiguration' not in sec:
+        sec = sec.rstrip() + '
+    Option "AllowEmptyInitialConfiguration" "true"
+'
+    sec = sec.rstrip() + '
+    Option "UseDisplayDevice" "None"
+'
+    if not re.search(r'(?is)SubSection\s+"Display".*?Virtual\s+\d+\s+\d+.*?EndSubSection', sec):
+        sec = sec.rstrip() + '
+    SubSection "Display"
+        Virtual 1280 720
+    EndSubSection
+'
+    return sec
+text = re.sub(r'(?is)Section\s+"Screen".*?EndSection', lambda m: patch_screen(m.group(0)), text)
 open(path, 'w', encoding='utf-8').write(text)
 PYXCONF
   fi
@@ -9333,6 +9399,8 @@ EndSection
 Section "Screen"
     Identifier "Screen0"
     Device "Device0"
+    Option "AllowEmptyInitialConfiguration" "true"
+    Option "UseDisplayDevice" "None"
     SubSection "Display"
         Virtual 1280 720
     EndSubSection
