@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="2026-05-07.v4.5.1"
+SCRIPT_VERSION="2026-05-07.v4.5.2"
 
 # club-3090 headless server/control installer
 # Install:
@@ -2262,13 +2262,24 @@ def write_instance_artifacts(instance):
     spec = instance_variant_spec(instance)
     paths = instance_paths(instance)
     os.makedirs(paths["dir"], exist_ok=True)
+    os.makedirs(os.path.join(paths["dir"], "cache"), exist_ok=True)
+    visible_devices = ",".join(str(int(idx)) for idx in (instance.get("gpu_indices") or [instance["gpu_index"]]))
+    cache_root = os.path.join(paths["dir"], "cache")
     with open(paths["env"], "w", encoding="utf-8") as f:
         f.write(f"PORT={int(instance['port'])}\n")
-        f.write("CUDA_VISIBLE_DEVICES=" + ",".join(str(int(idx)) for idx in (instance.get("gpu_indices") or [instance["gpu_index"]])) + "\n")
+        f.write(f"CUDA_VISIBLE_DEVICES={visible_devices}\n")
     override = (
         "services:\n"
         f"  {spec['service']}:\n"
         f"    container_name: {instance_container_name(instance)}\n"
+        "    environment:\n"
+        f"      CUDA_VISIBLE_DEVICES: \"{visible_devices}\"\n"
+        f"      NVIDIA_VISIBLE_DEVICES: \"{visible_devices}\"\n"
+        "      VLLM_CACHE_ROOT: /root/.cache/club3090-instance/vllm\n"
+        "      TORCHINDUCTOR_CACHE_DIR: /root/.cache/club3090-instance/torchinductor\n"
+        "      TRITON_CACHE_DIR: /root/.cache/club3090-instance/triton\n"
+        "    volumes:\n"
+        f"      - {cache_root}:/root/.cache/club3090-instance\n"
         "    labels:\n"
         f"      club3090.instance_id: \"{instance['id']}\"\n"
         f"      club3090.kind: \"{instance['kind']}\"\n"
@@ -3937,6 +3948,111 @@ def get_status_snapshot(force=False):
     if force or not snapshot or not updated_at:
         return refresh_status_snapshot()
     return snapshot
+
+
+def _tail_text_lines(path, max_lines=4000):
+    try:
+        max_lines = max(1, int(max_lines or 4000))
+    except Exception:
+        max_lines = 4000
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return "".join(f.readlines()[-max_lines:])
+    except Exception:
+        return ""
+
+
+def upload_text_to_0x0(text, filename="club3090-log.txt"):
+    payload = str(text or "")
+    if not payload.strip():
+        raise ValueError("No log text available to export")
+    body_bytes = payload.encode("utf-8", errors="replace")
+    boundary = "----club3090" + secrets.token_hex(12)
+    parts = []
+
+    def add_field(name, value):
+        parts.append(f"--{boundary}\r\n".encode("utf-8"))
+        parts.append(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"))
+        parts.append(str(value).encode("utf-8"))
+        parts.append(b"\r\n")
+
+    def add_file(name, upload_name, data, content_type="text/plain; charset=utf-8"):
+        parts.append(f"--{boundary}\r\n".encode("utf-8"))
+        parts.append(
+            f'Content-Disposition: form-data; name="{name}"; filename="{upload_name}"\r\n'.encode("utf-8")
+        )
+        parts.append(f"Content-Type: {content_type}\r\n\r\n".encode("utf-8"))
+        parts.append(data)
+        parts.append(b"\r\n")
+
+    add_file("file", filename, body_bytes)
+    parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+    request = urllib.request.Request(
+        "https://0x0.st",
+        data=b"".join(parts),
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Accept": "text/plain",
+            "User-Agent": "club3090-control",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=60) as response:
+        link = response.read().decode("utf-8", errors="replace").strip()
+    if not re.match(r"^https?://0x0\.st/[A-Za-z0-9]+(?:/[^\s]*)?$", link):
+        raise RuntimeError(f"Unexpected upload response: {link[:300]}")
+    return link
+
+
+def export_selected_log(source="docker", instance_id=""):
+    source_name = str(source or "docker").strip().lower()
+    exported_at = time.strftime("%Y-%m-%d %H:%M:%S")
+    if source_name == "audit":
+        raw_text = _tail_text_lines(AUDIT_LOG_FILE, max_lines=4000)
+        if not raw_text.strip():
+            raise ValueError("Audit log is empty")
+        file_name = f"club3090-audit-{time.strftime('%Y%m%d-%H%M%S')}.log"
+        header = (
+            "# club-3090 log export\n"
+            f"source: audit\n"
+            f"exported_at: {exported_at}\n"
+            f"script_version: {SCRIPT_VERSION}\n"
+            f"path: {AUDIT_LOG_FILE}\n\n"
+        )
+        return {
+            "source": "audit",
+            "instance_id": None,
+            "container": "",
+            "file_name": file_name,
+            "text": header + raw_text,
+        }
+    instance, container = resolve_runtime_log_container(instance_id)
+    if not container:
+        raise ValueError("No runtime log source selected")
+    watcher = get_runtime_log_watcher(container)
+    if watcher is None:
+        raise ValueError("Could not access the selected runtime log")
+    snapshot = watcher.snapshot()
+    raw_text = str(snapshot.get("text") or "")
+    if not raw_text.strip():
+        raise ValueError("Selected runtime log is empty")
+    label = (instance.get("id") if instance else (str(instance_id or "").strip().upper() or "primary"))
+    file_name = f"club3090-{label.lower()}-{time.strftime('%Y%m%d-%H%M%S')}.log"
+    header = (
+        "# club-3090 log export\n"
+        f"source: docker\n"
+        f"instance: {label}\n"
+        f"container: {container}\n"
+        f"exported_at: {exported_at}\n"
+        f"script_version: {SCRIPT_VERSION}\n\n"
+    )
+    return {
+        "source": "docker",
+        "instance_id": label,
+        "container": container,
+        "file_name": file_name,
+        "text": header + raw_text,
+    }
 
 
 def status_snapshot_collector():
@@ -6544,6 +6660,8 @@ function svgIcon(name) {
     return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M9 7V5h6v2m-7 3v7m4-7v7m4-7v7M7 7l1 12h8l1-12" fill="none"/></svg>';
   if (name === "copy")
     return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 9h10v10H9zM5 15H4V5h10v1" fill="none"/></svg>';
+  if (name === "upload")
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0l-4 4m4-4l4 4M5 20h14" fill="none"/></svg>';
   return "";
 }
 function renderIconButton({ title, action, icon, className = "" }) {
@@ -6798,7 +6916,7 @@ function ensureV413Layout() {
     const panel = document.createElement("div");
     panel.className = "panel";
     panel.id = "logsSourcePanel";
-    panel.innerHTML = `<h2>Log Sources</h2><div class="subtabs"><button class="subtab" id="logSourceDocker" onclick="setCurrentLogSource('docker')">Docker Logs</button><button class="subtab" id="logSourceAudit" onclick="setCurrentLogSource('audit')">Audit Logs</button></div><div class="value smallgap" id="logsSourceSummary">-</div>`;
+  panel.innerHTML = `<div class="panel-head"><h2>Log Sources</h2><div class="preset-actions">${renderIconButton({ title: "Export Logs", action: "exportCurrentLog()", icon: "upload" })}</div></div><div class="subtabs"><button class="subtab" id="logSourceDocker" onclick="setCurrentLogSource('docker')">Docker Logs</button><button class="subtab" id="logSourceAudit" onclick="setCurrentLogSource('audit')">Audit Logs</button></div><div class="value smallgap" id="logsSourceSummary">-</div>`;
     logs.appendChild(panel);
   }
   const profiles = findPanelByHeading("system", "Profiles");
@@ -8110,7 +8228,9 @@ ensureV414Layout = function () {
 };
 const logCache = Object.create(null);
 let statusRefreshPromise = null;
+let pendingForcedStatusRefresh = false;
 let logConnectToken = 0;
+let logExportBusy = false;
 function renderLogSourcePanel() {
   if ($("logSourceDocker"))
     $("logSourceDocker").classList.toggle(
@@ -8231,6 +8351,41 @@ function logStreamConfig() {
     signature: `docker:${instanceId || "primary"}`,
     url: `/admin/logs${instanceId ? `?instance=${encodeURIComponent(instanceId)}` : ""}`,
   };
+}
+function currentLogExportRequest() {
+  if (currentLogSource === "audit") {
+    return { source: "audit", instance_id: null };
+  }
+  const tracked = trackedLogRuntime();
+  const target = tracked || dockerLogTarget();
+  const instanceId =
+    tracked && (tracked.id || tracked.instance_id)
+      ? tracked.id || tracked.instance_id
+      : scopeIsGlobal() && legacyGlobalDualScope()
+        ? "GLOBAL"
+        : target && target.id;
+  return { source: "docker", instance_id: instanceId || null };
+}
+async function exportCurrentLog() {
+  if (logExportBusy) return;
+  logExportBusy = true;
+  try {
+    const req = currentLogExportRequest();
+    const payload = await post(
+      "/admin/log-export",
+      req,
+      `/admin/log-export ${req.source} ${req.instance_id || "host"}`,
+    );
+    openApiKeyModal(
+      "Log Export Link",
+      payload.url || "",
+      "Share this link directly for debugging. It points to the currently selected log export.",
+    );
+  } catch (e) {
+    alert(e);
+  } finally {
+    logExportBusy = false;
+  }
 }
 connectLogs = function (force = false) {
   const visible = activeTabName === "logs" || showGlobalLogs;
@@ -8478,10 +8633,8 @@ function activateTab(name, firstRender = false) {
   syncActiveTabDisplay();
   if (activeTabName === "logs" || showGlobalLogs || firstRender)
     connectLogs(false);
-  if (activeTabName === "metrics") {
-    redrawMetricsSoon();
-    refreshStatus().catch(() => {});
-  }
+  if (activeTabName === "metrics") redrawMetricsSoon();
+  refreshStatus({ force: true }).catch(() => {});
   queueUiStateSave();
   setTimeout(() => {
     if (!searchState.active && $("autoscroll").checked && $("log"))
@@ -8491,12 +8644,17 @@ function activateTab(name, firstRender = false) {
 tab = function (e, n) {
   activateTab(n, false);
 };
-refreshStatus = async function () {
-  if (statusRefreshPromise) return statusRefreshPromise;
+refreshStatus = async function (opts = {}) {
+  const force = !!(opts && opts.force);
+  if (statusRefreshPromise) {
+    if (force) pendingForcedStatusRefresh = true;
+    return statusRefreshPromise;
+  }
   statusRefreshPromise = (async () => {
     try {
       ensureV414Layout();
-      const r = await fetch("/admin/status", { cache: "no-store" });
+      const suffix = force ? `?force=1&_=${Date.now()}` : "";
+      const r = await fetch(`/admin/status${suffix}`, { cache: "no-store" });
       if (!r.ok) throw new Error(`status fetch failed (${r.status})`);
       const j = await r.json();
       const metrics = j.metrics || {},
@@ -8529,6 +8687,10 @@ refreshStatus = async function () {
       setMsg("Status error: " + e);
     } finally {
       statusRefreshPromise = null;
+      if (pendingForcedStatusRefresh) {
+        pendingForcedStatusRefresh = false;
+        refreshStatus({ force: true }).catch(() => {});
+      }
     }
   })();
   return statusRefreshPromise;
@@ -8623,7 +8785,9 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             self.send_bytes(html.encode("utf-8"), "text/html; charset=utf-8")
             return
         if path == "/admin/status":
-            self.send_json(get_status_snapshot())
+            params = parse_admin_query_params(parsed)
+            force = str(params.get("force") or "").strip().lower() in {"1", "true", "yes", "on"}
+            self.send_json(get_status_snapshot(force=force))
             return
         if path == "/admin/logs":
             self.close_connection = False
@@ -8811,6 +8975,37 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                 cfg = write_ui_config(data)
                 log_audit("admin_ui_config", keys=sorted(list((data or {}).keys())))
                 self.send_json({"ok": True, "ui_config": cfg})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path == "/admin/log-export":
+            try:
+                data = self.read_json_body()
+                export_payload = export_selected_log(
+                    source=data.get("source") or "docker",
+                    instance_id=data.get("instance_id") or "",
+                )
+                url = upload_text_to_0x0(
+                    export_payload.get("text") or "",
+                    filename=export_payload.get("file_name") or "club3090-log.txt",
+                )
+                log_audit(
+                    "admin_log_export",
+                    source=export_payload.get("source"),
+                    instance=export_payload.get("instance_id"),
+                    container=export_payload.get("container"),
+                    url=url,
+                )
+                self.send_json(
+                    {
+                        "ok": True,
+                        "source": export_payload.get("source"),
+                        "instance_id": export_payload.get("instance_id"),
+                        "container": export_payload.get("container"),
+                        "file_name": export_payload.get("file_name"),
+                        "url": url,
+                    }
+                )
             except Exception as e:
                 self.send_json({"ok": False, "error": str(e)}, 500)
             return
