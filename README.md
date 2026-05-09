@@ -23,6 +23,22 @@ This repository is the server-management layer. It is designed to integrate with
 - Optional `--online use-https` mode that enables a Caddy-backed self-signed HTTPS frontend for the admin panel and proxy
 - Power presets, fan speed control, idle downclocking, and system information for remote server management
 
+## Screenshots
+
+<img width="1080" height="2408" alt="Screenshot_20260508-072044" src="https://github.com/user-attachments/assets/6e04fbdf-7fc4-4ab9-a4d6-4f46d8dde932" />
+<img width="1080" height="2408" alt="Screenshot_20260509-052143" src="https://github.com/user-attachments/assets/dff17890-df04-43ee-9785-7a12499bfaee" />
+<img width="1080" height="2408" alt="Screenshot_20260509-052131" src="https://github.com/user-attachments/assets/86ce63e2-b5fc-41d7-86aa-2b39c935316e" />
+<img width="1080" height="2408" alt="Screenshot_20260509-052121" src="https://github.com/user-attachments/assets/1e5bb5a1-177d-4fb7-92b1-be87a3884f74" />
+<img width="1080" height="2408" alt="Screenshot_20260509-052110" src="https://github.com/user-attachments/assets/69cbde3a-731f-451d-9a2f-d5ede08a4ec5" />
+<img width="1080" height="2408" alt="Screenshot_20260509-052058" src="https://github.com/user-attachments/assets/a6837107-e0a1-43de-afaa-04751dd47ab8" />
+<img width="1080" height="2408" alt="Screenshot_20260509-052048" src="https://github.com/user-attachments/assets/02683f61-144e-48cb-9c22-83765fa87e20" />
+<img width="1080" height="2408" alt="Screenshot_20260509-052022" src="https://github.com/user-attachments/assets/7d46da12-21a9-40d1-a7cc-135ea9573bfb" />
+<img width="1080" height="2408" alt="Screenshot_20260509-052015" src="https://github.com/user-attachments/assets/e75f6d18-b8ee-47a4-ab29-2ab4e009f2a3" />
+<img width="1080" height="2408" alt="Screenshot_20260509-051944" src="https://github.com/user-attachments/assets/675b8a15-4126-4bed-8a14-01b71ec75437" />
+<img width="1080" height="2408" alt="Screenshot_20260509-051933" src="https://github.com/user-attachments/assets/e54baa38-c232-457e-a0da-235638d064a4" />
+<img width="1080" height="2408" alt="Screenshot_20260508-074059" src="https://github.com/user-attachments/assets/bdb2e054-3da8-43fd-9667-b1101693c90e" />
+
+
 ## Supported Linux Families
 
 - Arch
