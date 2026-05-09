@@ -25,10 +25,8 @@ This repository is the server-management layer. It is designed to integrate with
 
 ## Screenshots
 
-<img width="1080" height="2408" alt="Screenshot_20260508-074059" src="https://github.com/user-attachments/assets/bdb2e054-3da8-43fd-9667-b1101693c90e" />
 <img width="1080" height="2408" alt="Screenshot_20260509-051933" src="https://github.com/user-attachments/assets/e54baa38-c232-457e-a0da-235638d064a4" />
-<img width="1080" height="2408" alt="Screenshot_20260509-051944" src="https://github.com/user-attachments/assets/675b8a15-4126-4bed-8a14-01b71ec75437" />
-<img width="1080" height="2408" alt="Screenshot_20260509-052015" src="https://github.com/user-attachments/assets/e75f6d18-b8ee-47a4-ab29-2ab4e009f2a3" />
+<img width="1080" height="2408" alt="Screenshot_20260508-074059" src="https://github.com/user-attachments/assets/bdb2e054-3da8-43fd-9667-b1101693c90e" />
 <img width="1080" height="2408" alt="Screenshot_20260509-052022" src="https://github.com/user-attachments/assets/7d46da12-21a9-40d1-a7cc-135ea9573bfb" />
 <img width="1080" height="2408" alt="Screenshot_20260509-052048" src="https://github.com/user-attachments/assets/02683f61-144e-48cb-9c22-83765fa87e20" />
 <img width="1080" height="2408" alt="Screenshot_20260509-052058" src="https://github.com/user-attachments/assets/a6837107-e0a1-43de-afaa-04751dd47ab8" />
