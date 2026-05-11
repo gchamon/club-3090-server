@@ -2,26 +2,25 @@
 
 Single-file installer for a [club-3090](https://github.com/noonghunna/club-3090) inference host, providing a full-featured browser admin control panel, distro-aware install/update logic, systemd service setup, a reverse proxy that automatically routes requests to the correct containers via a single endpoint with optional configurable vLLM setting presets, live log management, GPU power and fan speed controls, multi-instance GPU orchestration, and API access control for multiple users.
 
-This repository is the server-management layer. It is designed to integrate with an existing [club-3090](https://github.com/noonghunna/club-3090) installation and allow for easy remote management of the server.
+This repository is the server-management layer. It integrates with the upstream [club-3090](https://github.com/noonghunna/club-3090) runtime and, on a fresh install, now clones that upstream repo automatically into `/opt/ai/club-3090` before wiring up the control plane.
 
 ## What This Script Provides
 
-- Linux distribution detection for Arch-family and Ubuntu/Debian-family systems
-- Installer and updater logic in one self-contained script
-- A control stack installed under `/opt/club3090-control`
-- An admin UI on `:8008/admin`
-- An OpenAI-compatible proxy on `:8009` so you can chat with the LLM on a unified port regardless of what docker container is in use.
-- GPU-aware backend selection
-- Per-GPU multi-instance runtime management for single-card presets
-- Native support for dual-GPU presets
-- Live Docker log streaming that stays aware of multiple backend containers
-- A dedicated Audit tab that reuses the shared searchable live-log viewer for audit events
-- Request metrics, uptime, health reporting, and backend auto-start behavior
-- Per-user API key authentication, access control, and quota enforcement
+- Fully self contained installer/updater script that handles everything you need to self-host a club-3090 based inference server, optimized for headless Arch and Debian/Ubuntu based distros with docker logs automatically printed to tty1
+- A control stack installed under `/opt/club3090-control` and an admin web panel running on `localhost:8008/admin`
+- An OpenAI-compatible proxy on `:8009` so you can chat with the LLM on a unified port regardless of what docker containers are in use.
+- GPU-aware backend selection with per-GPU and multi-instance runtime management for single-card, dual-card or multi-card presets with dynamic runtime inventory discovery from the local `club-3090` checkout
+- Built-in local inference chat with server-persisted conversations across browsers/devices, per-conversation saved settings, folders, automatic conversation naming, system-prompt templates, rich markdown/media rendering, collapsible thinking trace rendering, local attachments, and automatic context compaction/rollover
+- Live Docker and audit log streaming that stays aware of multiple backend containers
+- Preset launch state that only flips to `Active` after the backend fully finishes booting, with boot/error browser notifications and fast failure reporting when a compose never actually starts a container
+- UI-driven model download/setup jobs with stdout/stderr streamed into Audit Logs
+- Hardware metrics, uptime, health reporting, and backend auto-start and manual control, as well as full server remote management controls
+- Power presets, fan speed control, idle downclocking, and system information for remote server management
+- Create dynamic instances and run multiple docker containers per GPU or GPU Pairs and be able to run inference on a single unified endpoint with different configurable vLLM setting presets 
+- Optional per-user API key authentication, access control, and optional quota enforcement
 - An optional loopback-only automation API for local tools on the same machine
 - Optional `--online` mode that opens and forwards only the admin/proxy ports to the internet
 - Optional `--online use-https` mode that enables a Caddy-backed self-signed HTTPS frontend for the admin panel and proxy
-- Power presets, fan speed control, idle downclocking, and system information for remote server management
 
 ## Screenshots
 
@@ -34,6 +33,182 @@ This repository is the server-management layer. It is designed to integrate with
 <img width="1080" height="2408" alt="Screenshot_20260509-052121" src="https://github.com/user-attachments/assets/1e5bb5a1-177d-4fb7-92b1-be87a3884f74" />
 <img width="1080" height="2408" alt="Screenshot_20260509-052131" src="https://github.com/user-attachments/assets/86ce63e2-b5fc-41d7-86aa-2b39c935316e" />
 <img width="1080" height="2408" alt="Screenshot_20260508-072044" src="https://github.com/user-attachments/assets/6e04fbdf-7fc4-4ab9-a4d6-4f46d8dde932" />
+
+## Quick Start Guide
+
+This section is written for someone who just wants the server working and may not be so familiar with the complexities of LLM configuration.
+
+### What this project does
+
+- [club-3090](https://github.com/noonghunna/club-3090) is the stack that actually runs the AI models
+- this server script adds a browser-based admin panel, a stable proxy port, logs, power controls, and easier model/preset management
+- after setup, you can control everything from the admin panel instead of manually typing long terminal commands
+
+### Before you begin
+
+Make sure your Linux machine already has:
+
+- a supported NVIDIA GPU
+- working NVIDIA drivers
+- Docker
+- internet access
+- a normal Linux user account that can use `sudo`
+
+If you plan to download gated Hugging Face models, also have your Hugging Face token ready.
+
+### Step 1: Run the installer
+
+Run the installer directly:
+
+```bash
+curl -fsSL https://tinyurl.com/club-3090-webserver | bash
+```
+
+If you already downloaded this repo locally, you can also run:
+
+```bash
+bash install-club3090-server.sh
+```
+
+If you need gated model downloads and already have a Hugging Face token, use:
+
+```bash
+curl -fsSL https://tinyurl.com/club-3090-webserver | \
+  HF_TOKEN=hf_xxx bash
+```
+
+On a fresh machine, the installer will create `/opt/ai/` if needed, clone the upstream `club-3090` repo into `/opt/ai/club-3090`, fix script permissions, and then continue with the normal setup.
+
+### Step 2: Open the admin panel
+
+When the installer finishes, open a browser and go to:
+
+```text
+http://YOUR-SERVER-IP:8008/admin
+```
+
+If you installed with custom ports, replace `8008` with your chosen admin port.
+
+### Step 3: Log in
+
+When the login screen appears, sign in with your normal Linux user credentials.
+
+Use:
+
+- your Linux username
+- your Linux password
+
+In other words, log in with the same account you would normally use for `sudo` or for signing into that Linux machine. The admin panel does not create a separate default password for you.
+
+### Step 4: Download or prepare a model
+
+After logging in, open the `Presets` tab.
+
+You will see discovered model presets from the local `club-3090` checkout. Some presets may show that downloads are still required.
+
+If a preset is not ready:
+
+1. Click its `Download` button.
+2. Wait for the download/setup job to finish.
+3. Watch progress in `Audit Logs`.
+
+If you prefer to prepare the model manually in the terminal first, a common example is:
+
+```bash
+cd /opt/ai/club-3090
+bash scripts/setup.sh qwen3.6-27b
+```
+
+Some advanced presets, such as DFlash variants, may require extra model files. The admin panel will usually tell you what command is needed.
+
+### Step 5: Start your first preset
+
+Still in the `Presets` tab:
+
+1. Pick the model you want.
+2. Pick a preset that says it is ready.
+3. Click `Apply`.
+4. The UI will jump into Docker Logs immediately so you can follow the launch.
+5. Wait while the instance launches.
+6. When startup completes successfully, the ready badge flips to `Active`, the card shows how long launch took, and the action button becomes `Stop`
+
+If something fails, the preset will show `Error` and the logs will show what happened.
+
+For most beginners:
+
+- Use a single-GPU preset if you only want one model running on one GPU, or the global scope to automatically distribute presets to alll available GPUs.
+- Use the default or recommended preset first before trying special variants like long-context, dual-card, turbo, or DFlash
+- Test if inference is working correctly via the built-in chat interface and watch the generated statistics
+
+### Step 6: Test the AI server
+
+Once a preset is active, the proxy is usually available on:
+
+```text
+http://YOUR-SERVER-IP:8009/v1
+```
+
+That proxy gives you one stable API endpoint even if you switch between different backends later.
+
+You can test it with:
+
+```bash
+curl http://YOUR-SERVER-IP:8009/v1/models
+```
+
+Or with a chat request:
+
+```bash
+curl -s http://YOUR-SERVER-IP:8009/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3.6-27b-autoround","messages":[{"role":"user","content":"Hello"}],"max_tokens":128}'
+```
+
+### Step 7: Everyday admin panel usage
+
+Here is the simple mental model for the main tabs:
+
+- `Main`: quick status, running containers, uptime, and GPU overview
+- `System`: service controls, power/fan controls, and machine information
+- `Presets`: download models, start/stop presets, and manage which runtime is active
+- `Chat`: built-in local streaming chat client with full markdown support, configuration and mcp servers
+- `Users`: create API users and keys if you want to share the server safely
+- `Metrics`: request counts, usage history, and runtime performance data
+- `Logs`: Docker logs and audit logs for troubleshooting
+
+### Common first tasks
+
+After installation, most people will want to do these things:
+
+1. Log in with their Linux username and password.
+2. Open `Presets`.
+3. Download the model files the desired preset needs.
+4. Click `Apply` on a recommended preset.
+5. Wait until it becomes `Active`.
+6. Copy the proxy base URL `http://YOUR-SERVER-IP:8009/v1` into their AI client.
+
+### If you want to use an app like Open WebUI, Cline, or another OpenAI-compatible client
+
+Most OpenAI-compatible apps need:
+
+- Base URL: `http://YOUR-SERVER-IP:8009/v1`
+- API key: only if you enabled user/API-key protection
+- Model name: whichever model the active backend serves
+
+If the client asks for an endpoint and does not mention presets, start with the plain proxy URL above.
+
+### If something does not work
+
+Try these checks in order:
+
+1. Confirm the admin panel opens.
+2. Confirm you can log in with your Linux user credentials.
+3. Confirm the preset you selected finished downloading.
+4. Confirm the preset reached `Active`, not just `Booting`.
+5. Read `Logs` and `Audit Logs` for the exact failure message.
+6. Confirm Docker and the NVIDIA driver are working on the Linux host.
+
+If you changed the upstream repo manually or pulled a new upstream version, run update or migrate again so the control layer and upstream runtime stay in sync.
 
 ## Supported Linux Families
 
@@ -53,33 +228,20 @@ The script reads `/etc/os-release` and installs the right package names for the 
 - NVIDIA drivers already installed
 - Docker already installed and usable
 - Docker Compose plugin or compatible `docker compose`
-- An existing `club-3090` checkout that contains the upstream runtime assets and `scripts/switch.sh` resident in `/opt/ai/club-3090`
-
-Typical upstream checkout:
-
-```bash
-git clone https://github.com/noonghunna/club-3090.git /opt/ai/club-3090
-```
+- Internet access so the installer can clone the upstream `club-3090` repo into `/opt/ai/club-3090` on first install
 
 ## Supported Runtime Presets
 
-Single-card presets that can be assigned per GPU:
+As of `v5.0`, the server no longer ships a hardcoded preset catalog. Instead it scans the local upstream repo under `/opt/ai/club-3090`, parses compose headers and compose files directly, and builds `/opt/club3090-control/runtime_inventory.json`.
 
-- `vllm/default`
-- `vllm/long-vision`
-- `vllm/long-text`
-- `vllm/bounded-thinking`
-- `vllm/tools-text`
-- `vllm/minimal`
-- `llamacpp/default`
-- `llamacpp/concurrent`
+That means the Presets tab now reflects whatever models and variants exist in the checked-out upstream repo, including:
 
-Legacy upstream dual-GPU presets that remain available as fallback/default modes:
+- single-GPU presets
+- dual-GPU presets
+- multi-GPU presets
+- experimental or caveat-marked upstream variants
 
-- `vllm/dual`
-- `vllm/dual-turbo`
-- `vllm/dual-dflash`
-- `vllm/dual-dflash-noviz`
+Upstream switch tags such as `vllm/default`, `vllm/dual`, `vllm/gemma-mtp`, and `llamacpp/default` are still recognized when present, but the control layer can also launch compose variants that are only discoverable by scanning the repo tree.
 
 ## Install
 
@@ -94,6 +256,13 @@ Custom upstream checkout path and default mode:
 ```bash
 curl -fsSL https://tinyurl.com/club-3090-webserver | \
   CLUB3090_DIR=/opt/ai/club-3090 DEFAULT_MODE=vllm/dual-dflash bash
+```
+
+Pass a Hugging Face token inline when gated downloads are needed:
+
+```bash
+curl -fsSL https://tinyurl.com/club-3090-webserver | \
+  HF_TOKEN=hf_xxx bash
 ```
 
 Running a local copy:
@@ -114,6 +283,12 @@ Enable the local automation API:
 bash install-club3090-server.sh --local-automation
 ```
 
+Persist a Hugging Face token into the local `club-3090` repo `.env` so setup jobs and later admin-panel model downloads can reuse it automatically:
+
+```bash
+bash install-club3090-server.sh --hf-token hf_xxx
+```
+
 Public internet exposure:
 
 ```bash
@@ -130,7 +305,7 @@ bash install-club3090-server.sh --online use-https
 Updates the control layer without intentionally stopping an already-running backend:
 
 ```bash
-curl -fsSL https://tinyurl.com/club-3090-webserver | bash -s -- --update
+`curl -fsSL https://tinyurl.com/club-3090-webserver | bash -s -- --update`
 ```
 
 Or from a local copy:
@@ -150,6 +325,42 @@ Update with custom ports:
 ```bash
 bash install-club3090-server.sh --update --ports 18008:18009
 ```
+
+## Migrate
+
+Use `--migrate` when the upstream repo checkout itself needs to be replaced with a fresh clone while preserving downloaded model assets and runtime state:
+
+```bash
+curl -fsSL https://tinyurl.com/club-3090-webserver | bash -s -- --migrate
+```
+
+Or from a local copy:
+
+```bash
+bash install-club3090-server.sh --migrate
+```
+
+If an interrupted migration needs to be discarded and restarted from scratch instead of resumed:
+
+```bash
+bash install-club3090-server.sh --migrate restart
+```
+
+`--migrate`:
+
+- compares the local checkout head to the latest upstream head and skips repo replacement entirely if they already match
+- renames the old checkout to a timestamped backup
+- clones a fresh upstream `club-3090` repo into the original path
+- preserves `models-cache`, safe compose cache directories, and `.env`
+- logs the resolved old and new `MODEL_DIR` paths during migration and mirrors preserved weights into the effective post-merge model directory when it differs from the repo-local default
+- preserves old Genesis patch trees in the migration backup instead of copying them back into the fresh repo before `setup.sh` reclones them
+- rebuilds the dynamic runtime inventory
+- re-runs only the model setup commands required by the currently configured presets
+- writes resumable migration state to `/opt/club3090-control/migration-state.env`
+- emits continuous step-by-step progress and heartbeat messages during long-running phases like clone, setup, and update
+- resumes interrupted migrations automatically on the next `--migrate`
+- deletes the resume-state file automatically after a successful migration
+- accepts Hugging Face credentials either through `HF_TOKEN=...` or `--hf-token ...`, then stores that token in the repo `.env` so later setup and admin-panel download jobs can reuse it
 
 ## GPU Detection and Default Behavior
 
@@ -322,16 +533,22 @@ The admin UI is designed to control the whole server from one place. It exposes:
 - request counters and recent latency/token metrics
 - GPU, RAM, CPU, storage, and network telemetry
 - per-instance GPU subtabs for multi-GPU systems
+- dynamic model cards for upstream-discovered single, dual, multi, and experimental presets
+- model-summary view that caches up to the latest five active or previously active presets per model as a quick relaunch surface, including temporary boot entries and bulk stop/restart controls
 - per-instance preset assignment for single-card runtimes
-- per-instance start, restart, stop, and boot-autostart toggles
+- per-instance start, restart, stop, and boot-autostart toggles with boot-progress log handoff, active/booting/error state badges, and launch-time reporting
+- one-click runtime inventory rebuild from the web panel
+- preset-aware model downloads that stream installer output into Audit Logs
+- per-runtime generation stats cards that aggregate the latest latency, throughput, KV-cache, and token counters across all running instances
+- a local inference chat interface with realtime streaming, container and API-preset selection, markdown rendering, multi-attachment image/text upload support, paste-to-Markdown attachment conversion for long pastes, optional browser voice dictation, a compact modal chat-settings editor, and per-container generation stats
+- optional stdio MCP server integration for the local chat interface, with UI-managed add/enable/disable flows so enabled MCP tools can be exposed to the model during chat
 - a Users tab for API-key users, quotas, access rules, and proxy-auth policy
-- a dedicated Audit tab for global admin controls and live audit-event review
 - global power profile management
 - fan control and optimization toggles
 - Wake-on-LAN support
 - machine restart and shutdown controls
 - custom API preset creation, editing, and deletion
-- live Docker log streaming with search tools
+- live Docker and Audit logs streaming with search tools
 - shared searchable audit-log streaming backed by `/opt/club3090-control/audit.log`
 
 Authentication uses Linux usernames and passwords through `pamtester`.
@@ -347,13 +564,13 @@ That means:
 - multiple backend containers can be tailed correctly
 - logs remain usable even when container names differ by instance or runtime
 - the admin panel can subscribe to the selected instance's log stream
-- the Audit tab reuses the same searchable viewer against the audit log instead of Docker output
 
 ## Runtime Behavior
 
 - The control service stores the active default mode in `/opt/club3090-control/active_mode`
 - It stores the last known-good legacy mode in `/opt/club3090-control/last_good_mode`
 - It stores per-instance configuration in `/opt/club3090-control/instances.json`
+- It stores the scanned upstream runtime registry in `/opt/club3090-control/runtime_inventory.json`
 - It stores public/auth policy in `/opt/club3090-control/server_config.json`
 - It stores group/plan definitions in `/opt/club3090-control/groups.json`
 - It stores tracked online firewall and UPnP state in `/opt/club3090-control/network_state.json`

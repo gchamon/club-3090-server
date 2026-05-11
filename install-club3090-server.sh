@@ -1,19 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="2026-05-08.v4.5.6"
+SCRIPT_VERSION="2026-05-11.v0.5.27"
+
+printf 'Club-3090 Server Installer %s\n' "${SCRIPT_VERSION}"
 
 # club-3090 headless server/control installer
 # Install:
 #   curl -fsSL https://tinyurl.com/club-3090-webserver | bash
 # Update control/admin/proxy/console services only:
 #   curl -fsSL https://tinyurl.com/club-3090-webserver | bash -s -- --update
+# Migrate an existing /opt/ai/club-3090 checkout to a fresh upstream clone:
+#   curl -fsSL https://tinyurl.com/club-3090-webserver | bash -s -- --migrate
+# Restart a broken/incomplete migration from scratch:
+#   curl -fsSL https://tinyurl.com/club-3090-webserver | bash -s -- --migrate restart
 # Custom admin/proxy ports:
 #   bash install-club3090-server.sh --ports 18008:18009
+# Save a Hugging Face token for setup and later admin-panel downloads:
+#   bash install-club3090-server.sh --hf-token hf_xxx
 # Enable loopback-only local automation API:
 #   bash install-club3090-server.sh --local-automation
 # Overrides:
-#   CLUB3090_DIR=/path/to/club-3090 DEFAULT_MODE=vllm/dual-dflash bash install-club3090-server.sh
+#   CLUB3090_DIR=/path/to/club-3090 DEFAULT_MODE=vllm/dual-dflash HF_TOKEN=hf_xxx bash install-club3090-server.sh
 # If DEFAULT_MODE is unset, the installer auto-selects:
 #   - vllm/default on 0-1 detected GPUs
 #   - vllm/dual on 2+ detected GPUs
@@ -23,17 +31,30 @@ NETWORK_STATE_FILE="${CONTROL_DIR}/network_state.json"
 TLS_CERT_FILE="${CONTROL_DIR}/tls.crt"
 TLS_KEY_FILE="${CONTROL_DIR}/tls.key"
 CADDYFILE_PATH="${CONTROL_DIR}/Caddyfile"
+MIGRATION_STATE_FILE="${CONTROL_DIR}/migration-state.env"
 
 ACTION="install"
 ONLINE_MODE="disable"
 ONLINE_TLS_MODE="disable"
 LOCAL_AUTOMATION_MODE="disable"
 PORTS_SPEC=""
+HF_TOKEN_INPUT=""
+MIGRATION_FORCE_RESTART=0
+UPSTREAM_REPO_URL="${CLUB3090_REPO_URL:-https://github.com/noonghunna/club-3090.git}"
 while [[ "$#" -gt 0 ]]; do
   case "${1}" in
     --update)
       ACTION="update"
       shift
+      ;;
+    --migrate)
+      ACTION="migrate"
+      if [[ "$#" -ge 2 && "${2}" == "restart" ]]; then
+        MIGRATION_FORCE_RESTART=1
+        shift 2
+      else
+        shift
+      fi
       ;;
     --install)
       ACTION="install"
@@ -50,6 +71,14 @@ while [[ "$#" -gt 0 ]]; do
     --local-automation)
       LOCAL_AUTOMATION_MODE="enable"
       shift
+      ;;
+    --hf-token|--hf_token)
+      if [[ "$#" -lt 2 ]]; then
+        echo "ERROR: --hf-token requires a value." >&2
+        exit 1
+      fi
+      HF_TOKEN_INPUT="${2}"
+      shift 2
       ;;
     --ports)
       if [[ "$#" -lt 2 ]]; then
@@ -99,7 +128,30 @@ PYFLAG
   fi
 }
 
-if [[ "${ACTION}" == "update" && -z "${PORTS_SPEC}" ]]; then
+read_repo_env_value() {
+  local path="$1"
+  local key="$2"
+  if [[ -r "${path}" ]] && command -v python3 >/dev/null 2>&1; then
+    python3 - "$path" "$key" <<'PYENVREAD' 2>/dev/null
+import sys
+path, key = sys.argv[1], sys.argv[2]
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            if k.strip() == key:
+                print(v.strip())
+                break
+except Exception:
+    pass
+PYENVREAD
+  fi
+}
+
+if [[ ( "${ACTION}" == "update" || "${ACTION}" == "migrate" ) && -z "${PORTS_SPEC}" ]]; then
   existing_admin_port="$(read_existing_service_port CLUB3090_ADMIN_PORT || true)"
   existing_proxy_port="$(read_existing_service_port CLUB3090_PROXY_PORT || true)"
   existing_local_api_port="$(read_existing_service_port CLUB3090_LOCAL_API_PORT || true)"
@@ -180,6 +232,19 @@ HEADLESS_X_SH="${CONTROL_DIR}/prepare-headless-x.sh"
 ACTIVE_MODE_FILE="${CONTROL_DIR}/active_mode"
 BASH_BIN="${BASH_BIN:-$(command -v bash || true)}"
 PYTHON_BIN="${PYTHON_BIN:-$(command -v python3 || true)}"
+REPO_ENV_FILE="${CLUB3090_DIR}/.env"
+HF_TOKEN_VALUE="${HF_TOKEN_INPUT:-${HF_TOKEN:-}}"
+
+if [[ -z "${HF_TOKEN_VALUE}" ]]; then
+  existing_saved_hf_token="$(read_repo_env_value "${REPO_ENV_FILE}" "HF_TOKEN" || true)"
+  if [[ -n "${existing_saved_hf_token:-}" ]]; then
+    HF_TOKEN_VALUE="${existing_saved_hf_token}"
+  fi
+fi
+
+if [[ -n "${HF_TOKEN_VALUE}" ]]; then
+  export HF_TOKEN="${HF_TOKEN_VALUE}"
+fi
 
 ONLINE_EFFECTIVE_ENABLED="false"
 ONLINE_TLS_EFFECTIVE_ENABLED="false"
@@ -244,18 +309,13 @@ if [[ -z "${DEFAULT_MODE}" ]]; then
   DEFAULT_MODE="${AUTO_DEFAULT_MODE}"
 fi
 
-case "${DEFAULT_MODE}" in
-  vllm/default|vllm/long-vision|vllm/long-text|vllm/bounded-thinking|vllm/tools-text|vllm/minimal|vllm/dual|vllm/dual-turbo|vllm/dual-dflash|vllm/dual-dflash-noviz|llamacpp/default|llamacpp/concurrent) ;;
-  *) echo "Invalid DEFAULT_MODE: ${DEFAULT_MODE}" >&2; exit 1 ;;
-esac
-
-if [[ ! -d "${CLUB3090_DIR}" ]]; then
+if [[ ! -d "${CLUB3090_DIR}" && "${ACTION}" != "install" && ! ( "${ACTION}" == "migrate" && "${MIGRATION_FORCE_RESTART}" == "1" ) ]]; then
   echo "ERROR: CLUB3090_DIR does not exist: ${CLUB3090_DIR}" >&2
   echo "Re-run with: CLUB3090_DIR=/actual/path/to/club-3090 bash install-club3090-server.sh" >&2
   exit 1
 fi
 
-if [[ ! -f "${CLUB3090_DIR}/scripts/switch.sh" ]]; then
+if [[ ! -f "${CLUB3090_DIR}/scripts/switch.sh" && "${ACTION}" != "install" && ! ( "${ACTION}" == "migrate" && "${MIGRATION_FORCE_RESTART}" == "1" ) ]]; then
   echo "ERROR: Could not find ${CLUB3090_DIR}/scripts/switch.sh" >&2
   exit 1
 fi
@@ -279,6 +339,94 @@ else
   fi
   SUDO=(sudo)
 fi
+
+request_root_permissions() {
+  if [[ "${#SUDO[@]}" -eq 0 ]]; then
+    return 0
+  fi
+  printf 'Requesting root permissions\n'
+  if ! "${SUDO[@]}" -v; then
+    echo "ERROR: Failed to obtain root permissions with sudo." >&2
+    exit 1
+  fi
+}
+
+request_root_permissions
+
+bootstrap_upstream_repo_for_install() {
+  if [[ "${ACTION}" != "install" ]]; then
+    return 0
+  fi
+  if [[ -f "${CLUB3090_DIR}/scripts/switch.sh" ]]; then
+    return 0
+  fi
+  if [[ -d "${CLUB3090_DIR}" ]]; then
+    echo "ERROR: ${CLUB3090_DIR} already exists but is missing scripts/switch.sh." >&2
+    echo "Remove or repair that directory, or point CLUB3090_DIR at a valid club-3090 checkout." >&2
+    exit 1
+  fi
+  local parent_dir owner_name owner_group
+  parent_dir="$(dirname "${CLUB3090_DIR}")"
+  owner_name="${SUDO_USER:-$(id -un)}"
+  owner_group="$(id -gn "${owner_name}" 2>/dev/null || id -gn)"
+  log_step "Cloning upstream club-3090 into ${CLUB3090_DIR}"
+  "${SUDO[@]}" mkdir -p "${parent_dir}"
+  if ! "${SUDO[@]}" env GIT_TERMINAL_PROMPT=0 git clone --progress "${UPSTREAM_REPO_URL}" "${CLUB3090_DIR}"; then
+    echo "ERROR: Failed to clone ${UPSTREAM_REPO_URL} into ${CLUB3090_DIR}" >&2
+    exit 1
+  fi
+  "${SUDO[@]}" chmod -R a+rX "${CLUB3090_DIR}" >/dev/null 2>&1 || true
+  if [[ -d "${CLUB3090_DIR}/scripts" ]]; then
+    "${SUDO[@]}" find "${CLUB3090_DIR}/scripts" -maxdepth 1 -type f -name '*.sh' -exec chmod 755 {} +
+  fi
+  "${SUDO[@]}" chown -R "${owner_name}:${owner_group}" "${CLUB3090_DIR}" >/dev/null 2>&1 || true
+  if [[ ! -f "${CLUB3090_DIR}/scripts/switch.sh" ]]; then
+    echo "ERROR: Upstream clone completed but ${CLUB3090_DIR}/scripts/switch.sh is still missing." >&2
+    exit 1
+  fi
+}
+
+bootstrap_upstream_repo_for_install
+
+if [[ ! -d "${CLUB3090_DIR}" && ! ( "${ACTION}" == "migrate" && "${MIGRATION_FORCE_RESTART}" == "1" ) ]]; then
+  echo "ERROR: CLUB3090_DIR does not exist: ${CLUB3090_DIR}" >&2
+  exit 1
+fi
+
+if [[ ! -f "${CLUB3090_DIR}/scripts/switch.sh" && ! ( "${ACTION}" == "migrate" && "${MIGRATION_FORCE_RESTART}" == "1" ) ]]; then
+  echo "ERROR: Could not find ${CLUB3090_DIR}/scripts/switch.sh" >&2
+  exit 1
+fi
+
+restore_repo_for_forced_migration_restart() {
+  if [[ "${ACTION}" != "migrate" || "${MIGRATION_FORCE_RESTART}" != "1" ]]; then
+    return 0
+  fi
+  if [[ -d "${CLUB3090_DIR}" ]]; then
+    return 0
+  fi
+  if [[ ! -r "${MIGRATION_STATE_FILE}" ]]; then
+    return 0
+  fi
+  local backup_dir=""
+  local parsed_dir=""
+  set +u
+  # shellcheck disable=SC1090
+  . "${MIGRATION_STATE_FILE}"
+  set -u
+  backup_dir="${MIGRATION_BACKUP_DIR:-}"
+  parsed_dir="${MIGRATION_REPO_DIR:-}"
+  if [[ -n "${parsed_dir}" ]]; then
+    CLUB3090_DIR="${parsed_dir}"
+    REPO_ENV_FILE="${CLUB3090_DIR}/.env"
+  fi
+  if [[ -n "${backup_dir}" && -d "${backup_dir}" && ! -d "${CLUB3090_DIR}" ]]; then
+    status_line "Forced migrate restart: restoring backed-up repo from ${backup_dir} to ${CLUB3090_DIR} before restarting"
+    "${SUDO[@]}" mv "${backup_dir}" "${CLUB3090_DIR}"
+  fi
+}
+
+restore_repo_for_forced_migration_restart
 
 if [[ -z "${BASH_BIN}" ]]; then
   echo "ERROR: bash is required but was not found in PATH." >&2
@@ -317,6 +465,717 @@ log_step() {
 
 log_done() {
   printf '[%s] done: %s\n' "$(date +%H:%M:%S)" "$*"
+}
+
+append_control_log_line() {
+  local line
+  line="$(date +'%Y-%m-%d %H:%M:%S') $*"
+  printf '%s\n' "${line}"
+  "${SUDO[@]}" mkdir -p "${CONTROL_DIR}" >/dev/null 2>&1 || true
+  printf '%s\n' "${line}" | "${SUDO[@]}" tee -a "${CONTROL_DIR}/control.log" >/dev/null 2>&1 || true
+  printf '%s\n' "${line}" | "${SUDO[@]}" tee -a "${CONTROL_DIR}/audit.log" >/dev/null 2>&1 || true
+}
+
+status_line() {
+  printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"
+}
+
+shell_quote() {
+  printf '%q' "$1"
+}
+
+ensure_control_dir() {
+  "${SUDO[@]}" mkdir -p "${CONTROL_DIR}" >/dev/null 2>&1 || true
+}
+
+migration_state_defaults() {
+  MIGRATION_STATUS=""
+  MIGRATION_RUN_ID=""
+  MIGRATION_STARTED_AT=""
+  MIGRATION_UPDATED_AT=""
+  MIGRATION_LAST_STEP=""
+  MIGRATION_REMOTE_HEAD=""
+  MIGRATION_REPO_URL=""
+  MIGRATION_REPO_DIR=""
+  MIGRATION_BACKUP_DIR=""
+  MIGRATION_REPO_RENAMED=0
+  MIGRATION_REPO_CLONED=0
+  MIGRATION_ASSETS_MERGED=0
+  MIGRATION_BOOTSTRAP_INVENTORY_DONE=0
+  MIGRATION_SETUP_DONE=0
+  MIGRATION_POST_SETUP_INVENTORY_DONE=0
+  MIGRATION_UPDATE_DONE=0
+  MIGRATION_FINAL_INVENTORY_DONE=0
+  MIGRATION_SERVICES_REFRESHED=0
+}
+
+migration_state_defaults
+
+load_migration_state() {
+  migration_state_defaults
+  if [[ ! -f "${MIGRATION_STATE_FILE}" ]]; then
+    return 1
+  fi
+  set +u
+  # shellcheck disable=SC1090
+  . "${MIGRATION_STATE_FILE}"
+  set -u
+  return 0
+}
+
+save_migration_state() {
+  ensure_control_dir
+  "${SUDO[@]}" tee "${MIGRATION_STATE_FILE}" >/dev/null <<STATE
+MIGRATION_STATUS=$(printf '%q' "${MIGRATION_STATUS}")
+MIGRATION_RUN_ID=$(printf '%q' "${MIGRATION_RUN_ID}")
+MIGRATION_STARTED_AT=$(printf '%q' "${MIGRATION_STARTED_AT}")
+MIGRATION_UPDATED_AT=$(printf '%q' "${MIGRATION_UPDATED_AT}")
+MIGRATION_LAST_STEP=$(printf '%q' "${MIGRATION_LAST_STEP}")
+MIGRATION_REMOTE_HEAD=$(printf '%q' "${MIGRATION_REMOTE_HEAD}")
+MIGRATION_REPO_URL=$(printf '%q' "${MIGRATION_REPO_URL}")
+MIGRATION_REPO_DIR=$(printf '%q' "${MIGRATION_REPO_DIR}")
+MIGRATION_BACKUP_DIR=$(printf '%q' "${MIGRATION_BACKUP_DIR}")
+MIGRATION_REPO_RENAMED=$(printf '%q' "${MIGRATION_REPO_RENAMED}")
+MIGRATION_REPO_CLONED=$(printf '%q' "${MIGRATION_REPO_CLONED}")
+MIGRATION_ASSETS_MERGED=$(printf '%q' "${MIGRATION_ASSETS_MERGED}")
+MIGRATION_BOOTSTRAP_INVENTORY_DONE=$(printf '%q' "${MIGRATION_BOOTSTRAP_INVENTORY_DONE}")
+MIGRATION_SETUP_DONE=$(printf '%q' "${MIGRATION_SETUP_DONE}")
+MIGRATION_POST_SETUP_INVENTORY_DONE=$(printf '%q' "${MIGRATION_POST_SETUP_INVENTORY_DONE}")
+MIGRATION_UPDATE_DONE=$(printf '%q' "${MIGRATION_UPDATE_DONE}")
+MIGRATION_FINAL_INVENTORY_DONE=$(printf '%q' "${MIGRATION_FINAL_INVENTORY_DONE}")
+MIGRATION_SERVICES_REFRESHED=$(printf '%q' "${MIGRATION_SERVICES_REFRESHED}")
+STATE
+}
+
+write_repo_env_value() {
+  local path="$1"
+  local key="$2"
+  local value="$3"
+  "${SUDO[@]}" "${PYTHON_BIN}" - "${path}" "${key}" "${value}" <<'PYENVWRITE'
+import os, sys
+path, key, value = sys.argv[1:4]
+rows = []
+found = False
+if os.path.exists(path):
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for raw in f:
+            line = raw.rstrip("\n")
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#") and "=" in line:
+                k, _v = line.split("=", 1)
+                if k.strip() == key:
+                    rows.append(f"{key}={value}")
+                    found = True
+                    continue
+            rows.append(line)
+if not found:
+    rows.append(f"{key}={value}")
+os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+with open(path, "w", encoding="utf-8", newline="\n") as f:
+    for line in rows:
+        f.write(line.rstrip("\n") + "\n")
+PYENVWRITE
+}
+
+persist_hf_token_if_available() {
+  if [[ -z "${HF_TOKEN_VALUE}" ]]; then
+    append_control_log_line "hf token: no token provided or previously saved; gated model downloads may require one later"
+    return 0
+  fi
+  append_control_log_line "hf token: persisting token to ${REPO_ENV_FILE} for setup and later admin download reuse"
+  write_repo_env_value "${REPO_ENV_FILE}" "HF_TOKEN" "${HF_TOKEN_VALUE}"
+}
+
+detect_upstream_remote_head() {
+  git ls-remote "${UPSTREAM_REPO_URL}" HEAD 2>/dev/null | awk 'NR==1{print $1}'
+}
+
+git_repo_head() {
+  local path="$1"
+  if [[ ! -d "${path}/.git" ]]; then
+    return 1
+  fi
+  git -C "${path}" rev-parse HEAD 2>/dev/null | head -n 1
+}
+
+migration_update_state() {
+  local step="$1"
+  MIGRATION_STATUS="in_progress"
+  MIGRATION_LAST_STEP="${step}"
+  MIGRATION_UPDATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  save_migration_state
+}
+
+migration_mark_flag_done() {
+  local flag_name="$1"
+  local step="$2"
+  printf -v "${flag_name}" '%s' "1"
+  migration_update_state "${step}"
+}
+
+migration_pending_summary() {
+  local pending=()
+  [[ "${MIGRATION_REPO_RENAMED}" == "1" ]] || pending+=("rename")
+  [[ "${MIGRATION_REPO_CLONED}" == "1" ]] || pending+=("clone")
+  [[ "${MIGRATION_ASSETS_MERGED}" == "1" ]] || pending+=("asset-merge")
+  [[ "${MIGRATION_BOOTSTRAP_INVENTORY_DONE}" == "1" ]] || pending+=("inventory-bootstrap")
+  [[ "${MIGRATION_SETUP_DONE}" == "1" ]] || pending+=("setup")
+  [[ "${MIGRATION_POST_SETUP_INVENTORY_DONE}" == "1" ]] || pending+=("inventory-post-setup")
+  [[ "${MIGRATION_UPDATE_DONE}" == "1" ]] || pending+=("update.sh")
+  [[ "${MIGRATION_FINAL_INVENTORY_DONE}" == "1" ]] || pending+=("inventory-final")
+  if [[ "${#pending[@]}" -eq 0 ]]; then
+    printf '%s' "none"
+  else
+    local joined=""
+    local item
+    for item in "${pending[@]}"; do
+      if [[ -n "${joined}" ]]; then
+        joined+=", "
+      fi
+      joined+="${item}"
+    done
+    printf '%s' "${joined}"
+  fi
+}
+
+prepare_migration_state() {
+  ensure_control_dir
+  local remote_head=""
+  remote_head="$(detect_upstream_remote_head || true)"
+  if [[ "${MIGRATION_FORCE_RESTART}" == "1" ]]; then
+    if [[ -f "${MIGRATION_STATE_FILE}" ]]; then
+      append_control_log_line "migrate forced restart requested; deleting previous resume state at ${MIGRATION_STATE_FILE}"
+      "${SUDO[@]}" rm -f "${MIGRATION_STATE_FILE}" >/dev/null 2>&1 || true
+    fi
+    migration_state_defaults
+  fi
+  if load_migration_state && [[ -n "${MIGRATION_STATUS}" && "${MIGRATION_STATUS}" != "complete" ]]; then
+    if [[ -n "${remote_head}" && -n "${MIGRATION_REMOTE_HEAD}" && "${remote_head}" != "${MIGRATION_REMOTE_HEAD}" ]]; then
+      append_control_log_line "migrate resume state found but upstream HEAD changed from ${MIGRATION_REMOTE_HEAD} to ${remote_head}; restarting unfinished migration phases"
+      MIGRATION_REMOTE_HEAD="${remote_head}"
+      MIGRATION_REPO_URL="${UPSTREAM_REPO_URL}"
+      MIGRATION_REPO_DIR="${CLUB3090_DIR}"
+      MIGRATION_REPO_CLONED=0
+      MIGRATION_ASSETS_MERGED=0
+      MIGRATION_BOOTSTRAP_INVENTORY_DONE=0
+      MIGRATION_SETUP_DONE=0
+      MIGRATION_POST_SETUP_INVENTORY_DONE=0
+      MIGRATION_UPDATE_DONE=0
+      MIGRATION_FINAL_INVENTORY_DONE=0
+      MIGRATION_SERVICES_REFRESHED=0
+      if [[ -n "${MIGRATION_BACKUP_DIR}" && -d "${MIGRATION_BACKUP_DIR}" && ! -d "${CLUB3090_DIR}" ]]; then
+        MIGRATION_REPO_RENAMED=1
+      fi
+      migration_update_state "resume_restart_new_upstream_head"
+    else
+      append_control_log_line "migrate resume detected: last_step=${MIGRATION_LAST_STEP:-unknown}, backup=${MIGRATION_BACKUP_DIR:-unknown}, pending=$(migration_pending_summary)"
+    fi
+    return 0
+  fi
+  migration_state_defaults
+  MIGRATION_STATUS="in_progress"
+  MIGRATION_RUN_ID="$(date +%Y%m%d-%H%M%S)"
+  MIGRATION_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  MIGRATION_UPDATED_AT="${MIGRATION_STARTED_AT}"
+  MIGRATION_LAST_STEP="initialized"
+  MIGRATION_REMOTE_HEAD="${remote_head}"
+  MIGRATION_REPO_URL="${UPSTREAM_REPO_URL}"
+  MIGRATION_REPO_DIR="${CLUB3090_DIR}"
+  save_migration_state
+  append_control_log_line "migrate state initialized: remote_head=${MIGRATION_REMOTE_HEAD:-unknown}, repo=${CLUB3090_DIR}"
+}
+
+finalize_migration_state_success() {
+  MIGRATION_STATUS="complete"
+  MIGRATION_LAST_STEP="complete"
+  MIGRATION_UPDATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  append_control_log_line "migrate completed successfully"
+  "${SUDO[@]}" rm -f "${MIGRATION_STATE_FILE}" >/dev/null 2>&1 || true
+  migration_state_defaults
+}
+
+migration_exit_trap() {
+  local rc=$?
+  if [[ "${ACTION}" == "migrate" ]]; then
+    if [[ "${rc}" -ne 0 ]]; then
+      ensure_control_dir
+      load_migration_state || true
+      if [[ -n "${MIGRATION_STARTED_AT}" ]]; then
+        MIGRATION_STATUS="interrupted"
+        MIGRATION_UPDATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        save_migration_state
+        status_line "Migration interrupted at step '${MIGRATION_LAST_STEP:-unknown}'. Resume later with --migrate."
+        status_line "Remaining migration phases: $(migration_pending_summary)"
+      fi
+    fi
+  fi
+}
+
+trap 'migration_exit_trap' EXIT
+trap 'exit 130' INT TERM
+
+run_live_command() {
+  local label="$1"
+  local cwd="$2"
+  local command="$3"
+  status_line "${label}: starting"
+  status_line "${label}: command: ${command}"
+  "${SUDO[@]}" env CLUB3090_STATUS_LABEL="${label}" CLUB3090_STATUS_CWD="${cwd}" CLUB3090_STATUS_COMMAND="${command}" CLUB3090_STATUS_HEARTBEAT_SECONDS="2" "${PYTHON_BIN}" - <<'PYRUNLIVE'
+import os
+import selectors
+import subprocess
+import sys
+import time
+
+label = os.environ.get("CLUB3090_STATUS_LABEL", "command")
+cwd = os.environ.get("CLUB3090_STATUS_CWD") or None
+command = os.environ.get("CLUB3090_STATUS_COMMAND", "")
+heartbeat_seconds = float(os.environ.get("CLUB3090_STATUS_HEARTBEAT_SECONDS", "2") or "2")
+start = time.time()
+last_emit = start
+env = os.environ.copy()
+if cwd:
+    env_path = os.path.join(cwd, ".env")
+    if os.path.exists(env_path):
+        try:
+            with open(env_path, "r", encoding="utf-8", errors="replace") as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    env[key.strip()] = value.strip()
+        except Exception:
+            pass
+proc = subprocess.Popen(
+    ["bash", "-lc", command],
+    cwd=cwd,
+    env=env,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+)
+selector = selectors.DefaultSelector()
+assert proc.stdout is not None
+fd = proc.stdout.fileno()
+os.set_blocking(fd, False)
+selector.register(proc.stdout, selectors.EVENT_READ)
+buffer = ""
+
+def stamp(message):
+    print(f"[{time.strftime('%H:%M:%S')}] {label}: {message}", flush=True)
+
+while True:
+    events = selector.select(timeout=heartbeat_seconds)
+    if events:
+        for key, _mask in events:
+            chunk = os.read(key.fd, 8192)
+            if not chunk:
+                continue
+            buffer += chunk.decode("utf-8", errors="replace")
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                line = line.rstrip("\r")
+                if line:
+                    stamp(line)
+                else:
+                    stamp("")
+                last_emit = time.time()
+    else:
+        if proc.poll() is None:
+            elapsed = int(time.time() - start)
+            idle = int(time.time() - last_emit)
+            stamp(f"still running ({elapsed}s elapsed, {idle}s since last output)")
+            last_emit = time.time()
+    if proc.poll() is not None:
+        try:
+            remainder = os.read(fd, 8192)
+        except BlockingIOError:
+            remainder = b""
+        if remainder:
+            buffer += remainder.decode("utf-8", errors="replace")
+        if buffer:
+            for line in buffer.splitlines():
+                stamp(line.rstrip("\r"))
+            buffer = ""
+        break
+
+rc = proc.wait()
+stamp(f"finished with exit code {rc} after {int(time.time() - start)}s")
+sys.exit(rc)
+PYRUNLIVE
+}
+
+count_tree_files() {
+  local path="$1"
+  if [[ ! -e "${path}" ]]; then
+    printf '0\n'
+    return 0
+  fi
+  find "${path}" -type f 2>/dev/null | wc -l | awk '{print $1}'
+}
+
+merge_dir_contents_logged() {
+  local label="$1"
+  local src="$2"
+  local dst="$3"
+  if [[ ! -d "${src}" ]]; then
+    append_control_log_line "${label}: source missing, skipping (${src})"
+    return 0
+  fi
+  local file_count
+  file_count="$(count_tree_files "${src}")"
+  migration_update_state "merge_${label}"
+  append_control_log_line "${label}: merging ${file_count} files from ${src} into ${dst}"
+  run_live_command "${label}" "/" "mkdir -p $(shell_quote "${dst}") && cp -a $(shell_quote "${src}")/. $(shell_quote "${dst}")/"
+}
+
+quarantine_non_git_genesis_dirs() {
+  local quarantine_root="${MIGRATION_BACKUP_DIR:-${CLUB3090_DIR}-migrate-artifacts}/preserved-genesis"
+  local genesis_dir
+  local rel
+  local dest
+  while IFS= read -r genesis_dir; do
+    [[ -n "${genesis_dir}" ]] || continue
+    if [[ -d "${genesis_dir}/.git" ]]; then
+      append_control_log_line "genesis quarantine: keeping existing git checkout ${genesis_dir}"
+      continue
+    fi
+    rel="${genesis_dir#"${CLUB3090_DIR}/"}"
+    dest="${quarantine_root}/${rel//\//__}.pre-setup"
+    append_control_log_line "genesis quarantine: moving non-git directory ${genesis_dir} to ${dest}"
+    run_live_command "genesis quarantine" "/" "mkdir -p $(shell_quote "$(dirname "${dest}")") && mv $(shell_quote "${genesis_dir}") $(shell_quote "${dest}")"
+  done < <(find "${CLUB3090_DIR}/models" -type d -path '*/vllm/patches/genesis' 2>/dev/null || true)
+}
+
+merge_dir_contents() {
+  local src="$1"
+  local dst="$2"
+  if [[ ! -d "${src}" ]]; then
+    return 0
+  fi
+  "${SUDO[@]}" mkdir -p "${dst}"
+  "${SUDO[@]}" cp -a "${src}/." "${dst}/"
+}
+
+merge_env_files() {
+  local dest="$1"
+  local src="$2"
+  local old_root="${3:-}"
+  local new_root="${4:-}"
+  if [[ ! -f "${src}" ]]; then
+    return 0
+  fi
+  "${SUDO[@]}" "${PYTHON_BIN}" - "${dest}" "${src}" "${old_root}" "${new_root}" <<'PYMERGEENV'
+import os, sys
+dest, src, old_root, new_root = sys.argv[1:5]
+def parse(path):
+    data = {}
+    if not os.path.exists(path):
+        return data
+    for raw in open(path, "r", encoding="utf-8", errors="replace").read().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key:
+            data[key] = value.strip()
+    return data
+def rewrite_repo_local_paths(data):
+    if not old_root or not new_root:
+        return data
+    prefix = old_root.rstrip("/") + "/"
+    for key, value in list(data.items()):
+        text = str(value or "").strip()
+        if key in {"MODEL_DIR", "HF_HOME", "TRANSFORMERS_CACHE"} and text.startswith(prefix):
+            data[key] = new_root.rstrip("/") + "/" + text[len(prefix):]
+    return data
+merged = parse(dest)
+incoming = rewrite_repo_local_paths(parse(src))
+merged.update(incoming)
+os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+with open(dest, "w", encoding="utf-8", newline="\n") as f:
+    for key in sorted(merged):
+        f.write(f"{key}={merged[key]}\n")
+PYMERGEENV
+}
+
+rebuild_runtime_inventory_cli() {
+  local phase_flag="${1:-}"
+  local phase_step="${2:-inventory_rebuild}"
+  if [[ "${ACTION}" == "migrate" || -n "${phase_flag}" ]]; then
+    migration_update_state "${phase_step}"
+  fi
+  append_control_log_line "runtime inventory rebuild starting (${phase_step})"
+  run_live_command "runtime inventory rebuild" "/" "env CLUB3090_DIR=$(shell_quote "${CLUB3090_DIR}") $(shell_quote "${PYTHON_BIN}") $(shell_quote "${CONTROL_PY}") --rebuild-inventory"
+  append_control_log_line "runtime inventory rebuild finished (${phase_step})"
+  if [[ -n "${phase_flag}" ]]; then
+    migration_mark_flag_done "${phase_flag}" "${phase_step}_complete"
+  fi
+}
+
+collect_required_setup_commands() {
+  "${SUDO[@]}" env CLUB3090_DIR="${CLUB3090_DIR}" "${PYTHON_BIN}" - "${CONTROL_DIR}" <<'PYSETUPCMDS'
+import json, os, sys
+control_dir = sys.argv[1]
+inventory_path = os.path.join(control_dir, "runtime_inventory.json")
+instances_path = os.path.join(control_dir, "instances.json")
+active_mode_path = os.path.join(control_dir, "active_mode")
+last_good_mode_path = os.path.join(control_dir, "last_good_mode")
+def load_json(path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+def read_text(path):
+    try:
+        return open(path, "r", encoding="utf-8").read().strip()
+    except Exception:
+        return ""
+inventory = load_json(inventory_path, {})
+variants = list(inventory.get("variants") or [])
+lookup = {}
+for variant in variants:
+    for key in (variant.get("variant_id"), variant.get("upstream_tag"), variant.get("compose_rel_path")):
+        if key:
+            lookup[str(key)] = variant
+modes = []
+for value in (read_text(active_mode_path), read_text(last_good_mode_path)):
+    if value:
+        modes.append(value)
+for row in load_json(instances_path, []):
+    if isinstance(row, dict) and row.get("enabled") and row.get("mode"):
+        modes.append(str(row.get("mode")))
+commands = []
+seen = set()
+for mode in modes:
+    variant = lookup.get(str(mode))
+    if not variant:
+        continue
+    command = str(variant.get("install_command") or "").strip()
+    if command and command not in seen:
+        seen.add(command)
+        commands.append(command)
+for command in commands:
+    print(command)
+PYSETUPCMDS
+}
+
+collect_required_update_models() {
+  "${SUDO[@]}" env CLUB3090_DIR="${CLUB3090_DIR}" "${PYTHON_BIN}" - "${CONTROL_DIR}" <<'PYUPDATEMODELS'
+import json, os, sys
+control_dir = sys.argv[1]
+inventory_path = os.path.join(control_dir, "runtime_inventory.json")
+instances_path = os.path.join(control_dir, "instances.json")
+active_mode_path = os.path.join(control_dir, "active_mode")
+last_good_mode_path = os.path.join(control_dir, "last_good_mode")
+def load_json(path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+def read_text(path):
+    try:
+        return open(path, "r", encoding="utf-8").read().strip()
+    except Exception:
+        return ""
+inventory = load_json(inventory_path, {})
+variants = list(inventory.get("variants") or [])
+lookup = {}
+for variant in variants:
+    for key in (variant.get("variant_id"), variant.get("upstream_tag"), variant.get("compose_rel_path")):
+        if key:
+            lookup[str(key)] = variant
+modes = []
+for value in (read_text(active_mode_path), read_text(last_good_mode_path)):
+    if value:
+        modes.append(value)
+for row in load_json(instances_path, []):
+    if isinstance(row, dict) and row.get("enabled") and row.get("mode"):
+        modes.append(str(row.get("mode")))
+seen = set()
+models = []
+for mode in modes:
+    variant = lookup.get(str(mode))
+    if not variant:
+        continue
+    model_id = str(variant.get("model_id") or "").strip()
+    if model_id and model_id not in seen:
+        seen.add(model_id)
+        models.append(model_id)
+for model_id in models:
+    print(model_id)
+PYUPDATEMODELS
+}
+
+run_required_setup_commands() {
+  local commands=()
+  mapfile -t commands < <(collect_required_setup_commands)
+  if [[ "${#commands[@]}" -eq 0 ]]; then
+    append_control_log_line "migrate setup: no required setup commands detected from persisted state"
+    migration_mark_flag_done "MIGRATION_SETUP_DONE" "setup_skipped_no_commands"
+    return 0
+  fi
+  local cmd
+  local idx=0
+  local total="${#commands[@]}"
+  for cmd in "${commands[@]}"; do
+    [[ -n "${cmd}" ]] || continue
+    idx=$((idx + 1))
+    migration_update_state "setup_command_${idx}_of_${total}"
+    append_control_log_line "migrate setup command: ${cmd}"
+    run_live_command "model setup ${idx}/${total}" "${CLUB3090_DIR}" "${cmd}"
+  done
+  migration_mark_flag_done "MIGRATION_SETUP_DONE" "setup_complete"
+}
+
+run_required_update_scripts() {
+  local models=()
+  mapfile -t models < <(collect_required_update_models)
+  if [[ "${#models[@]}" -eq 0 ]]; then
+    migration_update_state "update_script_full_repo"
+    append_control_log_line "migrate update.sh command: bash scripts/update.sh"
+    run_live_command "upstream update.sh" "${CLUB3090_DIR}" "bash scripts/update.sh"
+    migration_mark_flag_done "MIGRATION_UPDATE_DONE" "update_complete_full_repo"
+    return 0
+  fi
+  local model
+  local idx=0
+  local total="${#models[@]}"
+  for model in "${models[@]}"; do
+    [[ -n "${model}" ]] || continue
+    idx=$((idx + 1))
+    migration_update_state "update_script_${idx}_of_${total}_${model}"
+    append_control_log_line "migrate update.sh command: bash scripts/update.sh --force ${model}"
+    run_live_command "upstream update.sh ${idx}/${total}" "${CLUB3090_DIR}" "bash scripts/update.sh --force $(shell_quote "${model}")"
+  done
+  migration_mark_flag_done "MIGRATION_UPDATE_DONE" "update_complete"
+}
+
+migrate_repo_checkout() {
+  local timestamp local_head remote_head backup_dir repo_head_after_clone partial_dir
+  local_head="$(git_repo_head "${CLUB3090_DIR}" || true)"
+  remote_head="${MIGRATION_REMOTE_HEAD:-}"
+  if [[ -z "${MIGRATION_BACKUP_DIR}" ]]; then
+    timestamp="$(date +%Y%m%d-%H%M%S)"
+    MIGRATION_BACKUP_DIR="${CLUB3090_DIR}-backup_${timestamp}"
+    save_migration_state
+  fi
+  backup_dir="${MIGRATION_BACKUP_DIR}"
+
+  if [[ "${MIGRATION_REPO_RENAMED}" != "1" && -n "${local_head}" && -n "${remote_head}" && "${local_head}" == "${remote_head}" ]]; then
+    append_control_log_line "migrate checkout replacement skipped: local repo HEAD already matches upstream (${local_head})"
+    MIGRATION_REPO_RENAMED=1
+    MIGRATION_REPO_CLONED=1
+    MIGRATION_ASSETS_MERGED=1
+    migration_update_state "local_checkout_already_current"
+    return 0
+  fi
+
+  if [[ "${MIGRATION_REPO_RENAMED}" != "1" ]]; then
+    if [[ ! -d "${CLUB3090_DIR}" ]]; then
+      echo "ERROR: --migrate requires an existing checkout at ${CLUB3090_DIR}" >&2
+      exit 1
+    fi
+    if [[ -e "${backup_dir}" ]]; then
+      echo "ERROR: backup path already exists: ${backup_dir}" >&2
+      exit 1
+    fi
+    migration_update_state "backup_path_selected"
+    append_control_log_line "migrate backup path chosen: ${backup_dir}"
+    run_live_command "migrate rename existing checkout" "/" "mv $(shell_quote "${CLUB3090_DIR}") $(shell_quote "${backup_dir}")"
+    migration_mark_flag_done "MIGRATION_REPO_RENAMED" "rename_complete"
+    append_control_log_line "migrate rename success: ${CLUB3090_DIR} -> ${backup_dir}"
+  else
+    append_control_log_line "migrate rename step already complete; using backup at ${backup_dir}"
+  fi
+
+  if [[ ! -d "${backup_dir}" ]]; then
+    echo "ERROR: migration backup directory is missing: ${backup_dir}" >&2
+    exit 1
+  fi
+
+  if [[ "${MIGRATION_REPO_CLONED}" != "1" ]]; then
+    if repo_head_after_clone="$(git_repo_head "${CLUB3090_DIR}" || true)" && [[ -n "${repo_head_after_clone}" ]]; then
+      append_control_log_line "migrate clone step already satisfied by existing checkout at ${CLUB3090_DIR} (${repo_head_after_clone})"
+      migration_mark_flag_done "MIGRATION_REPO_CLONED" "clone_already_present"
+    else
+      if [[ -e "${CLUB3090_DIR}" ]]; then
+        partial_dir="${CLUB3090_DIR}-partial_$(date +%Y%m%d-%H%M%S)"
+        append_control_log_line "migrate found partial clone target at ${CLUB3090_DIR}; moving it aside to ${partial_dir}"
+        run_live_command "migrate quarantine partial clone" "/" "mv $(shell_quote "${CLUB3090_DIR}") $(shell_quote "${partial_dir}")"
+      fi
+      migration_update_state "clone_fresh_upstream_repo"
+      run_live_command "migrate git clone" "/" "GIT_TERMINAL_PROMPT=0 git clone --progress $(shell_quote "${UPSTREAM_REPO_URL}") $(shell_quote "${CLUB3090_DIR}")"
+      repo_head_after_clone="$(git_repo_head "${CLUB3090_DIR}" || true)"
+      append_control_log_line "migrate clone success: ${UPSTREAM_REPO_URL} -> ${CLUB3090_DIR} (${repo_head_after_clone:-unknown-head})"
+      migration_mark_flag_done "MIGRATION_REPO_CLONED" "clone_complete"
+    fi
+  else
+    append_control_log_line "migrate clone step already complete for ${CLUB3090_DIR}"
+  fi
+
+  if [[ "${MIGRATION_ASSETS_MERGED}" != "1" ]]; then
+    migration_update_state "asset_merge_start"
+    merge_dir_contents_logged "migrate models-cache merge" "${backup_dir}/models-cache" "${CLUB3090_DIR}/models-cache"
+    if [[ -f "${backup_dir}/.env" ]]; then
+      append_control_log_line "migrate env merge: merging ${backup_dir}/.env into ${CLUB3090_DIR}/.env"
+      merge_env_files "${CLUB3090_DIR}/.env" "${backup_dir}/.env" "${backup_dir}" "${CLUB3090_DIR}"
+    else
+      append_control_log_line "migrate env merge: no .env found in ${backup_dir}, skipping"
+    fi
+    local backup_model_dir_raw backup_model_dir_resolved new_model_dir_raw new_model_dir_resolved
+    backup_model_dir_raw="$(read_repo_env_value "${backup_dir}/.env" "MODEL_DIR" || true)"
+    if [[ -n "${backup_model_dir_raw}" ]]; then
+      if [[ "${backup_model_dir_raw}" = /* ]]; then
+        if [[ "${backup_model_dir_raw}" == "${CLUB3090_DIR}"* ]]; then
+          backup_model_dir_resolved="${backup_dir}${backup_model_dir_raw#"${CLUB3090_DIR}"}"
+        else
+          backup_model_dir_resolved="${backup_model_dir_raw}"
+        fi
+      else
+        backup_model_dir_resolved="$(cd "${backup_dir}" && cd "${backup_model_dir_raw}" 2>/dev/null && pwd || true)"
+      fi
+    else
+      backup_model_dir_resolved="${backup_dir}/models-cache"
+    fi
+    new_model_dir_raw="$(read_repo_env_value "${CLUB3090_DIR}/.env" "MODEL_DIR" || true)"
+    if [[ -n "${new_model_dir_raw}" ]]; then
+      if [[ "${new_model_dir_raw}" = /* ]]; then
+        new_model_dir_resolved="${new_model_dir_raw}"
+      else
+        new_model_dir_resolved="$(cd "${CLUB3090_DIR}" && cd "${new_model_dir_raw}" 2>/dev/null && pwd || true)"
+      fi
+    else
+      new_model_dir_resolved="${CLUB3090_DIR}/models-cache"
+    fi
+    append_control_log_line "migrate model-dir resolution: backup_raw=${backup_model_dir_raw:-<default>} backup_resolved=${backup_model_dir_resolved:-<unresolved>} new_raw=${new_model_dir_raw:-<default>} new_resolved=${new_model_dir_resolved:-<unresolved>}"
+    if [[ -n "${backup_model_dir_resolved:-}" && -d "${backup_model_dir_resolved}" && -n "${new_model_dir_resolved:-}" ]]; then
+      if [[ "${backup_model_dir_resolved}" != "${new_model_dir_resolved}" ]]; then
+        merge_dir_contents_logged "migrate effective model dir merge" "${backup_model_dir_resolved}" "${new_model_dir_resolved}"
+      else
+        append_control_log_line "migrate effective model dir merge skipped: source and target resolve to the same path (${new_model_dir_resolved})"
+      fi
+    else
+      append_control_log_line "migrate effective model dir merge skipped: source missing or unresolved"
+    fi
+    while IFS= read -r cache_dir; do
+      [[ -n "${cache_dir}" ]] || continue
+      if [[ "${cache_dir}" == *"/patches/genesis/"* || "${cache_dir}" == *"/patches/genesis" ]]; then
+        append_control_log_line "migrate cache merge skipped for genesis patch tree: ${cache_dir}"
+        continue
+      fi
+      local rel
+      rel="${cache_dir#"${backup_dir}/"}"
+      merge_dir_contents_logged "migrate cache merge ${rel}" "${cache_dir}" "${CLUB3090_DIR}/${rel}"
+    done < <(find "${backup_dir}/models" -type d -path '*/cache' 2>/dev/null || true)
+    append_control_log_line "migrate asset merge summary: repo-local models-cache preserved, effective MODEL_DIR mirrored, compose cache directories copied, .env merged if present"
+    migration_mark_flag_done "MIGRATION_ASSETS_MERGED" "asset_merge_complete"
+  else
+    append_control_log_line "migrate asset merge step already complete"
+  fi
 }
 
 APT_UPDATED=0
@@ -744,6 +1603,14 @@ fi
 
 log_done "Dependency preparation complete"
 
+if [[ "${ACTION}" == "migrate" ]]; then
+  log_step "Preparing resumable migration state"
+  prepare_migration_state
+  log_done "Migration state prepared"
+fi
+
+persist_hf_token_if_available
+
 "${SUDO[@]}" mkdir -p "${CONTROL_DIR}"
 
 # Disable older manual GPU power-limit services from earlier setup; v2.6 manages this dynamically.
@@ -752,8 +1619,8 @@ log_done "Dependency preparation complete"
 
 # On update, stop the previous console follower first so a noisy old version
 # does not keep spamming the active TTY while files are being replaced.
-if [[ "${ACTION}" == "update" ]]; then
-  log_step "Stopping currently managed club-3090 services before update"
+if [[ "${ACTION}" == "update" || "${ACTION}" == "migrate" ]]; then
+  log_step "Stopping currently managed club-3090 services before ${ACTION}"
   # Stop old services before replacing files so a broken/stale Python process cannot
   # keep serving old code while the update is being installed.
   "${SUDO[@]}" systemctl stop club3090-console-log.service 2>/dev/null || true
@@ -761,7 +1628,19 @@ if [[ "${ACTION}" == "update" ]]; then
   "${SUDO[@]}" systemctl stop club3090-caddy.service 2>/dev/null || true
   "${SUDO[@]}" systemctl stop club3090-headless-x.service 2>/dev/null || true
   "${SUDO[@]}" systemctl stop club3090-headless-x-v213.service 2>/dev/null || true
+  if [[ "${ACTION}" == "migrate" ]]; then
+    "${SUDO[@]}" systemctl stop club3090-vllm.service 2>/dev/null || true
+    if [[ -f "${CLUB3090_DIR}/scripts/switch.sh" ]]; then
+      (cd "${CLUB3090_DIR}" && "${SUDO[@]}" bash scripts/switch.sh --down) >/dev/null 2>&1 || true
+    fi
+  fi
   log_done "Old services stopped"
+fi
+
+if [[ "${ACTION}" == "migrate" ]]; then
+  log_step "Migrating upstream club-3090 checkout"
+  migrate_repo_checkout
+  log_done "Upstream checkout migrated"
 fi
 
 log_step "Writing embedded control backend to ${CONTROL_PY}"
@@ -769,8 +1648,11 @@ log_step "Writing embedded control backend to ${CONTROL_PY}"
 #!/usr/bin/env python3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
+import mimetypes
 import base64
+import codecs
 import collections
+import glob
 import hashlib
 import json
 import math
@@ -778,6 +1660,7 @@ import os
 import platform
 import re
 import secrets
+import select
 import shlex
 import shutil
 import socket
@@ -801,8 +1684,13 @@ INSTANCES_CONFIG_FILE = os.path.join(CONTROL_DIR, "instances.json")
 SERVER_CONFIG_FILE = os.path.join(CONTROL_DIR, "server_config.json")
 USERS_FILE = os.path.join(CONTROL_DIR, "users.json")
 GROUPS_FILE = os.path.join(CONTROL_DIR, "groups.json")
+CHAT_CONVERSATIONS_DIR = os.path.join(CONTROL_DIR, "conversations")
+CHAT_STATE_FILE = os.path.join(CHAT_CONVERSATIONS_DIR, "state.json")
+CHAT_ATTACHMENTS_DIR = os.path.join(CHAT_CONVERSATIONS_DIR, "attachments")
 LOCAL_API_TOKEN_FILE = os.path.join(CONTROL_DIR, "local_api_token")
 INSTANCES_DIR = os.path.join(CONTROL_DIR, "instances")
+RUNTIME_INVENTORY_FILE = os.path.join(CONTROL_DIR, "runtime_inventory.json")
+SWITCH_FAILURE_FILE = os.path.join(CONTROL_DIR, "switch_failure.json")
 DEFAULT_MODE = os.environ.get("DEFAULT_MODE", "vllm/default")
 ADMIN_PORT = int(os.environ.get("CLUB3090_ADMIN_PORT", "8008"))
 PROXY_PORT = int(os.environ.get("CLUB3090_PROXY_PORT", "8009"))
@@ -814,46 +1702,16 @@ PROXY_BIND_PORT = int(os.environ.get("CLUB3090_PROXY_BIND_PORT", str(PROXY_PORT)
 HTTPS_CERT_FILE = os.path.join(CONTROL_DIR, "tls.crt")
 HTTPS_KEY_FILE = os.path.join(CONTROL_DIR, "tls.key")
 
-MODES = {
-    "vllm/default": 8020,
-    "vllm/long-vision": 8020,
-    "vllm/long-text": 8020,
-    "vllm/bounded-thinking": 8020,
-    "vllm/tools-text": 8020,
-    "vllm/minimal": 8020,
-    "vllm/dual": 8010,
-    "vllm/dual-turbo": 8011,
-    "vllm/dual-dflash": 8012,
-    "vllm/dual-dflash-noviz": 8013,
-    "llamacpp/default": 8020,
-    "llamacpp/concurrent": 8020,
-}
-SINGLE_GPU_MODES = (
-    "vllm/default",
-    "vllm/long-vision",
-    "vllm/long-text",
-    "vllm/bounded-thinking",
-    "vllm/tools-text",
-    "vllm/minimal",
-    "llamacpp/default",
-    "llamacpp/concurrent",
-)
-DUAL_GPU_MODES = (
-    "vllm/dual",
-    "vllm/dual-turbo",
-    "vllm/dual-dflash",
-    "vllm/dual-dflash-noviz",
-)
-VARIANT_SPECS = {
-    "vllm/default": {"engine": "vllm", "compose_dir": "models/qwen3.6-27b/vllm/compose", "compose_file": "docker-compose.yml", "service": "vllm-qwen36-27b"},
-    "vllm/long-vision": {"engine": "vllm", "compose_dir": "models/qwen3.6-27b/vllm/compose", "compose_file": "docker-compose.long-vision.yml", "service": "vllm-qwen36-27b-long-vision"},
-    "vllm/long-text": {"engine": "vllm", "compose_dir": "models/qwen3.6-27b/vllm/compose", "compose_file": "docker-compose.long-text.yml", "service": "vllm-qwen36-27b-long-text"},
-    "vllm/bounded-thinking": {"engine": "vllm", "compose_dir": "models/qwen3.6-27b/vllm/compose", "compose_file": "docker-compose.bounded-thinking.yml", "service": "vllm-qwen36-27b-bounded-thinking"},
-    "vllm/tools-text": {"engine": "vllm", "compose_dir": "models/qwen3.6-27b/vllm/compose", "compose_file": "docker-compose.tools-text.yml", "service": "vllm-qwen36-27b"},
-    "vllm/minimal": {"engine": "vllm", "compose_dir": "models/qwen3.6-27b/vllm/compose", "compose_file": "docker-compose.minimal.yml", "service": "vllm-qwen36-27b-minimal"},
-    "llamacpp/default": {"engine": "llamacpp", "compose_dir": "models/qwen3.6-27b/llama-cpp/compose", "compose_file": "docker-compose.yml", "service": "llama-cpp-qwen36-27b"},
-    "llamacpp/concurrent": {"engine": "llamacpp", "compose_dir": "models/qwen3.6-27b/llama-cpp/compose", "compose_file": "docker-compose.concurrent.yml", "service": "llama-cpp-qwen36-27b-concurrent"},
-}
+MODES = {}
+SINGLE_GPU_MODES = ()
+DUAL_GPU_MODES = ()
+VARIANT_SPECS = {}
+VARIANT_BY_ID = {}
+VARIANT_BY_TAG = {}
+VARIANT_BY_CONTAINER = {}
+VARIANT_BY_SERVICE = {}
+VARIANT_BY_COMPOSE = {}
+MODEL_INDEX = {}
 INSTANCE_PORT_BASE = int(os.environ.get("CLUB3090_INSTANCE_PORT_BASE", "8200"))
 PAIR_INSTANCE_PORT_BASE = int(os.environ.get("CLUB3090_PAIR_INSTANCE_PORT_BASE", "8300"))
 COMPOSE_BIN = os.environ.get("CLUB3090_COMPOSE_BIN", "docker compose")
@@ -906,12 +1764,15 @@ switch_lock = threading.Lock()
 metrics_lock = threading.Lock()
 auth_cache = {}
 AUTH_CACHE_SECONDS = 120
+ADMIN_SESSION_COOKIE_NAME = "club3090_admin_session"
+ADMIN_SESSION_TTL_SECONDS = int(os.environ.get("CLUB3090_ADMIN_SESSION_TTL_SECONDS", "86400"))
+ADMIN_AUTH_DENIAL_LOG_WINDOW_SECONDS = int(os.environ.get("CLUB3090_ADMIN_AUTH_DENIAL_LOG_WINDOW_SECONDS", "30"))
 startup_time = time.time()
 recent_requests = collections.deque(maxlen=120)
 series_points = collections.deque(maxlen=240)
 request_queue = collections.deque(maxlen=50)
 metrics = {"total_requests":0,"active_requests":0,"completed_requests":0,"failed_requests":0,"streaming_requests":0,"queued_requests":0,"cold_starts":0,"failovers":0,"last_latency_s":None,"last_ttft_s":None,"last_tokens_per_second":None,"last_estimated_tokens":None,"last_preset":None,"last_path":None,"last_status":None}
-LOG_BOOTSTRAP_MARKER = os.environ.get("CLUB3090_LOG_BOOTSTRAP_MARKER", "Application Started")
+LOG_BOOTSTRAP_MARKER = os.environ.get("CLUB3090_LOG_BOOTSTRAP_MARKER", "Application startup complete")
 LOG_TAIL_MAX_BYTES = int(os.environ.get("CLUB3090_LOG_TAIL_MAX_BYTES", "102400"))
 runtime_log_watchers = {}
 runtime_log_watchers_lock = threading.Lock()
@@ -935,6 +1796,58 @@ compose_metadata_cache = {}
 runtime_log_metrics_cache = {}
 runtime_log_metric_memory = {}
 target_request_metrics = {}
+runtime_inventory_lock = threading.Lock()
+runtime_inventory_cache = {}
+runtime_inventory_built_at = 0.0
+model_install_job_lock = threading.Lock()
+admin_session_lock = threading.Lock()
+admin_sessions = {}
+admin_auth_denial_lock = threading.Lock()
+admin_auth_denial_state = {}
+audit_rate_limit_lock = threading.Lock()
+audit_rate_limit_state = {}
+AUDIT_RATE_LIMIT_WINDOWS = {
+    "admin_auth_denied": 5,
+    "local_api_denied": 5,
+    "proxy_auth_denied": 5,
+}
+model_install_job = {
+    "active": False,
+    "status": "idle",
+    "model_id": "",
+    "variant_id": "",
+    "command": "",
+    "started_at": 0,
+    "finished_at": 0,
+    "return_code": None,
+    "summary": "",
+    "inventory_rebuild_ok": None,
+}
+admin_task_job_lock = threading.Lock()
+admin_task_job = {
+    "active": False,
+    "status": "idle",
+    "task": "",
+    "label": "",
+    "command": "",
+    "started_at": 0,
+    "finished_at": 0,
+    "return_code": None,
+    "summary": "",
+    "mode": "",
+    "container": "",
+    "url": "",
+}
+switch_job_lock = threading.Lock()
+switch_job = {
+    "active": False,
+    "status": "idle",
+    "mode": "",
+    "target": "",
+    "started_at": 0,
+    "finished_at": 0,
+    "error": "",
+}
 
 POWER_IDLE_AFTER_SECONDS = int(os.environ.get("CLUB3090_POWER_IDLE_AFTER_SECONDS", "600"))
 CONTAINER_STOP_AFTER_SECONDS = int(os.environ.get("CLUB3090_CONTAINER_STOP_AFTER_SECONDS", "3600"))
@@ -976,9 +1889,59 @@ def log_control(message):
         pass
 
 
+def audit_event_category(event_type):
+    name = str(event_type or "").strip().lower()
+    if name.startswith("proxy_"):
+        return "proxy"
+    if name.startswith("admin_ui_"):
+        return "ui"
+    if name.startswith("admin_"):
+        return "admin"
+    if name.startswith("local_api_"):
+        return "automation"
+    if name.startswith("user_") or name.startswith("group_"):
+        return "access"
+    if name.startswith("model_install_") or name.startswith("instance_"):
+        return "runtime"
+    return "system"
+
+
+def _audit_rate_limit_key(event_type, fields):
+    parts = [str(event_type or "")]
+    for key in ("reason", "user", "client", "path", "instance", "action"):
+        value = fields.get(key)
+        if value not in (None, ""):
+            parts.append(f"{key}={value}")
+    return "|".join(parts)
+
+
+def should_emit_audit_event(event_type, fields):
+    window = int(AUDIT_RATE_LIMIT_WINDOWS.get(str(event_type or ""), 0) or 0)
+    if window <= 0:
+        return True
+    now = time.time()
+    key = _audit_rate_limit_key(event_type, fields)
+    with audit_rate_limit_lock:
+        last = float(audit_rate_limit_state.get(key, 0.0) or 0.0)
+        if last and (now - last) < window:
+            return False
+        audit_rate_limit_state[key] = now
+        stale_before = now - max(window * 2, 30)
+        for stale_key, stale_ts in list(audit_rate_limit_state.items()):
+            if stale_ts < stale_before:
+                audit_rate_limit_state.pop(stale_key, None)
+    return True
+
+
 def log_audit(event_type, **fields):
     os.makedirs(CONTROL_DIR, exist_ok=True)
-    entry = {"ts": int(time.time()), "event": str(event_type)}
+    if not should_emit_audit_event(event_type, fields):
+        return
+    entry = {
+        "ts": int(time.time()),
+        "event": str(event_type),
+        "category": audit_event_category(event_type),
+    }
     for key, value in fields.items():
         try:
             json.dumps(value)
@@ -990,6 +1953,419 @@ def log_audit(event_type, **fields):
             f.write(json.dumps(entry, sort_keys=True) + "\n")
     except Exception:
         pass
+
+
+def script_user_agent():
+    version = str(SCRIPT_VERSION or "").strip() or "unknown"
+    return f"club3090-control/{version}"
+
+
+def append_audit_text_line(text):
+    os.makedirs(CONTROL_DIR, exist_ok=True)
+    line = str(text or "").rstrip("\n") + "\n"
+    try:
+        with open(AUDIT_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
+
+
+def read_switch_failure():
+    data = read_json_file(SWITCH_FAILURE_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def write_switch_failure(mode, error_text):
+    payload = {
+        "mode": canonical_mode_selector(mode),
+        "error": str(error_text or "")[-12000:],
+        "ts": int(time.time()),
+    }
+    write_json_file(SWITCH_FAILURE_FILE, payload)
+    return payload
+
+
+def clear_switch_failure(mode=""):
+    existing = read_switch_failure()
+    if not existing:
+        return
+    target_mode = canonical_mode_selector(mode) if mode else ""
+    if target_mode and str(existing.get("mode") or "") != target_mode:
+        return
+    try:
+        os.remove(SWITCH_FAILURE_FILE)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+
+def write_json_atomic_if_changed(path, data, *, indent=None, sort_keys=False, separators=None):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    rendered = json.dumps(
+        data,
+        indent=indent,
+        sort_keys=sort_keys,
+        separators=separators,
+        ensure_ascii=False,
+    )
+    if indent is not None:
+        rendered += "\n"
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            existing = f.read()
+        if existing == rendered:
+            return False
+    except Exception:
+        pass
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(rendered)
+    os.replace(tmp, path)
+    return True
+
+
+def model_install_job_snapshot():
+    with model_install_job_lock:
+        return dict(model_install_job)
+
+
+def _set_model_install_job(**updates):
+    with model_install_job_lock:
+        model_install_job.update(updates)
+        return dict(model_install_job)
+
+
+def admin_task_job_snapshot():
+    with admin_task_job_lock:
+        return dict(admin_task_job)
+
+
+def _set_admin_task_job(**updates):
+    with admin_task_job_lock:
+        admin_task_job.update(updates)
+        return dict(admin_task_job)
+
+
+def switch_job_snapshot():
+    with switch_job_lock:
+        return dict(switch_job)
+
+
+def _set_switch_job(**updates):
+    with switch_job_lock:
+        switch_job.update(updates)
+        return dict(switch_job)
+
+
+def switch_job_active():
+    with switch_job_lock:
+        return bool(switch_job.get("active"))
+
+
+def _run_model_install_job(model_id, variant_id, install_command):
+    prefix = f"[model-install {model_id}]"
+    append_audit_text_line(f"{prefix} starting {install_command}")
+    _set_model_install_job(
+        active=True,
+        status="running",
+        model_id=model_id,
+        variant_id=variant_id,
+        command=install_command,
+        started_at=int(time.time()),
+        finished_at=0,
+        return_code=None,
+        summary="Running model install job",
+        inventory_rebuild_ok=None,
+    )
+    rc = 999
+    rebuild_ok = False
+    try:
+        process = subprocess.Popen(
+            ["bash", "-lc", install_command],
+            cwd=CLUB3090_DIR,
+            env=_repo_subprocess_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        try:
+            if process.stdout is not None:
+                for raw_line in process.stdout:
+                    append_audit_text_line(f"{prefix} {str(raw_line or '').rstrip()}")
+        finally:
+            rc = int(process.wait())
+    except Exception as e:
+        append_audit_text_line(f"{prefix} launcher error: {e}")
+        rc = 999
+    if rc == 0:
+        try:
+            rebuild_runtime_inventory()
+            rebuild_ok = True
+            append_audit_text_line(f"{prefix} inventory rebuild succeeded")
+        except Exception as e:
+            rebuild_ok = False
+            append_audit_text_line(f"{prefix} inventory rebuild failed: {e}")
+    else:
+        append_audit_text_line(f"{prefix} command failed with return code {rc}")
+    summary = f"Model install {'completed' if rc == 0 else 'failed'} (rc={rc})"
+    _set_model_install_job(
+        active=False,
+        status=("success" if rc == 0 else "failed"),
+        finished_at=int(time.time()),
+        return_code=rc,
+        summary=summary,
+        inventory_rebuild_ok=rebuild_ok if rc == 0 else False,
+    )
+    log_audit(
+        "model_install_job_finished",
+        model_id=model_id,
+        variant_id=variant_id,
+        return_code=rc,
+        inventory_rebuild_ok=rebuild_ok if rc == 0 else False,
+    )
+    append_audit_text_line(f"{prefix} {summary}")
+
+
+def start_model_install_job(model_id, variant_id, install_command):
+    inventory = load_runtime_inventory()
+    variant = next((row for row in inventory.get("variants") or [] if str(row.get("variant_id") or "") == str(variant_id or "")), None)
+    if not variant:
+        raise ValueError("Unknown variant")
+    if str(variant.get("model_id") or "") != str(model_id or ""):
+        raise ValueError("Variant/model mismatch")
+    expected_command = str(variant.get("install_command") or "").strip()
+    requested_command = str(install_command or "").strip()
+    if not expected_command:
+        raise ValueError("This preset does not have a supported install command")
+    if expected_command != requested_command:
+        raise ValueError("Install command validation failed")
+    with admin_task_job_lock:
+        if admin_task_job.get("active"):
+            raise RuntimeError("Wait for the current admin task to finish before starting a model install")
+    with model_install_job_lock:
+        if model_install_job.get("active"):
+            raise RuntimeError("A model install job is already running")
+        model_install_job.update(
+            {
+                "active": True,
+                "status": "queued",
+                "model_id": model_id,
+                "variant_id": variant_id,
+                "command": expected_command,
+                "started_at": int(time.time()),
+                "finished_at": 0,
+                "return_code": None,
+                "summary": "Queued model install job",
+                "inventory_rebuild_ok": None,
+            }
+        )
+    threading.Thread(
+        target=_run_model_install_job,
+        args=(str(model_id), str(variant_id), expected_command),
+        name=f"club3090-model-install-{_selector_token(model_id)}",
+        daemon=True,
+    ).start()
+    log_audit("model_install_job_started", model_id=model_id, variant_id=variant_id)
+    return model_install_job_snapshot()
+
+
+def _active_runtime_task_context():
+    mode = active_mode()
+    spec = resolve_variant_spec(mode) or {}
+    port = int(active_port() or 0)
+    return {
+        "mode": mode,
+        "spec": spec,
+        "port": port,
+        "url": (f"http://localhost:{port}" if port > 0 else ""),
+        "container": current_container(),
+        "engine": str(spec.get("engine") or "").strip(),
+        "served_model_name": str(spec.get("served_model_name") or "").strip(),
+    }
+
+
+def _build_admin_task_command(task_name):
+    task = _selector_token(task_name)
+    if task not in {"benchmark", "report"}:
+        raise ValueError("Unsupported admin task")
+    runtime = _active_runtime_task_context()
+    if task == "benchmark":
+        if runtime["port"] <= 0 or not port_open(runtime["port"], timeout=0.25):
+            raise RuntimeError("Benchmark requires a running backend. Start a preset first.")
+        parts = [f"URL={shlex.quote(runtime['url'])}", "PREFLIGHT_NO_AUTODETECT=1"]
+        if runtime["container"]:
+            parts.append(f"CONTAINER={shlex.quote(runtime['container'])}")
+        if runtime["served_model_name"]:
+            parts.append(f"MODEL={shlex.quote(runtime['served_model_name'])}")
+        parts.append("bash scripts/bench.sh")
+        return {
+            "task": "benchmark",
+            "label": "Benchmark",
+            "command": " ".join(parts),
+            "mode": runtime["mode"],
+            "container": runtime["container"],
+            "url": runtime["url"],
+        }
+    parts = []
+    if runtime["container"]:
+        parts.append(f"CONTAINER={shlex.quote(runtime['container'])}")
+    if runtime["engine"] in {"vllm", "llamacpp"}:
+        parts.append(f"ENGINE_KIND={shlex.quote(runtime['engine'])}")
+    parts.append("bash scripts/report.sh")
+    return {
+        "task": "report",
+        "label": "Run Report",
+        "command": " ".join(parts),
+        "mode": runtime["mode"],
+        "container": runtime["container"],
+        "url": runtime["url"],
+    }
+
+
+def _run_admin_task_job(task_info):
+    task = dict(task_info or {})
+    task_name = str(task.get("task") or "task").strip() or "task"
+    label = str(task.get("label") or task_name).strip() or task_name
+    command = str(task.get("command") or "").strip()
+    prefix = f"[admin-task {task_name}]"
+    append_audit_text_line(f"{prefix} starting {command}")
+    _set_admin_task_job(
+        active=True,
+        status="running",
+        task=task_name,
+        label=label,
+        command=command,
+        started_at=int(time.time()),
+        finished_at=0,
+        return_code=None,
+        summary=f"{label} running",
+        mode=str(task.get("mode") or ""),
+        container=str(task.get("container") or ""),
+        url=str(task.get("url") or ""),
+    )
+    rc = 999
+    try:
+        process = subprocess.Popen(
+            ["bash", "-lc", command],
+            cwd=CLUB3090_DIR,
+            env=_repo_subprocess_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        try:
+            if process.stdout is not None:
+                for raw_line in process.stdout:
+                    append_audit_text_line(f"{prefix} {str(raw_line or '').rstrip()}")
+        finally:
+            rc = int(process.wait())
+    except Exception as e:
+        append_audit_text_line(f"{prefix} launcher error: {e}")
+        rc = 999
+    if rc != 0:
+        append_audit_text_line(f"{prefix} command failed with return code {rc}")
+    summary = f"{label} {'completed' if rc == 0 else 'failed'} (rc={rc})"
+    _set_admin_task_job(
+        active=False,
+        status=("success" if rc == 0 else "failed"),
+        finished_at=int(time.time()),
+        return_code=rc,
+        summary=summary,
+    )
+    log_audit(
+        "admin_task_job_finished",
+        task=task_name,
+        label=label,
+        mode=str(task.get("mode") or ""),
+        container=str(task.get("container") or ""),
+        url=str(task.get("url") or ""),
+        return_code=rc,
+    )
+    append_audit_text_line(f"{prefix} {summary}")
+
+
+def start_admin_task_job(task_name):
+    task_info = _build_admin_task_command(task_name)
+    with admin_task_job_lock:
+        if admin_task_job.get("active"):
+            raise RuntimeError("Another admin task is already running")
+    with model_install_job_lock:
+        if model_install_job.get("active"):
+            raise RuntimeError("Wait for the current model install job to finish before starting this task")
+    _set_admin_task_job(
+        active=True,
+        status="queued",
+        task=str(task_info.get("task") or ""),
+        label=str(task_info.get("label") or ""),
+        command=str(task_info.get("command") or ""),
+        started_at=int(time.time()),
+        finished_at=0,
+        return_code=None,
+        summary=f"{str(task_info.get('label') or task_name)} queued",
+        mode=str(task_info.get("mode") or ""),
+        container=str(task_info.get("container") or ""),
+        url=str(task_info.get("url") or ""),
+    )
+    threading.Thread(
+        target=_run_admin_task_job,
+        args=(task_info,),
+        name=f"club3090-admin-task-{_selector_token(task_name)}",
+        daemon=True,
+    ).start()
+    log_audit(
+        "admin_task_job_started",
+        task=str(task_info.get("task") or ""),
+        label=str(task_info.get("label") or ""),
+        mode=str(task_info.get("mode") or ""),
+        container=str(task_info.get("container") or ""),
+        url=str(task_info.get("url") or ""),
+    )
+    return admin_task_job_snapshot()
+
+
+def start_self_update_job(scope):
+    scope_name = _selector_token(scope)
+    if scope_name not in {"controller", "club3090"}:
+        raise ValueError("Invalid update scope")
+    with admin_task_job_lock:
+        if admin_task_job.get("active"):
+            raise RuntimeError("Wait for the current admin task to finish before starting an update")
+    with model_install_job_lock:
+        if model_install_job.get("active"):
+            raise RuntimeError("Wait for the current model install job to finish before starting an update")
+    mode_flag = "--update" if scope_name == "controller" else "--migrate"
+    label = "admin script update" if scope_name == "controller" else "club-3090 migration"
+    command = f"set -o pipefail; curl -fsSL https://tinyurl.com/club-3090-webserver | bash -s -- {mode_flag}"
+    prefix = f"[self-update {scope_name}]"
+    append_audit_text_line(f"{prefix} queued {label}")
+    append_audit_text_line(f"{prefix} command: {command}")
+    log_audit("self_update_job_started", scope=scope_name, command=command)
+    audit_log_path = shlex.quote(AUDIT_LOG_FILE)
+    launcher = (
+        f'printf "%s\\n" "{prefix} starting {label}" >> {audit_log_path}; '
+        "sleep 1; "
+        f'bash -lc {shlex.quote(command)} >> {audit_log_path} 2>&1; '
+        'rc=$?; '
+        f'printf "%s\\n" "{prefix} finished (rc=${{rc}})" >> {audit_log_path}; '
+        f'printf "%s\\n" "{prefix} update flow complete" >> {audit_log_path}'
+    )
+    subprocess.Popen(
+        ["bash", "-lc", launcher],
+        cwd=CLUB3090_DIR,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    return {
+        "ok": True,
+        "scope": scope_name,
+        "label": label,
+        "command": command,
+        "focus_log_source": "audit",
+    }
 
 
 def default_target_request_metrics():
@@ -1028,7 +2404,7 @@ def read_ui_config():
         merged = dict(default)
         if "show_global_logs" in data:
             merged["show_global_logs"] = bool(data.get("show_global_logs"))
-        if str(data.get("active_tab") or "") in {"overview", "system", "presets", "users", "metrics", "logs", "audit"}:
+        if str(data.get("active_tab") or "") in {"overview", "system", "presets", "users", "metrics", "logs", "audit", "chat"}:
             merged["active_tab"] = str(data.get("active_tab"))
         if str(data.get("current_log_source") or "") in {"docker", "audit"}:
             merged["current_log_source"] = str(data.get("current_log_source"))
@@ -1040,20 +2416,19 @@ def read_ui_config():
 
 def write_ui_config(data):
     current = read_ui_config()
+    original = dict(current)
     if "show_global_logs" in data:
         current["show_global_logs"] = bool(data["show_global_logs"])
-    if str(data.get("active_tab") or "") in {"overview", "system", "presets", "users", "metrics", "logs", "audit"}:
+    if str(data.get("active_tab") or "") in {"overview", "system", "presets", "users", "metrics", "logs", "audit", "chat"}:
         current["active_tab"] = str(data.get("active_tab"))
     if str(data.get("current_log_source") or "") in {"docker", "audit"}:
         current["current_log_source"] = str(data.get("current_log_source"))
     if data.get("selected_scope") not in (None, ""):
         current["selected_scope"] = str(data.get("selected_scope"))
-    os.makedirs(CONTROL_DIR, exist_ok=True)
-    tmp = UI_CONFIG_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(current, f, separators=(",", ":"))
-    os.replace(tmp, UI_CONFIG_FILE)
-    return current
+    if current == original:
+        return current, False
+    write_json_atomic_if_changed(UI_CONFIG_FILE, current, separators=(",", ":"))
+    return current, True
 
 
 def read_json_file(path, default):
@@ -1066,12 +2441,1056 @@ def read_json_file(path, default):
 
 
 def write_json_file(path, data):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, sort_keys=True)
-    os.replace(tmp, path)
+    write_json_atomic_if_changed(path, data, indent=2, sort_keys=True)
+
+
+def default_chat_state():
+    return {
+        "activeConversationId": "",
+        "conversations": [],
+        "promptTemplates": [],
+    }
+
+
+def _chat_attachment_kind(value):
+    return "image" if str(value or "").strip().lower() == "image" else "text"
+
+
+def sanitize_chat_attachment(item):
+    item = item if isinstance(item, dict) else {}
+    kind = _chat_attachment_kind(item.get("kind"))
+    row = {
+        "id": str(item.get("id") or "").strip(),
+        "kind": kind,
+        "name": str(item.get("name") or "").strip() or ("image" if kind == "image" else "attachment"),
+        "mime": str(item.get("mime") or "").strip(),
+        "source": str(item.get("source") or "").strip(),
+    }
+    if kind == "image":
+        row["url"] = str(item.get("url") or "").strip()
+    else:
+        row["text"] = str(item.get("text") or "")
+    size_bytes = item.get("size_bytes")
+    try:
+        if size_bytes not in (None, ""):
+            row["size_bytes"] = max(0, int(size_bytes))
+    except Exception:
+        pass
+    return row
+
+
+def sanitize_chat_message(item):
+    item = item if isinstance(item, dict) else {}
+    row = {
+        "role": str(item.get("role") or "").strip().lower() or "user",
+        "text": str(item.get("text") or ""),
+        "attachments": [sanitize_chat_attachment(attachment) for attachment in (item.get("attachments") or []) if isinstance(attachment, dict)],
+    }
+    for key in (
+        "reasoningText",
+        "reasoning_content",
+        "reasoning",
+        "modelLabel",
+        "thinkingExpanded",
+        "thinkingDone",
+        "thinkingLive",
+        "thinkingStartedAt",
+        "thinkingDurationMs",
+    ):
+        value = item.get(key)
+        if value not in (None, ""):
+            row[key] = value
+    return row
+
+
+def sanitize_chat_conversation(item):
+    item = item if isinstance(item, dict) else {}
+    try:
+        threshold_pct = int(item.get("autoCompactThresholdPct") or 95)
+    except Exception:
+        threshold_pct = 95
+    try:
+        compaction_sequence = max(1, int(item.get("compactionSequence") or 1))
+    except Exception:
+        compaction_sequence = 1
+    row = {
+        "id": str(item.get("id") or "").strip(),
+        "title": str(item.get("title") or "").strip() or "Untitled conversation",
+        "folder": str(item.get("folder") or "").strip(),
+        "summary": str(item.get("summary") or ""),
+        "autoNamed": bool(item.get("autoNamed")),
+        "createdAt": int(item.get("createdAt") or int(time.time() * 1000)),
+        "updatedAt": int(item.get("updatedAt") or int(time.time() * 1000)),
+        "lastUsedAt": int(item.get("lastUsedAt") or int(time.time() * 1000)),
+        "statsCollapsed": bool(item.get("statsCollapsed")),
+        "presetId": str(item.get("presetId") or ""),
+        "apiPresetName": str(item.get("apiPresetName") or ""),
+        "params": dict(item.get("params") or {}) if isinstance(item.get("params"), dict) else {},
+        "systemPrompt": str(item.get("systemPrompt") or ""),
+        "autoCompactEnabled": item.get("autoCompactEnabled") is not False,
+        "autoCompactThresholdPct": threshold_pct,
+        "messages": [sanitize_chat_message(message) for message in (item.get("messages") or []) if isinstance(message, dict)],
+        "attachments": [sanitize_chat_attachment(attachment) for attachment in (item.get("attachments") or []) if isinstance(attachment, dict)],
+        "draftText": str(item.get("draftText") or ""),
+        "compactedFromId": str(item.get("compactedFromId") or ""),
+        "compactionSequence": compaction_sequence,
+    }
+    for key in (
+        "lastInputTokens",
+        "lastOutputTokens",
+        "lastTotalTokens",
+        "lastCtxSizeTokens",
+        "lastKvCacheUsagePct",
+        "lastRuntimeRequestAt",
+    ):
+        value = item.get(key)
+        if value not in (None, ""):
+            row[key] = value
+    return row
+
+
+def sanitize_chat_state_payload(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    conversations = [
+        sanitize_chat_conversation(conversation)
+        for conversation in (payload.get("conversations") or [])
+        if isinstance(conversation, dict)
+    ]
+    prompt_templates = []
+    for item in payload.get("promptTemplates") or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        text = str(item.get("text") or "")
+        if not name and not text:
+            continue
+        prompt_templates.append(
+            {
+                "id": str(item.get("id") or secrets.token_hex(6)),
+                "name": name,
+                "text": text,
+            }
+        )
+    active_id = str(payload.get("activeConversationId") or "").strip()
+    if not active_id and conversations:
+        active_id = str(conversations[0].get("id") or "")
+    return {
+        "activeConversationId": active_id,
+        "conversations": conversations,
+        "promptTemplates": prompt_templates,
+    }
+
+
+def read_chat_state():
+    data = read_json_file(CHAT_STATE_FILE, default_chat_state())
+    return sanitize_chat_state_payload(data)
+
+
+def write_chat_state(payload):
+    state = sanitize_chat_state_payload(payload)
+    write_json_file(CHAT_STATE_FILE, state)
+    return state
+
+
+def _chat_attachment_blob_path(attachment_id):
+    return os.path.join(CHAT_ATTACHMENTS_DIR, f"{attachment_id}.bin")
+
+
+def _chat_attachment_meta_path(attachment_id):
+    return os.path.join(CHAT_ATTACHMENTS_DIR, f"{attachment_id}.json")
+
+
+def chat_attachment_url(attachment_id):
+    return f"/admin/chat-attachments/{attachment_id}"
+
+
+def read_chat_attachment_meta(attachment_id):
+    return read_json_file(_chat_attachment_meta_path(attachment_id), {})
+
+
+def save_chat_attachment(item):
+    item = item if isinstance(item, dict) else {}
+    kind = _chat_attachment_kind(item.get("kind"))
+    if kind != "image":
+        raise ValueError("Only image attachments are uploaded separately.")
+    data_url = str(item.get("data_url") or "").strip()
+    if not data_url.startswith("data:") or ";base64," not in data_url:
+        raise ValueError("Image attachment must include a base64 data URL.")
+    header, encoded = data_url.split(",", 1)
+    mime = str(item.get("mime") or "").strip()
+    if not mime:
+        mime = str(header[5:].split(";", 1)[0] or "").strip()
+    if not mime.startswith("image/"):
+        raise ValueError("Only image attachments are supported.")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except Exception as exc:
+        raise ValueError("Invalid image attachment encoding.") from exc
+    attachment_id = str(item.get("id") or f"chat-attachment-{secrets.token_hex(8)}").strip()
+    if not attachment_id:
+        raise ValueError("Attachment id is required.")
+    os.makedirs(CHAT_ATTACHMENTS_DIR, exist_ok=True)
+    with open(_chat_attachment_blob_path(attachment_id), "wb") as handle:
+        handle.write(raw)
+    meta = {
+        "id": attachment_id,
+        "kind": "image",
+        "name": str(item.get("name") or "image").strip() or "image",
+        "mime": mime,
+        "source": str(item.get("source") or "").strip(),
+        "size_bytes": len(raw),
+        "created_at": int(time.time()),
+        "url": chat_attachment_url(attachment_id),
+    }
+    write_json_file(_chat_attachment_meta_path(attachment_id), meta)
+    return meta
+
+
+def read_chat_attachment_response(attachment_id):
+    meta = read_chat_attachment_meta(attachment_id)
+    if not isinstance(meta, dict) or not meta.get("id"):
+        return None, None
+    blob_path = _chat_attachment_blob_path(attachment_id)
+    try:
+        with open(blob_path, "rb") as handle:
+            payload = handle.read()
+    except Exception:
+        return None, None
+    mime = str(meta.get("mime") or "").strip() or "application/octet-stream"
+    return payload, mime
+
+
+def local_chat_attachment_id_from_url(url):
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    try:
+        path = urlsplit(raw).path
+    except Exception:
+        path = raw
+    prefix = "/admin/chat-attachments/"
+    if not path.startswith(prefix):
+        return ""
+    attachment_id = path[len(prefix):].strip().split("/", 1)[0]
+    return re.sub(r"[^A-Za-z0-9._-]+", "", attachment_id)
+
+
+def chat_attachment_data_url(url):
+    attachment_id = local_chat_attachment_id_from_url(url)
+    if not attachment_id:
+        return str(url or "").strip()
+    payload, mime = read_chat_attachment_response(attachment_id)
+    if payload is None:
+        return str(url or "").strip()
+    return f"data:{mime};base64,{base64.b64encode(payload).decode('ascii')}"
     return data
+
+
+def _format_model_display_name(model_id):
+    if not model_id:
+        return "Unknown Model"
+    if model_id == "qwen3.6-27b":
+        return "Qwen3.6-27B"
+    if model_id == "gemma-4-31b":
+        return "Gemma 4 31B"
+    return str(model_id).replace("-", " ")
+
+
+def _selector_token(text):
+    token = re.sub(r"[^a-zA-Z0-9]+", "-", str(text or "").strip().lower()).strip("-")
+    return token or "variant"
+
+
+def _variant_id_from_rel_path(rel_path):
+    rel = str(rel_path or "").replace("\\", "/").strip("/")
+    if not rel:
+        return "variant-unknown"
+    stem = rel[:-4] if rel.endswith(".yml") else rel
+    return "variant-" + _selector_token(stem)
+
+
+def _mode_selector_for_variant(variant):
+    if not isinstance(variant, dict):
+        return ""
+    return str(variant.get("upstream_tag") or variant.get("variant_id") or "").strip()
+
+
+def _variant_rel_compose_path(variant):
+    return str((variant or {}).get("compose_rel_path") or "").replace("\\", "/").strip("/")
+
+
+def _normalize_engine(engine):
+    raw = str(engine or "").strip().lower().replace("_", "-")
+    if raw == "llama-cpp":
+        return "llamacpp"
+    return raw
+
+
+def _load_repo_env_map():
+    env_path = os.path.join(CLUB3090_DIR, ".env")
+    result = {}
+    try:
+        with open(env_path, "r", encoding="utf-8", errors="replace") as f:
+            for raw_line in f:
+                line = str(raw_line or "").strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = str(key or "").strip()
+                if not key:
+                    continue
+                value = str(value or "").strip().strip("'").strip('"')
+                result[key] = value
+    except Exception:
+        return {}
+    return result
+
+
+def _repo_subprocess_env():
+    env = os.environ.copy()
+    for key, value in _load_repo_env_map().items():
+        if key:
+            env[str(key)] = str(value)
+    return env
+
+
+def _resolve_variant_model_dir_root(variant=None):
+    env_map = _load_repo_env_map()
+    raw = str(env_map.get("MODEL_DIR") or "").strip()
+    if not raw:
+        return os.path.join(CLUB3090_DIR, "models-cache")
+    if os.path.isabs(raw):
+        return raw
+    compose_root = str((variant or {}).get("compose_project_dir_abs_path") or "").strip()
+    if compose_root:
+        candidate = os.path.normpath(os.path.join(compose_root, raw))
+        if os.path.exists(candidate):
+            return candidate
+    return os.path.normpath(os.path.join(CLUB3090_DIR, raw))
+
+
+def _dir_has_filetype(path, suffixes):
+    try:
+        if not os.path.isdir(path):
+            return False
+        for root, _dirs, files in os.walk(path):
+            for name in files:
+                lower = str(name or "").lower()
+                if any(lower.endswith(sfx) for sfx in suffixes):
+                    return True
+    except Exception:
+        return False
+    return False
+
+
+def _extract_default_number(raw, minimum_digits=2):
+    text = str(raw or "")
+    match = re.search(r"\$\{[^}:]+:-([0-9]{%d,})\}" % int(minimum_digits), text)
+    if match:
+        return int(match.group(1))
+    match = re.search(r"([0-9]{%d,})" % int(minimum_digits), text)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _extract_shell_default_value(raw):
+    text = str(raw or "").strip().strip('"').strip("'")
+    match = re.match(r"^\$\{[^}:]+:-([^}]+)\}$", text)
+    if match:
+        return match.group(1).strip()
+    return text
+
+
+def _extract_token_count(raw):
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*([KMB])?\b", text, re.IGNORECASE)
+    if not match:
+        return None
+    value = float(match.group(1))
+    suffix = str(match.group(2) or "").upper()
+    scale = {"": 1, "K": 1000, "M": 1000 * 1000, "B": 1000 * 1000 * 1000}.get(suffix, 1)
+    try:
+        return int(value * scale)
+    except Exception:
+        return None
+
+
+def _normalize_status_kind(status_raw):
+    text = str(status_raw or "").strip().lower()
+    if not text:
+        return "unknown"
+    if "deprecated" in text:
+        return "deprecated"
+    if "upstream" in text and ("blocked" in text or "gated" in text):
+        return "upstream_gated"
+    if "preview" in text:
+        return "preview"
+    if "experimental" in text or "community" in text:
+        return "experimental"
+    if "caveat" in text or "known issue" in text or "warning" in text:
+        return "production_caveat"
+    if "production" in text or "prod" in text:
+        return "production"
+    return "unknown"
+
+
+def _category_for_variant(topology, status_kind):
+    topology_text = str(topology or "").strip().lower()
+    if status_kind in {"experimental", "preview", "upstream_gated", "deprecated"}:
+        return "experimental"
+    if topology_text.startswith("single"):
+        return "single"
+    if topology_text.startswith("dual"):
+        return "dual"
+    if topology_text.startswith("multi"):
+        return "multi"
+    return "experimental"
+
+
+def _scope_kind_for_topology(topology):
+    topology_text = str(topology or "").strip().lower()
+    if topology_text.startswith("single"):
+        return "single"
+    if topology_text.startswith("dual"):
+        return "dual"
+    if topology_text.startswith("multi"):
+        return "multi"
+    return "global_only"
+
+
+def _read_compose_profile_header(path):
+    profile = {}
+    current_key = None
+    in_profile = False
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for raw_line in f:
+                line = str(raw_line or "").rstrip("\n")
+                stripped = line.lstrip()
+                if not stripped.startswith("#"):
+                    if in_profile and profile:
+                        break
+                    continue
+                comment = stripped[1:]
+                if "Profile (at-a-glance)" in comment:
+                    in_profile = True
+                    current_key = None
+                    continue
+                if not in_profile:
+                    continue
+                if profile and re.match(r"^\s*-{8,}\s*$", comment):
+                    break
+                match = re.match(r"^\s*([A-Za-z][A-Za-z0-9 /-]*):\s*(.*)$", comment)
+                if match:
+                    current_key = re.sub(r"[^a-z0-9]+", "_", match.group(1).strip().lower()).strip("_")
+                    profile[current_key] = match.group(2).strip()
+                    continue
+                if current_key and re.match(r"^\s{10,}\S", comment):
+                    extra = comment.strip()
+                    if extra:
+                        profile[current_key] = (profile.get(current_key, "") + " " + extra).strip()
+                    continue
+                if profile:
+                    break
+    except Exception:
+        return {}
+    return profile
+
+
+def _read_compose_status_hints(path, max_lines=160):
+    hints = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for idx, raw_line in enumerate(f):
+                if idx >= int(max_lines):
+                    break
+                line = str(raw_line or "").strip()
+                if not line.startswith("#"):
+                    continue
+                match = re.match(r"^#\s*Status:\s*(.+)$", line)
+                if match:
+                    hints.append(match.group(1).strip())
+    except Exception:
+        return ""
+    return hints[0].strip() if hints else ""
+
+
+def _read_compose_runtime_metadata(path):
+    service_name = ""
+    container_name = ""
+    default_port = None
+    served_model_name = ""
+    max_model_len = None
+    model_path = ""
+    mmproj_path = ""
+    speculative_json = ""
+    draft_model_path = ""
+    command_items = []
+    in_command = False
+    in_ports = False
+    current_indent = 0
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for raw_line in f:
+                line = str(raw_line or "").rstrip("\n")
+                if not line.strip() or line.lstrip().startswith("#"):
+                    continue
+                indent = len(line) - len(line.lstrip(" "))
+                stripped = line.strip()
+                if stripped == "services:":
+                    continue
+                if not service_name and indent == 2 and stripped.endswith(":"):
+                    service_name = stripped[:-1]
+                    continue
+                if indent <= 4 and not stripped.startswith("- "):
+                    in_command = False
+                    in_ports = False
+                if stripped == "command:":
+                    in_command = True
+                    current_indent = indent
+                    continue
+                if stripped == "ports:":
+                    in_ports = True
+                    current_indent = indent
+                    continue
+                if in_command and indent > current_indent and stripped.startswith("- "):
+                    item = stripped[2:].strip()
+                    if len(item) >= 2 and item[0] == item[-1] and item[0] in {"'", '"'}:
+                        item = item[1:-1]
+                    command_items.append(item)
+                    continue
+                if in_ports and indent > current_indent and stripped.startswith("- "):
+                    port_item = stripped[2:].strip().strip('"').strip("'")
+                    parsed_port = _extract_default_number(port_item, minimum_digits=2)
+                    if parsed_port is not None and default_port is None:
+                        default_port = parsed_port
+                    continue
+                if not container_name:
+                    match = re.match(r"^container_name:\s*(.+)$", stripped)
+                    if match:
+                        container_name = match.group(1).strip().strip('"').strip("'")
+                        continue
+    except Exception:
+        return {}
+    for idx, item in enumerate(command_items):
+        if item == "--model" and idx + 1 < len(command_items):
+            model_path = _extract_shell_default_value(command_items[idx + 1])
+        elif item.startswith("--model="):
+            model_path = _extract_shell_default_value(item.split("=", 1)[1])
+        if item == "-m" and idx + 1 < len(command_items):
+            model_path = _extract_shell_default_value(command_items[idx + 1])
+        elif item.startswith("-m="):
+            model_path = _extract_shell_default_value(item.split("=", 1)[1])
+        if item == "--served-model-name" and idx + 1 < len(command_items):
+            served_model_name = command_items[idx + 1]
+        elif item.startswith("--served-model-name="):
+            served_model_name = item.split("=", 1)[1]
+        if item == "--max-model-len" and idx + 1 < len(command_items):
+            max_model_len = _extract_default_number(command_items[idx + 1], minimum_digits=4)
+        elif item.startswith("--max-model-len="):
+            max_model_len = _extract_default_number(item.split("=", 1)[1], minimum_digits=4)
+        if item == "-c" and idx + 1 < len(command_items) and max_model_len is None:
+            max_model_len = _extract_default_number(command_items[idx + 1], minimum_digits=4)
+        elif item.startswith("-c=") and max_model_len is None:
+            max_model_len = _extract_default_number(item.split("=", 1)[1], minimum_digits=4)
+        if item == "--mmproj" and idx + 1 < len(command_items):
+            mmproj_path = _extract_shell_default_value(command_items[idx + 1])
+        elif item.startswith("--mmproj="):
+            mmproj_path = _extract_shell_default_value(item.split("=", 1)[1])
+        if item == "--speculative-config" and idx + 1 < len(command_items):
+            speculative_json = command_items[idx + 1]
+        elif item.startswith("--speculative-config="):
+            speculative_json = item.split("=", 1)[1]
+    drafted_tokens = None
+    speculative_method = None
+    if speculative_json:
+        try:
+            parsed = json.loads(speculative_json)
+            speculative_method = str(parsed.get("method") or "").strip() or None
+            drafted_tokens = parsed.get("num_speculative_tokens")
+            draft_model_path = str(parsed.get("model") or "").strip()
+        except Exception:
+            speculative_method = None
+            drafted_tokens = None
+            draft_model_path = ""
+    return {
+        "service_name": service_name,
+        "container_name": container_name,
+        "default_port": default_port,
+        "served_model_name": served_model_name,
+        "max_model_len": max_model_len,
+        "model_path": model_path,
+        "mmproj_path": mmproj_path,
+        "speculative_method": speculative_method,
+        "drafted_tokens": drafted_tokens,
+        "draft_model_path": draft_model_path,
+    }
+
+
+def _parse_switch_variants():
+    switch_path = os.path.join(CLUB3090_DIR, "scripts", "switch.sh")
+    tag_by_compose = {}
+    if not os.path.exists(switch_path):
+        return tag_by_compose
+    try:
+        with open(switch_path, "r", encoding="utf-8", errors="replace") as f:
+            for raw_line in f:
+                line = str(raw_line or "").strip()
+                match = re.match(r'^\[([^\]]+)\]="([^|"]+)\|([^|"]+)\|([^"]+)"$', line)
+                if not match:
+                    continue
+                tag = match.group(1).strip()
+                compose_dir = match.group(3).strip().strip("/")
+                compose_file = match.group(4).strip().strip("/")
+                rel_path = (compose_dir + "/" + compose_file).replace("\\", "/").strip("/")
+                if tag and rel_path:
+                    tag_by_compose[rel_path] = tag
+    except Exception:
+        return {}
+    return tag_by_compose
+
+
+def _qwen_llamacpp_install_command(model_dir_root):
+    model_root = os.path.join(model_dir_root, "qwen3.6-27b")
+    gguf_dir = os.path.join(model_root, "unsloth-q3kxl")
+    return (
+        f'hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-UD-Q3_K_XL.gguf mmproj-F16.gguf --local-dir "{gguf_dir}"'
+        f' && mkdir -p "{model_root}"'
+        f' && if [ -f "{os.path.join(gguf_dir, "mmproj-F16.gguf")}" ]; then cp -f "{os.path.join(gguf_dir, "mmproj-F16.gguf")}" "{os.path.join(model_root, "mmproj-F16.gguf")}"; fi'
+    )
+
+
+def _hf_cache_subdir_from_model_path(model_path):
+    path = str(model_path or "").replace("\\", "/").strip()
+    marker = "/root/.cache/huggingface/"
+    if marker in path:
+        tail = path.split(marker, 1)[1].strip("/")
+        if tail:
+            return tail
+    return ""
+
+
+def _container_model_subpath(model_path):
+    path = str(model_path or "").replace("\\", "/").strip()
+    if not path:
+        return ""
+    for marker in ("/root/.cache/huggingface/", "/models/"):
+        if marker in path:
+            tail = path.split(marker, 1)[1].strip("/")
+            if tail:
+                return tail
+    return path.strip("/")
+
+
+def _detect_variant_install_state(variant, model_dir_root):
+    model_id = str((variant or {}).get("model_id") or "").strip()
+    engine = str((variant or {}).get("engine") or "").strip()
+    selector = _mode_selector_for_variant(variant)
+    rel_path = _variant_rel_compose_path(variant).lower()
+    compose_model_subdir = _hf_cache_subdir_from_model_path((variant or {}).get("model_path"))
+    draft_model_subdir = _hf_cache_subdir_from_model_path((variant or {}).get("draft_model_path"))
+    base_ready = False
+    ready = False
+    install_command = ""
+    install_reason = ""
+    if model_id == "qwen3.6-27b":
+        base_subdir = compose_model_subdir or "qwen3.6-27b-autoround-int4"
+        draft_subdir = draft_model_subdir or "qwen3.6-27b-dflash"
+        base_ready = _dir_has_filetype(os.path.join(model_dir_root, base_subdir), {".safetensors"})
+        dflash_ready = _dir_has_filetype(os.path.join(model_dir_root, draft_subdir), {".safetensors"})
+        gguf_file = os.path.join(model_dir_root, "qwen3.6-27b", "unsloth-q3kxl", "Qwen3.6-27B-UD-Q3_K_XL.gguf")
+        mmproj_file = os.path.join(model_dir_root, "qwen3.6-27b", "mmproj-F16.gguf")
+        mmproj_sidecar = os.path.join(model_dir_root, "qwen3.6-27b", "unsloth-q3kxl", "mmproj-F16.gguf")
+        llama_ready = os.path.isfile(gguf_file) and (os.path.isfile(mmproj_file) or os.path.isfile(mmproj_sidecar))
+        if engine == "llamacpp":
+            ready = llama_ready
+            install_command = _qwen_llamacpp_install_command(model_dir_root)
+            install_reason = "GGUF and mmproj assets are required for Qwen llama.cpp variants."
+        elif compose_model_subdir and compose_model_subdir != "qwen3.6-27b-autoround-int4":
+            return {
+                "install_state": "unavailable",
+                "install_command": "",
+                "install_reason": f"This preset expects model assets under {compose_model_subdir}, but no supported install workflow is defined for that upstream variant yet.",
+            }
+        elif "dflash" in selector.lower() or "dflash" in rel_path:
+            ready = base_ready and dflash_ready
+            install_command = "WITH_DFLASH_DRAFT=1 bash scripts/setup.sh qwen3.6-27b"
+            install_reason = "This preset needs the base Qwen weights plus the Qwen DFlash draft model."
+        else:
+            ready = base_ready
+            install_command = "bash scripts/setup.sh qwen3.6-27b"
+            install_reason = "This preset needs the base Qwen vLLM weights."
+    elif model_id == "gemma-4-31b":
+        base_subdir = compose_model_subdir or "gemma-4-31b-autoround-int4"
+        draft_subdir = draft_model_subdir or "gemma-4-31b-it-dflash"
+        base_ready = _dir_has_filetype(os.path.join(model_dir_root, base_subdir), {".safetensors"})
+        assistant_ready = _dir_has_filetype(os.path.join(model_dir_root, "gemma-4-31b-it-assistant"), {".safetensors"})
+        dflash_ready = _dir_has_filetype(os.path.join(model_dir_root, draft_subdir), {".safetensors"})
+        if "dflash" in selector.lower() or "dflash" in rel_path:
+            ready = base_ready and dflash_ready
+            install_command = "WITH_DFLASH_DRAFT=1 bash scripts/setup.sh gemma-4-31b"
+            install_reason = "This preset needs the base Gemma weights plus the Gemma DFlash drafter."
+        else:
+            ready = base_ready and assistant_ready
+            install_command = "bash scripts/setup.sh gemma-4-31b"
+            install_reason = "This preset needs the base Gemma weights plus the official Gemma assistant drafter."
+    else:
+        return {
+            "install_state": "unavailable",
+            "install_command": "",
+            "install_reason": f"No install workflow is defined for model {model_id}.",
+        }
+    return {
+        "install_state": "ready" if ready else "requires_download",
+        "install_command": install_command,
+        "install_reason": "" if ready else install_reason,
+    }
+
+
+def ensure_variant_install_ready(variant):
+    spec = variant if isinstance(variant, dict) else {}
+    model_dir_root = _resolve_variant_model_dir_root(spec)
+    state = _detect_variant_install_state(spec, model_dir_root)
+    install_state = str(state.get("install_state") or "").strip().lower()
+    if install_state == "ready":
+        return
+    selector = canonical_mode_selector(_mode_selector_for_variant(spec) or spec.get("selector") or spec.get("upstream_tag") or spec.get("variant_id"))
+    reason = str(state.get("install_reason") or "").strip()
+    install_command = str(state.get("install_command") or "").strip()
+    details = [f"Required model assets for {selector or 'this preset'} are not ready under {model_dir_root}."]
+    if reason:
+        details.append(reason)
+    if install_command:
+        details.append(f"Run from {CLUB3090_DIR}: {install_command}")
+    raise RuntimeError("\n".join(details))
+
+
+def _choose_fallback_variant(kind, preferred_model_id="", category=""):
+    inventory = load_runtime_inventory()
+    variants = list(inventory.get("variants") or [])
+    preferred_statuses = {"production", "production_caveat"}
+    wanted_model = str(preferred_model_id or "").strip()
+    wanted_category = str(category or "").strip()
+    candidates = []
+    for variant in variants:
+        if str(variant.get("scope_kind") or "") != str(kind or ""):
+            continue
+        status_kind = str(variant.get("status_kind") or "")
+        rank = 0 if status_kind in preferred_statuses else 1
+        if wanted_category and str(variant.get("category") or "") == wanted_category:
+            rank -= 1
+        if wanted_model and str(variant.get("model_id") or "") == wanted_model:
+            rank -= 2
+        candidates.append((rank, _mode_selector_for_variant(variant), variant))
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return candidates[0][2] if candidates else None
+
+
+def _rebuild_runtime_mode_tables(inventory):
+    global MODES, SINGLE_GPU_MODES, DUAL_GPU_MODES, VARIANT_SPECS
+    global VARIANT_BY_ID, VARIANT_BY_TAG, VARIANT_BY_CONTAINER, VARIANT_BY_SERVICE, VARIANT_BY_COMPOSE, MODEL_INDEX
+    modes = {}
+    single_modes = []
+    dual_modes = []
+    variant_specs = {}
+    by_id = {}
+    by_tag = {}
+    by_container = {}
+    by_service = {}
+    by_compose = {}
+    model_index = {}
+    for model in inventory.get("models") or []:
+        model_index[str(model.get("model_id") or "")] = dict(model)
+    for variant in inventory.get("variants") or []:
+        entry = dict(variant)
+        selector = _mode_selector_for_variant(entry)
+        variant_id = str(entry.get("variant_id") or "").strip()
+        compose_rel = _variant_rel_compose_path(entry)
+        spec = {
+            "variant_id": variant_id,
+            "selector": selector,
+            "upstream_tag": str(entry.get("upstream_tag") or "").strip() or None,
+            "model_id": str(entry.get("model_id") or "").strip(),
+            "engine": str(entry.get("engine") or "").strip(),
+            "topology": str(entry.get("topology") or "").strip(),
+            "category": str(entry.get("category") or "").strip(),
+            "scope_kind": str(entry.get("scope_kind") or "").strip(),
+            "compose_rel_path": compose_rel,
+            "compose_abs_path": str(entry.get("compose_abs_path") or "").strip(),
+            "compose_dir_abs_path": str(entry.get("compose_dir_abs_path") or "").strip(),
+            "compose_project_dir_abs_path": str(entry.get("compose_project_dir_abs_path") or "").strip(),
+            "service": str(entry.get("service_name") or entry.get("service") or "").strip(),
+            "service_name": str(entry.get("service_name") or entry.get("service") or "").strip(),
+            "container_name": str(entry.get("container_name") or "").strip(),
+            "default_port": int(entry.get("default_port") or 0),
+            "served_model_name": str(entry.get("served_model_name") or "").strip(),
+            "max_model_len": entry.get("max_model_len"),
+            "drafter": str(entry.get("drafter") or "").strip(),
+            "kv_format": str(entry.get("kv_format") or "").strip(),
+            "vision": str(entry.get("vision") or "").strip(),
+            "genesis": str(entry.get("genesis") or "").strip(),
+            "status_kind": str(entry.get("status_kind") or "").strip(),
+            "status_raw": str(entry.get("status_raw") or "").strip(),
+            "quality_summary": str(entry.get("quality_summary") or "").strip(),
+            "best_for": str(entry.get("best_for") or "").strip(),
+            "caveats": str(entry.get("caveats") or "").strip(),
+            "install_state": str(entry.get("install_state") or "").strip(),
+            "install_command": str(entry.get("install_command") or "").strip(),
+            "install_reason": str(entry.get("install_reason") or "").strip(),
+            "speculative_method": entry.get("speculative_method"),
+            "drafted_tokens": entry.get("drafted_tokens"),
+        }
+        for key in {variant_id, selector, compose_rel}:
+            if key:
+                variant_specs[key] = spec
+                if spec["default_port"]:
+                    modes[key] = int(spec["default_port"])
+        if variant_id:
+            by_id[variant_id] = spec
+        if spec.get("upstream_tag"):
+            by_tag[spec["upstream_tag"]] = spec
+        if spec.get("container_name"):
+            by_container[spec["container_name"]] = spec
+        if spec.get("service_name"):
+            by_service[spec["service_name"]] = spec
+        if compose_rel:
+            by_compose[compose_rel] = spec
+        canonical = selector or variant_id
+        if spec["scope_kind"] == "single" and canonical:
+            single_modes.append(canonical)
+        elif spec["scope_kind"] == "dual" and canonical:
+            dual_modes.append(canonical)
+    MODES = modes
+    SINGLE_GPU_MODES = tuple(dict.fromkeys(single_modes))
+    DUAL_GPU_MODES = tuple(dict.fromkeys(dual_modes))
+    VARIANT_SPECS = variant_specs
+    VARIANT_BY_ID = by_id
+    VARIANT_BY_TAG = by_tag
+    VARIANT_BY_CONTAINER = by_container
+    VARIANT_BY_SERVICE = by_service
+    VARIANT_BY_COMPOSE = by_compose
+    MODEL_INDEX = model_index
+
+
+def rebuild_runtime_inventory():
+    global runtime_inventory_cache, runtime_inventory_built_at
+    repo_root = os.path.abspath(CLUB3090_DIR)
+    tag_by_compose = _parse_switch_variants()
+    try:
+        repo_head = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).strip()
+    except Exception:
+        repo_head = ""
+    inventory = {
+        "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "repo_root": repo_root,
+        "repo_head": repo_head,
+        "switch_script_present": os.path.exists(os.path.join(repo_root, "scripts", "switch.sh")),
+        "setup_script_present": os.path.exists(os.path.join(repo_root, "scripts", "setup.sh")),
+        "launch_script_present": os.path.exists(os.path.join(repo_root, "scripts", "launch.sh")),
+        "update_script_present": os.path.exists(os.path.join(repo_root, "scripts", "update.sh")),
+        "models": [],
+        "variants": [],
+    }
+    model_rows = {}
+    pattern = os.path.join(repo_root, "models", "*", "*", "compose", "**", "*.yml")
+    compose_paths = sorted(glob.glob(pattern, recursive=True))
+    for compose_abs_path in compose_paths:
+        rel_path = os.path.relpath(compose_abs_path, repo_root).replace("\\", "/")
+        parts = rel_path.split("/")
+        if len(parts) < 6 or parts[0] != "models":
+            continue
+        model_id = parts[1]
+        engine = _normalize_engine(parts[2])
+        topology = parts[4]
+        profile = _read_compose_profile_header(compose_abs_path)
+        status_hints = _read_compose_status_hints(compose_abs_path)
+        runtime_meta = _read_compose_runtime_metadata(compose_abs_path)
+        status_text = str(profile.get("status") or "").strip()
+        if not status_text:
+            status_text = status_hints
+        variant = {
+            "variant_id": _variant_id_from_rel_path(rel_path),
+            "upstream_tag": tag_by_compose.get(rel_path),
+            "model_id": model_id,
+            "engine": engine,
+            "topology": topology,
+            "compose_rel_path": rel_path,
+            "compose_abs_path": compose_abs_path,
+            "compose_dir_abs_path": os.path.dirname(compose_abs_path),
+            "compose_project_dir_abs_path": os.path.join(repo_root, "models", model_id, parts[2], "compose"),
+            "service_name": runtime_meta.get("service_name") or "",
+            "container_name": runtime_meta.get("container_name") or "",
+            "default_port": runtime_meta.get("default_port") or 0,
+            "served_model_name": runtime_meta.get("served_model_name") or "",
+            "max_model_len": runtime_meta.get("max_model_len") or _extract_token_count(profile.get("max_ctx")),
+            "model_path": runtime_meta.get("model_path") or "",
+            "mmproj_path": runtime_meta.get("mmproj_path") or "",
+            "draft_model_path": runtime_meta.get("draft_model_path") or "",
+            "drafter": str(profile.get("drafter") or "").strip(),
+            "kv_format": str(profile.get("kv") or "").strip(),
+            "vision": str(profile.get("vision") or "").strip(),
+            "genesis": str(profile.get("genesis") or "").strip(),
+            "status_raw": status_text,
+            "status_kind": _normalize_status_kind(status_text),
+            "caveats": str(profile.get("caveats") or "").strip(),
+            "best_for": str(profile.get("best_for") or "").strip(),
+            "quality_summary": str(profile.get("quality") or "").strip(),
+            "speculative_method": runtime_meta.get("speculative_method"),
+            "drafted_tokens": runtime_meta.get("drafted_tokens"),
+        }
+        if variant["status_kind"] == "unknown" and variant["caveats"]:
+            variant["status_kind"] = "production_caveat"
+        variant["category"] = _category_for_variant(variant["topology"], variant["status_kind"])
+        variant["scope_kind"] = _scope_kind_for_topology(variant["topology"])
+        variant.update(_detect_variant_install_state(variant, _resolve_variant_model_dir_root(variant)))
+        inventory["variants"].append(variant)
+        model_row = model_rows.setdefault(
+            model_id,
+            {
+                "model_id": model_id,
+                "display_name": _format_model_display_name(model_id),
+                "engine_groups": [],
+                "installed_state": "missing",
+                "setup_supported": False,
+                "default_install_command": "",
+                "categories": {
+                    "single": [],
+                    "dual": [],
+                    "multi": [],
+                    "experimental": [],
+                },
+                "summary": "",
+            },
+        )
+        if engine not in model_row["engine_groups"]:
+            model_row["engine_groups"].append(engine)
+        if variant["category"] in model_row["categories"]:
+            model_row["categories"][variant["category"]].append(variant["variant_id"])
+        if not model_row["summary"] and variant["best_for"]:
+            model_row["summary"] = variant["best_for"]
+    for model_id, model_row in model_rows.items():
+        variants = [row for row in inventory["variants"] if row.get("model_id") == model_id]
+        safe_variants = [row for row in variants if row.get("status_kind") in {"production", "production_caveat"}]
+        any_ready = any(row.get("install_state") == "ready" for row in safe_variants)
+        any_known = any(row.get("install_state") in {"ready", "requires_download"} for row in variants)
+        any_partial = any(row.get("install_state") == "ready" for row in variants)
+        any_downloadable = any(row.get("install_state") == "requires_download" for row in variants)
+        preferred_summary_order = {"vllm/default": 0, "vllm/gemma-mtp": 0, "llamacpp/default": 1}
+        preferred_summaries = [
+            row for row in variants
+            if str(row.get("upstream_tag") or "") in preferred_summary_order
+        ]
+        preferred_summaries.sort(key=lambda row: preferred_summary_order.get(str(row.get("upstream_tag") or ""), 99))
+        if preferred_summaries:
+            model_row["summary"] = str(preferred_summaries[0].get("best_for") or model_row.get("summary") or "")
+        else:
+            fallback_summary = next((str(row.get("best_for") or "") for row in safe_variants if row.get("best_for")), "")
+            if fallback_summary:
+                model_row["summary"] = fallback_summary
+        model_row["default_install_command"] = next(
+            (
+                str(row.get("install_command") or "")
+                for row in variants
+                if row.get("install_command")
+                and str(row.get("engine") or "") == "vllm"
+                and "WITH_DFLASH_DRAFT=1" not in str(row.get("install_command") or "")
+            ),
+            "",
+        )
+        if not model_row["default_install_command"]:
+            model_row["default_install_command"] = next(
+                (
+                    str(row.get("install_command") or "")
+                    for row in variants
+                    if row.get("install_command") and "WITH_DFLASH_DRAFT=1" not in str(row.get("install_command") or "")
+                ),
+                "",
+            )
+        if not model_row["default_install_command"]:
+            model_row["default_install_command"] = next((str(row.get("install_command") or "") for row in variants if row.get("install_command")), "")
+        model_row["setup_supported"] = bool(model_row["default_install_command"])
+        if any_ready:
+            model_row["installed_state"] = "ready" if not any_downloadable else "partial"
+        elif any_partial or any_downloadable:
+            model_row["installed_state"] = "partial" if any_partial else "missing"
+        elif any_known:
+            model_row["installed_state"] = "missing"
+        else:
+            model_row["installed_state"] = "unsupported"
+        model_row["engine_groups"].sort()
+        inventory["models"].append(model_row)
+    inventory["models"].sort(key=lambda row: row.get("display_name") or row.get("model_id") or "")
+    inventory["variants"].sort(key=lambda row: (row.get("model_id") or "", row.get("category") or "", _mode_selector_for_variant(row)))
+    write_json_file(RUNTIME_INVENTORY_FILE, inventory)
+    _rebuild_runtime_mode_tables(inventory)
+    with runtime_inventory_lock:
+        runtime_inventory_cache = dict(inventory)
+        runtime_inventory_built_at = time.time()
+    return inventory
+
+
+def load_runtime_inventory(force=False, rebuild_if_missing=True):
+    global runtime_inventory_cache, runtime_inventory_built_at
+    now = time.time()
+    with runtime_inventory_lock:
+        cached = dict(runtime_inventory_cache) if runtime_inventory_cache else {}
+        cached_at = float(runtime_inventory_built_at or 0.0)
+    if cached and not force and cached_at and (now - cached_at) < 10.0:
+        return cached
+    if not force:
+        data = read_json_file(RUNTIME_INVENTORY_FILE, {})
+        if isinstance(data, dict) and data.get("variants"):
+            _rebuild_runtime_mode_tables(data)
+            with runtime_inventory_lock:
+                runtime_inventory_cache = dict(data)
+                runtime_inventory_built_at = time.time()
+            return data
+    if rebuild_if_missing:
+        return rebuild_runtime_inventory()
+    return {}
+
+
+def canonical_mode_selector(mode):
+    spec = VARIANT_SPECS.get(str(mode or "").strip()) or VARIANT_BY_TAG.get(str(mode or "").strip())
+    return str((spec or {}).get("selector") or mode or "").strip()
+
+
+def resolve_variant_spec(mode):
+    selector = str(mode or "").strip()
+    if not selector:
+        return None
+    if not VARIANT_SPECS:
+        load_runtime_inventory()
+    return VARIANT_SPECS.get(selector) or VARIANT_BY_TAG.get(selector) or VARIANT_BY_ID.get(selector) or VARIANT_BY_COMPOSE.get(selector.replace("\\", "/"))
+
+
+def default_single_mode_selector():
+    load_runtime_inventory()
+    if DEFAULT_MODE in SINGLE_GPU_MODES:
+        return canonical_mode_selector(DEFAULT_MODE)
+    variant = _choose_fallback_variant("single", preferred_model_id="qwen3.6-27b", category="single")
+    if variant:
+        return _mode_selector_for_variant(variant)
+    return SINGLE_GPU_MODES[0] if SINGLE_GPU_MODES else canonical_mode_selector(DEFAULT_MODE or "vllm/default")
+
+
+def default_dual_mode_selector():
+    load_runtime_inventory()
+    if DEFAULT_MODE in DUAL_GPU_MODES:
+        return canonical_mode_selector(DEFAULT_MODE)
+    variant = _choose_fallback_variant("dual", preferred_model_id="qwen3.6-27b", category="dual")
+    if variant:
+        return _mode_selector_for_variant(variant)
+    return DUAL_GPU_MODES[0] if DUAL_GPU_MODES else canonical_mode_selector(DEFAULT_MODE or "vllm/dual")
 
 
 def default_server_config():
@@ -1086,7 +3505,31 @@ def default_server_config():
         "local_api_enabled": False,
         "local_api_port": LOCAL_API_PORT,
         "gpu_pairing_enabled": True,
+        "selected_preset_model": "",
+        "mcp_servers": [],
     }
+
+
+def sanitize_mcp_servers(rows):
+    normalized = []
+    seen = set()
+    for raw in rows if isinstance(rows, list) else []:
+        if not isinstance(raw, dict):
+            continue
+        server_id = str(raw.get("id") or "").strip() or secrets.token_hex(6)
+        if server_id in seen:
+            continue
+        seen.add(server_id)
+        command = str(raw.get("command") or "").strip()
+        if not command:
+            continue
+        normalized.append({
+            "id": server_id,
+            "name": str(raw.get("name") or server_id).strip() or server_id,
+            "command": command,
+            "enabled": bool(raw.get("enabled", True)),
+        })
+    return normalized
 
 
 def read_server_config():
@@ -1113,11 +3556,14 @@ def read_server_config():
     merged["https_cert_file"] = str(merged.get("https_cert_file") or HTTPS_CERT_FILE)
     merged["https_key_file"] = str(merged.get("https_key_file") or HTTPS_KEY_FILE)
     merged["admin_path"] = "/admin"
+    merged["selected_preset_model"] = str(data.get("selected_preset_model") or "").strip()
+    merged["mcp_servers"] = sanitize_mcp_servers(data.get("mcp_servers") or [])
     return merged
 
 
 def write_server_config(data):
     current = read_server_config()
+    original = dict(current)
     for key in ("allow_proxy_without_api_key", "online_enabled", "upnp_enabled", "https_enabled", "local_api_enabled", "gpu_pairing_enabled"):
         if key in data:
             current[key] = bool(data[key])
@@ -1129,9 +3575,257 @@ def write_server_config(data):
     for key in ("https_cert_file", "https_key_file"):
         if key in data and data[key]:
             current[key] = str(data[key])
+    if "selected_preset_model" in data:
+        current["selected_preset_model"] = str(data.get("selected_preset_model") or "").strip()
+    if "mcp_servers" in data:
+        current["mcp_servers"] = sanitize_mcp_servers(data.get("mcp_servers") or [])
     current["admin_path"] = "/admin"
-    write_json_file(SERVER_CONFIG_FILE, current)
+    if current != original:
+        write_json_file(SERVER_CONFIG_FILE, current)
     return current
+
+
+MCP_CLIENTS = {}
+MCP_CLIENTS_LOCK = threading.Lock()
+
+
+class McpStdioClient:
+    def __init__(self, server_row):
+        self.server = dict(server_row or {})
+        self.proc = None
+        self.lock = threading.Lock()
+        self.request_id = 0
+
+    def _ensure_started(self):
+        if self.proc and self.proc.poll() is None:
+            return
+        command = str(self.server.get("command") or "").strip()
+        if not command:
+            raise RuntimeError("MCP server command is empty")
+        self.proc = subprocess.Popen(
+            shlex.split(command),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            cwd=CLUB3090_DIR,
+            bufsize=0,
+        )
+        self.request_id += 1
+        init_id = self.request_id
+        self._write_message({"jsonrpc": "2.0", "id": init_id, "method": "initialize", "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "club3090-control", "version": SCRIPT_VERSION},
+        }})
+        while True:
+            payload = self._read_message(timeout=20)
+            if payload.get("id") != init_id:
+                continue
+            if payload.get("error"):
+                raise RuntimeError(str(payload.get("error")))
+            break
+        self._write_message({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
+
+    def _write_message(self, payload):
+        raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        header = f"Content-Length: {len(raw)}\r\n\r\n".encode("utf-8")
+        self.proc.stdin.write(header + raw)
+        self.proc.stdin.flush()
+
+    def _read_message(self, timeout=20):
+        stdout = self.proc.stdout
+        if stdout is None:
+            raise RuntimeError("MCP stdout is unavailable")
+        fd = stdout.fileno()
+        deadline = time.time() + max(1.0, float(timeout or 20))
+        header = b""
+        while b"\r\n\r\n" not in header:
+            remaining = max(0.1, deadline - time.time())
+            ready, _, _ = select.select([fd], [], [], remaining)
+            if not ready:
+                raise RuntimeError("Timed out waiting for MCP response headers")
+            chunk = os.read(fd, 1)
+            if not chunk:
+                raise RuntimeError("MCP server closed the connection")
+            header += chunk
+        header_text = header.decode("utf-8", errors="ignore")
+        match = re.search(r"Content-Length:\s*(\d+)", header_text, re.I)
+        if not match:
+            raise RuntimeError("MCP response did not include Content-Length")
+        length = int(match.group(1))
+        body = b""
+        while len(body) < length:
+            remaining = max(0.1, deadline - time.time())
+            ready, _, _ = select.select([fd], [], [], remaining)
+            if not ready:
+                raise RuntimeError("Timed out waiting for MCP response body")
+            chunk = os.read(fd, length - len(body))
+            if not chunk:
+                raise RuntimeError("MCP server closed during response body")
+            body += chunk
+        return json.loads(body.decode("utf-8", errors="ignore") or "{}")
+
+    def _notify(self, method, params):
+        with self.lock:
+            self._ensure_started()
+            self._write_message({"jsonrpc": "2.0", "method": method, "params": params or {}})
+
+    def _request(self, method, params, timeout=20):
+        with self.lock:
+            self._ensure_started()
+            self.request_id += 1
+            req_id = self.request_id
+            self._write_message({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params or {}})
+            while True:
+                payload = self._read_message(timeout=timeout)
+                if payload.get("id") != req_id:
+                    continue
+                if payload.get("error"):
+                    raise RuntimeError(str(payload.get("error")))
+                return payload.get("result") or {}
+
+    def tools(self):
+        result = self._request("tools/list", {}, timeout=20)
+        return list(result.get("tools") or [])
+
+    def call_tool(self, name, arguments):
+        result = self._request("tools/call", {"name": name, "arguments": arguments or {}}, timeout=60)
+        return result
+
+    def close(self):
+        proc = self.proc
+        self.proc = None
+        if not proc:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+def get_mcp_client(server_row):
+    server_id = str(server_row.get("id") or "").strip()
+    if not server_id:
+        raise RuntimeError("Invalid MCP server definition")
+    with MCP_CLIENTS_LOCK:
+        client = MCP_CLIENTS.get(server_id)
+        if client and client.server.get("command") == server_row.get("command"):
+            return client
+        if client:
+            client.close()
+        client = McpStdioClient(server_row)
+        MCP_CLIENTS[server_id] = client
+        return client
+
+
+def close_removed_mcp_clients(server_rows):
+    active_ids = {str(row.get("id") or "").strip() for row in server_rows if isinstance(row, dict)}
+    with MCP_CLIENTS_LOCK:
+        for server_id, client in list(MCP_CLIENTS.items()):
+            if server_id not in active_ids:
+                try:
+                    client.close()
+                finally:
+                    MCP_CLIENTS.pop(server_id, None)
+
+
+def mcp_server_status(server_row):
+    row = dict(server_row or {})
+    if not row.get("enabled"):
+        return {**row, "status": "disabled", "tools": [], "error": ""}
+    try:
+        client = get_mcp_client(row)
+        tools = client.tools()
+        return {
+            **row,
+            "status": "connected",
+            "tools": [
+                {
+                    "name": str(tool.get("name") or ""),
+                    "description": str(tool.get("description") or ""),
+                }
+                for tool in tools
+                if isinstance(tool, dict)
+            ],
+            "error": "",
+        }
+    except Exception as e:
+        return {**row, "status": "error", "tools": [], "error": str(e)}
+
+def validate_mcp_server_row(server_row):
+    row = dict(server_row or {})
+    if not str(row.get("command") or "").strip():
+        raise ValueError("MCP server command is required")
+    client = get_mcp_client(row)
+    tools = client.tools()
+    return {
+        **row,
+        "status": "connected",
+        "tools": [
+            {
+                "name": str(tool.get("name") or ""),
+                "description": str(tool.get("description") or ""),
+            }
+            for tool in tools
+            if isinstance(tool, dict)
+        ],
+        "error": "",
+    }
+
+
+def list_mcp_server_statuses():
+    rows = sanitize_mcp_servers(read_server_config().get("mcp_servers") or [])
+    close_removed_mcp_clients(rows)
+    return [mcp_server_status(row) for row in rows]
+
+
+def build_enabled_mcp_tools():
+    tools = []
+    tool_map = {}
+    for server in list_mcp_server_statuses():
+        if server.get("status") != "connected":
+            continue
+        client = get_mcp_client(server)
+        for tool in client.tools():
+            if not isinstance(tool, dict):
+                continue
+            base_name = str(tool.get("name") or "").strip()
+            if not base_name:
+                continue
+            qualified = f"{server['id']}__{base_name}"
+            tool_map[qualified] = {"server": server, "name": base_name}
+            tools.append({
+                "type": "function",
+                "function": {
+                    "name": qualified,
+                    "description": str(tool.get("description") or f"{server['name']} :: {base_name}"),
+                    "parameters": tool.get("inputSchema") or {"type": "object", "properties": {}},
+                },
+            })
+    return tools, tool_map
+
+
+def call_enabled_mcp_tool(tool_name, arguments, tool_map):
+    mapping = dict(tool_map.get(str(tool_name) or "") or {})
+    if not mapping:
+        raise RuntimeError(f"Unknown MCP tool: {tool_name}")
+    client = get_mcp_client(mapping["server"])
+    result = client.call_tool(mapping["name"], arguments or {})
+    parts = []
+    for item in list(result.get("content") or []):
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "text":
+            parts.append(str(item.get("text") or ""))
+        elif "text" in item:
+            parts.append(str(item.get("text") or ""))
+    if not parts and result.get("structuredContent") is not None:
+        parts.append(json.dumps(result.get("structuredContent"), indent=2, ensure_ascii=False))
+    return "\n".join([part for part in parts if part]).strip() or json.dumps(result, indent=2, ensure_ascii=False)
 
 
 def ensure_local_api_token():
@@ -1948,7 +4642,8 @@ def sanitize_custom_preset(raw):
     if ctk:
         payload["chat_template_kwargs"] = ctk
     desc = str(raw.get("description") or "").strip()
-    return {"params": payload, "description": desc}
+    system_prompt = str(raw.get("system_prompt") or "").strip()
+    return {"params": payload, "description": desc, "system_prompt": system_prompt}
 
 def read_custom_presets():
     try:
@@ -1965,22 +4660,20 @@ def read_custom_presets():
             if isinstance(preset, dict) and "params" in preset:
                 params = preset.get("params") if isinstance(preset.get("params"), dict) else {}
                 desc = str(preset.get("description") or "")
+                system_prompt = str(preset.get("system_prompt") or "")
             elif isinstance(preset, dict):
                 params = preset
                 desc = ""
+                system_prompt = ""
             else:
                 continue
-            clean[clean_name] = {"params": params, "description": desc}
+            clean[clean_name] = {"params": params, "description": desc, "system_prompt": system_prompt}
         return clean
     except Exception:
         return {}
 
 def write_custom_presets(data):
-    os.makedirs(CONTROL_DIR, exist_ok=True)
-    tmp = CUSTOM_PRESETS_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, sort_keys=True)
-    os.replace(tmp, CUSTOM_PRESETS_FILE)
+    write_json_atomic_if_changed(CUSTOM_PRESETS_FILE, data, indent=2, sort_keys=True)
     return data
 
 def get_all_presets():
@@ -1991,13 +4684,22 @@ def get_all_presets():
             all_presets[name] = params
     return all_presets
 
+def preset_system_prompt(name):
+    key = str(name or "").strip()
+    if not key:
+        return ""
+    if key in PRESETS:
+        return ""
+    item = read_custom_presets().get(key) or {}
+    return str(item.get("system_prompt") or "")
+
 def preset_catalog():
     defaults = []
     for name in PRESETS:
-        defaults.append({"name": name, "endpoint": f"/v1/{name}", "endpoint_alt": f"/{name}", "locked": True, "params": PRESETS[name], "description": DEFAULT_PRESET_DESCRIPTIONS.get(name, "Default preset")})
+        defaults.append({"name": name, "endpoint": f"/v1/{name}", "endpoint_alt": f"/{name}", "locked": True, "params": PRESETS[name], "description": DEFAULT_PRESET_DESCRIPTIONS.get(name, "Default preset"), "system_prompt": ""})
     customs = []
     for name, item in sorted(read_custom_presets().items()):
-        customs.append({"name": name, "endpoint": f"/v1/{name}", "endpoint_alt": f"/{name}", "locked": False, "params": item.get("params", {}), "description": item.get("description", "")})
+        customs.append({"name": name, "endpoint": f"/v1/{name}", "endpoint_alt": f"/{name}", "locked": False, "params": item.get("params", {}), "description": item.get("description", ""), "system_prompt": item.get("system_prompt", "")})
     return {"defaults": defaults, "custom": customs, "length_prefixes": LENGTH_PREFIXES}
 
 def save_custom_preset(name, preset_data):
@@ -2066,15 +4768,18 @@ def gpu_pairing_enabled(cfg=None, gpu_count=None):
     return gpu_pairing_default_enabled(count)
 
 def default_instances_config():
+    load_runtime_inventory()
     count = detect_gpu_count_runtime()
     rows = []
+    single_mode = default_single_mode_selector()
+    dual_mode = default_dual_mode_selector()
     for gpu_idx in range(count):
         rows.append({
             "id": f"GPU{gpu_idx}",
             "kind": "single",
             "gpu_indices": [gpu_idx],
-            "mode": "vllm/default",
-            "enabled": gpu_idx == 0 and DEFAULT_MODE in SINGLE_GPU_MODES,
+            "mode": single_mode,
+            "enabled": gpu_idx == 0 and single_mode in SINGLE_GPU_MODES,
             "port": INSTANCE_PORT_BASE + gpu_idx,
         })
     if count == 2 and gpu_pairing_enabled(gpu_count=count):
@@ -2082,8 +4787,8 @@ def default_instances_config():
             "id": "PAIR0_1",
             "kind": "dual",
             "gpu_indices": [0, 1],
-            "mode": DEFAULT_MODE if DEFAULT_MODE in DUAL_GPU_MODES else "vllm/dual",
-            "enabled": DEFAULT_MODE in DUAL_GPU_MODES,
+            "mode": dual_mode,
+            "enabled": dual_mode in DUAL_GPU_MODES,
             "port": PAIR_INSTANCE_PORT_BASE,
         })
     return rows
@@ -2127,9 +4832,11 @@ def instance_default_port(kind, gpu_indices):
     idx = int((gpu_indices or [0])[0])
     return INSTANCE_PORT_BASE + idx
 
-def normalize_instance(raw, used_ids=None, used_ports=None):
+def normalize_instance(raw, used_ids=None, used_ports=None, substitutions=None):
+    load_runtime_inventory()
     used_ids = used_ids if isinstance(used_ids, set) else set()
     used_ports = used_ports if isinstance(used_ports, set) else set()
+    substitutions = substitutions if isinstance(substitutions, list) else None
     if not isinstance(raw, dict):
         return None
     parsed = parse_instance_identifier(raw.get("id"))
@@ -2148,10 +4855,23 @@ def normalize_instance(raw, used_ids=None, used_ports=None):
     kind = parsed["kind"]
     gpu_indices = list(parsed["gpu_indices"])
     gpu_index = int(gpu_indices[0])
-    mode = str(raw.get("mode") or ("vllm/dual" if kind == "dual" else "vllm/default")).strip()
+    raw_mode = str(raw.get("mode") or (default_dual_mode_selector() if kind == "dual" else default_single_mode_selector())).strip()
+    mode = canonical_mode_selector(raw_mode)
     valid_modes = DUAL_GPU_MODES if kind == "dual" else SINGLE_GPU_MODES
-    if mode not in valid_modes or mode not in VARIANT_SPECS:
-        mode = "vllm/dual" if kind == "dual" else "vllm/default"
+    if mode not in valid_modes or not resolve_variant_spec(mode):
+        preferred_model = ""
+        preferred_spec = resolve_variant_spec(raw_mode)
+        if preferred_spec:
+            preferred_model = str(preferred_spec.get("model_id") or "")
+        fallback_variant = _choose_fallback_variant(kind, preferred_model_id=preferred_model, category=("dual" if kind == "dual" else "single"))
+        fallback_mode = _mode_selector_for_variant(fallback_variant) if fallback_variant else (default_dual_mode_selector() if kind == "dual" else default_single_mode_selector())
+        if substitutions is not None and raw_mode and raw_mode != fallback_mode:
+            substitutions.append({
+                "instance_id": instance_id,
+                "from_mode": raw_mode,
+                "to_mode": fallback_mode,
+            })
+        mode = fallback_mode
     try:
         port = int(raw.get("port"))
     except Exception:
@@ -2176,14 +4896,14 @@ def normalize_instance(raw, used_ids=None, used_ports=None):
         "port": port,
     }
 
-def normalize_instances(rows):
+def normalize_instances(rows, substitutions=None):
     if not isinstance(rows, list):
         rows = []
     used_ids = set()
     used_ports = set()
     clean = []
     for row in rows:
-        inst = normalize_instance(row, used_ids, used_ports)
+        inst = normalize_instance(row, used_ids, used_ports, substitutions=substitutions)
         if inst is not None:
             clean.append(inst)
     count = detect_gpu_count_runtime()
@@ -2192,12 +4912,13 @@ def normalize_instances(rows):
         iid = f"GPU{gpu_idx}"
         if iid in existing_ids:
             continue
-        inst = normalize_instance({"id": iid, "kind": "single", "gpu_indices": [gpu_idx], "mode": "vllm/default", "enabled": False, "port": INSTANCE_PORT_BASE + gpu_idx}, used_ids, used_ports)
+        inst = normalize_instance({"id": iid, "kind": "single", "gpu_indices": [gpu_idx], "mode": default_single_mode_selector(), "enabled": False, "port": INSTANCE_PORT_BASE + gpu_idx}, used_ids, used_ports, substitutions=substitutions)
         if inst is not None:
             clean.append(inst)
             existing_ids.add(inst["id"])
     if count == 2 and gpu_pairing_enabled(gpu_count=count) and "PAIR0_1" not in existing_ids:
-        inst = normalize_instance({"id": "PAIR0_1", "kind": "dual", "gpu_indices": [0, 1], "mode": DEFAULT_MODE if DEFAULT_MODE in DUAL_GPU_MODES else "vllm/dual", "enabled": DEFAULT_MODE in DUAL_GPU_MODES, "port": PAIR_INSTANCE_PORT_BASE}, used_ids, used_ports)
+        default_dual_mode = default_dual_mode_selector()
+        inst = normalize_instance({"id": "PAIR0_1", "kind": "dual", "gpu_indices": [0, 1], "mode": default_dual_mode, "enabled": default_dual_mode in DUAL_GPU_MODES, "port": PAIR_INSTANCE_PORT_BASE}, used_ids, used_ports, substitutions=substitutions)
         if inst is not None:
             clean.append(inst)
     if not clean:
@@ -2206,29 +4927,34 @@ def normalize_instances(rows):
     return clean
 
 def read_instances_config():
+    load_runtime_inventory()
+    substitutions = []
     try:
         with open(INSTANCES_CONFIG_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        rows = normalize_instances(data)
+        rows = normalize_instances(data, substitutions=substitutions)
     except Exception:
-        rows = normalize_instances([])
+        rows = normalize_instances([], substitutions=substitutions)
     count = detect_gpu_count_runtime()
-    changed = False
+    changed = bool(substitutions)
     if count == 2 and not gpu_pairing_enabled(gpu_count=count):
         filtered = [row for row in rows if row.get("kind") != "dual"]
         changed = len(filtered) != len(rows)
         rows = filtered
     if changed or not os.path.exists(INSTANCES_CONFIG_FILE):
         write_instances_config(rows)
+    for item in substitutions:
+        log_audit(
+            "instance_mode_substituted",
+            instance=item.get("instance_id"),
+            from_mode=item.get("from_mode"),
+            to_mode=item.get("to_mode"),
+        )
     return rows
 
 def write_instances_config(rows):
     rows = normalize_instances(rows)
-    os.makedirs(CONTROL_DIR, exist_ok=True)
-    tmp = INSTANCES_CONFIG_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(rows, f, indent=2)
-    os.replace(tmp, INSTANCES_CONFIG_FILE)
+    write_json_atomic_if_changed(INSTANCES_CONFIG_FILE, rows, indent=2)
     return rows
 
 def instance_container_name(instance):
@@ -2256,7 +4982,7 @@ def instance_ready_url(instance):
     return f"http://127.0.0.1:{int(instance['port'])}/v1/models"
 
 def instance_variant_spec(instance):
-    spec = VARIANT_SPECS.get(instance["mode"])
+    spec = resolve_variant_spec(instance["mode"])
     if not spec:
         raise ValueError(f"Unsupported instance mode: {instance['mode']}")
     return spec
@@ -2268,12 +4994,20 @@ def write_instance_artifacts(instance):
     os.makedirs(os.path.join(paths["dir"], "cache"), exist_ok=True)
     visible_devices = ",".join(str(int(idx)) for idx in (instance.get("gpu_indices") or [instance["gpu_index"]]))
     cache_root = os.path.join(paths["dir"], "cache")
+    repo_env = _load_repo_env_map()
     with open(paths["env"], "w", encoding="utf-8") as f:
+        for key in sorted(repo_env):
+            if key in {"PORT", "CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES", "MODEL_DIR"}:
+                continue
+            value = str(repo_env.get(key) or "").replace("\r", " ").replace("\n", " ")
+            f.write(f"{key}={value}\n")
+        f.write(f"MODEL_DIR={_resolve_variant_model_dir_root(spec)}\n")
         f.write(f"PORT={int(instance['port'])}\n")
         f.write(f"CUDA_VISIBLE_DEVICES={visible_devices}\n")
+        f.write(f"NVIDIA_VISIBLE_DEVICES={visible_devices}\n")
     override = (
         "services:\n"
-        f"  {spec['service']}:\n"
+        f"  {spec['service_name']}:\n"
         f"    container_name: {instance_container_name(instance)}\n"
         "    environment:\n"
         f"      CUDA_VISIBLE_DEVICES: \"{visible_devices}\"\n"
@@ -2286,7 +5020,10 @@ def write_instance_artifacts(instance):
         "    labels:\n"
         f"      club3090.instance_id: \"{instance['id']}\"\n"
         f"      club3090.kind: \"{instance['kind']}\"\n"
-        f"      club3090.mode: \"{instance['mode']}\"\n"
+        f"      club3090.mode: \"{canonical_mode_selector(instance['mode'])}\"\n"
+        f"      club3090.mode_selector: \"{canonical_mode_selector(instance['mode'])}\"\n"
+        f"      club3090.variant_id: \"{spec['variant_id']}\"\n"
+        f"      club3090.model_id: \"{spec['model_id']}\"\n"
         f"      club3090.gpu_indices: \"{','.join(str(int(idx)) for idx in instance.get('gpu_indices') or [instance['gpu_index']])}\"\n"
     )
     with open(paths["override"], "w", encoding="utf-8") as f:
@@ -2296,35 +5033,151 @@ def write_instance_artifacts(instance):
 def instance_compose_args(instance):
     spec = instance_variant_spec(instance)
     paths = write_instance_artifacts(instance)
-    compose_file = os.path.join(CLUB3090_DIR, spec["compose_dir"], spec["compose_file"])
+    compose_file = str(spec.get("compose_abs_path") or "").strip()
+    compose_project_dir = str(spec.get("compose_project_dir_abs_path") or "").strip() or os.path.dirname(compose_file)
     if not os.path.exists(compose_file):
         raise RuntimeError(f"Compose file missing for {instance['mode']}: {compose_file}")
-    return compose_cmd() + ["-p", instance_project_name(instance), "--env-file", paths["env"], "-f", compose_file, "-f", paths["override"]]
+    return compose_cmd() + ["--project-directory", compose_project_dir, "-p", instance_project_name(instance), "--env-file", paths["env"], "-f", compose_file, "-f", paths["override"]]
 
-def start_instance(instance_id, wait=True):
+
+def instance_compose_project_dir(instance):
+    spec = instance_variant_spec(instance)
+    compose_file = str(spec.get("compose_abs_path") or "").strip()
+    return str(spec.get("compose_project_dir_abs_path") or "").strip() or os.path.dirname(compose_file) or CLUB3090_DIR
+
+
+def instance_subprocess_env(instance):
+    spec = instance_variant_spec(instance)
+    env = _repo_subprocess_env()
+    visible_devices = ",".join(str(int(idx)) for idx in (instance.get("gpu_indices") or [instance["gpu_index"]]))
+    env["MODEL_DIR"] = _resolve_variant_model_dir_root(spec)
+    env["PORT"] = str(int(instance["port"]))
+    env["CUDA_VISIBLE_DEVICES"] = visible_devices
+    env["NVIDIA_VISIBLE_DEVICES"] = visible_devices
+    env["COMPOSE_BIN"] = COMPOSE_BIN
+    return env
+
+def start_instance(instance_id, track_switch_job=True):
     instance = get_instance(instance_id)
     if not instance:
         raise ValueError(f"Unknown instance: {instance_id}")
-    cmd = instance_compose_args(instance) + ["up", "-d"]
-    rc, out = run_cmd(cmd, timeout=1800)
-    log_control(f"INSTANCE start {instance['id']} mode={instance['mode']} rc={rc}: {out[-4000:]}")
-    if rc != 0:
-        raise RuntimeError(out or f"docker compose up failed for {instance['id']}")
-    if wait and not wait_for_port(int(instance["port"]), timeout=900):
-        raise RuntimeError(f"Timed out waiting for {instance['id']} on port {instance['port']}")
-    return {"instance": instance, "output": out[-4000:]}
+    try:
+        spec = instance_variant_spec(instance)
+        ensure_variant_install_ready(spec)
+        if track_switch_job:
+            _set_switch_job(
+                active=True,
+                status="booting",
+                mode=str(instance.get("mode") or ""),
+                target=str(instance.get("id") or ""),
+                started_at=int(time.time()),
+                finished_at=0,
+                error="",
+            )
+        cmd = instance_compose_args(instance) + ["up", "-d"]
+        rc, out = run_cmd(cmd, timeout=1800, cwd=instance_compose_project_dir(instance), env=instance_subprocess_env(instance))
+        log_control(f"INSTANCE start {instance['id']} mode={instance['mode']} rc={rc}: {out[-4000:]}")
+        if rc != 0:
+            raise RuntimeError(out or f"docker compose up failed for {instance['id']}")
+        wait_for_runtime_ready(
+            instance_container_name(instance),
+            instance_ready_url(instance),
+            timeout=900,
+        )
+        clear_switch_failure(instance["mode"])
+        if track_switch_job:
+            _set_switch_job(
+                active=False,
+                status="success",
+                mode=str(instance.get("mode") or ""),
+                target=str(instance.get("id") or ""),
+                finished_at=int(time.time()),
+                error="",
+            )
+        return {"instance": instance, "output": out[-4000:]}
+    except Exception as e:
+        write_switch_failure(instance["mode"], e)
+        if track_switch_job:
+            _set_switch_job(
+                active=False,
+                status="failed",
+                mode=str(instance.get("mode") or ""),
+                target=str(instance.get("id") or ""),
+                finished_at=int(time.time()),
+                error=str(e)[-12000:],
+            )
+        raise
 
 def stop_instance(instance_id):
     instance = get_instance(instance_id)
     if not instance:
         raise ValueError(f"Unknown instance: {instance_id}")
     cmd = instance_compose_args(instance) + ["down"]
-    rc, out = run_cmd(cmd, timeout=600)
+    rc, out = run_cmd(cmd, timeout=600, cwd=instance_compose_project_dir(instance), env=instance_subprocess_env(instance))
     if rc != 0:
         rc2, out2 = run_cmd(["docker", "rm", "-f", instance_container_name(instance)], timeout=120)
         out = (out or "") + f"\nmanual rm rc={rc2} {out2}"
     log_control(f"INSTANCE stop {instance['id']} rc={rc}: {out[-4000:]}")
     return rc, out[-4000:]
+
+
+def _configured_scope_targets_for_mode(instance_id="", mode=""):
+    selector = canonical_mode_selector(mode) if mode else ""
+    target_id = str(instance_id or "").strip().upper()
+    if not selector or target_id != "GLOBAL":
+        return []
+    spec = resolve_variant_spec(selector) or {}
+    scope_kind = str(spec.get("scope_kind") or "")
+    rows = read_instances_config()
+    if scope_kind == "single":
+        return [dict(row) for row in rows if row.get("kind") == "single" and canonical_mode_selector(row.get("mode")) == selector]
+    if scope_kind == "dual":
+        gpu_count = detect_gpu_count_runtime()
+        if gpu_count == 2 and not gpu_pairing_enabled(gpu_count=gpu_count):
+            return [{"id": "GLOBAL", "kind": "dual", "mode": selector}]
+        return [dict(row) for row in rows if row.get("kind") == "dual" and canonical_mode_selector(row.get("mode")) == selector]
+    if scope_kind in {"multi", "global_only"}:
+        return [{"id": "GLOBAL", "kind": "global", "mode": selector}]
+    return []
+
+
+def stop_runtime_scope(instance_id=None, mode=None):
+    selector = canonical_mode_selector(mode) if mode else ""
+    target_id = str(instance_id or "").strip().upper()
+    if is_legacy_global_instance_id(target_id):
+        return stop_legacy_global_instance()
+    if target_id and target_id != "GLOBAL":
+        return stop_instance(target_id)
+    matching = []
+    if selector:
+        matching = [
+            dict(row)
+            for row in running_runtime_rows(instances_snapshot(), legacy_global_instance_snapshot())
+            if canonical_mode_selector(row.get("mode")) == selector
+        ]
+    elif target_id == "GLOBAL":
+        matching = [dict(row) for row in running_runtime_rows(instances_snapshot(), legacy_global_instance_snapshot())]
+    if not matching:
+        matching = _configured_scope_targets_for_mode(target_id, selector)
+    outputs = []
+    rc = 0
+    seen = set()
+    for row in matching:
+        row_id = str(row.get("id") or "").strip().upper()
+        if not row_id or row_id in seen:
+            continue
+        seen.add(row_id)
+        if is_legacy_global_instance_id(row_id):
+            item_rc, item_out = stop_legacy_global_instance()
+        elif row_id == "GLOBAL":
+            item_rc, item_out = stop_global_mode()
+        else:
+            item_rc, item_out = stop_instance(row_id)
+        rc = max(rc, int(item_rc or 0))
+        outputs.append(f"{row_id}: {str(item_out or '').strip()}")
+    if not outputs:
+        return 0, "No matching runtime containers were active."
+    return rc, "\n".join([line for line in outputs if line]).strip()[-12000:]
 
 def update_instance(instance_id, mode=None, enabled=None):
     rows = read_instances_config()
@@ -2333,6 +5186,7 @@ def update_instance(instance_id, mode=None, enabled=None):
         if row["id"] != str(instance_id or "").strip().upper():
             continue
         if mode is not None:
+            mode = canonical_mode_selector(mode)
             valid_modes = DUAL_GPU_MODES if row.get("kind") == "dual" else SINGLE_GPU_MODES
             if mode not in valid_modes:
                 raise ValueError("Selected preset type does not match this instance")
@@ -2360,16 +5214,18 @@ def save_pair_instance(gpu_indices, mode=None, enabled=None):
             existing = row
             break
     if existing is None:
+        selected_mode = canonical_mode_selector(mode) if mode else default_dual_mode_selector()
         rows.append({
             "id": pair_id,
             "kind": "dual",
             "gpu_indices": pair,
-            "mode": mode if mode in DUAL_GPU_MODES else "vllm/dual",
+            "mode": selected_mode if selected_mode in DUAL_GPU_MODES else default_dual_mode_selector(),
             "enabled": bool(enabled),
             "port": instance_default_port("dual", pair),
         })
     else:
         if mode is not None:
+            mode = canonical_mode_selector(mode)
             if mode not in DUAL_GPU_MODES:
                 raise ValueError("Dual GPU pairs must use a dual preset")
             existing["mode"] = mode
@@ -2393,17 +5249,27 @@ def delete_pair_instance(instance_id):
     write_instances_config(remaining)
     return instances_snapshot()
 
+def mode_default_port(mode, default=0):
+    spec = resolve_variant_spec(mode)
+    try:
+        port = int((spec or {}).get("default_port") or 0)
+    except Exception:
+        port = 0
+    return port or int(default or 0)
+
+
 def detect_legacy_dual_mode():
+    load_runtime_inventory()
     if detect_gpu_count_runtime() != 2:
         return None
     file_mode = None
     try:
-        file_mode = open(ACTIVE_MODE_FILE, "r", encoding="utf-8").read().strip()
+        file_mode = canonical_mode_selector(open(ACTIVE_MODE_FILE, "r", encoding="utf-8").read().strip())
     except Exception:
         file_mode = None
-    if file_mode in DUAL_GPU_MODES and port_open(MODES[file_mode], timeout=0.08):
+    if file_mode in DUAL_GPU_MODES and port_open(mode_default_port(file_mode, PAIR_INSTANCE_PORT_BASE), timeout=0.08):
         return file_mode
-    open_dual = [mode for mode in DUAL_GPU_MODES if port_open(MODES[mode], timeout=0.08)]
+    open_dual = [mode for mode in dict.fromkeys(DUAL_GPU_MODES) if port_open(mode_default_port(mode, PAIR_INSTANCE_PORT_BASE), timeout=0.08)]
     if len(open_dual) == 1:
         return open_dual[0]
     return None
@@ -2434,7 +5300,7 @@ def instance_runtime_mode(instance):
 def instance_runtime_port(instance):
     if instance_uses_legacy_dual_runtime(instance):
         mode = instance_runtime_mode(instance)
-        return int(MODES.get(mode, (instance or {}).get("port") or PAIR_INSTANCE_PORT_BASE))
+        return int(mode_default_port(mode, (instance or {}).get("port") or PAIR_INSTANCE_PORT_BASE))
     return int((instance or {}).get("port") or 0)
 
 def instance_running(instance):
@@ -2444,6 +5310,10 @@ def legacy_runtime_container_name():
     names = vllm_container_names(all_containers=False)
     if not names:
         return ""
+    active_spec = resolve_variant_spec(active_mode())
+    active_name = str((active_spec or {}).get("container_name") or "")
+    if active_name and active_name in names:
+        return active_name
     preferred = [name for name in names if "pair0_1" not in name.lower()]
     return preferred[0] if preferred else names[0]
 
@@ -2460,11 +5330,11 @@ def legacy_global_target_mode():
         read_active_mode_file(),
         read_last_good_mode_file(),
         DEFAULT_MODE,
-        "vllm/dual",
+        default_dual_mode_selector(),
     ):
         if candidate in DUAL_GPU_MODES:
-            return candidate
-    return "vllm/dual"
+            return canonical_mode_selector(candidate)
+    return default_dual_mode_selector()
 
 def legacy_global_disable_mode():
     for row in read_instances_config():
@@ -2473,7 +5343,7 @@ def legacy_global_disable_mode():
         mode = str(row.get("mode") or "")
         if row.get("enabled") and mode in SINGLE_GPU_MODES:
             return mode
-    return "vllm/default"
+    return default_single_mode_selector()
 
 def legacy_global_enabled():
     file_mode = read_active_mode_file()
@@ -2489,18 +5359,15 @@ def is_legacy_global_instance_id(instance_id):
         and str(instance_id or "").strip().upper() == "GLOBAL"
     )
 
-def start_legacy_global_instance(wait=True):
+def start_legacy_global_instance():
     mode = legacy_global_target_mode()
     output = run_switch(mode)
-    if wait and not wait_for_port(int(MODES.get(mode, PAIR_INSTANCE_PORT_BASE)), timeout=900):
-        raise RuntimeError(f"Timed out waiting for legacy global dual runtime on port {MODES.get(mode, PAIR_INSTANCE_PORT_BASE)}")
     return {"instance": legacy_global_instance_snapshot(), "output": output[-4000:]}
 
 def stop_legacy_global_instance():
-    p = subprocess.run(["bash", "scripts/switch.sh", "--down"], cwd=CLUB3090_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=300)
-    out = (p.stdout or "")[-4000:]
-    log_control(f"INSTANCE legacy global stop rc={p.returncode}: {out}")
-    return p.returncode, out
+    out = cleanup_vllm_containers()
+    log_control(f"INSTANCE legacy global stop rc=0: {out}")
+    return 0, str(out or "")[-4000:]
 
 def set_legacy_global_enabled(enabled):
     if bool(enabled):
@@ -2526,11 +5393,11 @@ def primary_instance():
 def boot_enabled_instances():
     outputs = []
     rows = visible_instances(read_instances_config())
+    file_mode = read_active_mode_file()
     if detect_gpu_count_runtime() == 2 and not gpu_pairing_enabled(gpu_count=2):
-        file_mode = read_active_mode_file()
         if file_mode in DUAL_GPU_MODES:
             try:
-                result = start_legacy_global_instance(wait=True)
+                result = start_legacy_global_instance()
                 outputs.append(f"legacy dual started from active mode {file_mode}: {(result.get('output') or '')[-800:]}")
                 log_control("BOOT instances: " + " || ".join(outputs))
                 return outputs
@@ -2540,10 +5407,18 @@ def boot_enabled_instances():
         if not inst.get("enabled"):
             continue
         try:
-            result = start_instance(inst["id"], wait=True)
+            result = start_instance(inst["id"])
             outputs.append(f"{inst['id']} started: {(result.get('output') or '')[-800:]}")
         except Exception as e:
             outputs.append(f"{inst['id']} failed: {e}")
+    if not outputs and file_mode:
+        spec = resolve_variant_spec(file_mode)
+        if spec and str(spec.get("scope_kind") or "") in {"multi", "global_only"}:
+            try:
+                result = run_switch(file_mode)
+                outputs.append(f"global runtime started from active mode {file_mode}: {result[-800:]}")
+            except Exception as e:
+                outputs.append(f"global runtime failed: {e}")
     log_control("BOOT instances: " + " || ".join(outputs))
     return outputs
 
@@ -2680,7 +5555,7 @@ def legacy_global_instance_snapshot():
     mode = legacy_global_target_mode()
     running_mode = detect_legacy_dual_mode()
     runtime_mode = running_mode if running_mode in DUAL_GPU_MODES else mode
-    runtime_port = int(MODES.get(runtime_mode, PAIR_INSTANCE_PORT_BASE))
+    runtime_port = int(mode_default_port(runtime_mode, PAIR_INSTANCE_PORT_BASE))
     running = bool(running_mode in DUAL_GPU_MODES and port_open(runtime_port, timeout=0.08))
     return {
         "id": "GLOBAL",
@@ -2702,32 +5577,43 @@ def legacy_global_instance_snapshot():
     }
 
 def ready_url_for_mode(mode):
-    return f"http://localhost:{MODES[mode]}/v1/models"
+    return f"http://localhost:{mode_default_port(mode, PROXY_PORT)}/v1/models"
 
 def write_active_mode(mode):
+    selector = canonical_mode_selector(mode)
     os.makedirs(os.path.dirname(ACTIVE_MODE_FILE), exist_ok=True)
     with open(ACTIVE_MODE_FILE, "w", encoding="utf-8") as f:
-        f.write(mode)
+        f.write(selector)
+
+
+def clear_active_mode():
+    try:
+        os.remove(ACTIVE_MODE_FILE)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
 
 def read_active_mode_file():
     try:
-        mode = open(ACTIVE_MODE_FILE, "r", encoding="utf-8").read().strip()
-        return mode if mode in MODES else None
+        mode = canonical_mode_selector(open(ACTIVE_MODE_FILE, "r", encoding="utf-8").read().strip())
+        return mode if resolve_variant_spec(mode) else None
     except Exception:
         return None
 
 def write_last_good_mode(mode):
-    if mode in MODES:
+    selector = canonical_mode_selector(mode)
+    if resolve_variant_spec(selector):
         try:
             with open(LAST_GOOD_MODE_FILE, "w", encoding="utf-8") as f:
-                f.write(mode)
+                f.write(selector)
         except Exception:
             pass
 
 def read_last_good_mode_file():
     try:
-        mode = open(LAST_GOOD_MODE_FILE, "r", encoding="utf-8").read().strip()
-        return mode if mode in MODES else None
+        mode = canonical_mode_selector(open(LAST_GOOD_MODE_FILE, "r", encoding="utf-8").read().strip())
+        return mode if resolve_variant_spec(mode) else None
     except Exception:
         return None
 
@@ -2740,27 +5626,36 @@ def port_open(port, timeout=0.25):
         return False
 
 def detected_mode():
+    load_runtime_inventory()
     primary = primary_instance()
     if primary:
         return primary["mode"]
     # Source of truth is the mode selected by this controller/switch.sh.
     # If the file is stale, use a TCP-only port scan as a fallback. Never call /health.
     file_mode = read_active_mode_file()
-    if file_mode in MODES:
-        if port_open(MODES[file_mode], timeout=0.08):
+    known_modes = list(dict.fromkeys(list(SINGLE_GPU_MODES) + list(DUAL_GPU_MODES)))
+    if file_mode and resolve_variant_spec(file_mode):
+        if port_open(mode_default_port(file_mode, PROXY_PORT), timeout=0.08):
             return file_mode
         # During startup/switching the port may not be listening yet; keep the
         # intended mode unless another known mode is definitely listening.
-        open_modes = [m for m, p in MODES.items() if port_open(p, timeout=0.08)]
+        open_modes = [m for m in known_modes if port_open(mode_default_port(m, PROXY_PORT), timeout=0.08)]
         if len(open_modes) == 1:
             write_active_mode(open_modes[0])
             return open_modes[0]
+        failed = read_switch_failure()
+        if str(failed.get("mode") or "") == file_mode:
+            fallback = read_last_good_mode_file()
+            if fallback and fallback != file_mode:
+                return fallback
         return file_mode
-    open_modes = [m for m, p in MODES.items() if port_open(p, timeout=0.08)]
+    open_modes = [m for m in known_modes if port_open(mode_default_port(m, PROXY_PORT), timeout=0.08)]
     if len(open_modes) == 1:
         write_active_mode(open_modes[0])
         return open_modes[0]
-    fallback = DEFAULT_MODE if DEFAULT_MODE in MODES else "vllm/default"
+    fallback = read_last_good_mode_file() or canonical_mode_selector(DEFAULT_MODE)
+    if fallback not in known_modes:
+        fallback = default_single_mode_selector()
     write_active_mode(fallback)
     return fallback
 
@@ -2771,7 +5666,7 @@ def active_port():
     primary = primary_instance()
     if primary:
         return int(primary["port"])
-    return MODES.get(active_mode(), 8020)
+    return mode_default_port(active_mode(), 8020)
 
 def password_ok(username, password):
     if not username or not password or not shutil.which("pamtester"):
@@ -2799,6 +5694,81 @@ def check_basic_auth(header):
     except Exception:
         return False
 
+
+def parse_cookie_header(header):
+    values = {}
+    for chunk in str(header or "").split(";"):
+        if "=" not in chunk:
+            continue
+        key, value = chunk.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        values[key] = value.strip()
+    return values
+
+
+def _prune_admin_sessions(now=None):
+    current = float(now or time.time())
+    with admin_session_lock:
+        expired = [token for token, info in admin_sessions.items() if float((info or {}).get("expires_at") or 0.0) <= current]
+        for token in expired:
+            admin_sessions.pop(token, None)
+
+
+def create_admin_session(client_ip=""):
+    now = time.time()
+    token = secrets.token_urlsafe(32)
+    with admin_session_lock:
+        admin_sessions[token] = {
+            "client": str(client_ip or ""),
+            "expires_at": now + max(300, int(ADMIN_SESSION_TTL_SECONDS or 86400)),
+        }
+    return token
+
+
+def build_admin_session_cookie(token):
+    ttl = max(300, int(ADMIN_SESSION_TTL_SECONDS or 86400))
+    return f"{ADMIN_SESSION_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={ttl}"
+
+
+def expired_admin_session_cookie():
+    return f"{ADMIN_SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"
+
+
+def admin_session_ok(headers, client_ip=""):
+    _prune_admin_sessions()
+    token = parse_cookie_header(headers.get("Cookie", "")).get(ADMIN_SESSION_COOKIE_NAME, "")
+    if not token:
+        return False
+    now = time.time()
+    with admin_session_lock:
+        info = dict(admin_sessions.get(token) or {})
+        if not info:
+            return False
+        if float(info.get("expires_at") or 0.0) <= now:
+            admin_sessions.pop(token, None)
+            return False
+        bound_client = str(info.get("client") or "")
+        if bound_client and client_ip and bound_client != client_ip:
+            return False
+        info["expires_at"] = now + max(300, int(ADMIN_SESSION_TTL_SECONDS or 86400))
+        admin_sessions[token] = info
+        return True
+
+
+def should_log_admin_auth_denial(client_ip, path):
+    now = time.time()
+    key = (str(client_ip or ""), str(path or ""))
+    with admin_auth_denial_lock:
+        last = float(admin_auth_denial_state.get(key) or 0.0)
+        admin_auth_denial_state[key] = now
+        stale_before = now - max(60.0, float(ADMIN_AUTH_DENIAL_LOG_WINDOW_SECONDS or 30) * 4.0)
+        for existing_key, existing_time in list(admin_auth_denial_state.items()):
+            if float(existing_time or 0.0) < stale_before:
+                admin_auth_denial_state.pop(existing_key, None)
+    return now - last >= max(1.0, float(ADMIN_AUTH_DENIAL_LOG_WINDOW_SECONDS or 30))
+
 def docker_names(all_containers=False, force=False, max_age=2.0, timeout=1.5):
     cache_key = "all" if all_containers else "running"
     now = time.time()
@@ -2822,13 +5792,16 @@ def docker_names(all_containers=False, force=False, max_age=2.0, timeout=1.5):
         return cached_value
 
 def is_runtime_container_name(name):
-    n = name.lower()
-    return (
-        ("vllm" in n and ("qwen" in n or "qwen36" in n or "club" in n))
-        or ("llama-cpp" in n and ("qwen" in n or "qwen36" in n or "club" in n))
-        or "qwen36" in n
-        or "qwen3" in n
-    )
+    load_runtime_inventory()
+    text = str(name or "").strip()
+    lowered = text.lower()
+    if not text:
+        return False
+    if lowered.startswith("club3090-"):
+        return True
+    if text in VARIANT_BY_CONTAINER or text in VARIANT_BY_SERVICE:
+        return True
+    return False
 
 def vllm_container_names(all_containers=False, force=False, max_age=2.0, timeout=1.5):
     return [n for n in docker_names(all_containers=all_containers, force=force, max_age=max_age, timeout=timeout) if is_runtime_container_name(n)]
@@ -2842,7 +5815,63 @@ def current_container():
         if legacy_name:
             return legacy_name
     names = vllm_container_names(all_containers=False)
+    active_spec = resolve_variant_spec(active_mode())
+    active_name = str((active_spec or {}).get("container_name") or "")
+    if active_name and active_name in names:
+        return active_name
     return names[0] if names else ""
+
+
+def sequential_global_gpu_pairs(gpu_count=None):
+    try:
+        count = int(gpu_count if gpu_count is not None else detect_gpu_count_runtime())
+    except Exception:
+        count = 0
+    pairs = []
+    for first in range(0, max(count - 1, 0), 2):
+        second = first + 1
+        if second < count:
+            pairs.append([first, second])
+    return pairs
+
+
+def running_runtime_rows(instances=None, legacy_instance=None):
+    rows = []
+    if legacy_instance and legacy_instance.get("running"):
+        rows.append(dict(legacy_instance))
+    for row in instances or []:
+        if row.get("running"):
+            rows.append(dict(row))
+    rows.sort(key=lambda item: ((item.get("gpu_indices") or [item.get("gpu_index", 9999)]), str(item.get("id") or "")))
+    return rows
+
+
+def runtime_mode_list(rows, fallback_mode=""):
+    values = []
+    seen = set()
+    for row in rows or []:
+        mode = str(row.get("mode") or "").strip()
+        if mode and mode not in seen:
+            seen.add(mode)
+            values.append(mode)
+    fallback_mode = str(fallback_mode or "").strip()
+    if not values and fallback_mode:
+        values.append(fallback_mode)
+    return values
+
+
+def runtime_container_list(rows, fallback_container=""):
+    values = []
+    seen = set()
+    for row in rows or []:
+        container = str(row.get("container") or "").strip()
+        if container and container not in seen:
+            seen.add(container)
+            values.append(container)
+    fallback_container = str(fallback_container or "").strip()
+    if not values and fallback_container:
+        values.append(fallback_container)
+    return values
 
 def parse_admin_query_params(parsed):
     if not parsed or not parsed.query:
@@ -3029,7 +6058,7 @@ class RuntimeLogWatcher:
                         p.terminate()
                     except Exception:
                         pass
-                self._set_status(f"log stream for {self.container_name} ended; retrying...")
+                self._set_status(f"log stream for {self.container_name} ended; reconnecting...")
             except Exception as e:
                 self._set_status(f"log watcher error for {self.container_name}: {e}")
             time.sleep(2)
@@ -3100,66 +6129,15 @@ def compose_variant_metadata(mode):
         cached = compose_metadata_cache.get(cache_key)
         if isinstance(cached, dict):
             return dict(cached)
-    meta = dict(default)
-    spec = VARIANT_SPECS.get(cache_key) or {}
-    compose_dir = str(spec.get("compose_dir") or "").strip()
-    compose_file = str(spec.get("compose_file") or "").strip()
-    if not compose_dir or not compose_file:
-        return meta
-    path = os.path.join(CLUB3090_DIR, compose_dir, compose_file)
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            lines = f.read().splitlines()
-    except Exception:
-        return meta
-    items = []
-    for raw_line in lines:
-        line = str(raw_line or "").strip()
-        if not line or line.startswith("#") or not line.startswith("-"):
-            continue
-        item = line[1:].strip()
-        if not item or item.startswith("#"):
-            continue
-        if len(item) >= 2 and item[0] == item[-1] and item[0] in {"'", '"'}:
-            item = item[1:-1]
-        items.append(item)
-    for idx, item in enumerate(items):
-        if meta["ctx_size_tokens"] is None:
-            candidate = None
-            if item == "--max-model-len" and idx + 1 < len(items):
-                candidate = items[idx + 1]
-            elif item.startswith("--max-model-len="):
-                candidate = item.split("=", 1)[1]
-            if candidate:
-                match = re.search(r"([0-9]{4,})", str(candidate))
-                if match:
-                    meta["ctx_size_tokens"] = int(match.group(1))
-        if meta["speculative_method"] is None:
-            candidate = None
-            if item == "--speculative-config" and idx + 1 < len(items):
-                candidate = items[idx + 1]
-            elif item.startswith("--speculative-config="):
-                candidate = item.split("=", 1)[1]
-            if candidate:
-                start = candidate.find("{")
-                end = candidate.rfind("}")
-                if start >= 0 and end > start:
-                    try:
-                        payload = json.loads(candidate[start:end + 1])
-                    except Exception:
-                        payload = None
-                    if isinstance(payload, dict):
-                        method = str(payload.get("method") or "").strip()
-                        if method:
-                            meta["speculative_method"] = method
-                        drafted = payload.get("num_speculative_tokens")
-                        if drafted not in ("", None, False):
-                            try:
-                                meta["drafted_tokens"] = int(drafted)
-                            except Exception:
-                                pass
-        if meta["ctx_size_tokens"] is not None and meta["speculative_method"] is not None:
-            break
+    spec = resolve_variant_spec(cache_key) or {}
+    meta = {
+        "ctx_size_tokens": spec.get("max_model_len"),
+        "speculative_method": spec.get("speculative_method"),
+        "drafted_tokens": spec.get("drafted_tokens"),
+    }
+    for key, value in default.items():
+        if meta.get(key) in ("", None, False):
+            meta[key] = value
     with slow_cache_lock:
         compose_metadata_cache[cache_key] = dict(meta)
     return dict(meta)
@@ -3272,6 +6250,14 @@ def runtime_log_metrics_for_container(container_name, force=False, max_age=1.0):
     active_now = any(int(parsed.get(key) or 0) > 0 for key in ("running_requests", "waiting_requests", "pending_requests", "swapped_requests"))
     with slow_cache_lock:
         remembered = dict(runtime_log_metric_memory.get(cache_key) or {})
+    if parsed.get("prompt_tps") not in (None, "", 0, 0.0):
+        remembered["prompt_tps"] = parsed.get("prompt_tps")
+    elif remembered.get("prompt_tps") not in (None, ""):
+        parsed["prompt_tps"] = remembered.get("prompt_tps")
+    if parsed.get("generation_tps") not in (None, "", 0, 0.0):
+        remembered["generation_tps"] = parsed.get("generation_tps")
+    elif remembered.get("generation_tps") not in (None, ""):
+        parsed["generation_tps"] = remembered.get("generation_tps")
     if parsed.get("gpu_kv_cache_usage_pct") not in (None, "", 0, 0.0):
         remembered["gpu_kv_cache_usage_pct"] = parsed.get("gpu_kv_cache_usage_pct")
     elif not active_now and remembered.get("gpu_kv_cache_usage_pct") not in (None, ""):
@@ -3871,6 +6857,7 @@ def build_instance_runtime_metrics_entry(instance, target_metrics_snapshot=None)
     if request_key == "GLOBAL" and "LEGACY" in target_metrics_snapshot:
         request_key = "LEGACY"
     request_metrics = dict(target_metrics_snapshot.get(request_key) or default_target_request_metrics())
+    spec = resolve_variant_spec(row.get("mode")) or {}
     runtime_meta = compose_variant_metadata(row.get("mode"))
     log_metrics = runtime_log_metrics_for_container(row.get("container")) if row.get("running") and row.get("container") else {}
     speculative = dict(log_metrics.get("speculative") or {})
@@ -3890,6 +6877,11 @@ def build_instance_runtime_metrics_entry(instance, target_metrics_snapshot=None)
         "display_name": row.get("display_name") or row.get("id"),
         "kind": row.get("kind"),
         "mode": row.get("mode"),
+        "selector": str(spec.get("selector") or row.get("mode") or ""),
+        "model_id": str(spec.get("model_id") or ""),
+        "engine": str(spec.get("engine") or ""),
+        "served_model_name": str(spec.get("served_model_name") or ""),
+        "vision": str(spec.get("vision") or ""),
         "container": row.get("container") or "",
         "port": row.get("port"),
         "running": bool(row.get("running")),
@@ -3931,31 +6923,131 @@ def build_instance_runtime_metrics_snapshot(instances, legacy_instance, target_m
     return rows
 
 
+def build_global_runtime_metrics_entry(mode, port, container, metrics_snapshot, gpu_count=None):
+    selector = canonical_mode_selector(mode)
+    spec = resolve_variant_spec(selector) or {}
+    resolved_gpu_count = int(gpu_count if gpu_count is not None else detect_gpu_count_runtime() or 0)
+    scope_kind = str(spec.get("scope_kind") or "")
+    runtime_gpu_indices = (
+        list(range(max(resolved_gpu_count, 0)))
+        if scope_kind in {"multi", "global_only"}
+        else mode_gpu_indices(selector, gpu_count=resolved_gpu_count)
+    )
+    log_metrics = runtime_log_metrics_for_container(container) if container else {}
+    speculative = dict(log_metrics.get("speculative") or {})
+    if speculative.get("drafted_tokens") in (None, "") and spec.get("drafted_tokens") not in (None, ""):
+        speculative["drafted_tokens"] = spec.get("drafted_tokens")
+    prompt_tps = log_metrics.get("prompt_tps")
+    input_tokens = first_defined(metrics_snapshot.get("last_input_tokens"), metrics_snapshot.get("last_total_tokens"))
+    estimated_prefill_s = None
+    try:
+        if prompt_tps not in (None, "", 0, 0.0) and input_tokens not in (None, "", 0, 0.0):
+            estimated_prefill_s = round(float(input_tokens) / max(float(prompt_tps), 0.001), 3)
+    except Exception:
+        estimated_prefill_s = None
+    return {
+        "id": "GLOBAL",
+        "instance_id": "GLOBAL",
+        "display_name": "Global Runtime",
+        "kind": "global",
+        "mode": selector,
+        "selector": str(spec.get("selector") or selector or ""),
+        "model_id": str(spec.get("model_id") or ""),
+        "engine": str(spec.get("engine") or ""),
+        "served_model_name": str(spec.get("served_model_name") or ""),
+        "vision": str(spec.get("vision") or ""),
+        "container": str(container or ""),
+        "port": int(port or 0),
+        "running": True,
+        "gpu_indices": runtime_gpu_indices,
+        "ctx_size_tokens": spec.get("ctx_size_tokens"),
+        "speculative_method": spec.get("speculative_method"),
+        "prompt_tps": prompt_tps,
+        "generation_tps": log_metrics.get("generation_tps"),
+        "running_requests": log_metrics.get("running_requests"),
+        "waiting_requests": first_defined(log_metrics.get("waiting_requests"), log_metrics.get("pending_requests")),
+        "pending_requests": log_metrics.get("pending_requests"),
+        "swapped_requests": log_metrics.get("swapped_requests"),
+        "gpu_kv_cache_usage_pct": log_metrics.get("gpu_kv_cache_usage_pct"),
+        "cpu_kv_cache_usage_pct": log_metrics.get("cpu_kv_cache_usage_pct"),
+        "prefix_cache_hit_rate_pct": log_metrics.get("prefix_cache_hit_rate_pct"),
+        "speculative": speculative,
+        "last_status": metrics_snapshot.get("last_status"),
+        "last_latency_s": metrics_snapshot.get("last_latency_s"),
+        "last_ttft_s": metrics_snapshot.get("last_ttft_s"),
+        "last_prefill_s": estimated_prefill_s,
+        "last_tokens_per_second": metrics_snapshot.get("last_tokens_per_second"),
+        "last_estimated_tokens": metrics_snapshot.get("last_estimated_tokens"),
+        "last_input_tokens": metrics_snapshot.get("last_input_tokens"),
+        "last_output_tokens": metrics_snapshot.get("last_output_tokens"),
+        "last_total_tokens": metrics_snapshot.get("last_total_tokens"),
+        "last_tool_calls": metrics_snapshot.get("last_tool_calls"),
+        "last_preset": metrics_snapshot.get("last_preset"),
+        "last_path": metrics_snapshot.get("last_path"),
+        "last_request_at": metrics_snapshot.get("last_request_at"),
+    }
+
+
 def build_status_snapshot():
     with metrics_lock:
         m = dict(metrics)
         recent = list(recent_requests)
         series = list(series_points)
+    runtime_inventory = load_runtime_inventory()
+    current_mode = active_mode()
     ap = active_port()
+    current_container_name = current_container()
     cfg = read_server_config()
     gpu_count = detect_gpu_count_runtime()
     instances = instances_snapshot()
     legacy_instance = legacy_global_instance_snapshot()
     target_metrics_snapshot = snapshot_target_request_metrics()
     instance_runtime_metrics = build_instance_runtime_metrics_snapshot(instances, legacy_instance, target_metrics_snapshot)
-    dual_rows = []
-    if legacy_instance and legacy_instance.get("running"):
-        dual_rows.append(dict(legacy_instance))
-    for row in instances:
-        if row.get("kind") == "dual" and row.get("running"):
-            dual_rows.append(dict(row))
+    runtime_rows = running_runtime_rows(instances, legacy_instance)
+    scope_kind = str((resolve_variant_spec(current_mode) or {}).get("scope_kind") or "")
+    if not runtime_rows and current_container_name and scope_kind in {"multi", "global_only"} and port_open(ap, timeout=0.08):
+        instance_runtime_metrics["GLOBAL"] = build_global_runtime_metrics_entry(
+            current_mode,
+            ap,
+            current_container_name,
+            m,
+            gpu_count=gpu_count,
+        )
+        runtime_rows = [{
+            "id": "GLOBAL",
+            "kind": "global",
+            "gpu_indices": list(range(max(gpu_count, 0))),
+            "mode": current_mode,
+            "container": current_container_name,
+            "port": ap,
+            "running": True,
+        }]
+    dual_rows = [dict(row) for row in runtime_rows if row.get("kind") == "dual"]
     dual_rows.sort(key=lambda d: (d.get("gpu_indices") or [], d.get("id") or ""))
     legacy_dual_mode = legacy_instance.get("mode") if legacy_instance and legacy_instance.get("running") else None
+    failed_mode = str(read_switch_failure().get("mode") or "")
+    active_modes = [mode for mode in runtime_mode_list(runtime_rows, "") if mode and mode != failed_mode]
+    containers = runtime_container_list(runtime_rows, "")
+    reported_active_mode = ""
+    if current_mode in active_modes:
+        reported_active_mode = current_mode
+    elif len(active_modes) == 1:
+        reported_active_mode = active_modes[0]
+    reported_active_port = 0
+    if runtime_rows:
+        if reported_active_mode:
+            matching_row = next((row for row in runtime_rows if str(row.get("mode") or "") == reported_active_mode), None)
+            if matching_row:
+                reported_active_port = int(matching_row.get("port") or 0)
+        if reported_active_port <= 0 and len(runtime_rows) == 1:
+            reported_active_port = int(runtime_rows[0].get("port") or 0)
     gpus_snapshot, system_snapshot, _ = get_latest_runtime_snapshot()
     return {
-        "active_mode": active_mode(),
-        "active_port": ap,
-        "container": current_container(),
+        "active_mode": reported_active_mode,
+        "active_modes": active_modes,
+        "active_port": reported_active_port,
+        "container": (containers[0] if containers else ""),
+        "containers": containers,
         "club3090_dir": CLUB3090_DIR,
         "script_version": SCRIPT_VERSION,
         "uptime_seconds": int(time.time() - startup_time),
@@ -3974,12 +7066,20 @@ def build_status_snapshot():
         "gpu_count": gpu_count,
         "instances": instances,
         "legacy_global_instance": legacy_instance,
+        "runtime_inventory": runtime_inventory,
+        "models": list(runtime_inventory.get("models") or []),
+        "variants": list(runtime_inventory.get("variants") or []),
+        "model_install_job": model_install_job_snapshot(),
+        "admin_task_job": admin_task_job_snapshot(),
         "single_gpu_modes": list(SINGLE_GPU_MODES),
         "dual_gpu_modes": list(DUAL_GPU_MODES),
         "running_dual_mode": (dual_rows[0]["mode"] if dual_rows else legacy_dual_mode),
         "running_dual_gpu_indices": (dual_rows[0]["gpu_indices"] if dual_rows else ([0, 1] if legacy_dual_mode else [])),
         "running_dual_instances": dual_rows,
+        "running_runtimes": [instance_runtime_metrics.get(str(row.get("id") or "").strip().upper()) for row in runtime_rows if instance_runtime_metrics.get(str(row.get("id") or "").strip().upper())],
         "instance_runtime_metrics": instance_runtime_metrics,
+        "switch_failure": read_switch_failure(),
+        "switch_job": switch_job_snapshot(),
         "users": list_users_public(),
         "groups": list_groups_public(),
         "server_config": cfg,
@@ -4052,7 +7152,7 @@ def _upload_multipart_text(url, text, filename="club3090-log.txt", field_name="f
         headers={
             "Content-Type": f"multipart/form-data; boundary={boundary}",
             "Accept": "text/plain, application/json",
-            "User-Agent": "club3090-control/4.5.3",
+            "User-Agent": script_user_agent(),
         },
         method="POST",
     )
@@ -4668,9 +7768,9 @@ def apply_fan_curve_once():
         return ["no GPU targets selected for fan curve"]
     return set_gpu_fans(speed=None, auto=False, indices=target_indices)
 
-def run_cmd(cmd, timeout=15):
+def run_cmd(cmd, timeout=15, cwd=None, env=None):
     try:
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout, cwd=cwd, env=env)
         return p.returncode, (p.stdout or "").strip()
     except Exception as e:
         return 999, str(e)
@@ -4766,8 +7866,8 @@ def stop_vllm_container(reason="idle", instance_id=None):
         target = get_instance(instance_id) if instance_id else primary_instance()
         if target is None:
             log_control(f"POWER legacy stop requested reason={reason}")
-            p = subprocess.run(["bash", "scripts/switch.sh", "--down"], cwd=CLUB3090_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=300)
-            return p.returncode, (p.stdout or "")[-4000:]
+            out = cleanup_vllm_containers()
+            return 0, str(out or "")[-4000:]
         log_control(f"POWER stop container requested reason={reason} instance={target['id']}")
         rc, out = stop_instance(target["id"])
         with metrics_lock:
@@ -4787,7 +7887,7 @@ def ensure_vllm_running_for_request(instance_id=None):
     target = get_instance(instance_id) if instance_id else primary_instance()
     if target is None:
         mode = active_mode()
-        port = MODES.get(mode, 8020)
+        port = mode_default_port(mode, 8020)
         if port_open(port, timeout=0.25):
             with metrics_lock:
                 power_state["container"] = "running"
@@ -4803,7 +7903,7 @@ def ensure_vllm_running_for_request(instance_id=None):
             power_state["container"] = "running"
         return
     log_control(f"POWER auto-starting container for request instance={target['id']} mode={target['mode']}")
-    start_instance(target["id"], wait=True)
+    start_instance(target["id"])
     with metrics_lock:
         power_state["container"] = "running"
 
@@ -4815,12 +7915,13 @@ def idle_watchdog():
             now = time.time()
             with metrics_lock:
                 active = metrics.get("active_requests", 0)
-                idle_for = 0 if active > 0 else max(0.0, now - last_request_finished_at)
-            if active == 0 and idle_for >= POWER_IDLE_AFTER_SECONDS and not idle_power_applied:
+                booting = switch_job_active()
+                idle_for = 0 if active > 0 or booting else max(0.0, now - last_request_finished_at)
+            if active == 0 and not booting and idle_for >= POWER_IDLE_AFTER_SECONDS and not idle_power_applied:
                 apply_cpu_idle_power()
                 apply_gpu_idle_power()
                 idle_power_applied = True
-            if active > 0 or idle_for < POWER_IDLE_AFTER_SECONDS:
+            if active > 0 or booting or idle_for < POWER_IDLE_AFTER_SECONDS:
                 idle_power_applied = False
             if power_optimizations_enabled and not fan_manual_override:
                 # Refresh manual fan curve periodically even while idle; Linux/NVIDIA
@@ -4925,46 +8026,176 @@ def set_fan_max_toggle(enable, instance_id=None):
 def power_status():
     with metrics_lock:
         active = int(metrics.get("active_requests", 0) or 0)
-        idle_for = 0 if active > 0 else int(max(0.0, time.time() - last_request_finished_at))
+        booting = switch_job_active()
+        idle_for = 0 if active > 0 or booting else int(max(0.0, time.time() - last_request_finished_at))
         fan_curve_text = ", ".join([f"<{temp}C={speed}%" for temp, speed in FAN_CURVE]) + ", >=65C=100%"
         return {**power_state, "profile": current_profile, "idle_for_seconds": idle_for, "idle_power_after_seconds": POWER_IDLE_AFTER_SECONDS, "container_stop_after_seconds": 0, "container_auto_stop_enabled": CONTAINER_AUTO_STOP_ENABLED, "gpu_active_power_limit_w": GPU_ACTIVE_POWER_LIMIT_W, "gpu_idle_power_limit_w": GPU_IDLE_POWER_LIMIT_W, "gpu_idle_lock_clocks": GPU_IDLE_LOCK_CLOCKS, "cpu_active_governor": CPU_ACTIVE_GOVERNOR, "cpu_idle_governor": CPU_IDLE_GOVERNOR, "optimizations_enabled": power_optimizations_enabled, "fan_manual_override": fan_manual_override, "fan_curve": fan_curve_text, "fan_min_safe_speed": FAN_MIN_SAFE_SPEED}
 
-def wait_for_port(port, timeout=20):
-    deadline = time.time() + timeout
+def _docker_inspect_state(container_name):
+    name = str(container_name or "").strip()
+    if not name:
+        return {"exists": False, "running": False, "exit_code": None, "status": ""}
+    try:
+        payload = subprocess.check_output(
+            [
+                "docker",
+                "inspect",
+                "--format",
+                "{{.State.Status}}|{{.State.Running}}|{{.State.ExitCode}}",
+                name,
+            ],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).strip()
+    except Exception:
+        return {"exists": False, "running": False, "exit_code": None, "status": ""}
+    parts = payload.split("|")
+    status = str(parts[0] if len(parts) > 0 else "").strip().lower()
+    running = str(parts[1] if len(parts) > 1 else "").strip().lower() == "true"
+    try:
+        exit_code = int(str(parts[2] if len(parts) > 2 else "").strip())
+    except Exception:
+        exit_code = None
+    return {
+        "exists": True,
+        "running": running,
+        "exit_code": exit_code,
+        "status": status,
+    }
+
+
+def _docker_logs_tail(container_name, lines=80):
+    name = str(container_name or "").strip()
+    if not name:
+        return ""
+    try:
+        return subprocess.check_output(
+            ["docker", "logs", "--tail", str(max(1, int(lines))), name],
+            text=True,
+            stderr=subprocess.STDOUT,
+            timeout=10,
+        )
+    except Exception:
+        return ""
+
+
+def _container_bootstrap_complete(container_name):
+    logs = _docker_logs_tail(container_name, lines=200)
+    if not logs:
+        return False
+    marker = str(LOG_BOOTSTRAP_MARKER or "").strip()
+    if marker and marker in logs:
+        return True
+    return "Application startup complete" in logs
+
+
+def _ready_url_responding(url):
+    target = str(url or "").strip()
+    if not target:
+        return False
+    try:
+        with urllib.request.urlopen(target, timeout=3) as response:
+            return int(getattr(response, "status", 200) or 200) < 500
+    except Exception:
+        return False
+
+
+def wait_for_runtime_ready(container_name, ready_url, timeout=900):
+    name = str(container_name or "").strip()
+    target_url = str(ready_url or "").strip()
+    deadline = time.time() + max(5, int(timeout))
+    seen_container = False
     while time.time() < deadline:
-        if port_open(port, timeout=0.25):
+        state = _docker_inspect_state(name) if name else {"exists": False, "running": False, "exit_code": None, "status": ""}
+        if state.get("exists"):
+            seen_container = True
+            if not state.get("running"):
+                logs = _docker_logs_tail(name, lines=80)
+                raise RuntimeError(
+                    f"Container {name} stopped during boot "
+                    f"(status={state.get('status') or 'unknown'}, exit={state.get('exit_code')}).\n"
+                    + (logs[-12000:] if logs else "No docker logs were captured before exit.")
+                )
+        elif seen_container:
+            raise RuntimeError(f"Container {name} disappeared before reaching ready state.")
+        if _ready_url_responding(target_url) and (not name or _container_bootstrap_complete(name)):
             return True
-        time.sleep(0.5)
-    return False
+        time.sleep(1)
+    if name and not seen_container:
+        raise RuntimeError(f"Container {name} never appeared after compose launch.")
+    logs = _docker_logs_tail(name, lines=120) if name else ""
+    if logs:
+        raise RuntimeError(
+            f"Timed out waiting for runtime readiness at {target_url}.\n{logs[-12000:]}"
+        )
+    raise RuntimeError(f"Timed out waiting for runtime readiness at {target_url}.")
 
-def run_switch(mode, allow_fallback=True):
-    if mode not in MODES:
+def run_switch(mode):
+    selector = canonical_mode_selector(mode)
+    spec = resolve_variant_spec(selector)
+    if not spec:
         raise ValueError(f"Invalid mode: {mode}")
-    switch_path = os.path.join(CLUB3090_DIR, "scripts", "switch.sh")
-    if not os.path.exists(switch_path):
-        raise RuntimeError(f"Missing switch script: {switch_path}")
-
-    previous_mode = active_mode()
-    fallback_mode = read_last_good_mode_file() or (previous_mode if previous_mode in MODES else None) or (DEFAULT_MODE if DEFAULT_MODE in MODES else "vllm/default")
 
     def attempt(target_mode, label):
-        env = os.environ.copy()
+        target_spec = resolve_variant_spec(target_mode)
+        if not target_spec:
+            raise RuntimeError(f"Unknown target mode: {target_mode}")
+        ensure_variant_install_ready(target_spec)
+        target_port = mode_default_port(target_mode, 8020)
+        env = _repo_subprocess_env()
         env["READY_URL"] = ready_url_for_mode(target_mode)
-        env["PORT"] = str(int(MODES[target_mode]))
+        env["PORT"] = str(int(target_port))
+        env["MODEL_DIR"] = _resolve_variant_model_dir_root(target_spec)
+        env["COMPOSE_BIN"] = COMPOSE_BIN
         apply_cpu_active_power()
         apply_gpu_active_power(skip_fans=True)
         log_control(f"SWITCH {label} cleanup before mode={target_mode}")
         cleanup_msg = cleanup_vllm_containers()
         log_control(f"SWITCH {label} start mode={target_mode} port={env['PORT']} ready_url={env['READY_URL']}")
-        p = subprocess.run(["bash", "scripts/switch.sh", target_mode], cwd=CLUB3090_DIR, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=1800)
-        output = p.stdout or ""
-        port_ok = wait_for_port(MODES[target_mode], timeout=25)
-        if p.returncode != 0 or not port_ok:
-            log_control(f"SWITCH {label} failed mode={target_mode} rc={p.returncode} port_ok={port_ok}")
+        output = ""
+        rc = 0
+        upstream_tag = str(target_spec.get("upstream_tag") or "").strip()
+        switch_path = os.path.join(CLUB3090_DIR, "scripts", "switch.sh")
+        if upstream_tag and os.path.exists(switch_path):
+            p = subprocess.run(["bash", "scripts/switch.sh", upstream_tag, "--no-wait"], cwd=CLUB3090_DIR, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=1800)
+            rc = int(p.returncode)
+            output = p.stdout or ""
+        else:
+            compose_file = str(target_spec.get("compose_abs_path") or "").strip()
+            compose_project_dir = str(target_spec.get("compose_project_dir_abs_path") or "").strip() or os.path.dirname(compose_file) or CLUB3090_DIR
+            cmd = compose_cmd() + ["--project-directory", compose_project_dir, "-f", compose_file, "up", "-d"]
+            p = subprocess.run(
+                cmd,
+                cwd=compose_project_dir,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=1800,
+            )
+            rc = int(p.returncode)
+            output = p.stdout or ""
+        if rc != 0:
+            log_control(f"SWITCH {label} failed mode={target_mode} rc={rc}")
             cleanup_vllm_containers()
-            raise RuntimeError((output[-12000:] or f"switch.sh exited with {p.returncode}") + f"\nport_open={port_ok}\ncleanup={cleanup_msg}")
+            raise RuntimeError((output[-12000:] or f"launch exited with {rc}") + f"\ncleanup={cleanup_msg}")
+        wait_for_runtime_ready(
+            str(target_spec.get("container_name") or ""),
+            env["READY_URL"],
+            timeout=900,
+        )
         write_active_mode(target_mode)
         write_last_good_mode(target_mode)
+        clear_switch_failure(target_mode)
+        _set_switch_job(
+            active=False,
+            status="success",
+            mode=target_mode,
+            target="GLOBAL",
+            finished_at=int(time.time()),
+            error="",
+        )
         with metrics_lock:
             power_state["container"] = "running"
             power_state["last_action"] = f"switch_{target_mode}"
@@ -4973,17 +8204,34 @@ def run_switch(mode, allow_fallback=True):
         return output[-12000:]
 
     with switch_lock:
+        _set_switch_job(
+            active=True,
+            status="booting",
+            mode=selector,
+            target="GLOBAL",
+            started_at=int(time.time()),
+            finished_at=0,
+            error="",
+        )
         try:
-            return attempt(mode, "primary")
+            return attempt(selector, "primary")
         except Exception as first_error:
-            if not allow_fallback or fallback_mode == mode:
-                raise
-            log_control(f"SWITCH primary failed; falling back to {fallback_mode}: {first_error}")
-            try:
-                fallback_output = attempt(fallback_mode, "fallback")
-                return "REQUESTED MODE FAILED; FALLBACK STARTED\n\n" + str(first_error)[-4000:] + "\n\n----- fallback output -----\n" + fallback_output
-            except Exception as fallback_error:
-                raise RuntimeError("Requested mode failed and fallback also failed.\n\nRequested error:\n" + str(first_error)[-6000:] + "\n\nFallback error:\n" + str(fallback_error)[-6000:])
+            write_switch_failure(selector, first_error)
+            if read_active_mode_file() == selector:
+                clear_active_mode()
+            _set_switch_job(
+                active=False,
+                status="failed",
+                mode=selector,
+                target="GLOBAL",
+                finished_at=int(time.time()),
+                error=str(first_error)[-12000:],
+            )
+            with metrics_lock:
+                power_state["container"] = "stopped"
+                power_state["last_action"] = f"switch_failed_{selector}"
+                power_state["last_error"] = str(first_error)[-1000:]
+            raise
 
 def parse_preset_path(path):
     parsed = urlsplit(path)
@@ -5056,6 +8304,67 @@ def parse_preset_path(path):
 
     return path, None, None
 
+def merge_preset_params(payload, preset):
+    merged = dict(payload or {})
+    for key, value in dict(preset or {}).items():
+        if key == "chat_template_kwargs" and isinstance(value, dict):
+            current = merged.get("chat_template_kwargs")
+            if not isinstance(current, dict):
+                current = {}
+            merged["chat_template_kwargs"] = {**current, **value}
+        else:
+            merged[key] = value
+    return merged
+
+def merge_system_prompt_text(primary, secondary):
+    first = str(primary or "").strip()
+    second = str(secondary or "").strip()
+    if first and second:
+        return first + "\n\n" + second
+    return first or second
+
+def inject_system_prompt_into_messages(messages, system_prompt):
+    prompt = str(system_prompt or "").strip()
+    if not prompt:
+        return messages
+    rows = list(messages or [])
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("role") or "").strip().lower() != "system":
+            continue
+        content = item.get("content")
+        if isinstance(content, str):
+            item["content"] = merge_system_prompt_text(prompt, content)
+        elif isinstance(content, list):
+            parts = [{"type": "text", "text": prompt}]
+            parts.extend([part for part in content if isinstance(part, dict)])
+            item["content"] = parts
+        else:
+            item["content"] = prompt
+        return rows
+    rows.insert(0, {"role": "system", "content": prompt})
+    return rows
+
+def inject_system_prompt_into_payload(payload, system_prompt):
+    prompt = str(system_prompt or "").strip()
+    if not prompt or not isinstance(payload, dict):
+        return payload
+    updated = dict(payload)
+    if isinstance(updated.get("messages"), list):
+        updated["messages"] = inject_system_prompt_into_messages(updated.get("messages"), prompt)
+        return updated
+    if isinstance(updated.get("instructions"), str):
+        updated["instructions"] = merge_system_prompt_text(prompt, updated.get("instructions"))
+        return updated
+    if isinstance(updated.get("prompt"), str):
+        updated["prompt"] = merge_system_prompt_text(prompt, updated.get("prompt"))
+        return updated
+    if isinstance(updated.get("input"), str):
+        updated["input"] = merge_system_prompt_text(prompt, updated.get("input"))
+        return updated
+    return updated
+
 def apply_preset(body, preset_name, max_token_cap):
     try:
         data = json.loads(body or b"{}")
@@ -5064,14 +8373,8 @@ def apply_preset(body, preset_name, max_token_cap):
     preset = get_all_presets().get(preset_name)
     if not preset:
         return body
-    for key, value in preset.items():
-        if key == "chat_template_kwargs":
-            current = data.get("chat_template_kwargs")
-            if not isinstance(current, dict):
-                current = {}
-            data["chat_template_kwargs"] = {**current, **value}
-        else:
-            data[key] = value
+    data = merge_preset_params(dict(data), preset)
+    data = inject_system_prompt_into_payload(data, preset_system_prompt(preset_name))
     if max_token_cap is not None:
         capped_any = False
         for token_key in ("max_tokens", "max_completion_tokens"):
@@ -5096,11 +8399,592 @@ def parse_instance_path(path):
         return instance_id, trimmed
     return None, path
 
-HTML = r"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>club-3090 Control</title><style>:root{color-scheme:dark;--bg:#0b0f14;--panel:#121923;--line:#273243;--text:#e8eef7;--muted:#9dafc3;--blue:#72c7ff;--green:#2fc46b;--red:#ff5b6c;--amber:#ffcb6b;--orange:#ff8a2a;--field:#081018;--cyan:#7dd3fc;--turquoise:#26d6c6}*{box-sizing:border-box}body,html{min-height:100%;margin:0}body{font-family:system-ui,-apple-system,Segoe UI,Arial,sans-serif;background:var(--bg);color:var(--text);overflow-y:auto;overflow-x:hidden}header{position:sticky;top:0;z-index:10;padding:10px 12px;background:#111925f7;backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}.top{display:flex;justify-content:space-between;align-items:center;gap:8px}.brand{font-size:18px;font-weight:800}.pill{color:var(--muted);font-size:12px;border:1px solid var(--line);border-radius:999px;padding:4px 8px;background:#0a1119;margin-top:4px}.subtabs,.tabs{display:flex;gap:6px;overflow-x:auto}.tabs{padding-top:10px}.subtabs{margin-bottom:10px}.btn,.subtab,.tab{border:1px solid #34445a;background:#1b2635;color:#eef4ff;border-radius:10px;padding:9px 11px;font-size:13px;cursor:pointer;white-space:nowrap}.subtab.active,.tab.active{background:#203149;border-color:#3d6fa3}.btn:disabled{opacity:.5;cursor:not-allowed}.green{background:#113d25;border-color:#2c8a54}.turquoise{background:#079c9c;border-color:#4df5e8;color:#041316}.red{background:#4a1118;border-color:#8a2b35}.amber{background:#4a3511;border-color:#8a652b}.orange{background:#c45512;border-color:#ffae42;color:#fff}.blue{background:#12314d;border-color:#2a72a8}.purple{background:#4b1f75;border-color:#9460df;color:#fff}.default-profile{background:#1d5f96;border-color:#78c7ff;color:#fff}.container{display:flex;flex-direction:column;gap:10px;padding:10px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:12px;box-shadow:0 8px 30px #0004;margin-bottom:10px}.panel h2{font-size:14px;margin:0 0 10px}.chartgrid+.panel{margin-top:10px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.stat{background:#0b1119;border:1px solid #222d3c;border-radius:10px;padding:8px}.label{color:var(--muted);font-size:11px}label.label{display:inline-flex;align-items:center;gap:8px}label.label input[type=checkbox]{margin:0;flex:0 0 auto}.value{font-weight:700;font-size:13px;overflow-wrap:anywhere}.value-subline{display:block;margin-top:4px;color:var(--muted);font-size:12px;font-weight:600;line-height:1.35}.actions{display:flex;gap:7px;flex-wrap:wrap}.hidden{display:none!important}.tabpane{display:none}.tabpane.active{display:block}.metricpane{display:none}.metricpane.active{display:block}.logs{min-height:0;display:flex;flex-direction:column;margin-bottom:0}.loghead{display:flex;justify-content:space-between;align-items:center;padding-bottom:7px;gap:10px}.loghead h2{white-space:nowrap}.logheadchecks{display:flex;align-items:center;gap:12px;white-space:nowrap}.log{width:100%;height:clamp(360px,calc(100dvh - 430px),560px);min-height:320px;resize:vertical;white-space:pre-wrap;overflow-wrap:anywhere;background:#030608;color:#a5ffa5;border:1px solid #26313f;border-radius:12px;padding:12px;font-family:Consolas,monospace;font-size:12px;line-height:1.35}.log-card-hidden{display:none!important}.logs-tab .container{min-height:calc(100dvh - 108px)}.logs-tab .logs.panel{height:calc(100dvh - 252px);min-height:500px;margin-bottom:0}.logs-tab .log{height:auto;min-height:0;flex:1;resize:none}.logs-tab .content-tab{display:none!important}.logtools{display:none}.audit-tab .logtools,.logs-tab .logtools{display:block;margin-bottom:10px}.logtools h2{display:block;margin:0 0 10px}.logtools .searchbox{display:flex}.searchbox{display:flex;align-items:center;gap:6px;flex-wrap:nowrap;width:100%}.searchbox input{flex:1 1 auto;min-width:80px;background:var(--field);color:var(--text);border:1px solid #2c3a4f;border-radius:9px;padding:9px}.chartgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.gpu-chartgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.chart{height:145px;background:#081018;border:1px solid #213044;border-radius:12px;padding:8px}.chart.tall{height:220px}canvas{width:100%;height:100%}.msg{color:var(--amber);font-size:12px;min-height:18px;padding-top:6px}.smallgap{margin-bottom:5px}#auditSummary{margin-top:10px}.gpu-cards{display:grid;grid-template-columns:1fr;gap:10px}.gpu-card{background:#101722;border:1px solid #26313f;border-radius:14px;padding:12px}.gpu-title{font-weight:800;color:#d9ecff;margin-bottom:10px;border-bottom:1px solid #26313f;padding-bottom:7px}.gpu-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.gpu-section-title{color:#9dafc3;font-size:12px;text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px}.gpu-line{display:flex;justify-content:space-between;gap:8px;font-size:13px;padding:2px 0}.meter{height:7px;background:#081018;border-radius:99px;overflow:hidden;margin-top:5px}.meter span{display:block;height:100%;background:#2fc46b}.coregrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(90px,1fr));gap:6px}.storage-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px}.storage-section{display:flex;flex-direction:column;gap:10px}.storage-card.user-facing{background:#10243a;border-color:#2a72a8}.storage-card{background:#0b1119;border:1px solid #243144;border-radius:12px;padding:10px;min-width:0}.storage-title{font-weight:800;color:#d9ecff;margin-bottom:6px;overflow-wrap:anywhere}.storage-meta{color:#9dafc3;font-size:12px;margin-bottom:6px;overflow-wrap:anywhere}.storage-sizes{display:grid;grid-template-columns:minmax(85px,0.8fr) minmax(85px,0.8fr) minmax(95px,0.9fr);gap:6px;margin-bottom:8px}.storage-sizes .stat{padding:6px}.diskbar{height:8px;background:#081018;border-radius:99px;overflow:hidden;width:100%;margin-bottom:3px;margin-top:3px}.diskbar span{display:block;height:100%;background:#72c7ff}.netgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px}.temp-blue{color:#60a5fa}.temp-green{color:#2fc46b}.temp-yellow{color:#ffde59}.temp-orange{color:#ff8a2a}.temp-red{color:#ff5b6c}.temp-crimson{color:#dc143c;font-weight:900}.machine-row{margin-top:7px}.api-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:8px}.api-card{background:#0b1119;border:1px solid #243144;border-radius:12px;padding:10px}.api-card h3{font-size:13px;margin:0 0 6px;color:#d9ecff}.api-card p{margin:0;color:var(--muted);font-size:12px;line-height:1.35}.api-card-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.preset-actions{display:flex;gap:4px}.iconbtn{border:1px solid #34445a;background:#182231;color:#eef4ff;border-radius:8px;padding:5px 7px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px}.iconbtn svg{width:16px;height:16px;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}.preset-editor{display:none}.preset-editor.open{display:block}.formgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}.formgrid label{display:flex;flex-direction:column;gap:4px;color:var(--muted);font-size:12px}.formgrid input,.formgrid select{background:var(--field);color:var(--text);border:1px solid #2c3a4f;border-radius:9px;padding:8px}.preset-help{color:var(--muted);font-size:12px;line-height:1.35;margin-bottom:10px}.profile-balanced{background:#0faeb0;border-color:#5ff5e8;color:#031516}.panel-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:10px}.panel-head h2{margin:0}.add-preset-btn{width:30px;height:30px;border-radius:999px;border:1px solid #55ee91;background:#128a45;color:#fff;display:inline-flex;align-items:center;justify-content:center;padding:0;box-shadow:none}.add-preset-btn:hover{background:#18a957}.add-preset-btn svg{width:15px;height:15px;stroke:#fff;stroke-width:3;stroke-linecap:round}.preset-form-actions{display:flex;justify-content:center;gap:18px;margin-top:14px}.preset-intro{color:var(--muted);font-size:13px;line-height:1.45;margin:4px 0 2px}.preset-intro.hidden{display:none}.scope-strip{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:0 0 10px}.scope-strip .subtabs{margin:0}.club-modal{position:fixed;inset:0;background:rgba(2,7,14,.82);display:flex;align-items:center;justify-content:center;padding:16px;z-index:1000}.club-modal-card{width:min(720px,100%);background:#101824;border:1px solid #31455f;border-radius:14px;box-shadow:0 20px 70px rgba(0,0,0,.45);padding:14px}.modal-keybox{width:100%;min-height:120px;resize:vertical;border:1px solid #31455f;border-radius:10px;background:#07101a;color:#d9ecff;padding:10px;font:600 13px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace}.busy-note{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:12px;line-height:1.35}.spinner{width:12px;height:12px;border:2px solid #34445a;border-top-color:var(--blue);border-radius:999px;animation:.8s linear infinite club3090-spin;flex:0 0 auto}.instance-panel-busy{border-color:#35506d}.instance-panel-busy .actions,.instance-panel-busy .subtabs,.instance-panel-busy .value{opacity:.82}@keyframes club3090-spin{to{transform:rotate(360deg)}}@media (max-width:900px){.chartgrid{grid-template-columns:1fr}.gpu-chartgrid{grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.grid{grid-template-columns:1fr 1fr}.gpu-grid{grid-template-columns:1fr}.log{height:clamp(320px,calc(100dvh - 410px),520px)}.logs-tab .logs.panel{height:calc(100dvh - 250px);min-height:500px}.logs-tab .log{height:auto;min-height:0}}</style></head><body><header><div class="top"><div><div class="brand">club-3090 Control &bull; __SCRIPT_VERSION__</div><div class="pill" id="summary">loading...</div></div></div><div class="tabs"><button class="tab active" onclick="tab(event, 'overview')">Main</button><button class="tab" onclick="tab(event, 'system')">System</button><button class="tab" onclick="tab(event, 'presets')">Presets</button><button class="tab" id="usersTabBtn" onclick="tab(event, 'users')">Users</button><button class="tab" onclick="tab(event, 'metrics')">Metrics</button><button class="tab" onclick="tab(event, 'logs')">Logs</button></div></header><main class="container"><section id="overview" class="tabpane content-tab active"><div class="panel"><h2>Status</h2><div class="grid"><div class="stat"><div class="label">Mode</div><div class="value" id="mode">-</div></div><div class="stat"><div class="label">Container</div><div class="value" id="container">-</div></div><div class="stat"><div class="label">Requests</div><div class="value" id="req">-</div></div><div class="stat"><div class="label">Uptime</div><div class="value" id="uptime">-</div></div><div class="stat"><div class="label">Power</div><div class="value" id="powerbox">-</div></div><div class="stat"><div class="label">Last</div><div class="value" id="last">-</div></div></div><div class="msg" id="msg"></div></div><div id="gpuCards" class="gpu-cards"></div></section><section id="system" class="tabpane content-tab"><div class="panel"><h2>Services</h2><div class="value" id="services">-</div></div><div class="panel"><h2>Audit Overview</h2><div class="grid"><div class="stat"><div class="label">Admin UI</div><div class="value" id="auditAdminEndpoint">-</div></div><div class="stat"><div class="label">Proxy</div><div class="value" id="auditProxyEndpoint">-</div></div><div class="stat"><div class="label">Exposure</div><div class="value" id="auditExposure">-</div></div><div class="stat"><div class="label">Local Automation</div><div class="value" id="auditLocalApi">-</div></div></div><div class="value smallgap" id="auditSummary">-</div><div class="msg" id="auditMsg"></div></div><div class="panel"><h2>Access Policy</h2><div class="actions" id="accessPolicyRow"><label class="label"><input type="checkbox" id="auditAllowAnonymousProxy" onchange="mirrorAuthToggles(this.checked)"> allow requests without per-user API keys</label><button class="btn blue" onclick="saveAuthSettings()">Save Policy</button></div><div class="value smallgap" style="margin-top: 10px" id="auditPolicyText">-</div></div><div class="panel"><h2>System</h2><div class="actions"><button class="btn amber" onclick="wol()">Wake-on-LAN</button></div><div class="actions machine-row"><button class="btn red" onclick="machineAction('reboot')">Restart Machine</button><button class="btn red" onclick="machineAction('shutdown')">Shutdown Machine</button></div></div><div class="panel"><h2>Instances</h2><div class="subtabs" id="instanceTabs"></div><div class="value smallgap" id="instanceSummary">-</div><div class="actions" id="instanceActionRow"><button class="btn blue" onclick="instanceAction('start_instance')">Start</button><button class="btn amber" onclick="instanceAction('restart_instance')">Restart</button><button class="btn red" onclick="instanceAction('stop_container')">Stop</button><button class="btn green" id="instanceEnableBtn" onclick="toggleInstanceEnabled()">Disable Boot Autostart</button></div><div class="panel" style="margin-top:12px"><h2>Power Profiles</h2><div class="actions" id="profileActionRow"><button class="btn green" onclick="profile('eco')">Eco</button><button class="btn profile-balanced" onclick="profile('balanced')">Balanced</button><button class="btn default-profile" onclick="profile('default')">Default</button><button class="btn orange" onclick="profile('turbo')">Turbo</button></div></div><div class="panel"><h2>Optimizations + Cooling</h2><div class="actions" id="powerCoolingActionRow"><button class="btn green" id="optToggle" onclick="togglePowerOptimizations()">Disable Power Optimizations</button><button class="btn green" id="fanToggle" onclick="toggleFansMax()">Set Fans to Max</button></div></div><div class="msg" id="instanceMsg"></div></div></section><section id="presets" class="tabpane content-tab"><div class="panel"><h2>Per-Instance Docker Presets</h2><div class="preset-help">Assign a single-card preset to the currently selected GPU instance. Each instance gets its own GPU binding, docker override, port, and proxy prefix such as <code>:8009/GPU0/</code>.</div><div class="actions"><button class="btn blue" onclick="switchMode('vllm/default')">default</button><button class="btn blue" onclick="switchMode('vllm/long-vision')">long-vision</button><button class="btn blue" onclick="switchMode('vllm/long-text')">long-text</button><button class="btn blue" onclick="switchMode('vllm/bounded-thinking')">bounded-thinking</button><button class="btn blue" onclick="switchMode('vllm/tools-text')">tools-text</button><button class="btn blue" onclick="switchMode('vllm/minimal')">minimal</button><button class="btn blue" onclick="switchMode('llamacpp/default')">llamacpp-default</button><button class="btn blue" onclick="switchMode('llamacpp/concurrent')">llamacpp-concurrent</button></div></div><div class="panel"><h2>API Presets</h2><div class="preset-help">Default presets are locked. Custom presets are exposed as <code>:8009/v1/&lt;name&gt;</code> and <code>:8009/&lt;name&gt;</code>. Both forms work with <code>short-</code> and <code>concise-</code> prefixes.</div><div id="apiPresetGrid" class="api-grid"></div></div><div class="panel"><div class="panel-head"><h2>Custom Preset Templates</h2><button class="add-preset-btn" title="Create preset" aria-label="Create preset" onclick="openPresetEditor()"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none"/></svg></button></div><div id="presetIntro" class="preset-intro">Create custom endpoint templates for different workloads or clients. Each preset saves generation parameters like temperature, sampling, thinking mode, penalties, and token limits, then exposes them as custom OpenAI-compatible endpoints such as <code>:8009/v1/my_preset</code> and <code>:8009/my_preset</code>. Short and concise prefixes work with custom presets too.</div><div id="presetEditor" class="preset-editor"><div class="formgrid"><label>Endpoint name<input id="presetName" placeholder="my_coding"></label><label>Description<input id="presetDescription" placeholder="What this preset is for"></label><label>Temperature<input id="presetTemperature" type="number" step="0.01" placeholder="0.7"></label><label>Top P<input id="presetTopP" type="number" step="0.01" placeholder="0.95"></label><label>Top K<input id="presetTopK" type="number" step="1" placeholder="20"></label><label>Min P<input id="presetMinP" type="number" step="0.01" placeholder="0"></label><label>Thinking<select id="presetThinking"><option value="false">Disabled</option><option value="true">Enabled</option></select></label><label>Preserve Thinking<select id="presetPreserveThinking"><option value="false">No</option><option value="true">Yes</option></select></label><label>Repetition penalty<input id="presetRepetitionPenalty" type="number" step="0.01" placeholder="1.0"></label><label>Presence penalty<input id="presetPresencePenalty" type="number" step="0.01" placeholder="0"></label><label>Frequency penalty<input id="presetFrequencyPenalty" type="number" step="0.01" placeholder="0"></label><label>Max context / prompt tokens<input id="presetMaxCtx" type="number" step="1" placeholder="truncate_prompt_tokens"></label><label>Max reply tokens<input id="presetMaxTokens" type="number" step="1" placeholder="max_tokens"></label><label>Seed<input id="presetSeed" type="number" step="1" placeholder="optional"></label><label>Min reply tokens<input id="presetMinTokens" type="number" step="1" placeholder="min_tokens"></label><label>Logprobs<input id="presetLogprobs" type="number" step="1" placeholder="optional"></label><label>Top logprobs<input id="presetTopLogprobs" type="number" step="1" placeholder="optional"></label><label>Length penalty<input id="presetLengthPenalty" type="number" step="0.01" placeholder="optional"></label><label>Ignore EOS<select id="presetIgnoreEos"><option value="">Default</option><option value="false">No</option><option value="true">Yes</option></select></label><label>Skip special tokens<select id="presetSkipSpecial"><option value="">Default</option><option value="true">Yes</option><option value="false">No</option></select></label><label>Include stop text<select id="presetIncludeStop"><option value="">Default</option><option value="false">No</option><option value="true">Yes</option></select></label><label>Stop strings<input id="presetStop" placeholder="one per line or comma-separated"></label></div><div class="preset-form-actions"><button id="presetSaveBtn" class="btn green" onclick="savePresetFromForm()">💾 Save</button><button class="btn red" onclick="closePresetEditor()">❌ Cancel</button></div></div></div></section><section id="users" class="tabpane content-tab"></section><section id="metrics" class="tabpane content-tab"><div class="panel"><h2>Metrics</h2><div class="subtabs"><button class="subtab active" onclick="metricTab(event, 'mMain')">Main</button><button class="subtab" onclick="metricTab(event, 'mGpu')">GPUs</button><button class="subtab" onclick="metricTab(event, 'mRam')">RAM</button><button class="subtab" onclick="metricTab(event, 'mCpu')">CPU</button><button class="subtab" onclick="metricTab(event, 'mSystem')">System</button><button class="subtab" onclick="metricTab(event, 'mNetwork')">Network</button></div><div id="mMain" class="metricpane active"><div class="chartgrid"><div class="chart"><canvas id="cGpu"></canvas></div><div class="chart"><canvas id="cMem"></canvas></div><div class="chart"><canvas id="cLatency"></canvas></div><div class="chart"><canvas id="cTps"></canvas></div></div></div><div id="mGpu" class="metricpane"><div id="gpuMetricCharts" class="gpu-chartgrid"></div></div><div id="mRam" class="metricpane"><div id="ramInfo" class="value smallgap"></div><div class="chartgrid"><div class="chart tall"><canvas id="cRam"></canvas></div></div></div><div id="mCpu" class="metricpane"><div class="chartgrid"><div class="chart"><canvas id="cCpu"></canvas></div></div><div id="cpuCores" class="coregrid"></div></div><div id="mSystem" class="metricpane"><div class="chartgrid"><div class="chart"><canvas id="cSystemUtil"></canvas></div></div><div class="panel"><h2>System Information</h2><div id="systemInfo" class="value"></div></div><div class="panel"><h2>Storage</h2><div id="diskInfo"></div></div></div><div id="mNetwork" class="metricpane"><div id="netInfo" class="netgrid"></div><div class="chartgrid"><div class="chart"><canvas id="cNetDown"></canvas></div><div class="chart"><canvas id="cNetUp"></canvas></div></div></div></div></section><section id="logs" class="tabpane"></section><section class="panel logtools"><h2>Log Management</h2><div class="searchbox"><button class="btn" id="searchPrev" onclick="previousMatch()" disabled="disabled">⏪</button><input id="searchQuery" placeholder="Search log text" onkeydown="if (event.key === 'Enter') runSearchOrNext();"><button class="btn" id="searchNext" onclick="runSearchOrNext()">🔍</button><span style="border-left: 1px solid #34445a; height: 28px"></span><button class="btn" id="refreshBtn" onclick="refreshStatus()">♻️</button><button class="btn" id="clearBtn" onclick="clearOrCancelLog()">🗑️</button></div></section><section class="logs panel"><div class="loghead"><h2 id="logTitle">Docker Logs</h2><div class="logheadchecks"><span class="label" id="logInstanceLabel">instance: primary</span><label class="label"><input type="checkbox" id="showGlobalLogs" checked="checked" onchange="setShowGlobalLogs(this.checked)"> show globally</label><label class="label"><input type="checkbox" id="autoscroll" checked="checked"> auto-scroll</label></div></div><textarea id="log" class="log" readonly="readonly" wrap="soft">
-Connecting...</textarea></section></main><script>const searchState={active:!1,query:"",matches:[],index:-1,prevAutoscroll:!0};let lastStatus=null,activeTabName="overview",showGlobalLogs=!0;function $(e){return document.getElementById(e)}function setMsg(e){$("msg").textContent=e||""}function clearLog(){$("log").value=""}function appendLog(e){const t=$("log");t.value+=e+"\n",t.value.length>9e5&&(t.value=t.value.slice(-75e4)),searchState.active?recalculateMatches(!1):$("autoscroll").checked&&(t.scrollTop=t.scrollHeight)}function clearOrCancelLog(){searchState.active?cancelSearch():clearLog()}function recalculateMatches(e=!0){const t=$("searchQuery").value;if(!searchState.active||!t)return;const n=$("log").value.toLowerCase(),a=t.toLowerCase();let s=0,o=[];for(;a;){const e=n.indexOf(a,s);if(e<0)break;o.push(e),s=e+a.length}searchState.matches=o,o.length?searchState.index=e?Math.min(Math.max(searchState.index,0),o.length-1):0:searchState.index=-1,updateSearchUI(!1)}function runSearchOrNext(){if(searchState.active&&searchState.matches.length)return void nextMatch();$("searchQuery").value&&(searchState.prevAutoscroll=$("autoscroll").checked,searchState.active=!0,$("autoscroll").checked=!1,$("autoscroll").disabled=!0,recalculateMatches(!1),searchState.matches.length?gotoMatch(0):updateSearchUI(!1))}function gotoMatch(e){if(!searchState.matches.length)return;searchState.index=(e+searchState.matches.length)%searchState.matches.length;const t=searchState.matches[searchState.index],n=t+searchState.query.length,a=$("log");a.focus(),a.setSelectionRange(t,n);const s=a.value.slice(0,t).split("\n").length-1;a.scrollTop=Math.max(0,16*s-a.clientHeight/2),updateSearchUI(!1)}function nextMatch(){searchState.active&&searchState.matches.length&&gotoMatch(searchState.index+1)}function previousMatch(){searchState.active&&searchState.matches.length&&gotoMatch(searchState.index-1)}function cancelSearch(){searchState.active=!1,searchState.query="",searchState.matches=[],searchState.index=-1,$("searchQuery").value="",$("autoscroll").disabled=!1,$("autoscroll").checked=searchState.prevAutoscroll,$("log").setSelectionRange($("log").selectionStart,$("log").selectionStart),updateSearchUI(!0)}function updateSearchUI(e){searchState.active?(searchState.query=$("searchQuery").value,$("searchPrev").disabled=searchState.matches.length<2,$("searchNext").textContent=searchState.matches.length>1?"⏩":"🔍",$("refreshBtn").disabled=!0,$("refreshBtn").textContent=searchState.matches.length?`${searchState.index+1}/${searchState.matches.length}`:"0/0",$("clearBtn").textContent="❌"):($("searchPrev").disabled=!0,$("searchNext").textContent="🔍",$("refreshBtn").disabled=!1,$("refreshBtn").textContent="♻️",$("clearBtn").textContent="🗑️")}function fmtUptime(e){return e=Number(e||0),Math.floor(e/3600)+"h "+Math.floor(e%3600/60)+"m"}function mibToGiB(e){return(Number(e||0)/1024).toFixed(2)}function inferGpuStatus(e){const t=Number(e.util_pct||0);return lastStatus&&lastStatus.metrics&&lastStatus.metrics.active_requests>0?t>20?"Token Generation":"Prompt Processing":t>5?"Active":"Idle"}function tempClass(e){return(e=Number(e||0))<35?"temp-blue":e<50?"temp-green":e<60?"temp-yellow":e<70?"temp-orange":e<80?"temp-red":"temp-crimson"}function tempColor(e){return(e=Number(e||0))<35?"#60a5fa":e<50?"#2fc46b":e<60?"#ffde59":e<70?"#ff8a2a":e<80?"#ff5b6c":"#dc143c"}function tempLabel(e){return`${e||"N/A"} °C${Number(e||0)>=80?" ⚠️":""}`}function formatTempWithPeak(e,t){const n=formatMaybeNumber(e,0);if(!n)return"N/A";const a=Number(e||0)>=80?" ⚠️":"",s=formatMaybeNumber(t,0);if(!s)return`<span class="${tempClass(e)}">${n}°C${a}</span>`;const o=Number(t||0)>=80?" ⚠️":"";return`<span class="${tempClass(e)}">${n}°C${a}</span> <span class="${tempClass(t)}">( ${s}°↑ C${o})</span>`}const lastGpuStatusByIndex={};function formatMaybeNumber(e,t=2){const n=Number(e);if(Number.isFinite(n))return n.toFixed(t).replace(/\.?0+$/,"");const a=String(e??"").trim();return a&&"N/A"!==a&&"[Not Supported]"!==a?a:""}function formatGpuMetricWithPeak(e,t,n,a=2){const s=formatMaybeNumber(e,a);if(!s)return"N/A";const o=formatMaybeNumber(t,a);return`${s} ${n}${o?` ( ${o}&uarr; ${n})`:""}`}function renderGpuCards(e){if(!e||!e.length)return void($("gpuCards").innerHTML='<div class="panel">No GPU data</div>');const t={};$("gpuCards").innerHTML=e.map(e=>e.error?`<div class="gpu-card">${e.error}</div>`:(()=>{const n=inferGpuStatus(e),a=lastGpuStatusByIndex[String(e.index)]||"";return t[String(e.index)]=n,`<div class="gpu-card"><div class="gpu-title">GPU ${e.index} - ${e.name||"RTX 3090"}${e.vendor?" ("+e.vendor+")":""}</div><div class="gpu-grid"><div><div class="gpu-section-title">Temperature</div><div class="gpu-line"><span>Core</span><b>${formatTempWithPeak(e.temp_c,e.temp_peak_c)}</b></div></div><div><div class="gpu-section-title">VRAM</div><div class="gpu-line"><span>Free</span><b>${mibToGiB(e.mem_free_mib)} GB</b></div><div class="gpu-line"><span>Used</span><b>${mibToGiB(e.mem_used_mib)} GB</b></div><div class="gpu-line"><span>Max</span><b>${mibToGiB(e.mem_total_mib)} GB</b></div><div class="meter"><span style="width:${Number(e.mem_pct||0)}%"></span></div></div><div><div class="gpu-section-title">Power</div><div class="gpu-line"><span>Draw</span><b>${formatGpuMetricWithPeak(e.power_w,e.power_peak_w,"W",2)}</b></div><div class="gpu-line"><span>Max Power</span><b>${e.power_limit_w||"N/A"} W</b></div></div><div><div class="gpu-section-title">Fans</div><div class="gpu-line"><span>Speed</span><b>${e.fan_pct||"N/A"}%</b></div></div><div><div class="gpu-section-title">Clocks</div><div class="gpu-line"><span>Core</span><b>${formatGpuMetricWithPeak(e.core_clock_mhz,e.core_clock_peak_mhz,"MHz",0)}</b></div><div class="gpu-line"><span>Mem</span><b>${formatGpuMetricWithPeak(e.mem_clock_mhz,e.mem_clock_peak_mhz,"MHz",0)}</b></div></div><div><div class="gpu-section-title">Usage</div><div class="gpu-line"><span>Load</span><b>${e.util_pct||"N/A"}%</b></div><div class="gpu-line"><span>Status</span><b>${n}${a?` (Previous: ${a})`:""}</b></div></div></div></div>`})()).join(""),Object.keys(lastGpuStatusByIndex).forEach(e=>delete lastGpuStatusByIndex[e]),Object.assign(lastGpuStatusByIndex,t)}let editingPresetName=null;function presetParamSummary(e){e=e||{};const t=[];if(["temperature","top_p","top_k","min_p","presence_penalty","frequency_penalty","repetition_penalty","length_penalty","max_tokens","max_completion_tokens","min_tokens","truncate_prompt_tokens","seed","logprobs","top_logprobs"].forEach(n=>{void 0!==e[n]&&null!==e[n]&&""!==e[n]&&t.push(`${n}: ${e[n]}`)}),void 0!==e.ignore_eos&&t.push("ignore_eos: "+(e.ignore_eos?"on":"off")),void 0!==e.skip_special_tokens&&t.push("skip special: "+(e.skip_special_tokens?"on":"off")),void 0!==e.include_stop_str_in_output&&t.push("include stop: "+(e.include_stop_str_in_output?"on":"off")),void 0!==e.stop&&t.push(`stop: ${Array.isArray(e.stop)?e.stop.join("|"):e.stop}`),e.chat_template_kwargs){const n=e.chat_template_kwargs;void 0!==n.enable_thinking&&t.push("thinking: "+(n.enable_thinking?"on":"off")),n.preserve_thinking&&t.push("preserve thinking: on")}return t.join(", ")||"No explicit parameters"}function renderPresetCatalog(e){const t=$("apiPresetGrid");if(!t||!e)return;const n=[...e.defaults||[],...e.custom||[]];t.innerHTML=n.map(e=>{const t=e.locked;return`<div class="api-card"><div class="api-card-head"><h3>${e.endpoint}<br><span class="label">${e.endpoint_alt||"/"+e.name}</span></h3>${t?'<span class="label">default</span>':`<span class="preset-actions"><button class="iconbtn" title="Edit" onclick="editPreset('${e.name}')">✏️</button><button class="iconbtn" title="Delete" onclick="deletePreset('${e.name}')">❌</button></span>`}</div><p>${e.description||""}</p><p class="label">${presetParamSummary(e.params)}</p></div>`}).join("")+'<div class="api-card"><h3>/v1/short-* / /short-* and /v1/concise-* / /concise-*</h3><p>Prefix any default or custom preset to cap replies: short = 4096 tokens, concise = 512 tokens. Presets work both under /v1/name and /name for clients that append /v1 automatically.</p></div>'}function openPresetEditor(e){editingPresetName=e&&e.name?e.name:null,$("presetEditor").classList.add("open"),$("presetIntro")&&$("presetIntro").classList.add("hidden"),$("presetSaveBtn").textContent=editingPresetName?"💾 Save changes":"💾 Save",$("presetName").disabled=!!editingPresetName,$("presetName").value=e?.name||"",$("presetDescription").value=e?.description||"";const t=e?.params||{},n=t.chat_template_kwargs||{};$("presetTemperature").value=t.temperature??"",$("presetTopP").value=t.top_p??"",$("presetTopK").value=t.top_k??"",$("presetMinP").value=t.min_p??"",$("presetThinking").value=String(!!n.enable_thinking),$("presetPreserveThinking").value=String(!!n.preserve_thinking),$("presetRepetitionPenalty").value=t.repetition_penalty??"",$("presetPresencePenalty").value=t.presence_penalty??"",$("presetFrequencyPenalty").value=t.frequency_penalty??"",$("presetMaxCtx").value=t.truncate_prompt_tokens??"",$("presetMaxTokens").value=t.max_tokens??"",$("presetSeed").value=t.seed??"",$("presetMinTokens").value=t.min_tokens??"",$("presetLogprobs").value=t.logprobs??"",$("presetTopLogprobs").value=t.top_logprobs??"",$("presetLengthPenalty").value=t.length_penalty??"",$("presetIgnoreEos").value=void 0===t.ignore_eos?"":String(!!t.ignore_eos),$("presetSkipSpecial").value=void 0===t.skip_special_tokens?"":String(!!t.skip_special_tokens),$("presetIncludeStop").value=void 0===t.include_stop_str_in_output?"":String(!!t.include_stop_str_in_output),$("presetStop").value=Array.isArray(t.stop)?t.stop.join("\n"):t.stop??"",$("presetEditor").scrollIntoView({behavior:"smooth",block:"center"})}function closePresetEditor(){editingPresetName=null,$("presetEditor").classList.remove("open"),$("presetIntro")&&$("presetIntro").classList.remove("hidden")}function collectPresetForm(){function e(e){return $(e).value.trim()}const t={description:e("presetDescription"),enable_thinking:"true"===$("presetThinking").value,preserve_thinking:"true"===$("presetPreserveThinking").value};[["temperature","presetTemperature"],["top_p","presetTopP"],["top_k","presetTopK"],["min_p","presetMinP"],["repetition_penalty","presetRepetitionPenalty"],["presence_penalty","presetPresencePenalty"],["frequency_penalty","presetFrequencyPenalty"],["truncate_prompt_tokens","presetMaxCtx"],["max_tokens","presetMaxTokens"],["seed","presetSeed"],["min_tokens","presetMinTokens"],["logprobs","presetLogprobs"],["top_logprobs","presetTopLogprobs"],["length_penalty","presetLengthPenalty"]].forEach(([n,a])=>{const s=function(t){const n=e(t);return""===n?void 0:Number(n)}(a);Number.isFinite(s)&&(t[n]=s)}),[["ignore_eos","presetIgnoreEos"],["skip_special_tokens","presetSkipSpecial"],["include_stop_str_in_output","presetIncludeStop"]].forEach(([n,a])=>{const s=e(a);""!==s&&(t[n]="true"===s)});const n=e("presetStop");return n&&(t.stop=n),t}async function savePresetFromForm(){const e=editingPresetName||$("presetName").value.trim();try{const t=await fetch("/admin/presets",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"save",name:e,preset:collectPresetForm()})}),n=await t.json();if(!t.ok||!n.ok)throw new Error(n.error||"save failed");renderPresetCatalog(n.presets),closePresetEditor(),setMsg("Saved preset "+e),await refreshStatus()}catch(e){alert("Preset save failed: "+e)}}function editPreset(e){const t=(lastStatus?.presets?.custom||[]).find(t=>t.name===e);t&&openPresetEditor(t)}async function deletePreset(e){if(confirm("Delete custom preset "+e+"?"))try{const t=await fetch("/admin/presets",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"delete",name:e})}),n=await t.json();if(!t.ok||!n.ok)throw new Error(n.error||"delete failed");renderPresetCatalog(n.presets),setMsg("Deleted preset "+e),await refreshStatus()}catch(e){alert("Preset delete failed: "+e)}}function draw(e,t,n,a,s){const o=$(e);if(!o)return;const r=o.getContext("2d"),i=devicePixelRatio||1,l=o.width=o.clientWidth*i,c=o.height=o.clientHeight*i;if(r.clearRect(0,0,l,c),r.fillStyle=s||"#9dafc3",r.font=11*i+"px system-ui",r.fillText(a,8*i,14*i),!t.length)return;const u=t.map(e=>Number(e[n]||0)),d=1.1*Math.max(1,...u);r.strokeStyle=s,r.lineWidth=2*i,r.beginPath(),u.forEach((e,t)=>{const n=t/(u.length-1||1)*l,a=c-e/d*(c-24*i)-4*i;t?r.lineTo(n,a):r.moveTo(n,a)}),r.stroke(),r.fillStyle="#e8eef7",r.fillText(String(u[u.length-1]||0),l-62*i,14*i)}function drawGpuSeries(e,t,n,a,s,o){draw(e,t.map(e=>{const t=(e.gpus||[]).find(e=>String(e.index)===String(n));return{[a]:t?Number(t[a]||0):0}}),a,s,o)}function renderMetrics(e){const t=e.series||[];draw("cGpu",t,"gpu_util","GPU util %","#72c7ff"),draw("cMem",t,"mem_pct","VRAM %","#2fc46b"),draw("cLatency",t,"latency_s","Latency s","#ffcb6b"),draw("cTps",t,"tps","TPS est","#ff5b6c"),draw("cRam",t,"ram_pct","System RAM %","#2fc46b"),draw("cCpu",t,"cpu_pct","CPU total %","#72c7ff"),draw("cSystemUtil",t,"system_util_pct","System utilization %","#a78bfa"),draw("cNetDown",t,"net_rx_kbps","Download kbps","#2fc46b"),draw("cNetUp",t,"net_tx_kbps","Upload kbps","#72c7ff"),$("ramInfo")&&($("ramInfo").textContent=e.system&&e.system.memory?`Used ${mibToGiB(e.system.memory.used_mib)} / ${mibToGiB(e.system.memory.total_mib)} GB (${e.system.memory.used_pct}%)`:"");const n=e.system&&e.system.cpu&&e.system.cpu.cores||[];$("cpuCores")&&($("cpuCores").innerHTML=n.map(e=>`<div class="stat"><div class="label">Core ${e.core}</div><div class="value">${e.usage_pct}%</div><div class="meter"><span style="width:${e.usage_pct}%"></span></div></div>`).join(""));const a=e.system&&e.system.disks||[];function s(e){if(e.error)return`<div class="storage-card"><div class="storage-title">Error</div><div class="value">${e.error}</div></div>`;const t=`${e.path||e.source||e.name||"disk"}${e.label?" — "+e.label:""}`,n=`${e.model||""} ${e.transport?"· "+e.transport:""} · ${e.type||"-"} / ${e.partition_type||"-"} · ${e.fs||"-"} · ${e.mount||"not mounted"}${e.usage_basis?" · "+e.usage_basis:""}`,a=e=>null==e?"Unknown":`${e} GB`,s=a(e.free_gib),o=a(e.used_gib),r=a(e.total_gib),i=null===e.used_pct||void 0===e.used_pct?0:Number(e.used_pct||0),l=null===e.used_pct||void 0===e.used_pct?"usage unknown":`${i}% used`;return`<div class="${e.user_facing?"storage-card user-facing":"storage-card"}"><div class="storage-title">${t}</div><div class="storage-meta">${n}</div><div class="storage-sizes"><div class="stat"><div class="label">Free</div><div class="value">${s}</div></div><div class="stat"><div class="label">Used</div><div class="value">${o}</div></div><div class="stat"><div class="label">Total</div><div class="value">${r}</div></div></div><div class="diskbar"><span style="width:${i}%"></span></div><div class="label">${l}</div></div>`}if($("diskInfo")){const e=a.filter(e=>"disk"===e.kind||"disk"===e.type),t=a.filter(e=>!("disk"===e.kind||"disk"===e.type));$("diskInfo").innerHTML=`<div class="storage-section"><div class="panel"><h2>Disks</h2><div class="storage-list">${e.map(s).join("")||'<div class="value">No physical disks found</div>'}</div></div><div class="panel"><h2>Volumes</h2><div class="storage-list">${t.map(s).join("")||'<div class="value">No volumes found</div>'}</div></div></div>`}const o=e.system&&e.system.network||{};$("netInfo")&&($("netInfo").innerHTML=`<div class="stat"><div class="label">Local IP</div><div class="value">${o.local_ip||"unknown"}</div></div><div class="stat"><div class="label">Internet IP</div><div class="value">${o.public_ip||"unknown"}</div></div><div class="stat"><div class="label">Download</div><div class="value">${o.rx_kbps||0} kbps</div></div><div class="stat"><div class="label">Upload</div><div class="value">${o.tx_kbps||0} kbps</div></div>`);const r=e.system&&e.system.info||{};$("systemInfo")&&($("systemInfo").innerHTML=`OS: ${r.os||"unknown"}<br>Kernel: ${r.kernel||"unknown"}<br>Host: ${r.hostname||"unknown"}<br>User: ${r.username||"unknown"}<br>Machine: ${r.machine||"unknown"}<br>CPU: ${r.cpu_model||"unknown"}<br>Board/Product: ${r.board||"-"} / ${r.product||"-"}<br>BIOS: ${r.bios||"-"}<br>GPUs: ${r.gpus||"unknown"}`);const i=$("gpuMetricCharts");if(i&&e.gpus){const n=[{key:"util",suffix:"Util",label:"util %",color:"#72c7ff"},{key:"mem_pct",suffix:"Mem",label:"VRAM %",color:"#2fc46b"},{key:"temp",suffix:"Temp",label:"core temp °C",color:"#ffde59"},{key:"power",suffix:"Power",label:"power W",color:"#ff5b6c"}];i.innerHTML=n.map(t=>e.gpus.map(e=>`<div class="chart"><canvas id="cGpu${e.index}${t.suffix}"></canvas></div>`).join("")).join(""),n.forEach(n=>e.gpus.forEach(e=>{const a=n.color,s=`GPU${e.index} ${n.label}`;drawGpuSeries(`cGpu${e.index}${n.suffix}`,t,e.index,n.key,s,a)}))}}let selectedInstance="GPU0",logEs=null,selectedUserName="",selectedOverviewInstanceId="",selectedLogInstanceId="";function escapeHtml(e){return String(e??"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#39;")}function svgIcon(e){return"edit"===e?'<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4l10-10-4-4L4 16v4zM14 6l4 4" fill="none"/></svg>':"key"===e?'<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 7a4 4 0 1 0 0 8a4 4 0 0 0 0-8Zm0 0h6m-2 0v3m-3 0h6" fill="none"/></svg>':"reset"===e?'<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66M20 4v6h-6" fill="none"/></svg>':"delete"===e?'<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M9 7V5h6v2m-7 3v7m4-7v7m4-7v7M7 7l1 12h8l1-12" fill="none"/></svg>':"copy"===e?'<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 9h10v10H9zM5 15H4V5h10v1" fill="none"/></svg>':"upload"===e?'<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0l-4 4m4-4l4 4M5 20h14" fill="none"/></svg>':""}function renderIconButton({title:e,action:t,icon:n,className:a=""}){return`<button class="${`iconbtn ${a}`.trim()}" title="${escapeHtml(e)}" aria-label="${escapeHtml(e)}" onclick="${t}">${svgIcon(n)}</button>`}async function copyTextValue(e){const t=String(e||"");if(!t)return!1;if(navigator.clipboard&&navigator.clipboard.writeText)try{return await navigator.clipboard.writeText(t),!0}catch(e){}const n=document.createElement("textarea");n.value=t,n.setAttribute("readonly","readonly"),n.style.position="fixed",n.style.opacity="0",document.body.appendChild(n),n.focus(),n.select();let a=!1;try{a=document.execCommand("copy")}catch(e){a=!1}return n.remove(),a}function ensureApiKeyModal(){if($("apiKeyModal"))return;const e=document.createElement("div");e.id="apiKeyModal",e.className="club-modal hidden",e.innerHTML=`<div class="club-modal-card" role="dialog" aria-modal="true" aria-labelledby="apiKeyModalTitle"><div class="panel-head"><h2 id="apiKeyModalTitle">API Key</h2><button class="iconbtn" id="apiKeyModalTopClose" title="Close" aria-label="Close" onclick="closeApiKeyModal()">${svgIcon("delete")}</button></div><div class="preset-help" id="apiKeyModalHint">Use Copy to place the key on the clipboard.</div><textarea id="apiKeyModalValue" class="modal-keybox" readonly wrap="off"></textarea><div class="preset-form-actions"><button class="btn amber" onclick="copyApiKeyModalValue()">Copy</button><button class="btn blue" onclick="closeApiKeyModal()">Close</button></div><div class="msg" id="apiKeyModalMsg"></div></div>`,e.addEventListener("click",t=>{t.target===e&&closeApiKeyModal()}),document.body.appendChild(e)}let apiKeyModalOptions={copySuccessText:"Copied API key to clipboard.",showTopClose:!0};function openApiKeyModal(e,t,n="",a={}){ensureApiKeyModal(),apiKeyModalOptions={copySuccessText:"Copied API key to clipboard.",showTopClose:!0,...a},$("apiKeyModalTitle").textContent=e||"API Key",$("apiKeyModalHint").textContent=n||"Use Copy to place the key on the clipboard.",$("apiKeyModalValue").value=t||"",$("apiKeyModalMsg").textContent="",$("apiKeyModalTopClose")&&$("apiKeyModalTopClose").classList.toggle("hidden",!apiKeyModalOptions.showTopClose),$("apiKeyModal").classList.remove("hidden")}function closeApiKeyModal(){ensureApiKeyModal(),$("apiKeyModal").classList.add("hidden")}async function copyApiKeyModalValue(){ensureApiKeyModal();const e=await copyTextValue($("apiKeyModalValue").value||"");$("apiKeyModalMsg").textContent=e?apiKeyModalOptions.copySuccessText||"Copied API key to clipboard.":"Copy failed on this browser."}function setInstanceMsg(e){$("instanceMsg")&&($("instanceMsg").textContent=e||"")}function getInstanceList(){return lastStatus&&lastStatus.instances||[]}function setUsersMsg(e){$("usersMsg")&&($("usersMsg").textContent=e||"")}async function saveUserForm(){try{const e=await fetch("/admin/users",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"save",user:collectUserForm()})}),t=await e.json();if(!e.ok||!t.ok)throw new Error(t.error||"save failed");t.api_key&&openApiKeyModal("API key for "+t.user.name,t.api_key,"This key is now stored so it can be viewed again from the user card."),resetUserForm(),setUsersMsg("Saved user "+t.user.name),await refreshStatus()}catch(e){alert("User save failed: "+e)}}async function showUserApiKey(e){try{const t=await fetch("/admin/users",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"show_key",name:e})}),n=await t.json();if(!t.ok||!n.ok)throw new Error(n.error||"show failed");openApiKeyModal("API key for "+e,n.api_key,"Use Copy to place the current key on the clipboard.")}catch(e){alert("API key lookup failed: "+e)}}async function resetUserKey(e){if(confirm("Reset API key for "+e+"?"))try{const t=await fetch("/admin/users",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"reset_key",name:e})}),n=await t.json();if(!t.ok||!n.ok)throw new Error(n.error||"reset failed");openApiKeyModal("New API key for "+e,n.api_key,"The previous key is no longer valid. Use Copy if you need to share the replacement key."),setUsersMsg("Reset API key for "+e),await refreshStatus()}catch(e){alert("API key reset failed: "+e)}}async function deleteUserByName(e){if(confirm("Delete user "+e+"?"))try{const t=await fetch("/admin/users",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"delete",name:e})}),n=await t.json();if(!t.ok||!n.ok)throw new Error(n.error||"delete failed");selectedUserName===e&&resetUserForm(),setUsersMsg("Deleted user "+e),await refreshStatus()}catch(e){alert("User delete failed: "+e)}}let currentLogSource="docker";function setAuditMsg(e){$("auditMsg")&&($("auditMsg").textContent=e||"")}function mirrorAuthToggles(e){$("auditAllowAnonymousProxy")&&($("auditAllowAnonymousProxy").checked=!!e)}let selectedGroupName="";function setGroupsMsg(e){$("groupsMsg")&&($("groupsMsg").textContent=e||"")}function findPanelByHeading(e,t){return[...document.querySelectorAll(`#${e} .panel`)].find(e=>{const n=e.querySelector(".panel-head h2,h2");return(n&&n.textContent||"").trim()===t})||null}let selectedScope="GPU0";function currentScope(){return selectedScope||selectedInstance||"GPU0"}function scopeIsGlobal(){return"GLOBAL"===currentScope()}function ensureV413Layout(){const e=document.querySelector(".tabs"),t=e&&e.querySelector('.tab[onclick*="audit"]'),n=e&&e.querySelector('.tab[onclick*="logs"]');t&&t.remove(),e&&n&&e.appendChild(n);const a=$("system"),s=$("presets"),o=$("logs"),r=$("audit");if(a&&r){const e=findPanelByHeading("audit","Access Policy");e&&!e.dataset.v413Moved&&(e.dataset.v413Moved="1",a.insertBefore(e,a.children[1]||null));const t=findPanelByHeading("audit","Audit Overview");t&&o&&!t.dataset.v413Moved&&(t.dataset.v413Moved="1",o.insertBefore(t,o.firstChild||null));const n=findPanelByHeading("audit","Global Controls");n&&n.remove();const s=findPanelByHeading("audit","Audit Stream");s&&s.remove(),0!==r.childElementCount&&r.querySelector(".panel")||r.remove()}const i=findPanelByHeading("system","Access Policy");if(i){const e=[...i.querySelectorAll("button")].find(e=>(e.textContent||"").includes("Open Users Management"));e&&e.remove()}const l=[...document.querySelectorAll("#presets .panel")].find(e=>{const t=e.querySelector(".panel-head h2,h2");return t&&((t.textContent||"").includes("Per-Instance Docker Presets")||(t.textContent||"").includes("Single GPU Docker Presets"))});if(l){l.id="singlePresetCard";const e=l.querySelector("h2");e&&(e.textContent="Single GPU Docker Presets")}const c=[...document.querySelectorAll("#presets .panel .panel-head h2")].find(e=>"Custom Preset Templates"===(e.textContent||"").trim());if(c&&(c.textContent="Custom Configuration Endpoints"),s&&!$("presetScopePanel")){const e=document.createElement("div");e.className="panel",e.id="presetScopePanel",e.innerHTML='<h2>GPU Scope</h2><div class="subtabs" id="presetScopeTabs"></div><div class="value smallgap" id="presetScopeSummary">-</div>',s.insertBefore(e,s.firstChild||null)}if(s&&!$("dualPresetCard")){const e=document.createElement("div");e.className="panel",e.id="dualPresetCard",e.innerHTML='<h2>Dual GPU Docker Presets</h2><div class="preset-help">Apply a dual-GPU runtime across the first two detected cards. Use Global scope for these presets.</div><div class="actions"><button class="btn blue" onclick="switchDualMode(\'vllm/dual\')">dual</button><button class="btn blue" onclick="switchDualMode(\'vllm/dual-turbo\')">dual-turbo</button><button class="btn blue" onclick="switchDualMode(\'vllm/dual-dflash\')">dual-dflash</button><button class="btn blue" onclick="switchDualMode(\'vllm/dual-dflash-noviz\')">dual-dflash-noviz</button></div>';const t=$("singlePresetCard");t&&t.parentNode===s?s.insertBefore(e,t.nextSibling):s.insertBefore(e,s.children[1]||null)}if(o&&!$("logsSourcePanel")){const e=document.createElement("div");e.className="panel",e.id="logsSourcePanel",e.innerHTML=`<div class="panel-head"><h2>Log Sources</h2><div class="preset-actions">${renderIconButton({title:"Export Logs",action:"exportCurrentLog()",icon:"upload"})}</div></div><div class="subtabs"><button class="subtab" id="logSourceDocker" onclick="setCurrentLogSource('docker')">Docker Logs</button><button class="subtab" id="logSourceAudit" onclick="setCurrentLogSource('audit')">Audit Logs</button></div><div class="value smallgap" id="logsSourceSummary">-</div>`,o.appendChild(e)}const u=findPanelByHeading("system","Power Profiles");if(u&&!$("profileScopeNote")){const e=document.createElement("div");e.className="preset-help",e.id="profileScopeNote",u.insertBefore(e,u.querySelector(".actions")||u.firstChild)}const d=findPanelByHeading("system","Optimizations + Cooling");if(d&&!$("powerScopeNote")){const e=document.createElement("div");e.className="preset-help",e.id="powerScopeNote",d.insertBefore(e,d.querySelector(".actions")||d.firstChild)}}function quotaLimitText(e,t=""){return null==e||""===e?"unlimited":`${e}${t}`}function quotaWeightText(e){return null==e||""===e?"default":String(Number(e).toFixed(3)).replace(/\.?0+$/,"")}function quotaWindowText(e){return`${(e=e||{}).requests||0} msgs · score ${Number(e.score||0).toFixed(1)} · in ${e.input_tokens||0} · out ${e.output_tokens||0} · tools ${e.tool_calls||0} · thinking ${Number(e.thinking_seconds||0).toFixed(1)}s`}function quotaWeightLine(e){return`in ${quotaWeightText((e=e||{}).input_token_weight)} · out ${quotaWeightText(e.output_token_weight)} · tools ${quotaWeightText(e.tool_call_weight)} · thinking ${quotaWeightText(e.thinking_second_weight)}`}function quotaBudgetLine(e){return`5h ${quotaLimitText((e=e||{}).score_per_5h)} · week ${quotaLimitText(e.score_per_week)} · /msg tokens ${quotaLimitText(e.max_tokens_per_message)} · /msg tools ${quotaLimitText(e.max_tool_calls_per_message)}`}function parseQuotaNumber(e){const t=$(e);if(!t)return null;const n=t.value.trim();return""===n?null:Number(n)}function scopeItems(){const e=getInstanceList().slice();return e.sort((e,t)=>{const n="dual"===e.kind?1:0,a="dual"===t.kind?1:0;if(n!==a)return n-a;return((e.gpu_indices||[e.gpu_index])[0]||0)-((t.gpu_indices||[t.gpu_index])[0]||0)||String(e.id).localeCompare(String(t.id))}),e}function singleScopeItems(){return scopeItems().filter(e=>"dual"!==e.kind)}function pairScopeItems(){return scopeItems().filter(e=>"dual"===e.kind)}function gpuCount(){return Number(lastStatus&&lastStatus.gpu_count||0)}function canonicalPairId(e,t){const n=[Number(e),Number(t)].filter(e=>Number.isInteger(e)&&e>=0).sort((e,t)=>e-t);return 2!==n.length||n[0]===n[1]?"":`PAIR${n[0]}_${n[1]}`}function exactTwoPairTarget(){return pairScopeItems().find(e=>"[0,1]"===JSON.stringify((e.gpu_indices||[]).slice().sort((e,t)=>e-t)))||null}function currentScopeInstance(e=!1){return"GLOBAL"===currentScope()?e?null:exactTwoPairTarget():scopeItems().find(e=>e.id===currentScope())||singleScopeItems()[0]||pairScopeItems()[0]||null}function currentScopeKind(){const e=currentScopeInstance(!0);return e?e.kind:"GLOBAL"===currentScope()?"global":"single"}function dockerLogTarget(){return trackedLogRuntime()||currentScopeInstance(!1)||scopeItems()[0]||null}function scopeLabel(e){return e?"dual"===e.kind?`Pair ${(e.gpu_indices||[]).join(" + ")}`:e.id:"Global"}function scopeAllowsSinglePresets(){const e=currentScopeInstance(!0);return!!e&&"dual"!==e.kind}function scopeAllowsDualPresets(){const e=currentScopeInstance(!1);return!!e&&"dual"===e.kind}function runtimeTrackingItems(){const e=Object.values(lastStatus&&lastStatus.instance_runtime_metrics||{}).filter(e=>e&&e.running);return e.sort((e,t)=>{const n=Array.isArray(e.gpu_indices)?e.gpu_indices:[],a=Array.isArray(t.gpu_indices)?t.gpu_indices:[];return(n[0]??999)-(a[0]??999)||n.length-a.length||String(e.id||e.instance_id||"").localeCompare(String(t.id||t.instance_id||""))}),e}function normalizeTrackedRuntimeId(e){const t=runtimeTrackingItems();if(!t.length)return"";const n=String(e||"").trim().toUpperCase();if(n){const e=t.find(e=>String(e.id||e.instance_id).toUpperCase()===n);if(e)return String(e.id||e.instance_id)}return String(t[0].id||t[0].instance_id)}function trackedOverviewRuntime(){const e=normalizeTrackedRuntimeId(selectedOverviewInstanceId);return e?(selectedOverviewInstanceId=e,runtimeTrackingItems().find(t=>String(t.id||t.instance_id)===String(e))||null):null}function trackedLogRuntime(){const e=normalizeTrackedRuntimeId(selectedLogInstanceId);return e?(selectedLogInstanceId=e,runtimeTrackingItems().find(t=>String(t.id||t.instance_id)===String(e))||null):null}function setOverviewTrackedInstance(e){selectedOverviewInstanceId=normalizeTrackedRuntimeId(e),renderOverviewTracker(),lastStatus&&renderOverviewStatus(lastStatus)}function setLogTrackedInstance(e){selectedLogInstanceId=normalizeTrackedRuntimeId(e),renderLogTracker(),applyLogVisibility(),connectLogs(!0)}function formatCtxTokens(e){const t=Number(e||0);return!Number.isFinite(t)||t<=0?"-":t>=1e6?`${(t/1e6).toFixed(2).replace(/\.?0+$/,"")}M`:t>=1e3?`${(t/1e3).toFixed(t>=1e5?0:1).replace(/\.?0+$/,"")}K`:String(Math.round(t))}function formatNumber(e,t=2){const n=Number(e);return Number.isFinite(n)?n.toFixed(t).replace(/\.?0+$/,""):"-"}function formatLastStatusCard(e,t){const n=e||{},a=n.last_status??t.last_status,s=Number(a),o=[Number.isFinite(s)?`HTTP ${Math.trunc(s)}`:null!=a&&""!==a?String(a):"-"],r=n.last_latency_s??t.last_latency_s,i=n.last_ttft_s??t.last_ttft_s,l=n.last_tokens_per_second??t.last_tokens_per_second;null!=r&&o.push(`latency=${formatNumber(r,3)}s`),null!=i&&o.push(`ttft=${formatNumber(i,3)}s`),null!==n.last_prefill_s&&void 0!==n.last_prefill_s&&o.push(`prefill~=${formatNumber(n.last_prefill_s,3)}s`),null!=l&&o.push(`tk/s=${formatNumber(l,2)}`);const c=[];if(null!==n.gpu_kv_cache_usage_pct&&void 0!==n.gpu_kv_cache_usage_pct){const e=formatCtxTokens(n.ctx_size_tokens);c.push("-"!==e?`KV ${formatNumber(n.gpu_kv_cache_usage_pct,1)}% | ${e} ctx`:`KV ${formatNumber(n.gpu_kv_cache_usage_pct,1)}%`)}else n.ctx_size_tokens&&c.push(`${formatCtxTokens(n.ctx_size_tokens)} ctx`);const u=n.speculative||{},d=[];null!==u.drafted_tokens&&void 0!==u.drafted_tokens&&d.push(`drafted=${u.drafted_tokens}`),null!==u.accept_rate_pct&&void 0!==u.accept_rate_pct&&d.push(`accept=${formatNumber(u.accept_rate_pct,1)}%`),null!==u.accepted_tokens&&void 0!==u.accepted_tokens&&null!==u.draft_tokens&&void 0!==u.draft_tokens&&d.push(`accepted=${u.accepted_tokens}/${u.draft_tokens}`),null!==u.mean_acceptance_length&&void 0!==u.mean_acceptance_length&&d.push(`avg=${formatNumber(u.mean_acceptance_length,2)}`),null!==u.system_efficiency_pct&&void 0!==u.system_efficiency_pct&&d.push(`eff=${formatNumber(u.system_efficiency_pct,1)}%`);const p=[`<div>${o.join(" &middot; ")}</div>`];return c.length&&p.push(`<div class="value-subline">${c.join(" &middot; ")}</div>`),d.length&&p.push(`<div class="value-subline">spec ${d.join(" &middot; ")}</div>`),p.join("")}function formatRequestCard(e,t){const n=`total=${t.total_requests??0}, active=${t.active_requests??0}, fail=${t.failed_requests??0}, queue=${t.queued_requests??0}`;if(!e)return n;const a=[];return null!==e.running_requests&&void 0!==e.running_requests&&a.push(`run=${e.running_requests}`),null!==e.waiting_requests&&void 0!==e.waiting_requests&&a.push(`wait=${e.waiting_requests}`),null!==e.pending_requests&&void 0!==e.pending_requests&&a.push(`pending=${e.pending_requests}`),a.length?`${n}<div class="value-subline">instance ${a.join(" &middot; ")}</div>`:n}function renderOverviewTracker(){const e=findPanelByHeading("overview","Status");if(!e)return;let t=$("overviewTrackerRow");if(!t){t=document.createElement("div"),t.id="overviewTrackerRow",t.className="scope-strip";const n=e.querySelector(".grid");e.insertBefore(t,n||e.querySelector(".msg")||null)}const n=runtimeTrackingItems();if(n.length<=1)return t.innerHTML="",void t.classList.add("hidden");t.classList.remove("hidden");const a=normalizeTrackedRuntimeId(selectedOverviewInstanceId);selectedOverviewInstanceId=a,t.innerHTML=`<span class="label">Track instance</span><div class="subtabs">${n.map(e=>`<button class="subtab ${String(e.id||e.instance_id)===a?"active":""}" onclick="setOverviewTrackedInstance('${String(e.id||e.instance_id)}')">${escapeHtml(String(e.id||e.instance_id))}</button>`).join("")}</div>`}function renderLogTracker(){const e=document.querySelector(".logs.panel");if(!e)return;let t=$("logTrackerRow");t||(t=document.createElement("div"),t.id="logTrackerRow",t.className="scope-strip",e.insertBefore(t,$("log")||e.lastChild||null));const n=runtimeTrackingItems();if("audit"===currentLogSource||n.length<=1)return t.innerHTML="",void t.classList.add("hidden");t.classList.remove("hidden");const a=normalizeTrackedRuntimeId(selectedLogInstanceId);selectedLogInstanceId=a,t.innerHTML=`<span class="label">Track instance</span><div class="subtabs">${n.map(e=>`<button class="subtab ${String(e.id||e.instance_id)===a?"active":""}" onclick="setLogTrackedInstance('${String(e.id||e.instance_id)}')">${escapeHtml(String(e.id||e.instance_id))}</button>`).join("")}</div>`}function renderOverviewStatus(e){const t=e&&e.metrics||{},n=e&&e.power||{},a=trackedOverviewRuntime();$("summary")&&($("summary").textContent=a?`${a.id||a.instance_id} | ${a.mode||e.active_mode} | ${a.container||"no container"} | ${n.profile||"balanced"} | GPUs ${e.gpu_count??0}`:`${e.active_mode} | ${e.container||"no container"} | ${n.profile||"balanced"} | GPUs ${e.gpu_count??0}`),$("mode")&&($("mode").textContent=`${a?.mode||e.active_mode} / ${a?.port||e.active_port}`),$("container")&&($("container").textContent=a?.container||e.container||"none"),$("req")&&($("req").innerHTML=formatRequestCard(a,t)),$("last")&&($("last").innerHTML=formatLastStatusCard(a,t)),$("uptime")&&($("uptime").textContent=fmtUptime(e.uptime_seconds)),$("powerbox")&&($("powerbox").textContent=`profile=${n.profile||"-"}, GPU=${n.gpu||"-"}, CPU=${n.cpu||"-"}, fans=${n.fans||"-"}, container=${n.container||"-"}, idle=${n.idle_for_seconds??0}s`),renderOverviewTracker()}function setEditorState(e,t,n){const a=$(e),s=$(t);a&&a.classList.toggle("open",!!n),s&&s.classList.toggle("hidden",!!n)}function openUserEditor(){ensureUsersUi(),setEditorState("userEditor","userIntro",!0)}function openGroupEditor(){ensureGroupUi(),setEditorState("groupEditor","groupIntro",!0)}async function createPairGroup(e=null,t=null){if(gpuCount()<2)return void alert("At least two GPUs are required to create a dual pair.");let n=e,a=t;if(null===n||null===a){if(n=prompt(`First GPU index (0-${Math.max(gpuCount()-1,0)}):`,"0"),null===n)return;if(a=prompt(`Second GPU index (0-${Math.max(gpuCount()-1,0)}):`,"1"),null===a)return}const s=canonicalPairId(n,a);if(s)try{const e=await fetch("/admin/instances",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"save_pair",gpu_indices:[Number(n),Number(a)],mode:"vllm/dual",enabled:!1})}),t=await e.json();if(!e.ok||!t.ok)throw new Error(t.error||"pair save failed");setInstanceMsg(`Saved pair group ${s}`),await refreshStatus(),setScope(s,!1)}catch(e){alert("Pair group failed: "+e)}else alert("Select two distinct GPU indices.")}async function deleteCurrentPairGroup(){const e=currentScopeInstance(!0);if(e&&"dual"===e.kind){if(confirm(`Delete pair group ${e.id}?`))try{const t=await fetch("/admin/instances",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"delete_pair",instance_id:e.id})}),n=await t.json();if(!t.ok||!n.ok)throw new Error(n.error||"pair delete failed");setInstanceMsg(`Deleted pair group ${e.id}`),await refreshStatus(),setScope("GLOBAL",!1)}catch(e){alert("Pair delete failed: "+e)}}else alert("Select a dual pair scope first.")}async function switchDualMode(e){const t=currentScopeInstance(!1);if(t&&"dual"===t.kind){if(confirm(`Apply dual preset ${e} to ${t.id} on GPUs ${(t.gpu_indices||[]).join(", ")}? This will stop overlapping runtimes that already use those GPUs.`))try{await post("/admin/switch",{instance_id:t.id,mode:e})}catch(e){alert(e)}}else alert("Choose a dual pair tab, or use Global on an exactly-two-GPU server, before applying a dual preset.")}function profileDescription(e){return{eco:"Eco profile: lower GPU power limits, lower idle clocks, powersave CPU governor, faster idle/container stop timers.",balanced:"Balanced profile: normal server profile with 280W active GPU cap, idle downclocking after 10 minutes, and container stop after 1 hour.",default:"Default profile: keeps the 280W safety GPU cap but removes idle clock locking, uses schedutil CPU while active, and keeps standard idle timers.",turbo:"Turbo profile: higher GPU power allowance, performance CPU governor, relaxed idle timers, and minimal downclocking. Use when performance matters more than power."}[e]||"Apply profile?"}function applyDirectoryPayload(e){lastStatus||(lastStatus={}),Array.isArray(e.users)&&(lastStatus.users=e.users,renderUsers(e.users)),Array.isArray(e.groups)&&(lastStatus.groups=e.groups,renderGroups(e.groups)),e.server_config&&(lastStatus.server_config=e.server_config,renderAudit(e.server_config))}ensureUsersUi=function(){const e=document.querySelector(".tabs");if(e&&!document.getElementById("usersTabBtn")){const t=document.createElement("button");t.className="tab",t.id="usersTabBtn",t.textContent="Users",t.onclick=e=>tab(e,"users"),e.insertBefore(t,e.querySelector('.tab[onclick*="metrics"]')||null)}const t=document.querySelector("main.container");if(!t)return;let n=$("users");n||(n=document.createElement("section"),n.id="users",n.className="tabpane content-tab",t.insertBefore(n,document.getElementById("metrics"))),"1"!==n.dataset.v414Users&&(n.dataset.v414Users="1",n.innerHTML='<div class="panel"><div class="panel-head"><h2>User Accounts</h2><button class="add-preset-btn" title="New user" aria-label="New user" onclick="resetUserForm(false)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none"/></svg></button></div><div class="preset-intro" id="userIntro">Manage per-user API keys, access scopes, and Codex-style scored budgets. The configured list stays visible while the editor is collapsed.</div><div class="preset-editor" id="userEditor"><div class="formgrid"><label>User name<input id="userName" placeholder="client_a" /></label><label>Allowed targets<input id="userTargets" placeholder="*, legacy, GPU0, GPU1" /></label><label>Groups<input id="userGroups" placeholder="starter, premium" /></label><label>5h score budget<input id="userScore5h" type="number" step="0.1" placeholder="unlimited" /></label><label>Weekly score budget<input id="userScoreWeek" type="number" step="0.1" placeholder="unlimited" /></label><label>Max tokens / message<input id="userMaxTokensMsg" type="number" step="1" placeholder="unlimited" /></label><label>Max tool calls / message<input id="userMaxToolsMsg" type="number" step="1" placeholder="unlimited" /></label><label>Input token weight<input id="userInputTokenWeight" type="number" step="0.001" placeholder="default" /></label><label>Output token weight<input id="userOutputTokenWeight" type="number" step="0.001" placeholder="default" /></label><label>Tool-call weight<input id="userToolCallWeight" type="number" step="0.001" placeholder="default" /></label><label>Thinking-second weight<input id="userThinkingSecondWeight" type="number" step="0.001" placeholder="default" /></label><label>Enabled<select id="userEnabled"><option value="true">Enabled</option><option value="false">Disabled</option></select></label></div><div class="preset-form-actions"><button class="btn green" onclick="saveUserForm()">Save User</button><button class="btn red" onclick="resetUserForm(true)">Cancel</button></div></div><div class="msg" id="usersMsg"></div><div class="panel" style="margin-top:12px"><h2>Configured Users</h2><div id="usersGrid" class="api-grid"></div></div></div>')},resetUserForm=function(e=!0){ensureUsersUi(),selectedUserName="",$("userName").disabled=!1,$("userName").value="",$("userTargets").value="*",$("userGroups").value="",$("userScore5h").value="",$("userScoreWeek").value="",$("userMaxTokensMsg").value="",$("userMaxToolsMsg").value="",$("userInputTokenWeight").value="",$("userOutputTokenWeight").value="",$("userToolCallWeight").value="",$("userThinkingSecondWeight").value="",$("userEnabled").value="true",setEditorState("userEditor","userIntro",!e),setUsersMsg("")},collectUserForm=function(){function e(e){return($(e)&&$(e).value||"").trim()}return{name:e("userName"),allowed_targets:e("userTargets").split(",").map(e=>e.trim()).filter(Boolean),groups:e("userGroups").split(",").map(e=>e.trim()).filter(Boolean),enabled:"true"===$("userEnabled").value,generate_api_key:!selectedUserName,limits:{score_per_5h:parseQuotaNumber("userScore5h"),score_per_week:parseQuotaNumber("userScoreWeek"),max_tokens_per_message:parseQuotaNumber("userMaxTokensMsg"),max_tool_calls_per_message:parseQuotaNumber("userMaxToolsMsg"),input_token_weight:parseQuotaNumber("userInputTokenWeight"),output_token_weight:parseQuotaNumber("userOutputTokenWeight"),tool_call_weight:parseQuotaNumber("userToolCallWeight"),thinking_second_weight:parseQuotaNumber("userThinkingSecondWeight")}}},editUser=function(e){const t=(lastStatus&&lastStatus.users||[]).find(t=>t.name===e);t&&(ensureUsersUi(),selectedUserName=e,$("userName").disabled=!0,$("userName").value=t.name,$("userTargets").value=(t.allowed_targets||[]).join(", "),$("userGroups").value=(t.groups||[]).join(", "),$("userScore5h").value=t.limits.score_per_5h??"",$("userScoreWeek").value=t.limits.score_per_week??"",$("userMaxTokensMsg").value=t.limits.max_tokens_per_message??"",$("userMaxToolsMsg").value=t.limits.max_tool_calls_per_message??"",$("userInputTokenWeight").value=t.limits.input_token_weight??"",$("userOutputTokenWeight").value=t.limits.output_token_weight??"",$("userToolCallWeight").value=t.limits.tool_call_weight??"",$("userThinkingSecondWeight").value=t.limits.thinking_second_weight??"",$("userEnabled").value=String(!!t.enabled),openUserEditor())},renderUsers=function(e){ensureUsersUi();const t=$("usersGrid");t&&(e=e||[],selectedUserName&&!e.some(e=>e.name===selectedUserName)&&(selectedUserName=""),t.innerHTML=e.map(e=>{const t=[renderIconButton({title:"Edit",action:`editUser('${e.name}')`,icon:"edit"}),renderIconButton({title:e.api_key_available?"Show API key":"Show API key unavailable",action:`showUserApiKey('${e.name}')`,icon:"key"}),renderIconButton({title:"Reset API key",action:`resetUserKey('${e.name}')`,icon:"reset"}),renderIconButton({title:"Delete",action:`deleteUserByName('${e.name}')`,icon:"delete"})].join("");return`<div class="api-card"><div class="api-card-head"><h3>${e.name}<br><span class="label">${e.enabled?"enabled":"disabled"} &middot; access ${(e.effective_allowed_targets||e.allowed_targets||[]).join(", ")||"*"}</span></h3><span class="preset-actions">${t}</span></div><p>Groups: ${(e.groups||[]).join(", ")||"none"}</p><p>API key: ${e.has_api_key?e.api_key_available?"stored and viewable":"legacy key, reset once to store it":"not issued yet"}</p><p>Last 5h: ${quotaWindowText((e.usage||{}).window_5h)}</p><p>Last week: ${quotaWindowText((e.usage||{}).window_week)}</p><p class="label">Direct budgets &middot; ${quotaBudgetLine(e.limits||{})}</p><p class="label">Direct weights &middot; ${quotaWeightLine(e.limits||{})}</p><p class="label">Effective budgets &middot; ${quotaBudgetLine(e.effective_limits||{})}</p><p class="label">Effective weights &middot; ${quotaWeightLine(e.effective_limits||{})}</p></div>`}).join("")||'<div class="value">No API users configured yet.</div>')},ensureGroupUi=function(){ensureUsersUi();const e=$("users");if(!e)return;let t=$("groupsPanel");t||(t=document.createElement("div"),t.className="panel",t.id="groupsPanel",e.appendChild(t)),"1"!==t.dataset.v414Groups&&(t.dataset.v414Groups="1",t.innerHTML='<div class="panel-head"><h2>User Groups / Plans</h2><button class="add-preset-btn" title="New group" aria-label="New group" onclick="resetGroupForm(false)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none"/></svg></button></div><div class="preset-intro" id="groupIntro">Define reusable plans that carry scored budgets, per-message caps, and access scopes. The configured list stays visible while the editor is collapsed.</div><div class="preset-editor" id="groupEditor"><div class="formgrid"><label>Group name<input id="groupName" placeholder="starter" /></label><label>Description<input id="groupDescription" placeholder="Shared plan description" /></label><label>Allowed targets<input id="groupTargets" placeholder="*, legacy, GPU0, GPU1" /></label><label>5h score budget<input id="groupScore5h" type="number" step="0.1" placeholder="unlimited" /></label><label>Weekly score budget<input id="groupScoreWeek" type="number" step="0.1" placeholder="unlimited" /></label><label>Max tokens / message<input id="groupMaxTokensMsg" type="number" step="1" placeholder="unlimited" /></label><label>Max tool calls / message<input id="groupMaxToolsMsg" type="number" step="1" placeholder="unlimited" /></label><label>Input token weight<input id="groupInputTokenWeight" type="number" step="0.001" placeholder="default" /></label><label>Output token weight<input id="groupOutputTokenWeight" type="number" step="0.001" placeholder="default" /></label><label>Tool-call weight<input id="groupToolCallWeight" type="number" step="0.001" placeholder="default" /></label><label>Thinking-second weight<input id="groupThinkingSecondWeight" type="number" step="0.001" placeholder="default" /></label><label>Enabled<select id="groupEnabled"><option value="true">Enabled</option><option value="false">Disabled</option></select></label></div><div class="preset-form-actions"><button class="btn green" onclick="saveGroupForm()">Save Group</button><button class="btn red" onclick="resetGroupForm(true)">Cancel</button></div></div><div class="msg" id="groupsMsg"></div><div class="panel" style="margin-top:12px"><h2>Configured Groups</h2><div id="groupsGrid" class="api-grid"></div></div>')},resetGroupForm=function(e=!0){ensureGroupUi(),selectedGroupName="",$("groupName").disabled=!1,$("groupName").value="",$("groupDescription").value="",$("groupTargets").value="*",$("groupScore5h").value="",$("groupScoreWeek").value="",$("groupMaxTokensMsg").value="",$("groupMaxToolsMsg").value="",$("groupInputTokenWeight").value="",$("groupOutputTokenWeight").value="",$("groupToolCallWeight").value="",$("groupThinkingSecondWeight").value="",$("groupEnabled").value="true",setEditorState("groupEditor","groupIntro",!e),setGroupsMsg("")},collectGroupForm=function(){function e(e){return($(e)&&$(e).value||"").trim()}return{name:e("groupName"),description:e("groupDescription"),allowed_targets:e("groupTargets").split(",").map(e=>e.trim()).filter(Boolean),enabled:"true"===$("groupEnabled").value,limits:{score_per_5h:parseQuotaNumber("groupScore5h"),score_per_week:parseQuotaNumber("groupScoreWeek"),max_tokens_per_message:parseQuotaNumber("groupMaxTokensMsg"),max_tool_calls_per_message:parseQuotaNumber("groupMaxToolsMsg"),input_token_weight:parseQuotaNumber("groupInputTokenWeight"),output_token_weight:parseQuotaNumber("groupOutputTokenWeight"),tool_call_weight:parseQuotaNumber("groupToolCallWeight"),thinking_second_weight:parseQuotaNumber("groupThinkingSecondWeight")}}},editGroup=function(e){const t=(lastStatus&&lastStatus.groups||[]).find(t=>t.name===e);t&&(ensureGroupUi(),selectedGroupName=e,$("groupName").disabled=!0,$("groupName").value=t.name,$("groupDescription").value=t.description||"",$("groupTargets").value=(t.allowed_targets||[]).join(", "),$("groupScore5h").value=t.limits.score_per_5h??"",$("groupScoreWeek").value=t.limits.score_per_week??"",$("groupMaxTokensMsg").value=t.limits.max_tokens_per_message??"",$("groupMaxToolsMsg").value=t.limits.max_tool_calls_per_message??"",$("groupInputTokenWeight").value=t.limits.input_token_weight??"",$("groupOutputTokenWeight").value=t.limits.output_token_weight??"",$("groupToolCallWeight").value=t.limits.tool_call_weight??"",$("groupThinkingSecondWeight").value=t.limits.thinking_second_weight??"",$("groupEnabled").value=String(!!t.enabled),openGroupEditor())},renderGroups=function(e){ensureGroupUi();const t=$("groupsGrid");t&&(e=e||[],selectedGroupName&&!e.some(e=>e.name===selectedGroupName)&&(selectedGroupName=""),t.innerHTML=e.map(e=>`<div class="api-card"><div class="api-card-head"><h3>${e.name}<br><span class="label">${e.enabled?"enabled":"disabled"} · access ${(e.allowed_targets||[]).join(", ")||"*"}</span></h3><span class="preset-actions"><button class="iconbtn" title="Edit" onclick="editGroup('${e.name}')">✏️</button><button class="iconbtn" title="Delete" onclick="deleteGroupByName('${e.name}')">❌</button></span></div><p>${e.description||"No description"}</p><p class="label">Configured budgets · ${quotaBudgetLine(e.limits||{})}</p><p class="label">Configured weights · ${quotaWeightLine(e.limits||{})}</p><p class="label">Resolved budgets · ${quotaBudgetLine(e.resolved_limits||e.limits||{})}</p><p class="label">Resolved weights · ${quotaWeightLine(e.resolved_limits||e.limits||{})}</p></div>`).join("")||'<div class="value">No groups configured yet.</div>')},renderAudit=function(e){e=e||{},ensureV414Layout();const t=lastStatus&&lastStatus.admin_port||8008,n=lastStatus&&lastStatus.proxy_port||8009,a=e.admin_path||"/admin",s=!!e.online_enabled,o=!!e.allow_proxy_without_api_key,r=!!e.local_api_enabled,i=e.local_api_port||10881;$("auditAdminEndpoint")&&($("auditAdminEndpoint").innerHTML=`:${t}${a}`),$("auditProxyEndpoint")&&($("auditProxyEndpoint").innerHTML=`:${n}`),$("auditExposure")&&($("auditExposure").textContent=s?"online through proxy/admin only":"local/private only"),$("auditLocalApi")&&($("auditLocalApi").textContent=r?`127.0.0.1:${i}`:"disabled"),$("auditSummary")&&($("auditSummary").innerHTML="Audit entries capture admin actions, proxy authentication outcomes, quota denials, API usage, group changes, and user-management events. Use the shared log viewer below to inspect either Docker runtime logs or the audit log stream."),$("auditPolicyText")&&($("auditPolicyText").innerHTML=`Proxy API keys are currently <b>${o?"optional":"required"}</b>. Admin UI remains under <code>:${t}${a}</code>.`),mirrorAuthToggles(o)},saveAuthSettings=async function(){const e=!(!$("auditAllowAnonymousProxy")||!$("auditAllowAnonymousProxy").checked);mirrorAuthToggles(e);try{const t=await fetch("/admin/users",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"save_server_config",allow_proxy_without_api_key:e})}),n=await t.json();if(!t.ok||!n.ok)throw new Error(n.error||"config failed");n.server_config&&renderAudit(n.server_config),setAuditMsg("Saved access policy"),await refreshStatus()}catch(e){alert("Access policy failed: "+e)}},renderInstances=function(e){ensureV414Layout();const t=$("instanceTabs"),n=$("instanceSummary"),a=$("instanceEnableBtn"),s=findPanelByHeading("system","Instances");if(!t||!n||!s)return;e=scopeItems(),selectedScope&&("GLOBAL"===selectedScope||e.some(e=>e.id===selectedScope))||(selectedScope=singleScopeItems()[0]?.id||pairScopeItems()[0]?.id||"GLOBAL");const o=singleScopeItems().map(e=>`<button class="subtab ${e.id===currentScope()?"active":""}" onclick="setScope('${e.id}')">${e.id}${e.running?" • on":" • off"}</button>`).join("")+pairScopeItems().map(e=>`<button class="subtab ${e.id===currentScope()?"active":""}" onclick="setScope('${e.id}')">Pair ${(e.gpu_indices||[]).join("+")}${e.running?" • on":" • off"}</button>`).join("")+`<button class="subtab ${scopeIsGlobal()?"active":""}" onclick="setScope('GLOBAL')">Global</button>`;t.innerHTML=o,ensurePairManager();const r=currentScopeInstance(!1),i=[...s.querySelectorAll("#instanceActionRow .btn")||[]];scopeIsGlobal()&&r&&2===gpuCount()?(n.innerHTML=`Global scope controls the only dual pair <code>${r.id}</code> on GPUs ${(r.gpu_indices||[]).join(", ")} · mode ${r.mode} · port ${r.port} · proxy <code>${r.proxy_prefix}/</code>`,a&&(a.disabled=!1,a.textContent=r.enabled?"Disable Boot Autostart":"Enable Boot Autostart"),i.forEach(e=>e.disabled=!1)):scopeIsGlobal()?(n.innerHTML="Global scope selected. Create or choose a dual pair tab to manage arbitrary two-GPU dual presets. The profile and optimization controls below still apply against the active global context.",a&&(a.disabled=!0,a.textContent="Select a GPU or Pair Scope"),i.forEach(e=>e.disabled=!0)):r?(n.innerHTML=`${scopeLabel(r)} · ${r.assignment_text} · port ${r.port} · ${r.running?"running":"stopped"} · proxy <code>${r.proxy_prefix}/</code> · ${r.enabled?"autostart enabled":"autostart disabled"}`,a&&(a.disabled=!1,a.textContent=r.enabled?"Disable Boot Autostart":"Enable Boot Autostart"),i.forEach(e=>e.disabled=!1)):(n.textContent="No GPU instances configured",a&&(a.disabled=!0,a.textContent="Boot autostart unavailable"),i.forEach(e=>e.disabled=!0)),$("logInstanceLabel")&&($("logInstanceLabel").textContent=currentLogLabel())},renderPresetScopeTabs=function(){const e=$("presetScopeTabs"),t=$("presetScopeSummary");if(!e||!t)return;e.innerHTML=singleScopeItems().map(e=>`<button class="subtab ${e.id===currentScope()?"active":""}" onclick="setScope('${e.id}')">${e.id}</button>`).join("")+pairScopeItems().map(e=>`<button class="subtab ${e.id===currentScope()?"active":""}" onclick="setScope('${e.id}')">Pair ${(e.gpu_indices||[]).join("+")}</button>`).join("")+`<button class="subtab ${scopeIsGlobal()?"active":""}" onclick="setScope('GLOBAL')">Global</button>`;const n=currentScopeInstance(!1);scopeIsGlobal()&&n&&2===gpuCount()?t.innerHTML=`Global scope targets the only dual pair <code>${n.id}</code>. Dual preset buttons below will apply to GPUs ${(n.gpu_indices||[]).join(", ")}.`:scopeIsGlobal()?t.innerHTML="Global scope selected. Single-GPU presets are disabled here. Choose or create a dual pair tab to apply dual presets.":currentScopeInstance(!0)?t.innerHTML=`Targeting ${scopeLabel(currentScopeInstance(!0))} · ${currentScopeInstance(!0).assignment_text} · proxy <code>${currentScopeInstance(!0).proxy_prefix}/</code>`:t.textContent="No preset scope available",document.querySelectorAll("#singlePresetCard .actions .btn").forEach(e=>e.disabled=!scopeAllowsSinglePresets()),document.querySelectorAll("#dualPresetCard .actions .btn").forEach(e=>e.disabled=!scopeAllowsDualPresets())},updateScopedCards=function(){const e=currentScopeInstance(!1);$("profileScopeNote")&&($("profileScopeNote").innerHTML=`${scopeIsGlobal()?"Global":scopeLabel(e)} scope: applying a power profile resets the recorded GPU peak values and starts a fresh measurement session.`),$("powerScopeNote")&&($("powerScopeNote").innerHTML=`${scopeIsGlobal()?"Global":scopeLabel(e)} scope: optimization and cooling actions use the selected runtime context while keeping host-level power state in sync.`),renderLogSourcePanel()},powerAction=async function(e){const t=currentScopeInstance(!1);if(!["stop_container","start_instance","restart_instance","toggle_enabled"].includes(e)||t){if("stop_container"!==e||confirm(`Stop ${scopeLabel(t)} now?`))try{await post("/admin/power",{action:e,instance_id:t?t.id:null,enabled:t?!t.enabled:void 0})}catch(e){alert(e)}}else alert("Select a GPU or Pair scope first.")},instanceAction=async function(e){await powerAction(e)},toggleInstanceEnabled=async function(){const e=currentScopeInstance(!1);if(e)try{await post("/admin/power",{action:"toggle_enabled",instance_id:e.id,enabled:!e.enabled})}catch(e){alert(e)}else alert("Select a GPU or Pair scope first.")},switchMode=async function(e){const t=currentScopeInstance(!0);if(!t||"dual"===t.kind)return void alert("Select a single GPU tab to apply a single-GPU preset.");const n=pairScopeItems().find(e=>e.running&&(e.gpu_indices||[]).includes(Number(t.gpu_index))),a=n?`\n\nWarning: GPU ${t.gpu_index} is currently occupied by ${n.id} running ${n.mode}. Continuing will stop that pair and replace it with ${e} on ${t.id}.`:"";if(confirm(`Assign ${e} to ${t.id} and start it?${a}`))try{await post("/admin/switch",{instance_id:t.id,mode:e})}catch(e){alert(e)}},profile=async function(e){const t=currentScopeInstance(!1),n=scopeIsGlobal()?legacyGlobalDualScope()?"GLOBAL":t?.id||"GLOBAL":t?.id||null,a=scopeIsGlobal()?"Global":scopeLabel(t);if(confirm(profileDescription(e)+`\n\nApply this profile now to ${a} scope and reset the recorded GPU peaks?`))try{await post("/admin/profile",{profile:e,instance_id:n},`/admin/profile ${e} ${n||"GLOBAL"}`)}catch(e){alert(e)}},saveGroupForm=async function(){try{const e=await fetch("/admin/groups",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"save",group:collectGroupForm()})}),t=await e.json();if(!e.ok||!t.ok)throw new Error(t.error||"group save failed");applyDirectoryPayload(t),resetGroupForm(!0),setGroupsMsg("Saved group "+t.group.name),refreshStatus().catch(()=>{})}catch(e){alert("Group save failed: "+e)}},deleteGroupByName=async function(e){if(confirm("Delete group "+e+"?"))try{const t=await fetch("/admin/groups",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"delete",name:e})}),n=await t.json();if(!t.ok||!n.ok)throw new Error(n.error||"group delete failed");applyDirectoryPayload(n),selectedGroupName===e&&resetGroupForm(!0),setGroupsMsg("Deleted group "+e),refreshStatus().catch(()=>{})}catch(e){alert("Group delete failed: "+e)}},pairingEnabled=function(){return!!(lastStatus&&lastStatus.server_config&&lastStatus.server_config.gpu_pairing_enabled)},legacyGlobalDualScope=function(){return 2===gpuCount()&&!pairingEnabled()},singleScopeItems=function(){return scopeItems().filter(e=>"dual"!==e.kind)},pairScopeItems=function(){return pairingEnabled()?scopeItems().filter(e=>"dual"===e.kind):[]},exactTwoPairTarget=function(){return 2===gpuCount()&&scopeItems().find(e=>"PAIR0_1"===e.id)||null},currentScopeInstance=function(e=!1){return"GLOBAL"===currentScope()?legacyGlobalDualScope()?e?null:legacyGlobalPair():pairingEnabled()&&2===gpuCount()?e?null:exactTwoPairTarget():null:scopeItems().find(e=>e.id===currentScope())||singleScopeItems()[0]||pairScopeItems()[0]||null},dockerLogTarget=function(){if("audit"===currentLogSource)return null;const e=legacyGlobalPair(),t=currentScopeInstance(!1)||scopeItems()[0]||null;return scopeIsGlobal()&&legacyGlobalDualScope()||legacyGlobalDualScope()&&e&&e.running&&t&&"dual"!==t.kind&&("pair"===t.assignment_scope||t.overrides_dual_mode||!t.running)?null:t},scopeLabel=function(e){return e?"GLOBAL"===e.id?"Global Dual":"dual"===e.kind?`Pair ${(e.gpu_indices||[]).join(" + ")}`:e.id:legacyGlobalDualScope()?"Global Dual":"Global"},scopeAllowsSinglePresets=function(){const e=currentScopeInstance(!0);return!!e&&"dual"!==e.kind},scopeAllowsDualPresets=function(){if(scopeIsGlobal()&&2===gpuCount())return!0;const e=currentScopeInstance(!1);return!!e&&"dual"===e.kind};const UI_STATE_KEY="club3090-ui-state";let uiStateHydrated=!1,uiStateSaveTimer=null,instanceBusyState={active:!1,message:""},currentLogSignature="",statusPollTimer=null;function readCachedUiState(){try{return JSON.parse(localStorage.getItem(UI_STATE_KEY)||"{}")||{}}catch(e){return{}}}function writeCachedUiState(e){try{localStorage.setItem(UI_STATE_KEY,JSON.stringify(e||{}))}catch(e){}}function normalizeTabName(e){return"audit"===e?"logs":["overview","system","presets","metrics","users","logs"].includes(e)?e:"overview"}function currentUiState(){return{active_tab:normalizeTabName(activeTabName),selected_scope:selectedScope||"GLOBAL",current_log_source:"audit"===currentLogSource?"audit":"docker",show_global_logs:!!showGlobalLogs}}function queueUiStateSave(e={}){const t={...currentUiState(),...e};writeCachedUiState(t),uiStateSaveTimer&&clearTimeout(uiStateSaveTimer),uiStateSaveTimer=setTimeout(async()=>{try{await fetch("/admin/ui-config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(t)})}catch(e){}},120)}function activeTabButton(e){return[...document.querySelectorAll(".tab")].find(t=>(t.getAttribute("onclick")||"").includes(`'${e}'`)||t.id===`${e}TabBtn`)||null}function hydrateUiState(e){if(uiStateHydrated)return;const t={...readCachedUiState(),...e||{}};activeTabName=normalizeTabName(t.active_tab||activeTabName),currentLogSource="audit"===t.current_log_source?"audit":"docker",showGlobalLogs="boolean"==typeof t.show_global_logs?t.show_global_logs:showGlobalLogs;const n=new Set(scopeItems().map(e=>e.id)),a=t.selected_scope||selectedScope||"GLOBAL";selectedScope="GLOBAL"===a?"GLOBAL":n.has(a)?a:singleScopeItems()[0]?.id||pairScopeItems()[0]?.id||"GLOBAL","GLOBAL"!==selectedScope&&(selectedInstance=selectedScope),uiStateHydrated=!0}setShowGlobalLogs=async function(e){showGlobalLogs=!!e,applyLogVisibility(),queueUiStateSave({show_global_logs:showGlobalLogs});try{await fetch("/admin/ui-config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({show_global_logs:showGlobalLogs})})}catch(e){setMsg("Could not save UI config: "+e)}},legacyGlobalPair=function(){return lastStatus&&lastStatus.legacy_global_instance||null};let powerCoolingBusyState={active:!1,message:""};const STATUS_POLL_MS=1e3;function syncPowerCoolingBusyState(){const e=findPanelByHeading("system","Optimizations + Cooling");e&&(e.classList.toggle("instance-panel-busy",!!powerCoolingBusyState.active),[...e.querySelectorAll("button,input,select,textarea")].forEach(e=>{powerCoolingBusyState.active?e.setAttribute("disabled","disabled"):e.removeAttribute("disabled")}))}function setPowerCoolingBusy(e,t=""){powerCoolingBusyState={active:!!e,message:t||""},syncPowerCoolingBusyState()}async function withPowerCoolingBusy(e,t){setPowerCoolingBusy(!0,e);try{return await t()}finally{setPowerCoolingBusy(!1)}}function redrawMetricsSoon(){lastStatus&&(renderMetrics(lastStatus),requestAnimationFrame(()=>{lastStatus&&renderMetrics(lastStatus)}))}function syncInstancesBusyState(){const e=findPanelByHeading("system","Instances");if(!e)return;e.classList.toggle("instance-panel-busy",!!instanceBusyState.active),[...e.querySelectorAll("button,input,select,textarea")].forEach(e=>{instanceBusyState.active?e.setAttribute("disabled","disabled"):("gpuPairingEnabled"!==e.id||gpuCount()>=2)&&e.removeAttribute("disabled")});const t=$("pairingBusyNote");if(t){const e=instanceBusyState.message||(2===gpuCount()?"Keep disabled if you want Global to keep behaving like the shared two-GPU runtime.":"Enable this to manage arbitrary dual-GPU pair groups.");t.innerHTML=instanceBusyState.active?`<span class="spinner" aria-hidden="true"></span>${e}`:e}}function setInstancesBusy(e,t=""){instanceBusyState={active:!!e,message:t||""},syncInstancesBusyState()}async function saveGpuPairingSetting(e){setInstancesBusy(!0,"Applying GPU pairing setting...");try{const t=await fetch("/admin/users",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"save_server_config",gpu_pairing_enabled:!!e})}),n=await t.json();if(!t.ok||!n.ok)throw new Error(n.error||"GPU pairing update failed");n.server_config&&(lastStatus||(lastStatus={}),lastStatus.server_config=n.server_config),await refreshStatus(),e||setScope("GLOBAL",!1)}catch(e){alert("GPU pairing update failed: "+e)}finally{setInstancesBusy(!1)}}function ensureAuditOverviewCard(){const e=$("system"),t=findPanelByHeading("logs","Audit Overview")||findPanelByHeading("audit","Audit Overview")||findPanelByHeading("system","Audit Overview");if(e&&t){const n=findPanelByHeading("system","Services");e.insertBefore(t,n&&n.nextSibling||e.children[1]||null)}}function ensurePairingToggle(){const e=findPanelByHeading("system","Instances");if(!e)return;let t=$("pairingToggleRow");if(!t){t=document.createElement("div"),t.id="pairingToggleRow",t.className="actions";const n=$("instanceTabs");n&&n.parentNode===e&&n.insertAdjacentElement("beforebegin",t)}const n=gpuCount(),a=pairingEnabled(),s=!!instanceBusyState.active,o=s?instanceBusyState.message||"Applying GPU pairing setting...":2===n?"Keep disabled if you want Global to keep behaving like the shared two-GPU runtime.":"Enable this to manage arbitrary dual-GPU pair groups.";t.innerHTML=`<label class="label"><input type="checkbox" id="gpuPairingEnabled" ${a?"checked":""} ${n<2||s?"disabled":""} onchange="saveGpuPairingSetting(this.checked)"> Enable GPU Pairing</label><span class="label busy-note" id="pairingBusyNote">${s?`<span class="spinner" aria-hidden="true"></span>${o}`:o}</span>`}ensureAccessPolicyCard=function(){const e=findPanelByHeading("system","Access Policy");e&&"1"!==e.dataset.v414Policy&&(e.dataset.v414Policy="1",e.innerHTML='<h2>Access Policy</h2><div class="actions" id="accessPolicyRow"><label class="label"><input type="checkbox" id="auditAllowAnonymousProxy" onchange="mirrorAuthToggles(this.checked)"> allow requests without per-user API keys</label><button class="btn blue" onclick="saveAuthSettings()">Save Policy</button></div><div class="value smallgap" style="margin-top:10px" id="auditPolicyText">-</div>')},ensureMachineButtons=function(){const e=findPanelByHeading("system","System");if(!e)return;const t=[...e.querySelectorAll(".actions")],n=[...e.querySelectorAll("button")].find(e=>(e.textContent||"").includes("Wake-on-LAN")),a=e.querySelector(".machine-row");n&&a&&!a.contains(n)&&a.prepend(n),t.forEach(e=>{e===a||e.querySelector("button")||e.remove()})},allPairChoices=function(){const e=gpuCount(),t=[];for(let n=0;n<e;n+=1)for(let a=n+1;a<e;a+=1)t.push([n,a]);return t},ensurePairManager=function(){const e=findPanelByHeading("system","Instances");if(!e)return;let t=$("pairManagerBar");if(!t){t=document.createElement("div"),t.id="pairManagerBar",t.className="actions";const n=$("instanceSummary");n&&n.parentNode===e&&n.insertAdjacentElement("afterend",t)}if(!pairingEnabled()||gpuCount()<2)return void(t.innerHTML="");const n=currentScopeInstance(!0),a=!!n&&"dual"===n.kind,s=new Set(pairScopeItems().map(e=>e.id)),o=allPairChoices().filter(([e,t])=>!s.has(canonicalPairId(e,t))).map(([e,t])=>`<button class="btn blue" onclick="createPairGroup(${e},${t})">Add Pair ${e}+${t}</button>`).join("");t.style.margin="8px 0 10px",t.innerHTML=`${o||""}<button class="btn purple" onclick="createPairGroup()">Custom Pair Group</button>${a?`<button class="btn red" onclick="deleteCurrentPairGroup()">Delete ${scopeLabel(n)}</button>`:""}`},ensureV414Layout=function(){ensureV413Layout(),ensureUsersUi(),ensureGroupUi(),ensureAccessPolicyCard(),ensureAuditOverviewCard(),ensureMachineButtons(),ensurePairingToggle(),ensurePairManager(),syncInstancesBusyState(),syncPowerCoolingBusyState()};const logCache=Object.create(null);let statusRefreshPromise=null,pendingForcedStatusRefresh=!1,logConnectToken=0,logExportBusy=!1;function renderLogSourcePanel(){$("logSourceDocker")&&$("logSourceDocker").classList.toggle("active","docker"===currentLogSource),$("logSourceAudit")&&$("logSourceAudit").classList.toggle("active","audit"===currentLogSource),$("logsSourceSummary")&&($("logsSourceSummary").innerHTML="audit"!==currentLogSource?scopeIsGlobal()&&legacyGlobalDualScope()?"Docker logs selected. The shared live log viewer follows the active global dual runtime.":"Docker logs selected. The shared live log viewer follows the currently selected tracked instance.":"Audit logs selected. The shared live log viewer follows <code>/opt/club3090-control/audit.log</code>.")}function trimLogText(e){const t=String(e||"");return t.length>9e5?t.slice(-75e4):t}function logCacheEntry(e){return logCache[e]||(logCache[e]={text:"",loaded:!1}),logCache[e]}function renderCurrentLog(e){const t=$("log");if(!t)return;const n=logCacheEntry(e);t.value=n.loaded?n.text:"Connecting...\n",searchState.active?recalculateMatches(!0):$("autoscroll")&&$("autoscroll").checked&&(t.scrollTop=t.scrollHeight)}function replaceLogBuffer(e,t){const n=logCacheEntry(e);n.text=trimLogText(t||""),n.loaded=!0,e===currentLogSignature&&renderCurrentLog(e)}function appendLogChunk(e,t){if(!t)return;const n=logCacheEntry(e);n.text=trimLogText((n.text||"")+t),n.loaded=!0,e===currentLogSignature&&renderCurrentLog(e)}function syntheticLog(e){appendLog(`[admin-ui ${(new Date).toLocaleTimeString()}] ${e}`)}function adminResultText(e,t){let n="";if(e&&"object"==typeof e)try{n=JSON.stringify(e,null,2)}catch(e){n=""}return n||(n=String(t||"").trim()),n.length>5e3&&(n=n.slice(0,5e3)+"\n...<truncated>..."),n}function logStreamConfig(){if("audit"===currentLogSource)return{signature:"audit",url:"/admin/audit-stream?tail=4000"};const e=trackedLogRuntime(),t=e||dockerLogTarget(),n=e&&(e.id||e.instance_id)?e.id||e.instance_id:scopeIsGlobal()&&legacyGlobalDualScope()?"GLOBAL":t&&t.id;return{signature:`docker:${n||"primary"}`,url:"/admin/logs"+(n?`?instance=${encodeURIComponent(n)}`:"")}}function currentLogExportRequest(){if("audit"===currentLogSource)return{source:"audit",instance_id:null};if(currentLogSignature&&currentLogSignature.startsWith("docker:")){const e=currentLogSignature.slice(7);if(e&&"primary"!==e)return{source:"docker",instance_id:e}}const e=trackedLogRuntime(),t=e||dockerLogTarget();return{source:"docker",instance_id:(e&&(e.id||e.instance_id)?e.id||e.instance_id:scopeIsGlobal()&&legacyGlobalDualScope()?"GLOBAL":t&&t.id)||null}}async function exportCurrentLog(){if(!logExportBusy){logExportBusy=!0;try{const e=currentLogExportRequest();openApiKeyModal("Log Export Link",(await post("/admin/log-export",e,`/admin/log-export ${e.source} ${e.instance_id||"host"}`)).url||"","Share this link directly for debugging. It points to the currently selected log export.",{copySuccessText:"Copied exported log URL to the clipboard.",showTopClose:!1})}catch(e){alert(e)}finally{logExportBusy=!1}}}currentLogHeading=function(){return"audit"===currentLogSource?"Audit Logs":"Docker Logs"},currentLogLabel=function(){if("audit"===currentLogSource)return"source: audit";const e=trackedLogRuntime();if(e)return"instance: "+(e.id||e.instance_id||"primary");if(scopeIsGlobal()&&legacyGlobalDualScope())return"instance: Global dual";const t=dockerLogTarget();return"instance: "+(t&&t.id||"primary")},clearLog=function(){const e=currentLogSignature||logStreamConfig().signature,t=logCacheEntry(e);t.text="",t.loaded=!0,renderCurrentLog(e)},appendLog=function(e){appendLogChunk(currentLogSignature||logStreamConfig().signature,`${e}\n`)},applyLogVisibility=function(){const e="logs"===activeTabName;document.body.classList.toggle("logs-tab",e),document.body.classList.remove("audit-tab");const t=document.querySelector(".logs.panel");t&&t.classList.toggle("log-card-hidden",!e&&!showGlobalLogs),$("logTitle")&&($("logTitle").textContent=currentLogHeading()),$("logInstanceLabel")&&($("logInstanceLabel").textContent=currentLogLabel()),renderLogSourcePanel(),renderLogTracker(),currentLogSignature&&renderCurrentLog(currentLogSignature)},connectLogs=function(e=!1){if(!("logs"===activeTabName||showGlobalLogs)&&!e)return;const t=logStreamConfig();if(!e&&logEs&&t.signature===currentLogSignature)return void renderCurrentLog(t.signature);currentLogSignature=t.signature,renderCurrentLog(t.signature);const n=++logConnectToken;if(logEs){try{logEs.close()}catch(e){}logEs=null}const a=new EventSource(t.url);logEs=a;const s=(e,n)=>{let a=null;try{a=JSON.parse(n||"{}")}catch(e){}const s=a&&"string"==typeof a.text?a.text:String(n||"").replaceAll("\\u0000","\n");"reset"===e?replaceLogBuffer(t.signature,s):appendLogChunk(t.signature,s)};a.addEventListener("reset",e=>{n===logConnectToken&&s("reset",e.data)}),a.addEventListener("append",e=>{n===logConnectToken&&s("append",e.data)}),a.onmessage=e=>{n===logConnectToken&&s("append",e.data)},a.onerror=()=>{}},setCurrentLogSource=function(e){currentLogSource="audit"===e?"audit":"docker",applyLogVisibility(),queueUiStateSave({current_log_source:currentLogSource}),connectLogs(!0)},setShowGlobalLogs=async function(e){showGlobalLogs=!!e,applyLogVisibility(),queueUiStateSave({show_global_logs:showGlobalLogs}),connectLogs(!1)},setScope=function(e,t=!0){const n=new Set(scopeItems().map(e=>e.id));selectedScope="GLOBAL"===e?"GLOBAL":n.has(e)?e:singleScopeItems()[0]?.id||pairScopeItems()[0]?.id||"GLOBAL","GLOBAL"!==selectedScope&&(selectedInstance=selectedScope),renderInstances(getInstanceList()),renderPresetScopeTabs(),updateScopedCards(),applyLogVisibility(),queueUiStateSave(),t&&connectLogs(!0)},post=async function(e,t,n=""){const a=n||`${e} ${JSON.stringify(t||{})}`;syntheticLog(`request sent: ${a}`);try{const n=await fetch(e,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(t||{})}),s=await n.text();let o=null;try{o=JSON.parse(s)}catch(e){}if(!n.ok||o&&!1===o.ok)throw new Error(o&&o.error||s||`${e} failed`);return syntheticLog(`request finished: ${a}`),appendLog(`----- admin result -----\n${adminResultText(o,s)}\n------------------------`),refreshStatus().catch(()=>{}),o||s}catch(e){throw syntheticLog(`request failed: ${a} | ${e.message||e}`),appendLog(`----- admin error -----\n${e.message||e}\n-----------------------`),refreshStatus().catch(()=>{}),e}};const baseRenderMetrics=renderMetrics;function renderEnhancedGpuMetricCharts(e){const t=$("gpuMetricCharts");if(!t||!e.gpus)return;const n=e.series||[],a=[{key:"util",suffix:"Util",label:"util %",color:"#72c7ff"},{key:"mem_pct",suffix:"Mem",label:"VRAM %",color:"#2fc46b"},{key:"temp",suffix:"Temp",label:"core temp °C",color:"#ffde59"},{key:"fan",suffix:"Fan",label:"fan %",color:"#a855f7"},{key:"power",suffix:"Power",label:"power W",color:"#ff5b6c"}];t.innerHTML=a.map(t=>e.gpus.map(e=>`<div class="chart"><canvas id="cGpu${e.index}${t.suffix}"></canvas></div>`).join("")).join(""),a.forEach(t=>e.gpus.forEach(e=>drawGpuSeries(`cGpu${e.index}${t.suffix}`,n,e.index,t.key,`GPU${e.index} ${t.label}`,t.color)))}async function wol(){const e=prompt("MAC address to wake (blank = configured default):","");if(null!==e)try{await post("/admin/wol",{mac:e})}catch(e){alert(e)}}async function machineAction(e){const t="reboot"===e?"RESTART":"SHUT DOWN";if(confirm(t+" machine now?")&&confirm("Final confirmation: "+t+" now."))try{await post("/admin/machine",{action:e})}catch(e){alert(e)}}function syncActiveTabDisplay(){document.querySelectorAll(".tabpane").forEach(e=>e.classList.remove("active")),document.querySelectorAll(".tab").forEach(e=>e.classList.remove("active"));const e=$(activeTabName);e&&e.classList.add("active");const t=activeTabButton(activeTabName);t&&t.classList.add("active"),applyLogVisibility()}function activateTab(e,t=!1){activeTabName=normalizeTabName(e),syncActiveTabDisplay(),("logs"===activeTabName||showGlobalLogs||t)&&connectLogs(!1),"metrics"===activeTabName&&redrawMetricsSoon(),refreshStatus({force:!0}).catch(()=>{}),queueUiStateSave(),setTimeout(()=>{!searchState.active&&$("autoscroll").checked&&$("log")&&($("log").scrollTop=$("log").scrollHeight)},0)}function clearLegacyPollers(){const e=window.setInterval(()=>{},6e4);window.clearInterval(e);for(let t=1;t<e;t+=1)window.clearInterval(t)}function bootAdminUi(){clearLegacyPollers(),ensureV414Layout(),resetUserForm(!0),resetGroupForm(!0),selectedScope||(selectedScope=singleScopeItems()[0]?.id||pairScopeItems()[0]?.id||"GLOBAL"),setScope(selectedScope,!1),refreshStatus().catch(()=>{}),statusPollTimer&&clearInterval(statusPollTimer),statusPollTimer=setInterval(()=>{refreshStatus()},1e3),window.addEventListener("beforeunload",()=>{if(logEs)try{logEs.close()}catch(e){}})}renderMetrics=function(e){baseRenderMetrics(e),renderEnhancedGpuMetricCharts(e)},metricTab=function(e,t){document.querySelectorAll(".metricpane").forEach(e=>e.classList.remove("active")),document.querySelectorAll(".subtab").forEach(e=>e.classList.remove("active"));const n=$(t);n&&n.classList.add("active"),e&&e.target&&e.target.classList.add("active"),redrawMetricsSoon(),refreshStatus().catch(()=>{})},togglePowerOptimizations=async function(){const e=$("optToggle")&&$("optToggle").textContent.includes("Enable"),t=scopeIsGlobal()?"GLOBAL":currentScopeInstance(!1)&&currentScopeInstance(!1).id||null;try{await withPowerCoolingBusy(e?"Applying power optimizations...":"Disabling power optimizations...",()=>post("/admin/power",{action:e?"enable_optimizations":"disable_optimizations",instance_id:t},"/admin/power "+(e?"enable_optimizations":"disable_optimizations")))}catch(e){alert(e)}},toggleFansMax=async function(){const e=$("fanToggle")&&$("fanToggle").textContent.includes("Reset"),t=currentScopeInstance(!1),n=scopeIsGlobal()?"GLOBAL":t&&t.id||null;try{await withPowerCoolingBusy(e?"Resetting fans to default...":"Setting fans to max...",()=>post("/admin/power",{action:e?"fans_auto":"fans_max",instance_id:n},`/admin/power ${e?"fans_auto":"fans_max"} ${n||"host"}`))}catch(e){alert(e)}},tab=function(e,t){activateTab(t,!1)},refreshStatus=async function(e={}){const t=!(!e||!e.force);return statusRefreshPromise?(t&&(pendingForcedStatusRefresh=!0),statusRefreshPromise):(statusRefreshPromise=(async()=>{try{ensureV414Layout();const e=t?`?force=1&_=${Date.now()}`:"",n=await fetch(`/admin/status${e}`,{cache:"no-store"});if(!n.ok)throw new Error(`status fetch failed (${n.status})`);const a=await n.json(),s=(a.metrics,a.power||{});lastStatus=a,hydrateUiState(a.ui_config||{}),$("showGlobalLogs")&&($("showGlobalLogs").checked=!!showGlobalLogs),$("services").textContent=`vLLM=${a.vllm_service}, control=${a.control_service}, console=${a.console_service}`,renderOverviewStatus(a),renderGpuCards(a.gpus),$("optToggle").textContent=s.optimizations_enabled?"Disable Power Optimizations":"Enable Power Optimizations",$("fanToggle").textContent=s.fan_manual_override?"Reset Fans to Default":"Set Fans to Max",renderMetrics(a),renderPresetCatalog(a.presets),renderUsers(a.users||[]),renderGroups(a.groups||[]),renderAudit(a.server_config||{}),renderInstances(a.instances||[]),renderPresetScopeTabs(),updateScopedCards(),syncActiveTabDisplay(),("logs"===activeTabName||showGlobalLogs)&&connectLogs(!1),setMsg("")}catch(e){setMsg("Status error: "+e)}finally{statusRefreshPromise=null,pendingForcedStatusRefresh&&(pendingForcedStatusRefresh=!1,refreshStatus({force:!0}).catch(()=>{}))}})(),statusRefreshPromise)},bootAdminUi();</script></body></html>"""
+
+def runtime_supports_vision(spec):
+    text = str((spec or {}).get("vision") or "").strip().lower()
+    return text not in {"", "none", "no", "false", "blocked", "disabled", "n/a"}
+
+
+def resolve_admin_chat_target(instance_id="", mode=""):
+    target_id = str(instance_id or "").strip().upper()
+    selector = canonical_mode_selector(mode) if mode else ""
+    runtime_rows = running_runtime_rows(instances_snapshot(), legacy_global_instance_snapshot())
+    if target_id:
+        match = next((dict(row) for row in runtime_rows if str(row.get("id") or "").strip().upper() == target_id), None)
+        if match:
+            return match, resolve_variant_spec(match.get("mode")) or {}
+        if is_legacy_global_instance_id(target_id):
+            legacy = legacy_global_instance_snapshot()
+            if legacy and legacy.get("running"):
+                return dict(legacy), resolve_variant_spec(legacy.get("mode")) or {}
+    if selector:
+        match = next((dict(row) for row in runtime_rows if canonical_mode_selector(row.get("mode")) == selector), None)
+        if match:
+            return match, resolve_variant_spec(match.get("mode")) or {}
+        if current_container() and canonical_mode_selector(active_mode()) == selector:
+            spec = resolve_variant_spec(selector) or {}
+            return {
+                "id": "GLOBAL",
+                "kind": "global",
+                "mode": selector,
+                "container": current_container(),
+                "port": active_port(),
+                "running": True,
+                "gpu_indices": mode_gpu_indices(selector, gpu_count=detect_gpu_count_runtime()),
+            }, spec
+    primary = primary_instance()
+    if primary and primary.get("running"):
+        return dict(primary), resolve_variant_spec(primary.get("mode")) or {}
+    mode_now = active_mode()
+    spec = resolve_variant_spec(mode_now) or {}
+    container = current_container()
+    if container and port_open(active_port(), timeout=0.08):
+        return {
+            "id": "GLOBAL",
+            "kind": "global",
+            "mode": mode_now,
+            "container": container,
+            "port": active_port(),
+            "running": True,
+            "gpu_indices": mode_gpu_indices(mode_now, gpu_count=detect_gpu_count_runtime()),
+        }, spec
+    raise RuntimeError("No active runtime is available for chat.")
+
+
+def normalize_admin_chat_messages(messages, allow_images=False):
+    normalized = []
+    if not isinstance(messages, list):
+        raise ValueError("messages must be a list")
+    for item in messages:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        if role not in {"system", "user", "assistant"}:
+            continue
+        content = item.get("content")
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                part_type = str(part.get("type") or "").strip().lower()
+                if part_type == "text":
+                    text = str(part.get("text") or "")
+                    if text:
+                        parts.append({"type": "text", "text": text})
+                elif allow_images and part_type == "image_url":
+                    image_url = part.get("image_url")
+                    if isinstance(image_url, dict):
+                        url = str(image_url.get("url") or "").strip()
+                    else:
+                        url = str(image_url or "").strip()
+                    if url:
+                        parts.append({"type": "image_url", "image_url": {"url": chat_attachment_data_url(url)}})
+            reasoning_text = extract_reasoning_text(item)
+            if parts or (role == "assistant" and reasoning_text):
+                row = {"role": role, "content": parts if parts else ""}
+                if role == "assistant" and reasoning_text:
+                    row["reasoning_content"] = reasoning_text
+                normalized.append(row)
+            continue
+        text = str(content or "")
+        reasoning_text = extract_reasoning_text(item)
+        if text or (role == "assistant" and reasoning_text):
+            row = {"role": role, "content": text}
+            if role == "assistant" and reasoning_text:
+                row["reasoning_content"] = reasoning_text
+            normalized.append(row)
+    if not normalized:
+        raise ValueError("At least one chat message is required")
+    return normalized
+
+
+def apply_admin_chat_params(payload, params):
+    params = params if isinstance(params, dict) else {}
+    allowed_scalars = (
+        "temperature",
+        "top_p",
+        "top_k",
+        "min_p",
+        "presence_penalty",
+        "frequency_penalty",
+        "repetition_penalty",
+        "max_tokens",
+        "max_completion_tokens",
+        "truncate_prompt_tokens",
+        "seed",
+        "min_tokens",
+        "logprobs",
+        "top_logprobs",
+        "length_penalty",
+    )
+    allowed_bools = (
+        "ignore_eos",
+        "skip_special_tokens",
+        "include_stop_str_in_output",
+    )
+    for key in allowed_scalars:
+        if params.get(key) not in (None, ""):
+            payload[key] = params.get(key)
+    for key in allowed_bools:
+        if key in params:
+            payload[key] = bool(params.get(key))
+    stop = params.get("stop")
+    if isinstance(stop, list):
+        cleaned = [str(item) for item in stop if str(item)]
+        if cleaned:
+            payload["stop"] = cleaned
+    elif isinstance(stop, str) and stop.strip():
+        payload["stop"] = stop.strip()
+    chat_template_kwargs = {}
+    if "enable_thinking" in params:
+        chat_template_kwargs["enable_thinking"] = bool(params.get("enable_thinking"))
+    if "preserve_thinking" in params:
+        chat_template_kwargs["preserve_thinking"] = bool(params.get("preserve_thinking"))
+    if chat_template_kwargs:
+        payload["chat_template_kwargs"] = {**dict(payload.get("chat_template_kwargs") or {}), **chat_template_kwargs}
+    return payload
+
+def build_admin_chat_payload(data, spec, stream=False):
+    payload = {
+        "messages": normalize_admin_chat_messages(data.get("messages") or [], allow_images=runtime_supports_vision(spec)),
+        "stream": bool(stream),
+    }
+    model_name = str(data.get("model") or spec.get("served_model_name") or spec.get("model_id") or "").strip()
+    if model_name:
+        payload["model"] = model_name
+    preset_name = str(data.get("api_preset") or "").strip()
+    if preset_name:
+        preset = get_all_presets().get(preset_name)
+        if not preset:
+            raise ValueError(f"Unknown API preset: {preset_name}")
+        payload = merge_preset_params(payload, preset)
+        payload = inject_system_prompt_into_payload(payload, preset_system_prompt(preset_name))
+    else:
+        payload = apply_admin_chat_params(payload, data.get("params"))
+        payload = inject_system_prompt_into_payload(payload, (data.get("params") or {}).get("system_prompt"))
+    if stream:
+        payload["stream_options"] = {"include_usage": True}
+    return payload
+
+
+def chat_backend_request(port, payload):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/v1/chat/completions",
+        data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=None) as response:
+            raw = response.read()
+            return json.loads(raw.decode("utf-8", errors="ignore") or "{}")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(body or f"Runtime returned HTTP {e.code}")
+    except Exception as e:
+        raise RuntimeError(str(e))
+
+def open_chat_backend_stream(port, payload):
+    attempts = []
+    primary = dict(payload or {})
+    attempts.append(primary)
+    if "stream_options" in primary:
+        fallback = dict(primary)
+        fallback.pop("stream_options", None)
+        attempts.append(fallback)
+    last_error = None
+    for index, attempt in enumerate(attempts):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/v1/chat/completions",
+            data=json.dumps(attempt, separators=(",", ":")).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            return urllib.request.urlopen(req, timeout=None), attempt
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="ignore")
+            last_error = RuntimeError(body or f"Runtime returned HTTP {e.code}")
+            if index == 0 and "stream_options" in attempt and ("stream_options" in body.lower() or "include_usage" in body.lower()):
+                continue
+            raise last_error
+        except Exception as e:
+            last_error = RuntimeError(str(e))
+            raise last_error
+    raise last_error or RuntimeError("Unable to open chat stream")
+
+def iter_sse_events(response):
+    buffer = ""
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    while True:
+        chunk = response.read1(8192) if hasattr(response, "read1") else response.read(8192)
+        if not chunk:
+            break
+        text = decoder.decode(chunk).replace("\r\n", "\n").replace("\r", "\n")
+        buffer += text
+        while "\n\n" in buffer:
+            raw_event, buffer = buffer.split("\n\n", 1)
+            yield raw_event
+    tail = decoder.decode(b"", final=True).replace("\r\n", "\n").replace("\r", "\n")
+    buffer += tail
+    if buffer.strip():
+        yield buffer
+
+def merge_stream_tool_call_delta(store, delta_list):
+    for item in delta_list or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            index = int(item.get("index") or 0)
+        except Exception:
+            index = 0
+        current = dict(store.get(index) or {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+        if item.get("id"):
+            current["id"] = str(item.get("id"))
+        if item.get("type"):
+            current["type"] = str(item.get("type"))
+        function = item.get("function") if isinstance(item.get("function"), dict) else {}
+        current_function = dict(current.get("function") or {"name": "", "arguments": ""})
+        if function.get("name"):
+            current_function["name"] = str(function.get("name"))
+        if function.get("arguments") not in (None, ""):
+            current_function["arguments"] = str(current_function.get("arguments") or "") + str(function.get("arguments") or "")
+        current["function"] = current_function
+        store[index] = current
+
+def finalize_stream_tool_calls(store):
+    rows = []
+    for index in sorted(store.keys()):
+        item = dict(store.get(index) or {})
+        function = dict(item.get("function") or {})
+        rows.append({
+            "id": str(item.get("id") or secrets.token_hex(6)),
+            "type": str(item.get("type") or "function"),
+            "function": {
+                "name": str(function.get("name") or ""),
+                "arguments": str(function.get("arguments") or ""),
+            },
+        })
+    return rows
+
+def extract_reasoning_text(payload):
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("reasoning_content", "reasoning"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+def stream_admin_chat_request(handler, data):
+    global last_request_finished_at
+    data = data if isinstance(data, dict) else {}
+    target = None
+    target_id = "GLOBAL"
+    target_key = "GLOBAL"
+    preset_name = str(data.get("api_preset") or "").strip() or "direct"
+    start = time.time()
+    first_chunk_at = None
+    status_code = 200
+    metrics_started = False
+    stream_opened = False
+    response_usage = {"tokens": 0, "input_tokens": 0, "output_tokens": 0, "tool_calls": 0}
+    request_usage = {}
+    try:
+        target, spec = resolve_admin_chat_target(
+            instance_id=data.get("instance_id") or "",
+            mode=data.get("mode") or "",
+        )
+        target_id = str(target.get("id") or "GLOBAL")
+        target_key = str(target_id or "").strip().upper() or "GLOBAL"
+        port = int(target.get("port") or active_port() or 0)
+        if port <= 0:
+            raise RuntimeError("The selected runtime does not expose a valid port.")
+        payload = build_admin_chat_payload(data, spec, stream=True)
+        tools, tool_map = build_enabled_mcp_tools()
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+        request_seed = {
+            "messages": payload.get("messages") or [],
+            "max_tokens": payload.get("max_tokens"),
+            "max_completion_tokens": payload.get("max_completion_tokens"),
+            "tool_choice": payload.get("tool_choice"),
+            "max_tool_calls": payload.get("max_tool_calls"),
+            "max_parallel_tool_calls": payload.get("max_parallel_tool_calls"),
+        }
+        request_usage = extract_request_usage(
+            json.dumps(request_seed, separators=(",", ":")).encode("utf-8")
+        )
+        with metrics_lock:
+            metrics["total_requests"] += 1
+            metrics["active_requests"] += 1
+            metrics["last_preset"] = preset_name
+            metrics["last_path"] = "/admin/chat-stream"
+            target_request_metrics.setdefault(target_key, default_target_request_metrics())
+        metrics_started = True
+
+        handler.close_connection = False
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/event-stream")
+        handler.send_header("Cache-Control", "no-cache")
+        handler.send_header("Connection", "keep-alive")
+        handler.emit_pending_headers()
+        handler.end_headers()
+        stream_opened = True
+
+        assistant_text = ""
+        current_payload = dict(payload)
+        for _ in range(6):
+            stream_response, current_payload = open_chat_backend_stream(port, current_payload)
+            pass_text_parts = []
+            pass_reasoning_parts = []
+            tool_delta_store = {}
+            with stream_response as response:
+                for raw_event in iter_sse_events(response):
+                    data_lines = []
+                    for raw_line in str(raw_event or "").split("\n"):
+                        if raw_line.startswith("data:"):
+                            data_lines.append(raw_line[5:].lstrip())
+                    if not data_lines:
+                        continue
+                    data_text = "\n".join(data_lines).strip()
+                    if not data_text or data_text == "[DONE]":
+                        continue
+                    try:
+                        event_obj = json.loads(data_text)
+                    except Exception:
+                        continue
+                    if first_chunk_at is None:
+                        first_chunk_at = time.time()
+                    usage_block = event_obj.get("usage") if isinstance(event_obj.get("usage"), dict) else {}
+                    if usage_block:
+                        response_usage["input_tokens"] = max(
+                            int(response_usage.get("input_tokens") or 0),
+                            int(first_defined(usage_block.get("prompt_tokens"), usage_block.get("input_tokens"), 0) or 0),
+                        )
+                        response_usage["output_tokens"] = max(
+                            int(response_usage.get("output_tokens") or 0),
+                            int(first_defined(usage_block.get("completion_tokens"), usage_block.get("output_tokens"), 0) or 0),
+                        )
+                        response_usage["tokens"] = max(
+                            int(response_usage.get("tokens") or 0),
+                            int(usage_block.get("total_tokens") or 0),
+                        )
+                    for choice in event_obj.get("choices") or []:
+                        if not isinstance(choice, dict):
+                            continue
+                        delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+                        reasoning_chunk = extract_reasoning_text(delta) or extract_reasoning_text(choice)
+                        if reasoning_chunk:
+                            pass_reasoning_parts.append(reasoning_chunk)
+                            handler.send_sse_event("reasoning", {"text": reasoning_chunk})
+                        content_chunk = str(delta.get("content") or choice.get("text") or "")
+                        if content_chunk:
+                            assistant_text += content_chunk
+                            pass_text_parts.append(content_chunk)
+                            handler.send_sse_event("delta", {"text": content_chunk})
+                        merge_stream_tool_call_delta(tool_delta_store, delta.get("tool_calls") or [])
+            tool_calls = finalize_stream_tool_calls(tool_delta_store)
+            if not tool_calls:
+                break
+            payload_messages = list(current_payload.get("messages") or [])
+            assistant_message = {
+                "role": "assistant",
+                "content": "".join(pass_text_parts),
+                "tool_calls": tool_calls,
+            }
+            pass_reasoning_text = "".join(pass_reasoning_parts)
+            if pass_reasoning_text:
+                assistant_message["reasoning_content"] = pass_reasoning_text
+            payload_messages.append(assistant_message)
+            for tool_call in tool_calls:
+                call_id = str(tool_call.get("id") or secrets.token_hex(6))
+                function = dict(tool_call.get("function") or {})
+                tool_name = str(function.get("name") or "")
+                handler.send_sse_event("tool", {"name": tool_name, "message": f"Running tool {tool_name}..."})
+                try:
+                    arguments = json.loads(function.get("arguments") or "{}")
+                except Exception:
+                    arguments = {}
+                tool_result = call_enabled_mcp_tool(tool_name, arguments, tool_map)
+                payload_messages.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": tool_result,
+                })
+                response_usage["tool_calls"] = int(response_usage.get("tool_calls") or 0) + 1
+            current_payload["messages"] = payload_messages
+
+        if int(response_usage.get("output_tokens") or 0) <= 0 and assistant_text.strip():
+            response_usage["output_tokens"] = estimate_text_tokens(assistant_text)
+        if int(response_usage.get("input_tokens") or 0) <= 0:
+            response_usage["input_tokens"] = int(request_usage.get("input_tokens") or 0)
+        if int(response_usage.get("tokens") or 0) <= 0:
+            response_usage["tokens"] = int(response_usage.get("input_tokens") or 0) + int(response_usage.get("output_tokens") or 0)
+
+        log_metrics = runtime_log_metrics_for_container(target.get("container"), force=True) if target and target.get("container") else {}
+        ttft = round(first_chunk_at - start, 3) if first_chunk_at else None
+        generation_tps = first_defined(log_metrics.get("generation_tps"), None)
+        if generation_tps in (None, "", 0, 0.0) and first_chunk_at and int(response_usage.get("output_tokens") or 0) > 0:
+            generation_tps = round(
+                float(response_usage.get("output_tokens") or 0) / max(time.time() - first_chunk_at, 0.001),
+                2,
+            )
+        else:
+            generation_tps = round(float(generation_tps), 2) if generation_tps not in (None, "", 0, 0.0) else None
+
+        handler.send_sse_event("done", {
+            "ok": True,
+            "instance_id": target_id,
+            "mode": str(target.get("mode") or ""),
+            "model": str(current_payload.get("model") or ""),
+            "usage": response_usage,
+            "generation_tps": generation_tps,
+            "prompt_tps": log_metrics.get("prompt_tps"),
+            "ttft_s": ttft,
+        })
+        handler.close_connection = True
+    except Exception as e:
+        status_code = 500
+        if stream_opened:
+            try:
+                handler.send_sse_event("error", {"error": str(e)})
+            except Exception:
+                pass
+            handler.close_connection = True
+        else:
+            handler.send_json({"ok": False, "error": str(e)}, 500)
+    finally:
+        if metrics_started:
+            latency = round(time.time() - start, 3)
+            prompt_tokens = max(int(request_usage.get("input_tokens") or 0), int(response_usage.get("input_tokens") or 0))
+            output_tokens = max(int(response_usage.get("output_tokens") or 0), max(0, int(response_usage.get("tokens") or 0) - int(prompt_tokens)))
+            total_tokens = max(int(response_usage.get("tokens") or 0), int(prompt_tokens) + int(output_tokens))
+            log_metrics = runtime_log_metrics_for_container(target.get("container"), force=True) if target and target.get("container") else {}
+            ttft = round(first_chunk_at - start, 3) if first_chunk_at else None
+            display_tps = first_defined(log_metrics.get("generation_tps"), None)
+            if display_tps in (None, "", 0, 0.0) and first_chunk_at and output_tokens > 0:
+                display_tps = round(float(output_tokens) / max(time.time() - first_chunk_at, 0.001), 2)
+            elif display_tps not in (None, "", 0, 0.0):
+                display_tps = round(float(display_tps), 2)
+            else:
+                display_tps = None
+            with metrics_lock:
+                metrics["active_requests"] = max(0, metrics["active_requests"] - 1)
+                if metrics["active_requests"] <= 0:
+                    last_request_finished_at = time.time()
+                metrics["completed_requests"] += 1
+                if status_code >= 400:
+                    metrics["failed_requests"] += 1
+                metrics["last_latency_s"] = latency
+                metrics["last_status"] = status_code
+                if ttft is not None:
+                    metrics["last_ttft_s"] = ttft
+                if display_tps not in (None, "", 0, 0.0):
+                    metrics["last_tokens_per_second"] = display_tps
+                metrics["last_estimated_tokens"] = output_tokens or None
+                recent_requests.appendleft({
+                    "time": time.strftime("%H:%M:%S"),
+                    "status": status_code,
+                    "latency_s": latency,
+                    "preset": preset_name,
+                    "path": "/admin/chat-stream",
+                    "upstream": "/v1/chat/completions",
+                    "instance": target_id,
+                    "user": "admin",
+                })
+                target_row = dict(target_request_metrics.get(target_key) or default_target_request_metrics())
+                target_row["last_status"] = status_code
+                target_row["last_latency_s"] = latency
+                if ttft is not None:
+                    target_row["last_ttft_s"] = ttft
+                if display_tps not in (None, "", 0, 0.0):
+                    target_row["last_tokens_per_second"] = display_tps
+                target_row["last_estimated_tokens"] = output_tokens or None
+                target_row["last_input_tokens"] = prompt_tokens
+                target_row["last_output_tokens"] = output_tokens
+                target_row["last_total_tokens"] = total_tokens
+                target_row["last_tool_calls"] = int(response_usage.get("tool_calls") or 0)
+                target_row["last_preset"] = preset_name
+                target_row["last_path"] = "/admin/chat-stream"
+                target_row["last_request_at"] = int(time.time())
+                target_request_metrics[target_key] = target_row
+
+
+def run_admin_chat_request(data):
+    data = data if isinstance(data, dict) else {}
+    target, spec = resolve_admin_chat_target(
+        instance_id=data.get("instance_id") or "",
+        mode=data.get("mode") or "",
+    )
+    port = int(target.get("port") or active_port() or 0)
+    if port <= 0:
+        raise RuntimeError("The selected runtime does not expose a valid port.")
+    payload = build_admin_chat_payload(data, spec)
+    tools, tool_map = build_enabled_mcp_tools()
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+    parsed = {}
+    for _ in range(6):
+        parsed = chat_backend_request(port, payload)
+        choice = (parsed.get("choices") or [{}])[0] if isinstance(parsed, dict) else {}
+        message = choice.get("message") if isinstance(choice, dict) else {}
+        tool_calls = list(message.get("tool_calls") or []) if isinstance(message, dict) else []
+        if not tool_calls:
+            break
+        payload_messages = list(payload.get("messages") or [])
+        assistant_message = {
+            "role": "assistant",
+            "content": message.get("content") or "",
+            "tool_calls": tool_calls,
+        }
+        reasoning_text = extract_reasoning_text(message)
+        if reasoning_text:
+            assistant_message["reasoning_content"] = reasoning_text
+        payload_messages.append(assistant_message)
+        for tool_call in tool_calls:
+            call_id = str(tool_call.get("id") or secrets.token_hex(6))
+            function = dict(tool_call.get("function") or {})
+            tool_name = str(function.get("name") or "")
+            try:
+                arguments = json.loads(function.get("arguments") or "{}")
+            except Exception:
+                arguments = {}
+            tool_result = call_enabled_mcp_tool(tool_name, arguments, tool_map)
+            payload_messages.append({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": tool_result,
+            })
+        payload["messages"] = payload_messages
+    usage = extract_response_usage(json.dumps(parsed, separators=(",", ":")).encode("utf-8"))
+    return {
+        "ok": True,
+        "instance_id": str(target.get("id") or ""),
+        "mode": str(target.get("mode") or ""),
+        "model": str(payload.get("model") or ""),
+        "engine": str(spec.get("engine") or ""),
+        "supports_vision": runtime_supports_vision(spec),
+        "tools_enabled": len(tools),
+        "response": parsed,
+        "usage": usage,
+    }
+
+HTML = "<!doctype html><html><head><meta charset=\"utf-8\" /><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\" /><title>club-3090 Control</title><style>:root{color-scheme:dark;--bg:#0b0f14;--panel:#121923;--line:#273243;--text:#e8eef7;--muted:#9dafc3;--blue:#72c7ff;--green:#2fc46b;--red:#ff5b6c;--amber:#ffcb6b;--orange:#ff8a2a;--field:#081018;--cyan:#7dd3fc;--turquoise:#26d6c6}*{box-sizing:border-box}body,html{min-height:100%;margin:0}body{font-family:system-ui,-apple-system,Segoe UI,Arial,sans-serif;background:var(--bg);color:var(--text);overflow-y:auto;overflow-x:hidden}header{position:sticky;top:0;z-index:10;padding:10px 12px;background:#111925f7;backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}.top{display:flex;justify-content:space-between;align-items:center;gap:8px}.top-main{min-width:0;width:100%}.header-row{display:flex;align-items:stretch;gap:8px;margin-top:4px}.brand{font-size:18px;font-weight:800}.pill{flex:1 1 auto;min-width:0;color:var(--muted);font-size:12px;border:1px solid var(--line);border-radius:999px;padding:4px 8px;background:#0a1119;margin-top:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.header-chat-btn{flex:0 0 auto;background:linear-gradient(180deg,#285784,#1a3b5b);border-color:#4a83bb;box-shadow:inset 0 0 0 1px rgba(150,217,255,.18),0 0 0 1px rgba(114,199,255,.08)}.header-chat-btn svg{width:18px;height:18px}.header-chat-btn.active{border-color:#72c7ff;box-shadow:inset 0 0 0 1px rgba(150,217,255,.18),0 0 0 1px rgba(114,199,255,.12)}.subtabs,.tabs{display:flex;gap:6px;overflow-x:auto}.tabs{padding-top:10px}.subtabs{margin-bottom:10px}.btn,.subtab,.tab{border:1px solid #34445a;background:#1b2635;color:#eef4ff;border-radius:10px;padding:9px 11px;font-size:13px;cursor:pointer;white-space:nowrap}.subtab.active,.tab.active{background:#203149;border-color:#3d6fa3}.btn:disabled{opacity:.5;cursor:not-allowed}.green{background:#113d25;border-color:#2c8a54}.turquoise{background:#079c9c;border-color:#4df5e8;color:#041316}.red{background:#4a1118;border-color:#8a2b35}.rose{background:#6b2430;border-color:#ff8fa1;color:#fff1f4}.amber{background:#4a3511;border-color:#8a652b}.orange{background:#c45512;border-color:#ffae42;color:#fff}.blue{background:#12314d;border-color:#2a72a8}.purple{background:#4b1f75;border-color:#9460df;color:#fff}.default-profile{background:#1d5f96;border-color:#78c7ff;color:#fff}.container{display:flex;flex-direction:column;gap:10px;padding:10px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:12px;box-shadow:0 8px 30px #0004;margin-bottom:10px}.panel h2{font-size:14px;margin:0 0 10px}.chartgrid+.panel{margin-top:10px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.stat{background:#0b1119;border:1px solid #222d3c;border-radius:10px;padding:8px}.label{color:var(--muted);font-size:11px}label.label{display:inline-flex;align-items:center;gap:8px}label.label input[type=checkbox]{margin:0;flex:0 0 auto}.value{font-weight:700;font-size:13px;overflow-wrap:anywhere}.value-subline{display:block;margin-top:4px;color:var(--muted);font-size:12px;font-weight:600;line-height:1.35}.actions{display:flex;gap:7px;flex-wrap:wrap}.hidden{display:none!important}.tabpane{display:none}.tabpane.active{display:block}.metricpane{display:none}.metricpane.active{display:block}.logs{min-height:0;display:flex;flex-direction:column;margin-bottom:0}.loghead{display:flex;justify-content:space-between;align-items:center;padding-bottom:7px;gap:10px}.loghead h2{white-space:nowrap}.logheadchecks{display:flex;align-items:center;gap:12px;white-space:nowrap}.log{width:100%;height:clamp(360px,calc(100dvh - 430px),560px);min-height:320px;resize:vertical;white-space:pre-wrap;overflow-wrap:anywhere;background:#030608;color:#a5ffa5;border:1px solid #26313f;border-radius:12px;padding:12px;font-family:Consolas,monospace;font-size:12px;line-height:1.35}.log-card-hidden{display:none!important}.logs-tab .container{min-height:calc(100dvh - 108px)}.logs-tab .logs.panel{height:calc(100dvh - 252px);min-height:500px;margin-bottom:0}.logs-tab .log{height:auto;min-height:0;flex:1;resize:none}.logs-tab .content-tab{display:none!important}.logtools{display:none}.audit-tab .logtools,.logs-tab .logtools{display:block;margin-bottom:10px}.logtools h2{display:block;margin:0 0 10px}.logtools .searchbox{display:flex}.searchbox{display:flex;align-items:center;gap:6px;flex-wrap:nowrap;width:100%}.searchbox input{flex:1 1 auto;min-width:80px;background:var(--field);color:var(--text);border:1px solid #2c3a4f;border-radius:9px;padding:9px}.chartgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.gpu-chartgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.chart{height:145px;background:#081018;border:1px solid #213044;border-radius:12px;padding:8px}.chart.tall{height:220px}canvas{width:100%;height:100%}.msg{color:var(--amber);font-size:12px;min-height:18px;padding-top:6px}.msg.msg-error{color:var(--red)}.msg.msg-warning{color:var(--amber)}.msg.msg-success{color:var(--green)}.smallgap{margin-bottom:5px}#auditSummary{margin-top:10px}.gpu-cards{display:grid;grid-template-columns:1fr;gap:10px}.gpu-card{background:#101722;border:1px solid #26313f;border-radius:14px;padding:12px}.gpu-title{font-weight:800;color:#d9ecff;margin-bottom:10px;border-bottom:1px solid #26313f;padding-bottom:7px}.gpu-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.gpu-section-title{color:#9dafc3;font-size:12px;text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px}.gpu-line{display:flex;justify-content:space-between;gap:8px;font-size:13px;padding:2px 0}.meter{height:7px;background:#081018;border-radius:99px;overflow:hidden;margin-top:5px}.meter span{display:block;height:100%;background:#2fc46b}.coregrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(90px,1fr));gap:6px}.storage-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px}.storage-section{display:flex;flex-direction:column;gap:10px}.storage-card.user-facing{background:#10243a;border-color:#2a72a8}.storage-card{background:#0b1119;border:1px solid #243144;border-radius:12px;padding:10px;min-width:0}.storage-title{font-weight:800;color:#d9ecff;margin-bottom:6px;overflow-wrap:anywhere}.storage-meta{color:#9dafc3;font-size:12px;margin-bottom:6px;overflow-wrap:anywhere}.storage-sizes{display:grid;grid-template-columns:minmax(85px,0.8fr) minmax(85px,0.8fr) minmax(95px,0.9fr);gap:6px;margin-bottom:8px}.storage-sizes .stat{padding:6px}.diskbar{height:8px;background:#081018;border-radius:99px;overflow:hidden;width:100%;margin-bottom:3px;margin-top:3px}.diskbar span{display:block;height:100%;background:#72c7ff}.netgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px}.temp-blue{color:#60a5fa}.temp-green{color:#2fc46b}.temp-yellow{color:#ffde59}.temp-orange{color:#ff8a2a}.temp-red{color:#ff5b6c}.temp-crimson{color:#dc143c;font-weight:900}.machine-row{margin-top:7px}.api-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:8px}.api-card{background:#0b1119;border:1px solid #243144;border-radius:12px;padding:10px}.api-card h3{font-size:13px;margin:0 0 6px;color:#d9ecff}.api-card p{margin:0;color:var(--muted);font-size:12px;line-height:1.35}.api-card-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.preset-actions{display:flex;gap:4px}.iconbtn{border:1px solid #34445a;background:#182231;color:#eef4ff;border-radius:8px;padding:5px 7px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px}.iconbtn svg{width:16px;height:16px;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}.preset-editor{display:none}.preset-editor.open{display:block}.formgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}.formgrid label{display:flex;flex-direction:column;gap:4px;color:var(--muted);font-size:12px}.formgrid input,.formgrid select,.formgrid textarea{background-color:var(--field);color:var(--text);border:1px solid #2c3a4f;border-radius:9px;padding:8px}.chat-conversation-select,.chat-settings-grid select,.chat-toolbar select,.formgrid select{appearance:none;-webkit-appearance:none;background-image:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='m6 9 6 6 6-6' fill='none' stroke='%239dafc3' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E\");background-position:calc(100% - 14px) 50%;background-repeat:no-repeat;background-size:12px 12px;padding-right:32px}.formgrid textarea{min-height:120px;resize:vertical}.preset-form-span-2{grid-column:1/-1}.preset-help{color:var(--muted);font-size:12px;line-height:1.35;margin-bottom:10px}.profile-balanced{background:#0faeb0;border-color:#5ff5e8;color:#031516}.panel-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:10px}.panel-head h2{margin:0}.add-preset-btn{width:30px;height:30px;border-radius:999px;border:1px solid #55ee91;background:#128a45;color:#fff;display:inline-flex;align-items:center;justify-content:center;padding:0;box-shadow:none}.add-preset-btn:hover{background:#18a957}.add-preset-btn svg{width:15px;height:15px;stroke:#fff;stroke-width:3;stroke-linecap:round}.preset-form-actions{display:flex;justify-content:center;gap:18px;margin-top:14px}.preset-intro{color:var(--muted);font-size:13px;line-height:1.45;margin:4px 0 2px}.preset-intro.hidden{display:none}.scope-strip{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:0 0 10px}.scope-strip .subtabs{margin:0}.club-modal{position:fixed;inset:0;background:rgba(2,7,14,.82);display:flex;align-items:center;justify-content:center;padding:16px;z-index:1000}.club-modal-card{width:min(720px,100%);background:#101824;border:1px solid #31455f;border-radius:14px;box-shadow:0 20px 70px rgba(0,0,0,.45);padding:14px}.chat-settings-modal-card{width:min(880px,calc(100vw - 32px));max-height:min(90dvh,780px);overflow:auto}.conversation-modal-card{width:min(560px,100%)}.modal-keybox{width:100%;min-height:120px;resize:vertical;border:1px solid #31455f;border-radius:10px;background:#07101a;color:#d9ecff;padding:10px;font:600 13px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;overflow:auto;scrollbar-gutter:stable}.preset-section-label{color:#d9ecff;font-size:12px;font-weight:800;letter-spacing:.04em;text-transform:uppercase;margin:10px 0 6px}.busy-note{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:12px;line-height:1.35}.spinner{width:12px;height:12px;border:2px solid #34445a;border-top-color:var(--blue);border-radius:999px;animation:club3090-spin .8s linear infinite;flex:0 0 auto}.instance-panel-busy{border-color:#35506d}.instance-panel-busy .actions,.instance-panel-busy .subtabs,.instance-panel-busy .value{opacity:.82}.model-grid{display:grid;grid-template-columns:1fr;gap:12px;margin-top:12px}.model-card{background:#0b1119;border:1px solid #243144;border-radius:14px;padding:12px}.selected-model-card{background:#101823}.model-card-active-family{border-color:#5ff5e8;box-shadow:0 0 0 1px #5ff5e84a}.collapsed-model-card{opacity:.92}.model-card-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:10px}.model-card-head h3{margin:0;font-size:16px;color:#d9ecff}.model-summary{color:var(--muted);font-size:12px;line-height:1.45;margin-top:6px}.badge-row{display:flex;gap:6px;flex-wrap:wrap}.state-badge,.status-badge{display:inline-flex;align-items:center;border-radius:999px;padding:4px 8px;font-size:11px;font-weight:700;border:1px solid transparent}.state-ready{background:#113d25;border-color:#2c8a54;color:#d8ffe7}.state-active{background:#173c63;border-color:#72c7ff;color:#e0f3ff}.state-booting{background:#4a3511;border-color:#d7a63d;color:#ffe8b4}.state-error{background:#4a1118;border-color:#8a2b35;color:#ffd7dc}.status-production{background:#12314d;border-color:#2a72a8;color:#d7ecff}.status-active{background:#113d25;border-color:#2c8a54;color:#d8ffe7}.status-booting{background:#4a3511;border-color:#8a652b;color:#ffe8b4}.state-partial,.status-production_caveat{background:#4a3511;border-color:#8a652b;color:#ffe8b4}.state-requires_download{background:#10353a;border-color:#1ea6b8;color:#c9fbff}.state-missing,.status-preview,.status-upstream_gated{background:#12314d;border-color:#2a72a8;color:#d7ecff}.state-unavailable,.state-unsupported,.status-deprecated,.status-error,.status-experimental,.status-unknown{background:#4a1118;border-color:#8a2b35;color:#ffd7dc}.error-note{color:#ffd7dc}.variant-groups{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.variant-group{background:#101722;border:1px solid #26313f;border-radius:12px;padding:10px}.variant-group h4{margin:0 0 8px;font-size:13px;color:#d9ecff}.variant-grid{display:grid;grid-template-columns:1fr;gap:8px}.variant-card{background:#09101a;border:1px solid #213044;border-radius:12px;padding:10px}.variant-card.active-variant{border-color:#5ff5e8;box-shadow:0 0 0 1px #5ff5e84a}.variant-card-head{display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:6px}.variant-card-title{font-weight:800;color:#eef4ff;font-size:13px}.variant-caveat,.variant-install-note,.variant-meta{color:var(--muted);font-size:12px;line-height:1.4}.variant-meta strong{color:#d9ecff;font-weight:700}.variant-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.variant-footer{display:flex;justify-content:flex-end;align-items:center;min-height:18px;margin-top:8px}.variant-launch-time{color:#9ecdf3;font-size:11px;text-align:right}.model-active-summary{color:#d9ecff;font-size:12px;line-height:1.45;margin-top:8px}.summary-action-bar{display:flex;justify-content:flex-end;margin:0 0 12px}.summary-preset-card{background:#0c141e;border:1px solid #243144;border-radius:12px;padding:10px;margin-top:10px}.summary-preset-card-inactive{opacity:.72;border-color:#364150}.summary-preset-head{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}.summary-preset-title{font-weight:800;color:#eef4ff;font-size:13px}.summary-preset-meta{color:var(--muted);font-size:12px;line-height:1.4;margin-top:8px}.state-summary-inactive{background:#18202b;border-color:#465464;color:#c3cfda}.state-badge[role=button]{cursor:pointer}.empty-variant-note{color:var(--muted);font-size:12px}.chat-panel{overflow:hidden}.chat-panel-head{align-items:center}.chat-head-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;min-width:0}.chat-conversation-strip{display:flex;align-items:center;gap:6px;flex:1 1 auto;min-width:0;max-width:100%}.chat-conversation-select{flex:1 1 auto;min-width:0;max-width:100%;background-color:var(--field);color:var(--text);border:1px solid #2c3a4f;border-radius:10px;padding:8px 10px;font-size:13px}.chat-head-separator{color:#4d6077;font-size:18px;line-height:1;padding:0 2px}.chat-head-menu{position:relative;flex:0 0 auto}.danger-iconbtn{background:0 0;border-color:transparent;color:#ff6878;box-shadow:none}.danger-iconbtn:focus-visible,.danger-iconbtn:hover{background:rgba(255,91,108,.08);border-color:transparent;color:#ff8793}.chat-options-menu{position:absolute;right:0;top:calc(100% + 8px);display:flex;flex-direction:column;gap:6px;padding:10px;background:#0b1119;border:1px solid #243144;border-radius:12px;box-shadow:0 12px 30px rgba(0,0,0,.35);z-index:20}.chat-options-menu.hidden{display:none!important}.chat-shell{display:block}.chat-main{display:flex;flex-direction:column;gap:0}.chat-toolbar{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-bottom:2px}.chat-settings-grid label,.chat-toolbar label{display:flex;flex-direction:column;gap:4px;color:var(--muted);font-size:12px}.chat-settings-grid input,.chat-settings-grid select,.chat-settings-grid textarea,.chat-toolbar input,.chat-toolbar select{background-color:var(--field);color:var(--text);border:1px solid #2c3a4f;border-radius:9px;padding:8px}.chat-toolbar select{font-size:13px}.hidden-file-input{display:none!important}.chat-inline-images{display:flex;gap:8px;flex-wrap:wrap}.chat-attachment-rail{flex:1 1 auto;min-width:0;display:flex;align-items:center;gap:8px;overflow-x:auto;padding-bottom:2px;scrollbar-width:thin}.chat-attachment-pill,.chat-message-attachment{display:inline-flex;align-items:center;gap:8px;min-width:0;padding:6px 10px;border:1px solid #2c3a4f;border-radius:999px;background:#081018;color:#dce8f6;font-size:12px;white-space:nowrap}.chat-attachment-name{overflow:hidden;text-overflow:ellipsis}.chat-attachment-remove{appearance:none;border:0;background:0 0;color:var(--red);cursor:pointer;padding:0;font-size:13px;font-weight:800;line-height:1}.chat-attachment-pill.chat-attachment-image::after{content:\"image\";color:var(--muted);font-size:11px}.chat-attachment-pill.chat-attachment-text::after,.chat-message-attachment.chat-attachment-text::after{content:\"file\";color:var(--muted);font-size:11px}.chat-inline-images img,.chat-markdown-image{max-width:100%;border-radius:10px}.chat-markdown-media{width:100%;max-width:100%;border-radius:10px;border:1px solid #243144;background:#050a10}.chat-transcript{min-height:400px;max-height:72dvh;overflow:auto;background:#081018;border:1px solid #243144;border-radius:12px;padding:12px}.chat-turn+.chat-turn{margin-top:14px}.chat-turn-divider{display:flex;align-items:center;gap:10px;margin:0 0 12px;color:var(--muted);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em}.chat-turn-divider::before{content:\"\";flex:1 1 auto;height:1px;background:#243144}.chat-turn-label{flex:0 0 auto;color:#9ecdf3}.chat-message+.chat-message{margin-top:10px}.chat-message-title{font-size:12px;font-weight:800;color:#d9ecff;margin-bottom:6px}.chat-user .chat-message-title{color:#bde3ff}.chat-assistant .chat-message-title{color:#dfffb5}.chat-message-body{color:#e8eef7;font-size:13px;line-height:1.5;overflow-wrap:anywhere}.chat-message-body>:first-child{margin-top:0}.chat-message-body>:last-child{margin-bottom:0}.chat-message-body h1,.chat-message-body h2,.chat-message-body h3,.chat-message-body h4,.chat-message-body h5,.chat-message-body h6{margin:.9em 0 .45em;line-height:1.25;color:#f2f7ff}.chat-message-body h1{font-size:1.55em}.chat-message-body h2{font-size:1.35em}.chat-message-body h3{font-size:1.18em}.chat-message-body blockquote,.chat-message-body details,.chat-message-body hr,.chat-message-body ol,.chat-message-body p,.chat-message-body pre,.chat-message-body table,.chat-message-body ul{margin:.65em 0}.chat-message-body ol,.chat-message-body ul{padding-left:1.4em}.chat-message-body li+li{margin-top:.3em}.chat-message-body hr{border:0;border-top:1px solid #243144}.chat-message-body blockquote{margin-left:0;padding:.2em 0 .2em .9em;border-left:3px solid #35506d;color:#c5d6ea;background:rgba(23,35,51,.4)}.chat-message-body a{color:var(--blue)}.chat-message-body table{width:100%;border-collapse:collapse;overflow:hidden;border:1px solid #243144;border-radius:10px}.chat-message-body td,.chat-message-body th{border:1px solid #243144;padding:8px 10px;vertical-align:top}.chat-message-body th{color:#f2f7ff;background:rgba(25,40,57,.92);text-align:left}.chat-message-body tbody tr:nth-child(2n){background:rgba(10,16,24,.65)}.chat-message-body code,.chat-message-body kbd{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.chat-message-body :not(pre)>code{padding:.12em .42em;border-radius:6px;background:rgba(12,19,29,.95);border:1px solid #223044}.chat-message-body kbd{padding:.1em .4em;border-radius:6px;border:1px solid #34445a;background:#121b28}.chat-message-body mark{background:rgba(255,203,107,.24);color:#fff0ca;padding:0 .2em}.chat-message-attachments{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}.chat-thinking-card{margin:0 0 10px;border:1px solid #2b5d86;border-radius:12px;background:linear-gradient(180deg,rgba(18,49,77,.96),rgba(9,23,37,.96));overflow:hidden;box-shadow:inset 0 0 0 1px rgba(114,199,255,.08)}.chat-thinking-card.thinking-live{border-color:#3d79a9;box-shadow:inset 0 0 0 1px rgba(114,199,255,.14),0 0 0 1px rgba(114,199,255,.04)}.chat-thinking-toggle{width:100%;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 14px;border:0;background:0 0;color:#eef7ff;cursor:pointer;text-align:left}.chat-thinking-copy{min-width:0;display:flex;flex-direction:column;gap:3px}.chat-thinking-title{font-size:13px;font-weight:800;line-height:1.25}.chat-thinking-subtitle{color:#b7cde2;font-size:11px;line-height:1.35}.chat-thinking-chevron{flex:0 0 auto;display:inline-flex;align-items:center;color:#d7ecff}.chat-thinking-chevron svg{width:18px;height:18px}.chat-thinking-body{padding:0 14px 14px;border-top:1px solid rgba(114,199,255,.12)}.chat-thinking-body>:first-child{margin-top:12px}.chat-thinking-body>:last-child{margin-bottom:0}.chat-plain{white-space:pre-wrap;overflow-wrap:anywhere}.chat-code{margin:10px 0;background:#030608;border:1px solid #243144;border-radius:10px;overflow:auto}.chat-code-lang{color:var(--muted);font-size:11px;padding:6px 10px 0}.chat-code code{display:block;padding:10px;white-space:pre}.chat-rich-embed{margin-top:10px}.chat-status-msg{min-height:16px;padding-top:0;margin:0 0 2px}.chat-input-wrap{display:flex;flex-direction:column;gap:6px;margin-top:10px}.chat-composer-row{display:flex;align-items:stretch;gap:6px;min-width:0}#chatInput{flex:1 1 auto;width:auto;min-width:0;min-height:88px;max-height:176px;resize:none;background:#030608;color:#eef4ff;border:1px solid #26313f;border-radius:12px;padding:12px;font-family:inherit;font-size:14px;line-height:1.5}.chat-action-stack{flex:0 0 44px;display:grid;grid-template-rows:repeat(3,minmax(0,1fr));gap:6px}.chat-action-btn{width:100%;height:100%;min-height:0;border-radius:11px;padding:0}.chat-action-btn svg{width:21px;height:21px}.chat-send-btn svg{transform:scaleX(-1)}.chat-send-btn{background:#12314d;border-color:#2a72a8}.chat-send-btn.is-stop{background:#4a1118;border-color:#a83c48}.chat-send-btn.is-stop svg{fill:currentColor;stroke:none}#chatMicBtn.recording{background:#41131a;border-color:#a83c48;color:#ffe6ea}.chat-runtime-stats .generation-card{margin-top:0}.chat-stats-card{background:#0b1119;border:1px solid #243144;border-radius:12px;padding:12px;margin-top:5px}.chat-stats-head{display:flex;align-items:center;justify-content:space-between;gap:10px}.chat-stats-title{color:#d9ecff;font-size:12px;font-weight:800}.chat-stats-toggle{width:30px;height:30px;padding:0}.chat-stats-card.collapsed .chat-runtime-stats{display:none}.chat-runtime-stats{margin-top:8px}.chat-settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.chat-settings-span-2{grid-column:1/-1}.chat-settings-template-row,.chat-settings-toggle-row,.chat-threshold-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.chat-settings-template-row{display:grid;grid-template-columns:minmax(0,1fr) 152px;align-items:start;gap:8px}.chat-settings-template-name{min-width:0}.chat-settings-template-select{min-width:0}.chat-settings-template-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;grid-column:1/-1}.chat-settings-grid textarea{min-height:112px;resize:vertical}.chat-settings-note{color:var(--muted);font-size:12px;line-height:1.4}.chat-settings-template-note{margin-top:8px}.chat-settings-rule{border:0;border-top:1px solid #243144;margin:10px 0 0}.chat-settings-compact-block{display:flex;flex-direction:column;gap:8px;min-width:0;margin-top:12px}.chat-settings-compact-description,.chat-settings-toggle-row,.chat-threshold-row{font-size:12px}.chat-settings-compact-title{color:#eef4ff;font-weight:700;line-height:1.35}.chat-settings-compact-threshold-label{color:#d9ecff;font-weight:700}.chat-settings-compact-block input[type=range]{flex:1 1 60px;min-width:0;margin-top:-9px}.chat-settings-compact-description{margin:0}.chat-threshold-row output{min-width:0;color:#d9ecff;font-weight:800}.toggle-switch{display:inline-flex;align-items:center;gap:8px}.toggle-switch input{position:absolute;opacity:0;pointer-events:none}.toggle-switch-track{position:relative;width:42px;height:24px;border-radius:999px;background:#182231;border:1px solid #34445a;transition:background .18s ease,border-color .18s ease}.toggle-switch-track::after{content:\"\";position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:999px;background:#eef4ff;transition:transform .18s ease}.toggle-switch input:checked+.toggle-switch-track{background:#113d25;border-color:#2c8a54}.toggle-switch input:checked+.toggle-switch-track::after{transform:translateX(18px)}.mcp-server-row{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}.mcp-server-meta{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.generation-card{background:#0b1119;border:1px solid #243144;border-radius:12px;padding:10px;margin-top:10px}.generation-card-head{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:8px}.generation-card-head h3{margin:0;font-size:14px;color:#d9ecff}.generation-card-meta{color:var(--muted);font-size:12px;line-height:1.4}.generation-card-body .value-subline{margin-top:6px}@keyframes club3090-spin{to{transform:rotate(360deg)}}@media (max-width:900px){.chartgrid{grid-template-columns:1fr}.gpu-chartgrid{grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.grid{grid-template-columns:1fr 1fr}.gpu-grid{grid-template-columns:1fr}.variant-groups{grid-template-columns:1fr}.header-row{align-items:center}.chat-head-actions{width:100%;justify-content:flex-end}.chat-conversation-strip{width:100%;min-width:0}.chat-toolbar{grid-template-columns:repeat(2,minmax(0,1fr))}.chat-composer-row{align-items:stretch}.chat-settings-toggle-row,.chat-threshold-row{align-items:flex-start}.chat-settings-template-select{min-width:0}.log{height:clamp(320px,calc(100dvh - 410px),520px)}.logs-tab .logs.panel{height:calc(100dvh - 250px);min-height:500px}.logs-tab .log{height:auto;min-height:0}}</style></head><body><header><div class=\"top\"><div class=\"top-main\"><div class=\"brand\">club-3090 Control &bull; __SCRIPT_VERSION__</div><div class=\"header-row\"><div class=\"pill\" id=\"summary\">loading...</div><button class=\"iconbtn header-chat-btn\" id=\"chatLaunchBtn\" title=\"Open chat\" aria-label=\"Open chat\" onclick=\"openChatTab()\" ><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M5 18V6h14v9H8l-3 3Zm3-7h8m-8 3h5\" fill=\"none\" /></svg></button></div></div></div><div class=\"tabs\"><button class=\"tab active\" onclick=\"tab(event, 'overview')\">Main</button ><button class=\"tab\" onclick=\"tab(event, 'system')\">System</button ><button class=\"tab\" onclick=\"tab(event, 'presets')\">Presets</button ><button class=\"tab\" id=\"usersTabBtn\" onclick=\"tab(event, 'users')\"> Users</button ><button class=\"tab\" onclick=\"tab(event, 'metrics')\">Metrics</button ><button class=\"tab\" onclick=\"tab(event, 'logs')\">Logs</button></div></header><main class=\"container\"><section id=\"overview\" class=\"tabpane content-tab active\"><div class=\"panel\"><h2>Status</h2><div class=\"grid\"><div class=\"stat\"><div class=\"label\">Mode</div><div class=\"value\" id=\"mode\">-</div></div><div class=\"stat\"><div class=\"label\">Containers</div><div class=\"value\" id=\"container\">-</div></div><div class=\"stat\"><div class=\"label\">Requests</div><div class=\"value\" id=\"req\">-</div></div><div class=\"stat\"><div class=\"label\">Uptime</div><div class=\"value\" id=\"uptime\">-</div></div><div class=\"stat\"><div class=\"label\">Power</div><div class=\"value\" id=\"powerbox\">-</div></div><div class=\"stat\"><div class=\"label\">Users</div><div class=\"value\" id=\"last\">-</div></div></div><div class=\"msg\" id=\"msg\"></div></div><div class=\"panel\"><h2>Generation Stats</h2><div id=\"generationStatsContent\" class=\"value\">-</div></div><div id=\"gpuCards\" class=\"gpu-cards\"></div></section><section id=\"system\" class=\"tabpane content-tab\"><div class=\"panel\"><h2>Services</h2><div class=\"value\" id=\"services\">-</div></div><div class=\"panel\"><h2>Audit Overview</h2><div class=\"grid\"><div class=\"stat\"><div class=\"label\">Admin UI</div><div class=\"value\" id=\"auditAdminEndpoint\">-</div></div><div class=\"stat\"><div class=\"label\">Proxy</div><div class=\"value\" id=\"auditProxyEndpoint\">-</div></div><div class=\"stat\"><div class=\"label\">Exposure</div><div class=\"value\" id=\"auditExposure\">-</div></div><div class=\"stat\"><div class=\"label\">Local Automation</div><div class=\"value\" id=\"auditLocalApi\">-</div></div></div><div class=\"value smallgap\" id=\"auditSummary\">-</div><div class=\"msg\" id=\"auditMsg\"></div></div><div class=\"panel\"><h2>Access Policy</h2><div class=\"actions\" id=\"accessPolicyRow\"><label class=\"label\" ><input type=\"checkbox\" id=\"auditAllowAnonymousProxy\" onchange=\"mirrorAuthToggles(this.checked)\" /> allow requests without per-user API keys</label ><button class=\"btn blue\" onclick=\"saveAuthSettings()\"> Save Policy </button></div><div class=\"value smallgap\" style=\"margin-top: 10px\" id=\"auditPolicyText\" > - </div></div><div class=\"panel\"><h2>System</h2><div class=\"actions\" id=\"systemUtilityRow\"><button class=\"btn blue\" onclick=\"promptBenchmarkRun()\"> Benchmark</button ><button class=\"btn blue\" onclick=\"promptReportRun()\"> Run Report</button ><button class=\"btn blue\" onclick=\"promptUpdateRun()\"> Update</button></div><div class=\"actions machine-row\"><button class=\"btn amber\" onclick=\"wol()\">Wake-on-LAN</button ><button class=\"btn red\" onclick=\"machineAction('reboot')\"> Restart Machine</button ><button class=\"btn red\" onclick=\"machineAction('shutdown')\"> Shutdown Machine </button></div></div><div class=\"panel\"><h2>Instances</h2><div class=\"subtabs\" id=\"instanceTabs\"></div><div class=\"value smallgap\" id=\"instanceSummary\">-</div><div class=\"actions\" id=\"instanceActionRow\"><button class=\"btn blue\" onclick=\"instanceAction('start_instance')\"> Start</button ><button class=\"btn amber\" onclick=\"instanceAction('restart_instance')\" > Restart</button ><button class=\"btn red\" onclick=\"instanceAction('stop_container')\"> Stop</button ><button class=\"btn green\" id=\"instanceEnableBtn\" onclick=\"toggleInstanceEnabled()\" > Disable Boot Autostart </button></div><div class=\"panel\" style=\"margin-top:12px\"><h2>Power Profiles</h2><div class=\"actions\" id=\"profileActionRow\"><button class=\"btn green\" onclick=\"profile('eco')\">Eco</button ><button class=\"btn profile-balanced\" onclick=\"profile('balanced')\" > Balanced</button ><button class=\"btn default-profile\" onclick=\"profile('default')\" > Default</button ><button class=\"btn orange\" onclick=\"profile('turbo')\"> Turbo </button></div></div><div class=\"panel\"><h2>Optimizations + Cooling</h2><div class=\"actions\" id=\"powerCoolingActionRow\"><button class=\"btn green\" id=\"optToggle\" onclick=\"togglePowerOptimizations()\" > Disable Power Optimizations</button ><button class=\"btn green\" id=\"fanToggle\" onclick=\"toggleFansMax()\" > Set Fans to Max </button></div></div><div class=\"msg\" id=\"instanceMsg\"></div></div></section><section id=\"presets\" class=\"tabpane content-tab\"><div class=\"panel\"><div class=\"panel-head\"><h2>Dynamic Model Presets</h2><button class=\"btn green\" onclick=\"promptRuntimeInventoryRebuild()\" > Rebuild Dynamic Model DB </button></div><div class=\"preset-help\"> Discovered presets are rendered directly from the local <code>/opt/ai/club-3090</code> clone. Global applies single-GPU presets across every GPU, dual presets across every two-GPU pair, and multi-GPU presets to the shared runtime. </div><div class=\"preset-section-label\">Scope</div><div class=\"subtabs\" id=\"presetScopeTabs\"></div><div class=\"value smallgap\" id=\"presetScopeSummary\">-</div><div class=\"preset-section-label\">Models</div><div class=\"subtabs\" id=\"presetModelSelector\"></div><div class=\"value smallgap\" id=\"presetJobSummary\">-</div><div id=\"modelPresetGrid\" class=\"model-grid\"></div></div><div class=\"panel\"><h2>API Presets</h2><div class=\"preset-help\"> Default presets are locked. Custom presets are exposed as <code>:8009/v1/&lt;name&gt;</code> and <code>:8009/&lt;name&gt;</code>. Both forms work with <code>short-</code> and <code>concise-</code> prefixes. </div><div id=\"apiPresetGrid\" class=\"api-grid\"></div></div><div class=\"panel\"><div class=\"panel-head\"><h2>Custom Preset Templates</h2><button class=\"add-preset-btn\" title=\"Create preset\" aria-label=\"Create preset\" onclick=\"openPresetEditor()\" ><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M12 5v14M5 12h14\" fill=\"none\" /></svg></button></div><div id=\"presetIntro\" class=\"preset-intro\"> Create custom endpoint templates for different workloads or clients. Each preset saves generation parameters like temperature, sampling, thinking mode, penalties, and token limits, then exposes them as custom OpenAI-compatible endpoints such as <code>:8009/v1/my_preset</code> and <code>:8009/my_preset</code>. Short and concise prefixes work with custom presets too. </div><div id=\"presetEditor\" class=\"preset-editor\"><div class=\"formgrid\"><label >Endpoint name<input id=\"presetName\" placeholder=\"my_coding\" /></label ><label >Description<input id=\"presetDescription\" placeholder=\"What this preset is for\" /></label ><label class=\"preset-form-span-2\" >System Prompt<textarea id=\"presetSystemPrompt\" placeholder=\"Optional preset system prompt\" ></textarea></label ><label >Temperature<input id=\"presetTemperature\" type=\"number\" step=\"0.01\" placeholder=\"0.7\" /></label ><label >Top P<input id=\"presetTopP\" type=\"number\" step=\"0.01\" placeholder=\"0.95\" /></label ><label >Top K<input id=\"presetTopK\" type=\"number\" step=\"1\" placeholder=\"20\" /></label ><label >Min P<input id=\"presetMinP\" type=\"number\" step=\"0.01\" placeholder=\"0\" /></label ><label >Thinking<select id=\"presetThinking\"><option value=\"false\">Disabled</option><option value=\"true\">Enabled</option></select></label ><label >Preserve Thinking<select id=\"presetPreserveThinking\"><option value=\"false\">No</option><option value=\"true\">Yes</option></select></label ><label >Repetition penalty<input id=\"presetRepetitionPenalty\" type=\"number\" step=\"0.01\" placeholder=\"1.0\" /></label ><label >Presence penalty<input id=\"presetPresencePenalty\" type=\"number\" step=\"0.01\" placeholder=\"0\" /></label ><label >Frequency penalty<input id=\"presetFrequencyPenalty\" type=\"number\" step=\"0.01\" placeholder=\"0\" /></label ><label >Max context / prompt tokens<input id=\"presetMaxCtx\" type=\"number\" step=\"1\" placeholder=\"truncate_prompt_tokens\" /></label ><label >Max reply tokens<input id=\"presetMaxTokens\" type=\"number\" step=\"1\" placeholder=\"max_tokens\" /></label ><label >Min reply tokens<input id=\"presetMinTokens\" type=\"number\" step=\"1\" placeholder=\"min_tokens\" /></label ><label >Logprobs<input id=\"presetLogprobs\" type=\"number\" step=\"1\" placeholder=\"optional\" /></label ><label >Top logprobs<input id=\"presetTopLogprobs\" type=\"number\" step=\"1\" placeholder=\"optional\" /></label ><label >Length penalty<input id=\"presetLengthPenalty\" type=\"number\" step=\"0.01\" placeholder=\"optional\" /></label ><label >Ignore EOS<select id=\"presetIgnoreEos\"><option value=\"\">Default</option><option value=\"false\">No</option><option value=\"true\">Yes</option></select></label ><label >Skip special tokens<select id=\"presetSkipSpecial\"><option value=\"\">Default</option><option value=\"true\">Yes</option><option value=\"false\">No</option></select></label ><label >Include stop text<select id=\"presetIncludeStop\"><option value=\"\">Default</option><option value=\"false\">No</option><option value=\"true\">Yes</option></select></label ><label >Stop strings<input id=\"presetStop\" placeholder=\"one per line or comma-separated\" /></label></div><div class=\"preset-form-actions\"><button id=\"presetSaveBtn\" class=\"btn green\" onclick=\"savePresetFromForm()\" > 💾 Save</button ><button class=\"btn red\" onclick=\"closePresetEditor()\"> ❌ Cancel </button></div></div></div></section><section id=\"users\" class=\"tabpane content-tab\"></section><section id=\"chat\" class=\"tabpane content-tab\"><div class=\"panel chat-panel\"><div class=\"panel-head chat-panel-head\"><h2>Chat</h2><div class=\"chat-head-actions\"><div class=\"chat-conversation-strip\"><select id=\"chatConversationSelect\" class=\"chat-conversation-select\" aria-label=\"Conversation\" onchange=\"selectChatConversation(this.value)\" ></select><button class=\"iconbtn\" id=\"chatConversationNewBtn\" title=\"New conversation\" aria-label=\"New conversation\" onclick=\"createNewConversation()\" ><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M12 5v14M5 12h14\" fill=\"none\" /></svg></button><button class=\"iconbtn\" id=\"chatConversationEditBtn\" title=\"Rename or move conversation\" aria-label=\"Rename or move conversation\" onclick=\"openConversationEditorModal()\" ><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M4 20h4l10-10-4-4L4 16v4zM14 6l4 4\" fill=\"none\" /></svg></button><button class=\"iconbtn\" id=\"chatConversationDeleteBtn\" title=\"Delete conversation\" aria-label=\"Delete conversation\" onclick=\"deleteActiveConversation()\" ><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M5 7h14M9 7V5h6v2m-7 3v7m4-7v7m4-7v7M7 7l1 12h8l1-12\" fill=\"none\" /></svg></button><span class=\"chat-head-separator\" aria-hidden=\"true\">|</span><div class=\"chat-head-menu\"><button class=\"iconbtn\" id=\"chatSettingsToggle\" title=\"Chat options\" aria-label=\"Chat options\" onclick=\"toggleChatOptionsMenu()\" ><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M12 8.5a3.5 3.5 0 1 0 0 7a3.5 3.5 0 0 0 0-7Zm8 3.5l-2.1.8a6.9 6.9 0 0 1-.6 1.4l.9 2l-2.1 2.1l-2-.9a6.9 6.9 0 0 1-1.4.6L12 20l-1.1-2.1a6.9 6.9 0 0 1-1.4-.6l-2 .9l-2.1-2.1l.9-2a6.9 6.9 0 0 1-.6-1.4L4 12l2.1-1.1a6.9 6.9 0 0 1 .6-1.4l-.9-2l2.1-2.1l2 .9a6.9 6.9 0 0 1 1.4-.6L12 4l1.1 2.1a6.9 6.9 0 0 1 1.4.6l2-.9l2.1 2.1l-.9 2a6.9 6.9 0 0 1 .6 1.4L20 12Z\" fill=\"none\" /></svg></button><div class=\"chat-options-menu hidden\" id=\"chatOptionsMenu\"><button class=\"btn blue\" onclick=\"openChatSettingsPanel()\"> Chat Settings </button><button class=\"btn blue\" onclick=\"openMcpManagerModal()\"> MCP Servers </button></div></div></div></div></div><div class=\"chat-shell\"><div class=\"chat-main\"><div class=\"chat-toolbar\"><label >Container <select id=\"chatPresetSelect\" onchange=\"selectChatPreset(this.value)\"></select></label><label >API Preset <select id=\"chatApiPresetSelect\" onchange=\"selectChatApiPreset(this.value)\"></select></label></div><div class=\"msg chat-status-msg\" id=\"chatMsg\"></div><div class=\"chat-transcript\" id=\"chatTranscript\"></div><div class=\"chat-input-wrap\"><div class=\"chat-composer-row\"><textarea id=\"chatInput\" rows=\"4\" placeholder=\"Send a test message to the selected active preset...\" oninput=\"handleChatInputChange()\" onkeydown=\"handleChatInputKeydown(event)\" onpaste=\"handleChatPaste(event)\" ></textarea><div class=\"chat-action-stack\"><button class=\"iconbtn chat-action-btn chat-send-btn\" onclick=\"sendChatMessage()\" id=\"chatSendBtn\" title=\"Send message\" aria-label=\"Send message\" ><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M4 12 19 5l-3.8 5.4L19 12l-3.8 1.6L19 19 4 12Z\" fill=\"currentColor\" stroke=\"none\" /></svg></button><button class=\"iconbtn chat-action-btn chat-mic-btn\" onclick=\"toggleChatDictation()\" id=\"chatMicBtn\" title=\"Voice dictation\" aria-label=\"Voice dictation\" ><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M12 15a3 3 0 0 0 3-3V7a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3Zm0 0v4m-4-4a4 4 0 0 0 8 0\" fill=\"none\" /></svg></button><button class=\"iconbtn chat-action-btn chat-attach-btn\" onclick=\"openChatAttachmentPicker()\" id=\"chatAttachBtn\" title=\"Attach files or images\" aria-label=\"Attach files or images\" ><svg viewBox=\"-3 0 28 28\" aria-hidden=\"true\"><path d=\"M8 12.5 14.5 6a3.5 3.5 0 1 1 5 5L10.5 20a5 5 0 1 1-7-7L13 3.5\" fill=\"none\" /></svg></button></div></div><input id=\"chatAttachmentInput\" type=\"file\" multiple class=\"hidden-file-input\" accept=\"image/*,.txt,.md,.markdown,.json,.jsonl,.csv,.tsv,.yaml,.yml,.xml,.html,.css,.js,.mjs,.cjs,.ts,.tsx,.jsx,.py,.sh,.bash,.zsh,.log,.ini,.cfg,.conf\" onchange=\"handleChatAttachmentSelect(event)\" /><div class=\"chat-attachment-rail\" id=\"chatAttachmentRow\"></div></div><div class=\"chat-stats-card\" id=\"chatStatsCard\"><div class=\"chat-stats-head\"><div class=\"chat-stats-title\">Generation Stats</div><button class=\"iconbtn chat-stats-toggle\" id=\"chatStatsToggleBtn\" title=\"Collapse generation stats\" aria-label=\"Collapse generation stats\" onclick=\"toggleChatStatsCollapsed()\" ><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"m6 15 6-6 6 6\" fill=\"none\" /></svg></button></div><div class=\"chat-runtime-stats\" id=\"chatRuntimeStats\">-</div></div></div></div></div></section><section id=\"metrics\" class=\"tabpane content-tab\"><div class=\"panel\"><h2>Metrics</h2><div class=\"subtabs\"><button class=\"subtab active\" onclick=\"metricTab(event, 'mMain')\"> Main</button ><button class=\"subtab\" onclick=\"metricTab(event, 'mGpu')\"> GPUs</button ><button class=\"subtab\" onclick=\"metricTab(event, 'mRam')\"> RAM</button ><button class=\"subtab\" onclick=\"metricTab(event, 'mCpu')\"> CPU</button ><button class=\"subtab\" onclick=\"metricTab(event, 'mSystem')\"> System</button ><button class=\"subtab\" onclick=\"metricTab(event, 'mNetwork')\"> Network </button></div><div id=\"mMain\" class=\"metricpane active\"><div class=\"chartgrid\"><div class=\"chart\"><canvas id=\"cGpu\"></canvas></div><div class=\"chart\"><canvas id=\"cMem\"></canvas></div><div class=\"chart\"><canvas id=\"cLatency\"></canvas></div><div class=\"chart\"><canvas id=\"cTps\"></canvas></div></div></div><div id=\"mGpu\" class=\"metricpane\"><div id=\"gpuMetricCharts\" class=\"gpu-chartgrid\"></div></div><div id=\"mRam\" class=\"metricpane\"><div id=\"ramInfo\" class=\"value smallgap\"></div><div class=\"chartgrid\"><div class=\"chart tall\"><canvas id=\"cRam\"></canvas></div></div></div><div id=\"mCpu\" class=\"metricpane\"><div class=\"chartgrid\"><div class=\"chart\"><canvas id=\"cCpu\"></canvas></div></div><div id=\"cpuCores\" class=\"coregrid\"></div></div><div id=\"mSystem\" class=\"metricpane\"><div class=\"chartgrid\"><div class=\"chart\"><canvas id=\"cSystemUtil\"></canvas></div></div><div class=\"panel\"><h2>System Information</h2><div id=\"systemInfo\" class=\"value\"></div></div><div class=\"panel\"><h2>Storage</h2><div id=\"diskInfo\"></div></div></div><div id=\"mNetwork\" class=\"metricpane\"><div id=\"netInfo\" class=\"netgrid\"></div><div class=\"chartgrid\"><div class=\"chart\"><canvas id=\"cNetDown\"></canvas></div><div class=\"chart\"><canvas id=\"cNetUp\"></canvas></div></div></div></div></section><section id=\"logs\" class=\"tabpane\"></section><section class=\"panel logtools\"><h2>Log Management</h2><div class=\"searchbox\"><button class=\"btn\" id=\"searchPrev\" onclick=\"previousMatch()\" disabled > ⏪</button ><input id=\"searchQuery\" placeholder=\"Search log text\" onkeydown=\"if (event.key === 'Enter') runSearchOrNext();\" /><button class=\"btn\" id=\"searchNext\" onclick=\"runSearchOrNext()\"> 🔍</button ><span style=\"border-left: 1px solid #34445a; height: 28px\"></span ><button class=\"btn\" id=\"refreshBtn\" onclick=\"refreshStatus()\"> ♻️</button ><button class=\"btn\" id=\"clearBtn\" onclick=\"clearOrCancelLog()\"> 🗑️ </button></div></section><section class=\"logs panel\"><div class=\"loghead\"><h2 id=\"logTitle\">Docker Logs</h2><div class=\"logheadchecks\"><span class=\"label\" id=\"logInstanceLabel\">instance: primary</span ><label class=\"label\" ><input type=\"checkbox\" id=\"showGlobalLogs\" checked onchange=\"setShowGlobalLogs(this.checked)\" /> show globally</label ><label class=\"label\" ><input type=\"checkbox\" id=\"autoscroll\" checked /> auto-scroll</label ></div></div><textarea id=\"log\" class=\"log\" readonly wrap=\"soft\"> Connecting...</textarea ></section></main><script>const searchState={active:!1,query:\"\",matches:[],index:-1,prevAutoscroll:!0};let lastStatus=null,activeTabName=\"overview\",showGlobalLogs=!0,lastWindowFocused=\"function\"!=typeof document.hasFocus||document.hasFocus(),lastSwitchNotificationKey=\"\";function $(id){return document.getElementById(id)}function setMsg(t){$(\"msg\").textContent=t||\"\"}function setElementMsg(id,text,tone=\"warning\"){const node=$(id);if(!node)return;const nextText=String(text||\"\");if(node.textContent=nextText,node.classList.remove(\"msg-error\",\"msg-warning\",\"msg-success\"),!nextText)return;const nextTone=String(tone||\"warning\").trim().toLowerCase();\"error\"!==nextTone&&\"success\"!==nextTone&&\"warning\"!==nextTone||node.classList.add(`msg-${nextTone}`)}function windowIsFocused(){return!!lastWindowFocused&&!document.hidden}async function ensureNotificationPermission(){if(\"undefined\"==typeof Notification)return\"unsupported\";if(\"granted\"===Notification.permission)return\"granted\";if(\"denied\"===Notification.permission)return\"denied\";try{return await Notification.requestPermission()}catch(e){return\"error\"}}async function showBrowserNotification(title,body){const heading=String(title||\"Club-3090\"),message=String(body||\"\").trim(),permission=await ensureNotificationPermission();if(\"granted\"===permission&&\"undefined\"!=typeof Notification)try{return void new Notification(heading,{body:message,tag:\"club3090-runtime\"})}catch(e){}\"unsupported\"===permission&&window.alert(`${heading}\\n\\n${message}`)}function clearLog(){const signature=currentLogSignature||logStreamConfig().signature,entry=logCacheEntry(signature);entry.text=\"\",entry.loaded=!0,renderCurrentLog(signature)}function appendLog(t){appendLogChunk(currentLogSignature||logStreamConfig().signature,`${t}\\n`)}function clearOrCancelLog(){searchState.active?cancelSearch():clearLog()}function recalculateMatches(keepIndex=!0){const q=$(\"searchQuery\").value;if(!searchState.active||!q)return;const text=$(\"log\").value.toLowerCase(),needle=q.toLowerCase();let pos=0,m=[];for(;needle;){const i=text.indexOf(needle,pos);if(i<0)break;m.push(i),pos=i+needle.length}searchState.matches=m,m.length?searchState.index=keepIndex?Math.min(Math.max(searchState.index,0),m.length-1):0:searchState.index=-1,updateSearchUI(!1)}function runSearchOrNext(){if(searchState.active&&searchState.matches.length)return void nextMatch();$(\"searchQuery\").value&&(searchState.prevAutoscroll=$(\"autoscroll\").checked,searchState.active=!0,$(\"autoscroll\").checked=!1,$(\"autoscroll\").disabled=!0,recalculateMatches(!1),searchState.matches.length?gotoMatch(0):updateSearchUI(!1))}function gotoMatch(i){if(!searchState.matches.length)return;searchState.index=(i+searchState.matches.length)%searchState.matches.length;const start=searchState.matches[searchState.index],end=start+searchState.query.length,log=$(\"log\");log.focus(),log.setSelectionRange(start,end);const before=log.value.slice(0,start).split(\"\\n\").length-1;log.scrollTop=Math.max(0,16*before-log.clientHeight/2),updateSearchUI(!1)}function nextMatch(){searchState.active&&searchState.matches.length&&gotoMatch(searchState.index+1)}function previousMatch(){searchState.active&&searchState.matches.length&&gotoMatch(searchState.index-1)}function cancelSearch(){searchState.active=!1,searchState.query=\"\",searchState.matches=[],searchState.index=-1,$(\"searchQuery\").value=\"\",$(\"autoscroll\").disabled=!1,$(\"autoscroll\").checked=searchState.prevAutoscroll,$(\"log\").setSelectionRange($(\"log\").selectionStart,$(\"log\").selectionStart),updateSearchUI(!0)}function updateSearchUI(reset){searchState.active?(searchState.query=$(\"searchQuery\").value,$(\"searchPrev\").disabled=searchState.matches.length<2,$(\"searchNext\").textContent=searchState.matches.length>1?\"⏩\":\"🔍\",$(\"refreshBtn\").disabled=!0,$(\"refreshBtn\").textContent=searchState.matches.length?`${searchState.index+1}/${searchState.matches.length}`:\"0/0\",$(\"clearBtn\").textContent=\"❌\"):($(\"searchPrev\").disabled=!0,$(\"searchNext\").textContent=\"🔍\",$(\"refreshBtn\").disabled=!1,$(\"refreshBtn\").textContent=\"♻️\",$(\"clearBtn\").textContent=\"🗑️\")}function fmtUptime(s){return s=Number(s||0),Math.floor(s/3600)+\"h \"+Math.floor(s%3600/60)+\"m\"}function mibToGiB(v){return(Number(v||0)/1024).toFixed(2)}function inferGpuStatus(g){const u=Number(g.util_pct||0);return lastStatus&&lastStatus.metrics&&lastStatus.metrics.active_requests>0?u>20?\"Token Generation\":\"Prompt Processing\":u>5?\"Active\":\"Idle\"}function tempClass(t){return(t=Number(t||0))<35?\"temp-blue\":t<50?\"temp-green\":t<60?\"temp-yellow\":t<70?\"temp-orange\":t<80?\"temp-red\":\"temp-crimson\"}function trimFormattedNumber(text){return String(text||\"\").replace(/(\\.\\d*?[1-9])0+$|\\.0+$/,\"$1\")}function formatTempWithPeak(current,peak){const currentText=formatMaybeNumber(current,0);if(!currentText)return\"N/A\";const currentWarn=Number(current||0)>=80?\" ⚠️\":\"\",peakText=formatMaybeNumber(peak,0);if(!peakText)return`<span class=\"${tempClass(current)}\">${currentText}°C${currentWarn}</span>`;const peakWarn=Number(peak||0)>=80?\" ⚠️\":\"\";return`<span class=\"${tempClass(current)}\">${currentText}°C${currentWarn}</span> <span class=\"${tempClass(peak)}\">( ${peakText}°↑ C${peakWarn})</span>`}window.addEventListener(\"focus\",()=>{lastWindowFocused=!0}),window.addEventListener(\"blur\",()=>{lastWindowFocused=!1}),document.addEventListener(\"visibilitychange\",()=>{lastWindowFocused=\"function\"==typeof document.hasFocus?document.hasFocus():!document.hidden});const gpuStatusHistoryByIndex={},runtimeStatusHistoryById={};function formatMaybeNumber(value,digits=2){const num=Number(value);if(Number.isFinite(num))return trimFormattedNumber(num.toFixed(digits));const raw=String(value??\"\").trim();return raw&&\"N/A\"!==raw&&\"[Not Supported]\"!==raw?raw:\"\"}function formatGpuMetricWithPeak(current,peak,unit,digits=2){const currentText=formatMaybeNumber(current,digits);if(!currentText)return\"N/A\";const peakText=formatMaybeNumber(peak,digits);return`${currentText} ${unit}${peakText?` ( ${peakText}&uarr; ${unit})`:\"\"}`}function updateStatusHistory(store,key,nextStatus){const normalizedKey=String(key||\"\").trim(),status=String(nextStatus||\"\").trim();if(!normalizedKey||!status)return{current:status,previous:\"\"};const existing=store[normalizedKey]||{current:\"\",previous:\"\"};existing.current&&existing.current!==status?store[normalizedKey]={current:status,previous:existing.current}:existing.current||(store[normalizedKey]={current:status,previous:existing.previous||\"\"});const resolved=store[normalizedKey]||{current:status,previous:\"\"};return{current:status,previous:resolved.previous&&resolved.previous!==status?resolved.previous:\"\"}}function runtimeActivityStatus(runtime){const running=Number(runtime?.running_requests||0),waiting=Number(runtime?.waiting_requests||0),pending=Number(runtime?.pending_requests||0),swapped=Number(runtime?.swapped_requests||0),generationTps=Number(runtime?.generation_tps||0),lastTps=Number(runtime?.last_tokens_per_second||0);return(running>0||waiting>0||pending>0||swapped>0)&&(generationTps>.1||lastTps>.1)?\"Generation\":running>0||waiting>0||pending>0||swapped>0?\"Prompt Processing\":\"Idle\"}function renderGpuCards(gs){gs&&gs.length?$(\"gpuCards\").innerHTML=gs.map(g=>g.error?`<div class=\"gpu-card\">${g.error}</div>`:(()=>{const statusHistory=updateStatusHistory(gpuStatusHistoryByIndex,g.index,inferGpuStatus(g)),currentStatus=statusHistory.current,previousStatus=statusHistory.previous;return`<div class=\"gpu-card\"><div class=\"gpu-title\">GPU ${g.index} - ${g.name||\"RTX 3090\"}${g.vendor?\" (\"+g.vendor+\")\":\"\"}</div><div class=\"gpu-grid\"><div><div class=\"gpu-section-title\">Temperature</div><div class=\"gpu-line\"><span>Core</span><b>${formatTempWithPeak(g.temp_c,g.temp_peak_c)}</b></div></div><div><div class=\"gpu-section-title\">VRAM</div><div class=\"gpu-line\"><span>Free</span><b>${mibToGiB(g.mem_free_mib)} GB</b></div><div class=\"gpu-line\"><span>Used</span><b>${mibToGiB(g.mem_used_mib)} GB</b></div><div class=\"gpu-line\"><span>Max</span><b>${mibToGiB(g.mem_total_mib)} GB</b></div><div class=\"meter\"><span style=\"width:${Number(g.mem_pct||0)}%\"></span></div></div><div><div class=\"gpu-section-title\">Power</div><div class=\"gpu-line\"><span>Draw</span><b>${formatGpuMetricWithPeak(g.power_w,g.power_peak_w,\"W\",2)}</b></div><div class=\"gpu-line\"><span>Max Power</span><b>${g.power_limit_w||\"N/A\"} W</b></div></div><div><div class=\"gpu-section-title\">Fans</div><div class=\"gpu-line\"><span>Speed</span><b>${g.fan_pct||\"N/A\"}%</b></div></div><div><div class=\"gpu-section-title\">Clocks</div><div class=\"gpu-line\"><span>Core</span><b>${formatGpuMetricWithPeak(g.core_clock_mhz,g.core_clock_peak_mhz,\"MHz\",0)}</b></div><div class=\"gpu-line\"><span>Mem</span><b>${formatGpuMetricWithPeak(g.mem_clock_mhz,g.mem_clock_peak_mhz,\"MHz\",0)}</b></div></div><div><div class=\"gpu-section-title\">Usage</div><div class=\"gpu-line\"><span>Load</span><b>${g.util_pct||\"N/A\"}%</b></div><div class=\"gpu-line\"><span>Status</span><b>${currentStatus}${previousStatus?` (Previous: ${previousStatus})`:\"\"}</b></div></div></div></div>`})()).join(\"\"):$(\"gpuCards\").innerHTML='<div class=\"panel\">No GPU data</div>'}let editingPresetName=null;function presetParamSummary(params){params=params||{};const bits=[];if([\"temperature\",\"top_p\",\"top_k\",\"min_p\",\"presence_penalty\",\"frequency_penalty\",\"repetition_penalty\",\"length_penalty\",\"max_tokens\",\"max_completion_tokens\",\"min_tokens\",\"truncate_prompt_tokens\",\"logprobs\",\"top_logprobs\"].forEach(k=>{void 0!==params[k]&&null!==params[k]&&\"\"!==params[k]&&bits.push(`${k}: ${params[k]}`)}),void 0!==params.ignore_eos&&bits.push(\"ignore_eos: \"+(params.ignore_eos?\"on\":\"off\")),void 0!==params.skip_special_tokens&&bits.push(\"skip special: \"+(params.skip_special_tokens?\"on\":\"off\")),void 0!==params.include_stop_str_in_output&&bits.push(\"include stop: \"+(params.include_stop_str_in_output?\"on\":\"off\")),void 0!==params.stop&&bits.push(`stop: ${Array.isArray(params.stop)?params.stop.join(\"|\"):params.stop}`),params.chat_template_kwargs){const c=params.chat_template_kwargs;void 0!==c.enable_thinking&&bits.push(\"thinking: \"+(c.enable_thinking?\"on\":\"off\")),c.preserve_thinking&&bits.push(\"preserve thinking: on\")}return bits.join(\", \")||\"No explicit parameters\"}function renderPresetCatalog(catalog){const grid=$(\"apiPresetGrid\");if(!grid||!catalog)return;const items=[...catalog.defaults||[],...catalog.custom||[]];grid.innerHTML=items.map(p=>{const locked=p.locked;return`<div class=\"api-card\"><div class=\"api-card-head\"><h3>${p.endpoint}<br><span class=\"label\">${p.endpoint_alt||\"/\"+p.name}</span></h3>${locked?'<span class=\"label\">default</span>':`<span class=\"preset-actions\"><button class=\"iconbtn\" title=\"Edit\" onclick=\"editPreset('${p.name}')\">✏️</button><button class=\"iconbtn\" title=\"Delete\" onclick=\"deletePreset('${p.name}')\">❌</button></span>`}</div><p>${p.description||\"\"}</p><p class=\"label\">${presetParamSummary(p.params)}</p></div>`}).join(\"\")+'<div class=\"api-card\"><h3>/v1/short-* / /short-* and /v1/concise-* / /concise-*</h3><p>Prefix any default or custom preset to cap replies: short = 4096 tokens, concise = 512 tokens. Presets work both under /v1/name and /name for clients that append /v1 automatically.</p></div>'}function openPresetEditor(data){editingPresetName=data&&data.name?data.name:null,$(\"presetEditor\").classList.add(\"open\"),$(\"presetIntro\")&&$(\"presetIntro\").classList.add(\"hidden\"),$(\"presetSaveBtn\").textContent=editingPresetName?\"💾 Save changes\":\"💾 Save\",$(\"presetName\").disabled=!!editingPresetName,$(\"presetName\").value=data?.name||\"\",$(\"presetDescription\").value=data?.description||\"\",$(\"presetSystemPrompt\").value=data?.system_prompt||\"\";const p=data?.params||{},c=p.chat_template_kwargs||{};$(\"presetTemperature\").value=p.temperature??\"\",$(\"presetTopP\").value=p.top_p??\"\",$(\"presetTopK\").value=p.top_k??\"\",$(\"presetMinP\").value=p.min_p??\"\",$(\"presetThinking\").value=String(!!c.enable_thinking),$(\"presetPreserveThinking\").value=String(!!c.preserve_thinking),$(\"presetRepetitionPenalty\").value=p.repetition_penalty??\"\",$(\"presetPresencePenalty\").value=p.presence_penalty??\"\",$(\"presetFrequencyPenalty\").value=p.frequency_penalty??\"\",$(\"presetMaxCtx\").value=p.truncate_prompt_tokens??\"\",$(\"presetMaxTokens\").value=p.max_tokens??\"\",$(\"presetMinTokens\").value=p.min_tokens??\"\",$(\"presetLogprobs\").value=p.logprobs??\"\",$(\"presetTopLogprobs\").value=p.top_logprobs??\"\",$(\"presetLengthPenalty\").value=p.length_penalty??\"\",$(\"presetIgnoreEos\").value=void 0===p.ignore_eos?\"\":String(!!p.ignore_eos),$(\"presetSkipSpecial\").value=void 0===p.skip_special_tokens?\"\":String(!!p.skip_special_tokens),$(\"presetIncludeStop\").value=void 0===p.include_stop_str_in_output?\"\":String(!!p.include_stop_str_in_output),$(\"presetStop\").value=Array.isArray(p.stop)?p.stop.join(\"\\n\"):p.stop??\"\",$(\"presetEditor\").scrollIntoView({behavior:\"smooth\",block:\"center\"})}function closePresetEditor(){editingPresetName=null,$(\"presetEditor\").classList.remove(\"open\"),$(\"presetIntro\")&&$(\"presetIntro\").classList.remove(\"hidden\")}function collectPresetForm(){function val(id){return $(id).value.trim()}const preset={description:val(\"presetDescription\"),system_prompt:$(\"presetSystemPrompt\").value,enable_thinking:\"true\"===$(\"presetThinking\").value,preserve_thinking:\"true\"===$(\"presetPreserveThinking\").value};[[\"temperature\",\"presetTemperature\"],[\"top_p\",\"presetTopP\"],[\"top_k\",\"presetTopK\"],[\"min_p\",\"presetMinP\"],[\"repetition_penalty\",\"presetRepetitionPenalty\"],[\"presence_penalty\",\"presetPresencePenalty\"],[\"frequency_penalty\",\"presetFrequencyPenalty\"],[\"truncate_prompt_tokens\",\"presetMaxCtx\"],[\"max_tokens\",\"presetMaxTokens\"],[\"min_tokens\",\"presetMinTokens\"],[\"logprobs\",\"presetLogprobs\"],[\"top_logprobs\",\"presetTopLogprobs\"],[\"length_penalty\",\"presetLengthPenalty\"]].forEach(([k,id])=>{const n=function(id){const v=val(id);return\"\"===v?void 0:Number(v)}(id);Number.isFinite(n)&&(preset[k]=n)}),[[\"ignore_eos\",\"presetIgnoreEos\"],[\"skip_special_tokens\",\"presetSkipSpecial\"],[\"include_stop_str_in_output\",\"presetIncludeStop\"]].forEach(([k,id])=>{const v=val(id);\"\"!==v&&(preset[k]=\"true\"===v)});const stop=val(\"presetStop\");return stop&&(preset.stop=stop),preset}async function savePresetFromForm(){const name=editingPresetName||$(\"presetName\").value.trim();try{const r=await fetch(\"/admin/presets\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({action:\"save\",name,preset:collectPresetForm()})}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||\"save failed\");renderPresetCatalog(j.presets),closePresetEditor(),setMsg(\"Saved preset \"+name),await refreshStatus()}catch(e){alert(\"Preset save failed: \"+e)}}function editPreset(name){const p=(lastStatus?.presets?.custom||[]).find(x=>x.name===name);p&&openPresetEditor(p)}async function deletePreset(name){if(confirm(\"Delete custom preset \"+name+\"?\"))try{const r=await fetch(\"/admin/presets\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({action:\"delete\",name})}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||\"delete failed\");renderPresetCatalog(j.presets),setMsg(\"Deleted preset \"+name),await refreshStatus()}catch(e){alert(\"Preset delete failed: \"+e)}}function draw(id,data,key,label,color){const c=$(id);if(!c)return;const ctx=c.getContext(\"2d\"),dpr=devicePixelRatio||1,w=c.width=c.clientWidth*dpr,h=c.height=c.clientHeight*dpr;if(ctx.clearRect(0,0,w,h),ctx.fillStyle=color||\"#9dafc3\",ctx.font=11*dpr+\"px system-ui\",ctx.fillText(label,8*dpr,14*dpr),!data.length)return;const vals=data.map(x=>Number(x[key]||0)),max=1.1*Math.max(1,...vals);ctx.strokeStyle=color,ctx.lineWidth=2*dpr,ctx.beginPath(),vals.forEach((v,i)=>{const x=i/(vals.length-1||1)*w,y=h-v/max*(h-24*dpr)-4*dpr;i?ctx.lineTo(x,y):ctx.moveTo(x,y)}),ctx.stroke(),ctx.fillStyle=\"#e8eef7\",ctx.fillText(String(vals[vals.length-1]||0),w-62*dpr,14*dpr)}function drawGpuSeries(id,series,index,key,label,color){draw(id,series.map(p=>{const g=(p.gpus||[]).find(x=>String(x.index)===String(index));return{[key]:g?Number(g[key]||0):0}}),key,label,color)}function renderMetrics(j){const s=j.series||[];draw(\"cGpu\",s,\"gpu_util\",\"GPU util %\",\"#72c7ff\"),draw(\"cMem\",s,\"mem_pct\",\"VRAM %\",\"#2fc46b\"),draw(\"cLatency\",s,\"latency_s\",\"Latency s\",\"#ffcb6b\"),draw(\"cTps\",s,\"tps\",\"TPS est\",\"#ff5b6c\"),draw(\"cRam\",s,\"ram_pct\",\"System RAM %\",\"#2fc46b\"),draw(\"cCpu\",s,\"cpu_pct\",\"CPU total %\",\"#72c7ff\"),draw(\"cSystemUtil\",s,\"system_util_pct\",\"System utilization %\",\"#a78bfa\"),draw(\"cNetDown\",s,\"net_rx_kbps\",\"Download kbps\",\"#2fc46b\"),draw(\"cNetUp\",s,\"net_tx_kbps\",\"Upload kbps\",\"#72c7ff\"),$(\"ramInfo\")&&($(\"ramInfo\").textContent=j.system&&j.system.memory?`Used ${mibToGiB(j.system.memory.used_mib)} / ${mibToGiB(j.system.memory.total_mib)} GB (${j.system.memory.used_pct}%)`:\"\");const cores=j.system&&j.system.cpu&&j.system.cpu.cores||[];$(\"cpuCores\")&&($(\"cpuCores\").innerHTML=cores.map(c=>`<div class=\"stat\"><div class=\"label\">Core ${c.core}</div><div class=\"value\">${c.usage_pct}%</div><div class=\"meter\"><span style=\"width:${c.usage_pct}%\"></span></div></div>`).join(\"\"));const disks=j.system&&j.system.disks||[];function storageCard(d){if(d.error)return`<div class=\"storage-card\"><div class=\"storage-title\">Error</div><div class=\"value\">${d.error}</div></div>`;const title=`${d.path||d.source||d.name||\"disk\"}${d.label?\" — \"+d.label:\"\"}`,meta=`${d.model||\"\"} ${d.transport?\"· \"+d.transport:\"\"} · ${d.type||\"-\"} / ${d.partition_type||\"-\"} · ${d.fs||\"-\"} · ${d.mount||\"not mounted\"}${d.usage_basis?\" · \"+d.usage_basis:\"\"}`,sizeText=v=>null==v?\"Unknown\":`${v} GB`,free=sizeText(d.free_gib),used=sizeText(d.used_gib),total=sizeText(d.total_gib),pct=null===d.used_pct||void 0===d.used_pct?0:Number(d.used_pct||0),pctLabel=null===d.used_pct||void 0===d.used_pct?\"usage unknown\":`${pct}% used`;return`<div class=\"${d.user_facing?\"storage-card user-facing\":\"storage-card\"}\"><div class=\"storage-title\">${title}</div><div class=\"storage-meta\">${meta}</div><div class=\"storage-sizes\"><div class=\"stat\"><div class=\"label\">Free</div><div class=\"value\">${free}</div></div><div class=\"stat\"><div class=\"label\">Used</div><div class=\"value\">${used}</div></div><div class=\"stat\"><div class=\"label\">Total</div><div class=\"value\">${total}</div></div></div><div class=\"diskbar\"><span style=\"width:${pct}%\"></span></div><div class=\"label\">${pctLabel}</div></div>`}if($(\"diskInfo\")){const physical=disks.filter(d=>\"disk\"===d.kind||\"disk\"===d.type),volumes=disks.filter(d=>!(\"disk\"===d.kind||\"disk\"===d.type));$(\"diskInfo\").innerHTML=`<div class=\"storage-section\"><div class=\"panel\"><h2>Disks</h2><div class=\"storage-list\">${physical.map(storageCard).join(\"\")||'<div class=\"value\">No physical disks found</div>'}</div></div><div class=\"panel\"><h2>Volumes</h2><div class=\"storage-list\">${volumes.map(storageCard).join(\"\")||'<div class=\"value\">No volumes found</div>'}</div></div></div>`}const net=j.system&&j.system.network||{};$(\"netInfo\")&&($(\"netInfo\").innerHTML=`<div class=\"stat\"><div class=\"label\">Local IP</div><div class=\"value\">${net.local_ip||\"unknown\"}</div></div><div class=\"stat\"><div class=\"label\">Internet IP</div><div class=\"value\">${net.public_ip||\"unknown\"}</div></div><div class=\"stat\"><div class=\"label\">Download</div><div class=\"value\">${net.rx_kbps||0} kbps</div></div><div class=\"stat\"><div class=\"label\">Upload</div><div class=\"value\">${net.tx_kbps||0} kbps</div></div>`);const info=j.system&&j.system.info||{};$(\"systemInfo\")&&($(\"systemInfo\").innerHTML=`OS: ${info.os||\"unknown\"}<br>Kernel: ${info.kernel||\"unknown\"}<br>Host: ${info.hostname||\"unknown\"}<br>User: ${info.username||\"unknown\"}<br>Machine: ${info.machine||\"unknown\"}<br>CPU: ${info.cpu_model||\"unknown\"}<br>Board/Product: ${info.board||\"-\"} / ${info.product||\"-\"}<br>BIOS: ${info.bios||\"-\"}<br>GPUs: ${info.gpus||\"unknown\"}`);const holder=$(\"gpuMetricCharts\");if(holder&&j.gpus){const cats=[{key:\"util\",suffix:\"Util\",label:\"util %\",color:\"#72c7ff\"},{key:\"mem_pct\",suffix:\"Mem\",label:\"VRAM %\",color:\"#2fc46b\"},{key:\"temp\",suffix:\"Temp\",label:\"core temp °C\",color:\"#ffde59\"},{key:\"power\",suffix:\"Power\",label:\"power W\",color:\"#ff5b6c\"}];holder.innerHTML=cats.map(cat=>j.gpus.map(g=>`<div class=\"chart\"><canvas id=\"cGpu${g.index}${cat.suffix}\"></canvas></div>`).join(\"\")).join(\"\"),cats.forEach(cat=>j.gpus.forEach(g=>{const color=cat.color,label=`GPU${g.index} ${cat.label}`;drawGpuSeries(`cGpu${g.index}${cat.suffix}`,s,g.index,cat.key,label,color)}))}}let selectedInstance=\"GPU0\",logEs=null,selectedUserName=\"\",selectedOverviewInstanceId=\"\",selectedLogInstanceId=\"\",selectedPresetModelId=\"\",selectedPresetModelHydrated=!1,pendingLogJump=null;const SUMMARY_CACHE_KEY=\"club3090-preset-summary-v520\",CHAT_STATE_KEY=\"club3090-chat-state-v527\",LEGACY_CHAT_STATE_KEY=\"club3090-chat-state-v520\",LEGACY_CHAT_STATE_KEY_V516=\"club3090-chat-state-v516\",CHAT_UNTITLED_TITLE=\"Untitled conversation\",CHAT_MIN_COMPACTION_THRESHOLD=50,CHAT_MAX_COMPACTION_THRESHOLD=95,CHAT_THINKING_RENDER_INTERVAL_MS=250,CHAT_CONVERSATION_FOLDER_RE=/^[A-Za-z0-9 _-]*$/;let presetSummaryCache={persistent:{},transient:{},restartTargets:[],lastSeenUptime:0},chatStateServerReady=!1,chatStateSaveTimer=null,lastQueuedChatStateJson=\"\";function defaultChatParams(){return{temperature:\"\",top_p:\"\",top_k:\"\",min_p:\"\",repetition_penalty:\"\",presence_penalty:\"\",frequency_penalty:\"\",max_tokens:\"\",seed:\"\",enable_thinking:!1,preserve_thinking:!1}}function clampChatCompactionThreshold(value){const numeric=Number(value);return Number.isFinite(numeric)?Math.max(50,Math.min(95,Math.round(numeric))):95}function normalizeConversationFolder(value){return String(value||\"\").replace(/[^A-Za-z0-9 _-]+/g,\"\").replace(/\\s+/g,\" \").trim()}function isValidConversationFolder(value){return CHAT_CONVERSATION_FOLDER_RE.test(String(value||\"\"))}function cloneChatParams(params={}){return{...defaultChatParams(),...params&&\"object\"==typeof params?params:{},enable_thinking:!!params?.enable_thinking,preserve_thinking:!!params?.preserve_thinking}}function cloneChatAttachment(attachment={}){const kind=\"image\"===attachment?.kind?\"image\":\"text\",row={id:String(attachment?.id||\"\"),kind,name:String(attachment?.name||(\"image\"===kind?\"image\":\"attachment\")),mime:String(attachment?.mime||\"\"),source:String(attachment?.source||\"\")};return\"image\"===kind?(row.url=String(attachment?.url||\"\"),void 0!==attachment?.size_bytes&&(row.size_bytes=attachment.size_bytes)):row.text=String(attachment?.text||\"\"),row}function cloneChatMessage(message={}){return{...message,role:String(message?.role||\"user\"),text:String(message?.text||\"\"),attachments:Array.isArray(message?.attachments)?message.attachments.map(cloneChatAttachment):[],reasoningText:String(message?.reasoningText||\"\"),reasoning_content:String(message?.reasoning_content||\"\"),reasoning:String(message?.reasoning||\"\"),modelLabel:String(message?.modelLabel||\"\")}}function cloneChatMessages(messages=[]){return Array.isArray(messages)?messages.map(cloneChatMessage):[]}function currentChatStatePayload(){return{activeConversationId:chatState.activeConversationId,conversations:Array.isArray(chatState.conversations)?chatState.conversations.map(conversation=>({...conversation,folder:normalizeConversationFolder(conversation?.folder||\"\"),title:String(conversation?.title||\"\").trim()||CHAT_UNTITLED_TITLE,summary:String(conversation?.summary||\"\"),presetId:String(conversation?.presetId||\"\"),apiPresetName:String(conversation?.apiPresetName||\"\"),params:cloneChatParams(conversation?.params),systemPrompt:String(conversation?.systemPrompt||\"\"),autoCompactEnabled:!1!==conversation?.autoCompactEnabled,autoCompactThresholdPct:clampChatCompactionThreshold(conversation?.autoCompactThresholdPct),messages:cloneChatMessages(conversation?.messages),attachments:Array.isArray(conversation?.attachments)?conversation.attachments.map(cloneChatAttachment):[],draftText:String(conversation?.draftText||\"\"),compactedFromId:String(conversation?.compactedFromId||\"\"),compactionSequence:Math.max(1,Number(conversation?.compactionSequence||1)||1),lastInputTokens:void 0!==conversation?.lastInputTokens?conversation.lastInputTokens:void 0,lastOutputTokens:void 0!==conversation?.lastOutputTokens?conversation.lastOutputTokens:void 0,lastTotalTokens:void 0!==conversation?.lastTotalTokens?conversation.lastTotalTokens:void 0,lastCtxSizeTokens:void 0!==conversation?.lastCtxSizeTokens?conversation.lastCtxSizeTokens:void 0,lastKvCacheUsagePct:void 0!==conversation?.lastKvCacheUsagePct?conversation.lastKvCacheUsagePct:void 0,lastRuntimeRequestAt:void 0!==conversation?.lastRuntimeRequestAt?conversation.lastRuntimeRequestAt:void 0})):[],promptTemplates:Array.isArray(chatState.promptTemplates)?chatState.promptTemplates.map(template=>({id:String(template?.id||chatConversationId()),name:String(template?.name||\"\").trim(),text:String(template?.text||\"\")})):[]}}function queueServerChatStateSave(payload=currentChatStatePayload()){if(!chatStateServerReady)return;const nextJson=JSON.stringify(payload||{});nextJson!==lastQueuedChatStateJson&&(lastQueuedChatStateJson=nextJson,chatStateSaveTimer&&clearTimeout(chatStateSaveTimer),chatStateSaveTimer=setTimeout(async()=>{try{await fetch(\"/admin/chat-state\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:nextJson})}catch(e){}},120))}function chatConversationId(){return`chat-${Date.now()}-${Math.random().toString(36).slice(2,8)}`}function isUntitledConversationTitle(title){return!String(title||\"\").trim()||String(title||\"\").trim()===CHAT_UNTITLED_TITLE}function createChatConversation(seed={},inheritFrom=null){const base=inheritFrom&&\"object\"==typeof inheritFrom?inheritFrom:{},createdAt=Number(seed.createdAt||Date.now());return{id:String(seed.id||chatConversationId()),title:String(seed.title||CHAT_UNTITLED_TITLE).trim()||CHAT_UNTITLED_TITLE,folder:void 0!==seed.folder?normalizeConversationFolder(seed.folder):normalizeConversationFolder(base.folder||\"\"),summary:String(seed.summary||\"\"),autoNamed:void 0!==seed.autoNamed?!!seed.autoNamed:!isUntitledConversationTitle(seed.title||\"\"),createdAt,updatedAt:Number(seed.updatedAt||createdAt),lastUsedAt:Number(seed.lastUsedAt||seed.updatedAt||createdAt),statsCollapsed:void 0!==seed.statsCollapsed?!!seed.statsCollapsed:!!base.statsCollapsed,presetId:void 0!==seed.presetId?String(seed.presetId||\"\"):String(base.presetId||\"\"),apiPresetName:void 0!==seed.apiPresetName?String(seed.apiPresetName||\"\"):String(base.apiPresetName||\"\"),params:void 0!==seed.params?cloneChatParams(seed.params):cloneChatParams(base.params),systemPrompt:void 0!==seed.systemPrompt?String(seed.systemPrompt||\"\"):String(base.systemPrompt||\"\"),autoCompactEnabled:void 0!==seed.autoCompactEnabled?!!seed.autoCompactEnabled:!1!==base.autoCompactEnabled,autoCompactThresholdPct:clampChatCompactionThreshold(void 0!==seed.autoCompactThresholdPct?seed.autoCompactThresholdPct:base.autoCompactThresholdPct),messages:cloneChatMessages(seed.messages),attachments:Array.isArray(seed.attachments)?seed.attachments.map(cloneChatAttachment):[],draftText:String(seed.draftText||\"\"),compactedFromId:String(seed.compactedFromId||\"\"),compactionSequence:Math.max(1,Number(void 0!==seed.compactionSequence?seed.compactionSequence:base.compactionSequence||1)||1),lastInputTokens:void 0!==seed.lastInputTokens?Number(seed.lastInputTokens||0):void 0,lastOutputTokens:void 0!==seed.lastOutputTokens?Number(seed.lastOutputTokens||0):void 0,lastTotalTokens:void 0!==seed.lastTotalTokens?Number(seed.lastTotalTokens||0):void 0,lastCtxSizeTokens:void 0!==seed.lastCtxSizeTokens?Number(seed.lastCtxSizeTokens||0):void 0,lastKvCacheUsagePct:void 0!==seed.lastKvCacheUsagePct?Number(seed.lastKvCacheUsagePct||0):void 0,lastRuntimeRequestAt:void 0!==seed.lastRuntimeRequestAt?Number(seed.lastRuntimeRequestAt||0):void 0}}let chatState={activeConversationId:\"\",conversations:[],presetId:\"\",apiPresetName:\"\",messages:[],attachments:[],busy:!1,params:defaultChatParams(),systemPrompt:\"\",autoCompactEnabled:!0,autoCompactThresholdPct:95,statsCollapsed:!1,promptTemplates:[]},chatOptionsMenuOpen=!1,mcpManagerState={servers:[],editingId:\"\"},chatSettingsDraft=null,chatRecognition=null,chatTranscriptAutoFollow=!0,chatRequestController=null,chatAutoTitleGenerationId=0,chatThinkingTicker=null;function escapeHtml(value){return String(value??\"\").replaceAll(\"&\",\"&amp;\").replaceAll(\"<\",\"&lt;\").replaceAll(\">\",\"&gt;\").replaceAll('\"',\"&quot;\").replaceAll(\"'\",\"&#39;\")}function svgIcon(name){return\"edit\"===name?'<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M4 20h4l10-10-4-4L4 16v4zM14 6l4 4\" fill=\"none\"/></svg>':\"key\"===name?'<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M14 7a4 4 0 1 0 0 8a4 4 0 0 0 0-8Zm0 0h6m-2 0v3m-3 0h6\" fill=\"none\"/></svg>':\"reset\"===name?'<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M20 12a8 8 0 1 1-2.34-5.66M20 4v6h-6\" fill=\"none\"/></svg>':\"delete\"===name?'<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M5 7h14M9 7V5h6v2m-7 3v7m4-7v7m4-7v7M7 7l1 12h8l1-12\" fill=\"none\"/></svg>':\"copy\"===name?'<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M9 9h10v10H9zM5 15H4V5h10v1\" fill=\"none\"/></svg>':\"upload\"===name?'<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M12 16V4m0 0l-4 4m4-4l4 4M5 20h14\" fill=\"none\"/></svg>':\"send\"===name?'<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M4 12 19 5l-3.8 5.4L19 12l-3.8 1.6L19 19 4 12Z\" fill=\"currentColor\" stroke=\"none\"/></svg>':\"stop\"===name?'<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M7 7h10v10H7z\" fill=\"currentColor\" stroke=\"none\"/></svg>':\"close\"===name?'<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"m6 6 12 12M18 6 6 18\" fill=\"none\"/></svg>':\"plus\"===name?'<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M12 5v14M5 12h14\" fill=\"none\"/></svg>':\"chat\"===name?'<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M5 18V6h14v9H8l-3 3Zm3-7h8m-8 3h5\" fill=\"none\"/></svg>':\"gear\"===name?'<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M12 8.5a3.5 3.5 0 1 0 0 7a3.5 3.5 0 0 0 0-7Zm8 3.5l-2.1.8a6.9 6.9 0 0 1-.6 1.4l.9 2l-2.1 2.1l-2-.9a6.9 6.9 0 0 1-1.4.6L12 20l-1.1-2.1a6.9 6.9 0 0 1-1.4-.6l-2 .9l-2.1-2.1l.9-2a6.9 6.9 0 0 1-.6-1.4L4 12l2.1-1.1a6.9 6.9 0 0 1 .6-1.4l-.9-2l2.1-2.1l2 .9a6.9 6.9 0 0 1 1.4-.6L12 4l1.1 2.1a6.9 6.9 0 0 1 1.4.6l2-.9l2.1 2.1l-.9 2a6.9 6.9 0 0 1 .6 1.4L20 12Z\" fill=\"none\"/></svg>':\"chevron-up\"===name?'<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"m6 15 6-6 6 6\" fill=\"none\"/></svg>':\"chevron-down\"===name?'<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"m6 9 6 6 6-6\" fill=\"none\"/></svg>':\"chevron-right\"===name?'<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"m9 6 6 6-6 6\" fill=\"none\"/></svg>':\"\"}function renderIconButton({title,action,icon,className=\"\"}){return`<button class=\"${`iconbtn ${className}`.trim()}\" title=\"${escapeHtml(title)}\" aria-label=\"${escapeHtml(title)}\" onclick=\"${action}\">${svgIcon(icon)}</button>`}async function copyTextValue(value){const text=String(value||\"\");if(!text)return!1;if(navigator.clipboard&&navigator.clipboard.writeText)try{return await navigator.clipboard.writeText(text),!0}catch(e){}const temp=document.createElement(\"textarea\");temp.value=text,temp.setAttribute(\"readonly\",\"readonly\"),temp.style.position=\"fixed\",temp.style.opacity=\"0\",document.body.appendChild(temp),temp.focus(),temp.select();let copied=!1;try{copied=document.execCommand(\"copy\")}catch(e){copied=!1}return temp.remove(),copied}function ensureApiKeyModal(){if($(\"apiKeyModal\"))return;const modal=document.createElement(\"div\");modal.id=\"apiKeyModal\",modal.className=\"club-modal hidden\",modal.innerHTML=`<div class=\"club-modal-card\" role=\"dialog\" aria-modal=\"true\" aria-labelledby=\"apiKeyModalTitle\"><div class=\"panel-head\"><h2 id=\"apiKeyModalTitle\">API Key</h2><button class=\"iconbtn\" id=\"apiKeyModalTopClose\" title=\"Close\" aria-label=\"Close\" onclick=\"closeApiKeyModal()\">${svgIcon(\"delete\")}</button></div><div class=\"preset-help\" id=\"apiKeyModalHint\">Use Copy to place the key on the clipboard.</div><textarea id=\"apiKeyModalValue\" class=\"modal-keybox\" readonly wrap=\"off\"></textarea><div class=\"preset-form-actions\"><button class=\"btn amber\" onclick=\"copyApiKeyModalValue()\">Copy</button><button class=\"btn blue\" onclick=\"closeApiKeyModal()\">Close</button></div><div class=\"msg\" id=\"apiKeyModalMsg\"></div></div>`,modal.addEventListener(\"click\",event=>{event.target===modal&&closeApiKeyModal()}),document.body.appendChild(modal)}let apiKeyModalOptions={copySuccessText:\"Copied API key to clipboard.\",showTopClose:!0};function openApiKeyModal(title,value,hint=\"\",options={}){ensureApiKeyModal(),apiKeyModalOptions={copySuccessText:\"Copied API key to clipboard.\",showTopClose:!0,...options},$(\"apiKeyModalTitle\").textContent=title||\"API Key\",$(\"apiKeyModalHint\").textContent=hint||\"Use Copy to place the key on the clipboard.\",$(\"apiKeyModalValue\").value=value||\"\",$(\"apiKeyModalMsg\").textContent=\"\",$(\"apiKeyModalTopClose\")&&$(\"apiKeyModalTopClose\").classList.toggle(\"hidden\",!apiKeyModalOptions.showTopClose),$(\"apiKeyModal\").classList.remove(\"hidden\")}function closeApiKeyModal(){ensureApiKeyModal(),$(\"apiKeyModal\").classList.add(\"hidden\")}async function copyApiKeyModalValue(){ensureApiKeyModal();const ok=await copyTextValue($(\"apiKeyModalValue\").value||\"\");$(\"apiKeyModalMsg\").textContent=ok?apiKeyModalOptions.copySuccessText||\"Copied API key to clipboard.\":\"Copy failed on this browser.\"}function setInstanceMsg(t){$(\"instanceMsg\")&&($(\"instanceMsg\").textContent=t||\"\")}function getInstanceList(){return lastStatus&&lastStatus.instances||[]}function setUsersMsg(t){$(\"usersMsg\")&&($(\"usersMsg\").textContent=t||\"\")}async function saveUserForm(){try{const r=await fetch(\"/admin/users\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({action:\"save\",user:collectUserForm()})}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||\"save failed\");j.api_key&&openApiKeyModal(\"API key for \"+j.user.name,j.api_key,\"This key is now stored so it can be viewed again from the user card.\"),resetUserForm(),setUsersMsg(\"Saved user \"+j.user.name),await refreshStatus()}catch(e){alert(\"User save failed: \"+e)}}async function showUserApiKey(name){try{const r=await fetch(\"/admin/users\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({action:\"show_key\",name})}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||\"show failed\");openApiKeyModal(\"API key for \"+name,j.api_key,\"Use Copy to place the current key on the clipboard.\")}catch(e){alert(\"API key lookup failed: \"+e)}}async function resetUserKey(name){if(confirm(\"Reset API key for \"+name+\"?\"))try{const r=await fetch(\"/admin/users\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({action:\"reset_key\",name})}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||\"reset failed\");openApiKeyModal(\"New API key for \"+name,j.api_key,\"The previous key is no longer valid. Use Copy if you need to share the replacement key.\"),setUsersMsg(\"Reset API key for \"+name),await refreshStatus()}catch(e){alert(\"API key reset failed: \"+e)}}async function deleteUserByName(name){if(confirm(\"Delete user \"+name+\"?\"))try{const r=await fetch(\"/admin/users\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({action:\"delete\",name})}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||\"delete failed\");selectedUserName===name&&resetUserForm(),setUsersMsg(\"Deleted user \"+name),await refreshStatus()}catch(e){alert(\"User delete failed: \"+e)}}let currentLogSource=\"docker\";function setAuditMsg(t){$(\"auditMsg\")&&($(\"auditMsg\").textContent=t||\"\")}function mirrorAuthToggles(v){$(\"auditAllowAnonymousProxy\")&&($(\"auditAllowAnonymousProxy\").checked=!!v)}let selectedGroupName=\"\";function setGroupsMsg(t){$(\"groupsMsg\")&&($(\"groupsMsg\").textContent=t||\"\")}function findPanelByHeading(sectionId,heading){return[...document.querySelectorAll(`#${sectionId} .panel`)].find(panel=>{const title=panel.querySelector(\".panel-head h2,h2\");return(title&&title.textContent||\"\").trim()===heading})||null}let selectedScope=\"GPU0\";function currentScope(){return selectedScope||selectedInstance||\"GPU0\"}function scopeIsGlobal(){return\"GLOBAL\"===currentScope()}function ensureV413Layout(){const tabs=document.querySelector(\".tabs\"),auditBtn=tabs&&tabs.querySelector('.tab[onclick*=\"audit\"]'),logsBtn=tabs&&tabs.querySelector('.tab[onclick*=\"logs\"]');auditBtn&&auditBtn.remove(),tabs&&logsBtn&&tabs.appendChild(logsBtn);const system=$(\"system\"),logs=($(\"presets\"),$(\"logs\")),audit=$(\"audit\");if(system&&audit){const accessPolicy=findPanelByHeading(\"audit\",\"Access Policy\");accessPolicy&&!accessPolicy.dataset.v413Moved&&(accessPolicy.dataset.v413Moved=\"1\",system.insertBefore(accessPolicy,system.children[1]||null));const overview=findPanelByHeading(\"audit\",\"Audit Overview\");overview&&logs&&!overview.dataset.v413Moved&&(overview.dataset.v413Moved=\"1\",logs.insertBefore(overview,logs.firstChild||null));const globalControls=findPanelByHeading(\"audit\",\"Global Controls\");globalControls&&globalControls.remove();const auditStream=findPanelByHeading(\"audit\",\"Audit Stream\");auditStream&&auditStream.remove(),0!==audit.childElementCount&&audit.querySelector(\".panel\")||audit.remove()}const accessCard=findPanelByHeading(\"system\",\"Access Policy\");if(accessCard){const openUsers=[...accessCard.querySelectorAll(\"button\")].find(btn=>(btn.textContent||\"\").includes(\"Open Users Management\"));openUsers&&openUsers.remove()}const singleCard=[...document.querySelectorAll(\"#presets .panel\")].find(panel=>{const h=panel.querySelector(\".panel-head h2,h2\");return h&&((h.textContent||\"\").includes(\"Per-Instance Docker Presets\")||(h.textContent||\"\").includes(\"Single GPU Docker Presets\"))});if(singleCard){singleCard.id=\"singlePresetCard\";const title=singleCard.querySelector(\"h2\");title&&(title.textContent=\"Dynamic Model Presets\")}const customTitle=[...document.querySelectorAll(\"#presets .panel .panel-head h2\")].find(h=>\"Custom Preset Templates\"===(h.textContent||\"\").trim());if(customTitle&&(customTitle.textContent=\"Custom Configuration Endpoints\"),$(\"presetScopePanel\")&&$(\"presetScopePanel\").remove(),$(\"dualPresetCard\")&&$(\"dualPresetCard\").remove(),logs&&!$(\"logsSourcePanel\")){const panel=document.createElement(\"div\");panel.className=\"panel\",panel.id=\"logsSourcePanel\",panel.innerHTML=`<div class=\"panel-head\"><h2>Log Sources</h2><div class=\"preset-actions\">${renderIconButton({title:\"Export Logs\",action:\"exportCurrentLog()\",icon:\"upload\"})}</div></div><div class=\"subtabs\"><button class=\"subtab\" id=\"logSourceDocker\" onclick=\"setCurrentLogSource('docker')\">Docker Logs</button><button class=\"subtab\" id=\"logSourceAudit\" onclick=\"setCurrentLogSource('audit')\">Audit Logs</button></div><div class=\"value smallgap\" id=\"logsSourceSummary\">-</div>`,logs.appendChild(panel)}const profiles=findPanelByHeading(\"system\",\"Power Profiles\");if(profiles&&!$(\"profileScopeNote\")){const note=document.createElement(\"div\");note.className=\"preset-help\",note.id=\"profileScopeNote\",profiles.insertBefore(note,profiles.querySelector(\".actions\")||profiles.firstChild)}const power=findPanelByHeading(\"system\",\"Optimizations + Cooling\");if(power&&!$(\"powerScopeNote\")){const note=document.createElement(\"div\");note.className=\"preset-help\",note.id=\"powerScopeNote\",power.insertBefore(note,power.querySelector(\".actions\")||power.firstChild)}}function quotaLimitText(v,suffix=\"\"){return null==v||\"\"===v?\"unlimited\":`${v}${suffix}`}function quotaWeightText(v){return null==v||\"\"===v?\"default\":trimFormattedNumber(Number(v).toFixed(3))}function quotaWindowText(windowData){return`${(windowData=windowData||{}).requests||0} msgs · score ${Number(windowData.score||0).toFixed(1)} · in ${windowData.input_tokens||0} · out ${windowData.output_tokens||0} · tools ${windowData.tool_calls||0} · thinking ${Number(windowData.thinking_seconds||0).toFixed(1)}s`}function quotaWeightLine(limits){return`in ${quotaWeightText((limits=limits||{}).input_token_weight)} · out ${quotaWeightText(limits.output_token_weight)} · tools ${quotaWeightText(limits.tool_call_weight)} · thinking ${quotaWeightText(limits.thinking_second_weight)}`}function quotaBudgetLine(limits){return`5h ${quotaLimitText((limits=limits||{}).score_per_5h)} · week ${quotaLimitText(limits.score_per_week)} · /msg tokens ${quotaLimitText(limits.max_tokens_per_message)} · /msg tools ${quotaLimitText(limits.max_tool_calls_per_message)}`}function parseQuotaNumber(id){const el=$(id);if(!el)return null;const v=el.value.trim();return\"\"===v?null:Number(v)}function scopeItems(){const items=getInstanceList().slice();return items.sort((a,b)=>{const ak=\"dual\"===a.kind?1:0,bk=\"dual\"===b.kind?1:0;if(ak!==bk)return ak-bk;return((a.gpu_indices||[a.gpu_index])[0]||0)-((b.gpu_indices||[b.gpu_index])[0]||0)||String(a.id).localeCompare(String(b.id))}),items}function singleScopeItems(){return scopeItems().filter(x=>\"dual\"!==x.kind)}function pairScopeItems(){return pairingEnabled()?scopeItems().filter(x=>\"dual\"===x.kind):[]}function gpuCount(){return Number(lastStatus&&lastStatus.gpu_count||0)}function canonicalPairId(a,b){const nums=[Number(a),Number(b)].filter(x=>Number.isInteger(x)&&x>=0).sort((x,y)=>x-y);return 2!==nums.length||nums[0]===nums[1]?\"\":`PAIR${nums[0]}_${nums[1]}`}function exactTwoPairTarget(){return 2===gpuCount()&&scopeItems().find(x=>\"PAIR0_1\"===x.id)||null}function currentScopeInstance(strict=!1){return\"GLOBAL\"===currentScope()?legacyGlobalDualScope()?strict?null:legacyGlobalPair():pairingEnabled()&&2===gpuCount()?strict?null:exactTwoPairTarget():null:scopeItems().find(x=>x.id===currentScope())||singleScopeItems()[0]||pairScopeItems()[0]||null}function dockerLogTarget(){if(\"audit\"===currentLogSource)return null;const legacy=legacyGlobalPair(),cur=currentScopeInstance(!1)||scopeItems()[0]||null;return scopeIsGlobal()&&legacyGlobalDualScope()||legacyGlobalDualScope()&&legacy&&legacy.running&&cur&&\"dual\"!==cur.kind&&(\"pair\"===cur.assignment_scope||cur.overrides_dual_mode||!cur.running)?null:cur}function scopeLabel(inst){return inst?\"GLOBAL\"===inst.id?\"Global Dual\":\"dual\"===inst.kind?`Pair ${(inst.gpu_indices||[]).join(\" + \")}`:inst.id:legacyGlobalDualScope()?\"Global Dual\":\"Global\"}function runtimeTrackingItems(){const rows=Object.values(lastStatus&&lastStatus.instance_runtime_metrics||{}).filter(row=>row&&row.running);return rows.sort((a,b)=>{const ag=Array.isArray(a.gpu_indices)?a.gpu_indices:[],bg=Array.isArray(b.gpu_indices)?b.gpu_indices:[];return(ag[0]??999)-(bg[0]??999)||ag.length-bg.length||String(a.id||a.instance_id||\"\").localeCompare(String(b.id||b.instance_id||\"\"))}),rows}function normalizeTrackedRuntimeId(value){const rows=runtimeTrackingItems();if(!rows.length)return\"\";const candidate=String(value||\"\").trim().toUpperCase();if(candidate){const exact=rows.find(row=>String(row.id||row.instance_id).toUpperCase()===candidate);if(exact)return String(exact.id||exact.instance_id)}return String(rows[0].id||rows[0].instance_id)}function trackedOverviewRuntime(){const id=normalizeTrackedRuntimeId(selectedOverviewInstanceId);return id?(selectedOverviewInstanceId=id,runtimeTrackingItems().find(row=>String(row.id||row.instance_id)===String(id))||null):null}function trackedLogRuntime(){const id=normalizeTrackedRuntimeId(selectedLogInstanceId);return id?(selectedLogInstanceId=id,runtimeTrackingItems().find(row=>String(row.id||row.instance_id)===String(id))||null):null}function setOverviewTrackedInstance(id){selectedOverviewInstanceId=normalizeTrackedRuntimeId(id),renderOverviewTracker(),lastStatus&&renderOverviewStatus(lastStatus)}function setLogTrackedInstance(id){selectedLogInstanceId=normalizeTrackedRuntimeId(id),renderLogTracker(),applyLogVisibility(),connectLogs(!0)}function formatCtxTokens(value){const num=Number(value||0);return!Number.isFinite(num)||num<=0?\"-\":num>=1e6?`${trimFormattedNumber((num/1e6).toFixed(2))}M`:num>=1e3?`${trimFormattedNumber((num/1e3).toFixed(num>=1e5?0:1))}K`:String(Math.round(num))}function formatNumber(value,digits=2){const num=Number(value);return Number.isFinite(num)?trimFormattedNumber(num.toFixed(digits)):\"-\"}function formatCompactInt(value){const num=Number(value);if(!Number.isFinite(num))return\"-\";const abs=Math.abs(num);return abs>=1e9?`${trimFormattedNumber((num/1e9).toFixed(abs>=1e10?0:1))}B`:abs>=1e6?`${trimFormattedNumber((num/1e6).toFixed(abs>=1e7?0:1))}M`:abs>=1e3?`${trimFormattedNumber((num/1e3).toFixed(abs>=1e5?0:1))}K`:String(Math.round(num))}function formatElapsedLaunch(seconds){const total=Math.max(0,Math.round(Number(seconds||0))),mins=Math.floor(total/60),secs=total%60;return mins>0?`${mins} min, ${secs} s to launch`:`${secs} s to launch`}function formatMaybeTimestamp(ts){const num=Number(ts||0);if(!Number.isFinite(num)||num<=0)return\"-\";try{return new Date(1e3*num).toLocaleTimeString([],{hour:\"2-digit\",minute:\"2-digit\",second:\"2-digit\"})}catch(e){return\"-\"}}function runtimeStatsRows(j){return Array.isArray(j?.running_runtimes)?j.running_runtimes.filter(Boolean):[]}function formatRuntimeModeValue(j,runtime){if(runtime)return`${runtime.mode||\"-\"} / ${runtime.port||\"-\"}`;const modes=Array.isArray(j?.active_modes)?j.active_modes.filter(Boolean):[],port=j?.active_port||\"-\";return modes.length>1?`${modes.join(\", \")} / multiple`:`${modes[0]||j?.active_mode||\"-\"} / ${port}`}function formatRuntimeContainerValue(j,runtime){if(runtime)return runtime.container||\"none\";const containers=Array.isArray(j?.containers)?j.containers.filter(Boolean):[];return containers.length?containers.join(\", \"):\"none\"}function formatUsersValue(j){const userCount=Array.isArray(j?.users)?j.users.length:0,groupNames=Array.isArray(j?.groups)?j.groups.map(group=>String(group?.name||\"\").trim()).filter(Boolean):[];return`<div>${userCount} registered user${1===userCount?\"\":\"s\"}</div><div class=\"value-subline\">groups: ${groupNames.length?escapeHtml(groupNames.join(\", \")):\"none configured\"}</div>`}function formatLastStatusCard(runtime,metrics){const target=runtime||{},rawStatus=target.last_status??metrics.last_status,statusNum=Number(rawStatus),head=[Number.isFinite(statusNum)?`HTTP ${Math.trunc(statusNum)}`:null!=rawStatus&&\"\"!==rawStatus?String(rawStatus):\"-\"],latency=target.last_latency_s??metrics.last_latency_s,ttft=target.last_ttft_s??metrics.last_ttft_s,tps=[target.last_tokens_per_second,target.generation_tps,metrics.last_tokens_per_second].find(value=>Number(value)>0);null!=latency&&head.push(`latency=${formatNumber(latency,3)}s`),null!=ttft&&head.push(`ttft=${formatNumber(ttft,3)}s`),null!==target.last_prefill_s&&void 0!==target.last_prefill_s&&head.push(`prefill~=${formatNumber(target.last_prefill_s,3)}s`),null!=tps&&head.push(`tk/s=${formatNumber(tps,2)}`);const detail=[];if(null!==target.gpu_kv_cache_usage_pct&&void 0!==target.gpu_kv_cache_usage_pct){const ctxText=formatCtxTokens(target.ctx_size_tokens);detail.push(\"-\"!==ctxText?`KV ${formatNumber(target.gpu_kv_cache_usage_pct,1)}% | ${ctxText} ctx`:`KV ${formatNumber(target.gpu_kv_cache_usage_pct,1)}%`)}else target.ctx_size_tokens&&detail.push(`${formatCtxTokens(target.ctx_size_tokens)} ctx`);const spec=target.speculative||{},specBits=[];null!==spec.drafted_tokens&&void 0!==spec.drafted_tokens&&specBits.push(`drafted=${spec.drafted_tokens}`),null!==spec.accept_rate_pct&&void 0!==spec.accept_rate_pct&&specBits.push(`accept=${formatNumber(spec.accept_rate_pct,1)}%`),null!==spec.accepted_tokens&&void 0!==spec.accepted_tokens&&null!==spec.draft_tokens&&void 0!==spec.draft_tokens&&specBits.push(`accepted=${spec.accepted_tokens}/${spec.draft_tokens}`),null!==spec.mean_acceptance_length&&void 0!==spec.mean_acceptance_length&&specBits.push(`avg=${formatNumber(spec.mean_acceptance_length,2)}`),null!==spec.system_efficiency_pct&&void 0!==spec.system_efficiency_pct&&specBits.push(`eff=${formatNumber(spec.system_efficiency_pct,1)}%`);const lines=[`<div>${head.join(\" &middot; \")}</div>`];return detail.length&&lines.push(`<div class=\"value-subline\">${detail.join(\" &middot; \")}</div>`),specBits.length&&lines.push(`<div class=\"value-subline\">spec ${specBits.join(\" &middot; \")}</div>`),lines.join(\"\")}function formatGenerationRuntimeCard(runtime){if(!runtime)return\"\";const statusHistory=updateStatusHistory(runtimeStatusHistoryById,runtime.id||runtime.instance_id,runtimeActivityStatus(runtime)),statusBits=[`status ${statusHistory.current}`,statusHistory.previous?`previous ${statusHistory.previous}`:\"\"].filter(Boolean),queueBits=[];Number(runtime.waiting_requests||0)>0&&queueBits.push(`waiting ${runtime.waiting_requests}`),Number(runtime.pending_requests||0)>0&&queueBits.push(`pending ${runtime.pending_requests}`),Number(runtime.swapped_requests||0)>0&&queueBits.push(`swapped ${runtime.swapped_requests}`);const perfBits=[];null!==runtime.prompt_tps&&void 0!==runtime.prompt_tps&&perfBits.push(`prompt ${formatNumber(runtime.prompt_tps,2)} tk/s`),null!==runtime.generation_tps&&void 0!==runtime.generation_tps&&perfBits.push(`generation ${formatNumber(runtime.generation_tps,2)} tk/s`),null!==runtime.prefix_cache_hit_rate_pct&&void 0!==runtime.prefix_cache_hit_rate_pct&&perfBits.push(`prefix hit ${formatNumber(runtime.prefix_cache_hit_rate_pct,1)}%`),null!==runtime.cpu_kv_cache_usage_pct&&void 0!==runtime.cpu_kv_cache_usage_pct&&perfBits.push(`CPU KV ${formatNumber(runtime.cpu_kv_cache_usage_pct,1)}%`);const tokenBits=[];null!==runtime.last_input_tokens&&void 0!==runtime.last_input_tokens&&tokenBits.push(`input ${formatCompactInt(runtime.last_input_tokens)}`),null!==runtime.last_output_tokens&&void 0!==runtime.last_output_tokens&&tokenBits.push(`output ${formatCompactInt(runtime.last_output_tokens)}`),null!==runtime.last_total_tokens&&void 0!==runtime.last_total_tokens&&tokenBits.push(`total ${formatCompactInt(runtime.last_total_tokens)}`),null!==runtime.last_tool_calls&&void 0!==runtime.last_tool_calls&&tokenBits.push(`tools ${runtime.last_tool_calls}`);const meta=[runtime.mode||\"-\",runtime.container||\"no container\",Array.isArray(runtime.gpu_indices)&&runtime.gpu_indices.length?`GPUs ${runtime.gpu_indices.join(\", \")}`:\"GPU mapping unavailable\"],pathText=runtime.last_path?escapeHtml(runtime.last_path):\"No request path recorded yet.\";return`<div class=\"generation-card\"><div class=\"generation-card-head\"><div><h3>${escapeHtml(runtime.display_name||runtime.id||\"Runtime\")}</h3><div class=\"generation-card-meta\">${escapeHtml(meta.join(\" · \"))}</div></div></div><div class=\"generation-card-body\">${formatLastStatusCard(runtime,{})}<div class=\"value-subline\">${escapeHtml(statusBits.join(\" · \"))}</div>${queueBits.length?`<div class=\"value-subline\">${escapeHtml(queueBits.join(\" · \"))}</div>`:\"\"}${perfBits.length?`<div class=\"value-subline\">${escapeHtml(perfBits.join(\" · \"))}</div>`:\"\"}${tokenBits.length?`<div class=\"value-subline\">${escapeHtml(tokenBits.join(\" · \"))}</div>`:\"\"}<div class=\"value-subline\">last path: ${pathText}</div><div class=\"value-subline\">last request: ${escapeHtml(formatMaybeTimestamp(runtime.last_request_at))}</div></div></div>`}function renderGenerationStats(j){const host=$(\"generationStatsContent\");if(!host)return;const rows=runtimeStatsRows(j),started=rows.filter(row=>[row?.last_status,row?.last_latency_s,row?.last_ttft_s,row?.last_tokens_per_second,row?.last_total_tokens,row?.last_output_tokens,row?.last_request_at,row?.prompt_tps,row?.generation_tps,row?.gpu_kv_cache_usage_pct].some(value=>null!=value&&\"\"!==value&&0!==value));rows.length?started.length?host.innerHTML=started.map(formatGenerationRuntimeCard).join(\"\"):host.innerHTML='<div class=\"empty-variant-note\">Runtime containers are online and waiting for inference. The first completed generation will populate per-instance latency, throughput, KV-cache, and token counters here so you can compare all active backends at a glance.</div>':host.innerHTML='<div class=\"empty-variant-note\">No runtime containers are active yet. Once a backend is online, this card will summarize live queue pressure, throughput, cache usage, and the latest request details for every running instance in one place.</div>'}function formatRequestCard(runtime,metrics){return`total=${metrics.total_requests??0}, active=${metrics.active_requests??0}, fail=${metrics.failed_requests??0}, queue=${metrics.queued_requests??0}`}function renderOverviewTracker(){const panel=findPanelByHeading(\"overview\",\"Status\");if(!panel)return;let row=$(\"overviewTrackerRow\");if(!row){row=document.createElement(\"div\"),row.id=\"overviewTrackerRow\",row.className=\"scope-strip\";const grid=panel.querySelector(\".grid\");panel.insertBefore(row,grid||panel.querySelector(\".msg\")||null)}const rows=runtimeTrackingItems();if(rows.length<=1)return row.innerHTML=\"\",void row.classList.add(\"hidden\");row.classList.remove(\"hidden\");const current=normalizeTrackedRuntimeId(selectedOverviewInstanceId);selectedOverviewInstanceId=current,row.innerHTML=`<span class=\"label\">Track instance</span><div class=\"subtabs\">${rows.map(item=>`<button class=\"subtab ${String(item.id||item.instance_id)===current?\"active\":\"\"}\" onclick=\"setOverviewTrackedInstance('${String(item.id||item.instance_id)}')\">${escapeHtml(String(item.id||item.instance_id))}</button>`).join(\"\")}</div>`}function renderLogTracker(){const card=document.querySelector(\".logs.panel\");if(!card)return;let row=$(\"logTrackerRow\");row||(row=document.createElement(\"div\"),row.id=\"logTrackerRow\",row.className=\"scope-strip\",card.insertBefore(row,$(\"log\")||card.lastChild||null));const rows=runtimeTrackingItems();if(\"audit\"===currentLogSource||rows.length<=1)return row.innerHTML=\"\",void row.classList.add(\"hidden\");row.classList.remove(\"hidden\");const current=normalizeTrackedRuntimeId(selectedLogInstanceId);selectedLogInstanceId=current,row.innerHTML=`<span class=\"label\">Track instance</span><div class=\"subtabs\">${rows.map(item=>`<button class=\"subtab ${String(item.id||item.instance_id)===current?\"active\":\"\"}\" onclick=\"setLogTrackedInstance('${String(item.id||item.instance_id)}')\">${escapeHtml(String(item.id||item.instance_id))}</button>`).join(\"\")}</div>`}function renderOverviewStatus(j){const metrics=j&&j.metrics||{},power=j&&j.power||{},runtime=trackedOverviewRuntime(),containers=Array.isArray(j?.containers)?j.containers.filter(Boolean):[],modes=Array.isArray(j?.active_modes)?j.active_modes.filter(Boolean):[];$(\"summary\")&&($(\"summary\").textContent=runtime?`${runtime.id||runtime.instance_id} | ${runtime.mode||j.active_mode} | ${runtime.container||\"no container\"} | ${power.profile||\"balanced\"} | GPUs ${j.gpu_count??0}`:`${modes[0]||j.active_mode||\"-\"} | ${containers[0]||j.container||\"no container\"} | ${power.profile||\"balanced\"} | GPUs ${j.gpu_count??0}`),$(\"mode\")&&($(\"mode\").textContent=formatRuntimeModeValue(j,runtime)),$(\"container\")&&($(\"container\").textContent=formatRuntimeContainerValue(j,runtime)),$(\"req\")&&($(\"req\").innerHTML=formatRequestCard(runtime,metrics)),$(\"last\")&&($(\"last\").innerHTML=formatUsersValue(j)),$(\"uptime\")&&($(\"uptime\").textContent=fmtUptime(j.uptime_seconds)),$(\"powerbox\")&&($(\"powerbox\").textContent=`profile=${power.profile||\"-\"}, GPU=${power.gpu||\"-\"}, CPU=${power.cpu||\"-\"}, fans=${power.fans||\"-\"}, container=${power.container||\"-\"}, idle=${power.idle_for_seconds??0}s`),renderGenerationStats(j),renderOverviewTracker()}function setEditorState(editorId,introId,open){const ed=$(editorId),intro=$(introId);ed&&ed.classList.toggle(\"open\",!!open),intro&&intro.classList.toggle(\"hidden\",!!open)}function openUserEditor(){ensureUsersUi(),setEditorState(\"userEditor\",\"userIntro\",!0)}function openGroupEditor(){ensureGroupUi(),setEditorState(\"groupEditor\",\"groupIntro\",!0)}async function createPairGroup(first=null,second=null){if(gpuCount()<2)return void alert(\"At least two GPUs are required to create a dual pair.\");let a=first,b=second;if(null===a||null===b){if(a=prompt(`First GPU index (0-${Math.max(gpuCount()-1,0)}):`,\"0\"),null===a)return;if(b=prompt(`Second GPU index (0-${Math.max(gpuCount()-1,0)}):`,\"1\"),null===b)return}const id=canonicalPairId(a,b);if(id)try{const r=await fetch(\"/admin/instances\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({action:\"save_pair\",gpu_indices:[Number(a),Number(b)],mode:\"vllm/dual\",enabled:!1})}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||\"pair save failed\");setInstanceMsg(`Saved pair group ${id}`),await refreshStatus(),setScope(id,!1)}catch(e){alert(\"Pair group failed: \"+e)}else alert(\"Select two distinct GPU indices.\")}async function deleteCurrentPairGroup(){const cur=currentScopeInstance(!0);if(cur&&\"dual\"===cur.kind){if(confirm(`Delete pair group ${cur.id}?`))try{const r=await fetch(\"/admin/instances\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({action:\"delete_pair\",instance_id:cur.id})}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||\"pair delete failed\");setInstanceMsg(`Deleted pair group ${cur.id}`),await refreshStatus(),setScope(\"GLOBAL\",!1)}catch(e){alert(\"Pair delete failed: \"+e)}}else alert(\"Select a dual pair scope first.\")}async function switchDualMode(m){const cur=currentScopeInstance(!1);if(cur&&\"dual\"===cur.kind){if(confirm(`Apply dual preset ${m} to ${cur.id} on GPUs ${(cur.gpu_indices||[]).join(\", \")}? This will stop overlapping runtimes that already use those GPUs.`))try{await post(\"/admin/switch\",{instance_id:cur.id,mode:m})}catch(e){alert(e)}}else alert(\"Choose a dual pair tab, or use Global on an exactly-two-GPU server, before applying a dual preset.\")}function profileDescription(p){return{eco:\"Eco profile: lower GPU power limits, lower idle clocks, powersave CPU governor, faster idle/container stop timers.\",balanced:\"Balanced profile: normal server profile with 280W active GPU cap, idle downclocking after 10 minutes, and container stop after 1 hour.\",default:\"Default profile: keeps the 280W safety GPU cap but removes idle clock locking, uses schedutil CPU while active, and keeps standard idle timers.\",turbo:\"Turbo profile: higher GPU power allowance, performance CPU governor, relaxed idle timers, and minimal downclocking. Use when performance matters more than power.\"}[p]||\"Apply profile?\"}function applyDirectoryPayload(j){lastStatus||(lastStatus={}),Array.isArray(j.users)&&(lastStatus.users=j.users,renderUsers(j.users)),Array.isArray(j.groups)&&(lastStatus.groups=j.groups,renderGroups(j.groups)),j.server_config&&(lastStatus.server_config=j.server_config,renderAudit(j.server_config))}ensureUsersUi=function(){const tabs=document.querySelector(\".tabs\");if(tabs&&!document.getElementById(\"usersTabBtn\")){const b=document.createElement(\"button\");b.className=\"tab\",b.id=\"usersTabBtn\",b.textContent=\"Users\",b.onclick=ev=>tab(ev,\"users\"),tabs.insertBefore(b,tabs.querySelector('.tab[onclick*=\"metrics\"]')||null)}const main=document.querySelector(\"main.container\");if(!main)return;let section=$(\"users\");section||(section=document.createElement(\"section\"),section.id=\"users\",section.className=\"tabpane content-tab\",main.insertBefore(section,document.getElementById(\"metrics\"))),\"1\"!==section.dataset.v414Users&&(section.dataset.v414Users=\"1\",section.innerHTML='<div class=\"panel\"><div class=\"panel-head\"><h2>User Accounts</h2><button class=\"add-preset-btn\" title=\"New user\" aria-label=\"New user\" onclick=\"resetUserForm(false)\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M12 5v14M5 12h14\" fill=\"none\"/></svg></button></div><div class=\"preset-intro\" id=\"userIntro\">Manage per-user API keys, access scopes, and Codex-style scored budgets. The configured list stays visible while the editor is collapsed.</div><div class=\"preset-editor\" id=\"userEditor\"><div class=\"formgrid\"><label>User name<input id=\"userName\" placeholder=\"client_a\" /></label><label>Allowed targets<input id=\"userTargets\" placeholder=\"*, legacy, GPU0, GPU1\" /></label><label>Groups<input id=\"userGroups\" placeholder=\"starter, premium\" /></label><label>5h score budget<input id=\"userScore5h\" type=\"number\" step=\"0.1\" placeholder=\"unlimited\" /></label><label>Weekly score budget<input id=\"userScoreWeek\" type=\"number\" step=\"0.1\" placeholder=\"unlimited\" /></label><label>Max tokens / message<input id=\"userMaxTokensMsg\" type=\"number\" step=\"1\" placeholder=\"unlimited\" /></label><label>Max tool calls / message<input id=\"userMaxToolsMsg\" type=\"number\" step=\"1\" placeholder=\"unlimited\" /></label><label>Input token weight<input id=\"userInputTokenWeight\" type=\"number\" step=\"0.001\" placeholder=\"default\" /></label><label>Output token weight<input id=\"userOutputTokenWeight\" type=\"number\" step=\"0.001\" placeholder=\"default\" /></label><label>Tool-call weight<input id=\"userToolCallWeight\" type=\"number\" step=\"0.001\" placeholder=\"default\" /></label><label>Thinking-second weight<input id=\"userThinkingSecondWeight\" type=\"number\" step=\"0.001\" placeholder=\"default\" /></label><label>Enabled<select id=\"userEnabled\"><option value=\"true\">Enabled</option><option value=\"false\">Disabled</option></select></label></div><div class=\"preset-form-actions\"><button class=\"btn green\" onclick=\"saveUserForm()\">Save User</button><button class=\"btn red\" onclick=\"resetUserForm(true)\">Cancel</button></div></div><div class=\"msg\" id=\"usersMsg\"></div><div class=\"panel\" style=\"margin-top:12px\"><h2>Configured Users</h2><div id=\"usersGrid\" class=\"api-grid\"></div></div></div>')},resetUserForm=function(collapse=!0){ensureUsersUi(),selectedUserName=\"\",$(\"userName\").disabled=!1,$(\"userName\").value=\"\",$(\"userTargets\").value=\"*\",$(\"userGroups\").value=\"\",$(\"userScore5h\").value=\"\",$(\"userScoreWeek\").value=\"\",$(\"userMaxTokensMsg\").value=\"\",$(\"userMaxToolsMsg\").value=\"\",$(\"userInputTokenWeight\").value=\"\",$(\"userOutputTokenWeight\").value=\"\",$(\"userToolCallWeight\").value=\"\",$(\"userThinkingSecondWeight\").value=\"\",$(\"userEnabled\").value=\"true\",setEditorState(\"userEditor\",\"userIntro\",!collapse),setUsersMsg(\"\")},collectUserForm=function(){function val(id){return($(id)&&$(id).value||\"\").trim()}return{name:val(\"userName\"),allowed_targets:val(\"userTargets\").split(\",\").map(x=>x.trim()).filter(Boolean),groups:val(\"userGroups\").split(\",\").map(x=>x.trim()).filter(Boolean),enabled:\"true\"===$(\"userEnabled\").value,generate_api_key:!selectedUserName,limits:{score_per_5h:parseQuotaNumber(\"userScore5h\"),score_per_week:parseQuotaNumber(\"userScoreWeek\"),max_tokens_per_message:parseQuotaNumber(\"userMaxTokensMsg\"),max_tool_calls_per_message:parseQuotaNumber(\"userMaxToolsMsg\"),input_token_weight:parseQuotaNumber(\"userInputTokenWeight\"),output_token_weight:parseQuotaNumber(\"userOutputTokenWeight\"),tool_call_weight:parseQuotaNumber(\"userToolCallWeight\"),thinking_second_weight:parseQuotaNumber(\"userThinkingSecondWeight\")}}},editUser=function(name){const user=(lastStatus&&lastStatus.users||[]).find(u=>u.name===name);user&&(ensureUsersUi(),selectedUserName=name,$(\"userName\").disabled=!0,$(\"userName\").value=user.name,$(\"userTargets\").value=(user.allowed_targets||[]).join(\", \"),$(\"userGroups\").value=(user.groups||[]).join(\", \"),$(\"userScore5h\").value=user.limits.score_per_5h??\"\",$(\"userScoreWeek\").value=user.limits.score_per_week??\"\",$(\"userMaxTokensMsg\").value=user.limits.max_tokens_per_message??\"\",$(\"userMaxToolsMsg\").value=user.limits.max_tool_calls_per_message??\"\",$(\"userInputTokenWeight\").value=user.limits.input_token_weight??\"\",$(\"userOutputTokenWeight\").value=user.limits.output_token_weight??\"\",$(\"userToolCallWeight\").value=user.limits.tool_call_weight??\"\",$(\"userThinkingSecondWeight\").value=user.limits.thinking_second_weight??\"\",$(\"userEnabled\").value=String(!!user.enabled),openUserEditor())},renderUsers=function(users){ensureUsersUi();const grid=$(\"usersGrid\");grid&&(users=users||[],selectedUserName&&!users.some(u=>u.name===selectedUserName)&&(selectedUserName=\"\"),grid.innerHTML=users.map(u=>{const actions=[renderIconButton({title:\"Edit\",action:`editUser('${u.name}')`,icon:\"edit\"}),renderIconButton({title:u.api_key_available?\"Show API key\":\"Show API key unavailable\",action:`showUserApiKey('${u.name}')`,icon:\"key\"}),renderIconButton({title:\"Reset API key\",action:`resetUserKey('${u.name}')`,icon:\"reset\"}),renderIconButton({title:\"Delete\",action:`deleteUserByName('${u.name}')`,icon:\"delete\"})].join(\"\");return`<div class=\"api-card\"><div class=\"api-card-head\"><h3>${u.name}<br><span class=\"label\">${u.enabled?\"enabled\":\"disabled\"} &middot; access ${(u.effective_allowed_targets||u.allowed_targets||[]).join(\", \")||\"*\"}</span></h3><span class=\"preset-actions\">${actions}</span></div><p>Groups: ${(u.groups||[]).join(\", \")||\"none\"}</p><p>API key: ${u.has_api_key?u.api_key_available?\"stored and viewable\":\"legacy key, reset once to store it\":\"not issued yet\"}</p><p>Last 5h: ${quotaWindowText((u.usage||{}).window_5h)}</p><p>Last week: ${quotaWindowText((u.usage||{}).window_week)}</p><p class=\"label\">Direct budgets &middot; ${quotaBudgetLine(u.limits||{})}</p><p class=\"label\">Direct weights &middot; ${quotaWeightLine(u.limits||{})}</p><p class=\"label\">Effective budgets &middot; ${quotaBudgetLine(u.effective_limits||{})}</p><p class=\"label\">Effective weights &middot; ${quotaWeightLine(u.effective_limits||{})}</p></div>`}).join(\"\")||'<div class=\"value\">No API users configured yet.</div>')},ensureGroupUi=function(){ensureUsersUi();const users=$(\"users\");if(!users)return;let panel=$(\"groupsPanel\");panel||(panel=document.createElement(\"div\"),panel.className=\"panel\",panel.id=\"groupsPanel\",users.appendChild(panel)),\"1\"!==panel.dataset.v414Groups&&(panel.dataset.v414Groups=\"1\",panel.innerHTML='<div class=\"panel-head\"><h2>User Groups / Plans</h2><button class=\"add-preset-btn\" title=\"New group\" aria-label=\"New group\" onclick=\"resetGroupForm(false)\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M12 5v14M5 12h14\" fill=\"none\"/></svg></button></div><div class=\"preset-intro\" id=\"groupIntro\">Define reusable plans that carry scored budgets, per-message caps, and access scopes. The configured list stays visible while the editor is collapsed.</div><div class=\"preset-editor\" id=\"groupEditor\"><div class=\"formgrid\"><label>Group name<input id=\"groupName\" placeholder=\"starter\" /></label><label>Description<input id=\"groupDescription\" placeholder=\"Shared plan description\" /></label><label>Allowed targets<input id=\"groupTargets\" placeholder=\"*, legacy, GPU0, GPU1\" /></label><label>5h score budget<input id=\"groupScore5h\" type=\"number\" step=\"0.1\" placeholder=\"unlimited\" /></label><label>Weekly score budget<input id=\"groupScoreWeek\" type=\"number\" step=\"0.1\" placeholder=\"unlimited\" /></label><label>Max tokens / message<input id=\"groupMaxTokensMsg\" type=\"number\" step=\"1\" placeholder=\"unlimited\" /></label><label>Max tool calls / message<input id=\"groupMaxToolsMsg\" type=\"number\" step=\"1\" placeholder=\"unlimited\" /></label><label>Input token weight<input id=\"groupInputTokenWeight\" type=\"number\" step=\"0.001\" placeholder=\"default\" /></label><label>Output token weight<input id=\"groupOutputTokenWeight\" type=\"number\" step=\"0.001\" placeholder=\"default\" /></label><label>Tool-call weight<input id=\"groupToolCallWeight\" type=\"number\" step=\"0.001\" placeholder=\"default\" /></label><label>Thinking-second weight<input id=\"groupThinkingSecondWeight\" type=\"number\" step=\"0.001\" placeholder=\"default\" /></label><label>Enabled<select id=\"groupEnabled\"><option value=\"true\">Enabled</option><option value=\"false\">Disabled</option></select></label></div><div class=\"preset-form-actions\"><button class=\"btn green\" onclick=\"saveGroupForm()\">Save Group</button><button class=\"btn red\" onclick=\"resetGroupForm(true)\">Cancel</button></div></div><div class=\"msg\" id=\"groupsMsg\"></div><div class=\"panel\" style=\"margin-top:12px\"><h2>Configured Groups</h2><div id=\"groupsGrid\" class=\"api-grid\"></div></div>')},resetGroupForm=function(collapse=!0){ensureGroupUi(),selectedGroupName=\"\",$(\"groupName\").disabled=!1,$(\"groupName\").value=\"\",$(\"groupDescription\").value=\"\",$(\"groupTargets\").value=\"*\",$(\"groupScore5h\").value=\"\",$(\"groupScoreWeek\").value=\"\",$(\"groupMaxTokensMsg\").value=\"\",$(\"groupMaxToolsMsg\").value=\"\",$(\"groupInputTokenWeight\").value=\"\",$(\"groupOutputTokenWeight\").value=\"\",$(\"groupToolCallWeight\").value=\"\",$(\"groupThinkingSecondWeight\").value=\"\",$(\"groupEnabled\").value=\"true\",setEditorState(\"groupEditor\",\"groupIntro\",!collapse),setGroupsMsg(\"\")},collectGroupForm=function(){function val(id){return($(id)&&$(id).value||\"\").trim()}return{name:val(\"groupName\"),description:val(\"groupDescription\"),allowed_targets:val(\"groupTargets\").split(\",\").map(x=>x.trim()).filter(Boolean),enabled:\"true\"===$(\"groupEnabled\").value,limits:{score_per_5h:parseQuotaNumber(\"groupScore5h\"),score_per_week:parseQuotaNumber(\"groupScoreWeek\"),max_tokens_per_message:parseQuotaNumber(\"groupMaxTokensMsg\"),max_tool_calls_per_message:parseQuotaNumber(\"groupMaxToolsMsg\"),input_token_weight:parseQuotaNumber(\"groupInputTokenWeight\"),output_token_weight:parseQuotaNumber(\"groupOutputTokenWeight\"),tool_call_weight:parseQuotaNumber(\"groupToolCallWeight\"),thinking_second_weight:parseQuotaNumber(\"groupThinkingSecondWeight\")}}},editGroup=function(name){const group=(lastStatus&&lastStatus.groups||[]).find(g=>g.name===name);group&&(ensureGroupUi(),selectedGroupName=name,$(\"groupName\").disabled=!0,$(\"groupName\").value=group.name,$(\"groupDescription\").value=group.description||\"\",$(\"groupTargets\").value=(group.allowed_targets||[]).join(\", \"),$(\"groupScore5h\").value=group.limits.score_per_5h??\"\",$(\"groupScoreWeek\").value=group.limits.score_per_week??\"\",$(\"groupMaxTokensMsg\").value=group.limits.max_tokens_per_message??\"\",$(\"groupMaxToolsMsg\").value=group.limits.max_tool_calls_per_message??\"\",$(\"groupInputTokenWeight\").value=group.limits.input_token_weight??\"\",$(\"groupOutputTokenWeight\").value=group.limits.output_token_weight??\"\",$(\"groupToolCallWeight\").value=group.limits.tool_call_weight??\"\",$(\"groupThinkingSecondWeight\").value=group.limits.thinking_second_weight??\"\",$(\"groupEnabled\").value=String(!!group.enabled),openGroupEditor())},renderGroups=function(groups){ensureGroupUi();const grid=$(\"groupsGrid\");grid&&(groups=groups||[],selectedGroupName&&!groups.some(g=>g.name===selectedGroupName)&&(selectedGroupName=\"\"),grid.innerHTML=groups.map(g=>`<div class=\"api-card\"><div class=\"api-card-head\"><h3>${g.name}<br><span class=\"label\">${g.enabled?\"enabled\":\"disabled\"} · access ${(g.allowed_targets||[]).join(\", \")||\"*\"}</span></h3><span class=\"preset-actions\"><button class=\"iconbtn\" title=\"Edit\" onclick=\"editGroup('${g.name}')\">✏️</button><button class=\"iconbtn\" title=\"Delete\" onclick=\"deleteGroupByName('${g.name}')\">❌</button></span></div><p>${g.description||\"No description\"}</p><p class=\"label\">Configured budgets · ${quotaBudgetLine(g.limits||{})}</p><p class=\"label\">Configured weights · ${quotaWeightLine(g.limits||{})}</p><p class=\"label\">Resolved budgets · ${quotaBudgetLine(g.resolved_limits||g.limits||{})}</p><p class=\"label\">Resolved weights · ${quotaWeightLine(g.resolved_limits||g.limits||{})}</p></div>`).join(\"\")||'<div class=\"value\">No groups configured yet.</div>')},renderAudit=function(cfg){cfg=cfg||{},ensureV414Layout();const adminPort=lastStatus&&lastStatus.admin_port||8008,proxyPort=lastStatus&&lastStatus.proxy_port||8009,adminPath=cfg.admin_path||\"/admin\",online=!!cfg.online_enabled,authOptional=!!cfg.allow_proxy_without_api_key,localEnabled=!!cfg.local_api_enabled,localPort=cfg.local_api_port||10881;$(\"auditAdminEndpoint\")&&($(\"auditAdminEndpoint\").innerHTML=`:${adminPort}${adminPath}`),$(\"auditProxyEndpoint\")&&($(\"auditProxyEndpoint\").innerHTML=`:${proxyPort}`),$(\"auditExposure\")&&($(\"auditExposure\").textContent=online?\"online through proxy/admin only\":\"local/private only\"),$(\"auditLocalApi\")&&($(\"auditLocalApi\").textContent=localEnabled?`127.0.0.1:${localPort}`:\"disabled\"),$(\"auditSummary\")&&($(\"auditSummary\").innerHTML=\"Audit entries capture admin actions, proxy authentication outcomes, quota denials, API usage, group changes, and user-management events. Use the shared log viewer below to inspect either Docker runtime logs or the audit log stream.\"),$(\"auditPolicyText\")&&($(\"auditPolicyText\").innerHTML=`Proxy API keys are currently <b>${authOptional?\"optional\":\"required\"}</b>. Admin UI remains under <code>:${adminPort}${adminPath}</code>.`),mirrorAuthToggles(authOptional)},saveAuthSettings=async function(){const allow=!(!$(\"auditAllowAnonymousProxy\")||!$(\"auditAllowAnonymousProxy\").checked);mirrorAuthToggles(allow);try{const r=await fetch(\"/admin/users\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({action:\"save_server_config\",allow_proxy_without_api_key:allow})}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||\"config failed\");j.server_config&&renderAudit(j.server_config),setAuditMsg(\"Saved access policy\"),await refreshStatus()}catch(e){alert(\"Access policy failed: \"+e)}},renderInstances=function(instances){ensureV414Layout();const tabs=$(\"instanceTabs\"),summary=$(\"instanceSummary\"),btn=$(\"instanceEnableBtn\"),panel=findPanelByHeading(\"system\",\"Instances\");if(!tabs||!summary||!panel)return;instances=scopeItems(),selectedScope&&(\"GLOBAL\"===selectedScope||instances.some(x=>x.id===selectedScope))||(selectedScope=singleScopeItems()[0]?.id||pairScopeItems()[0]?.id||\"GLOBAL\");const tabsHtml=singleScopeItems().map(x=>`<button class=\"subtab ${x.id===currentScope()?\"active\":\"\"}\" onclick=\"setScope('${x.id}')\">${x.id}${x.running?\" • on\":\" • off\"}</button>`).join(\"\")+pairScopeItems().map(x=>`<button class=\"subtab ${x.id===currentScope()?\"active\":\"\"}\" onclick=\"setScope('${x.id}')\">Pair ${(x.gpu_indices||[]).join(\"+\")}${x.running?\" • on\":\" • off\"}</button>`).join(\"\")+`<button class=\"subtab ${scopeIsGlobal()?\"active\":\"\"}\" onclick=\"setScope('GLOBAL')\">Global</button>`;tabs.innerHTML=tabsHtml,ensurePairManager();const target=currentScopeInstance(!1),actionButtons=[...panel.querySelectorAll(\"#instanceActionRow .btn\")||[]];scopeIsGlobal()&&target&&2===gpuCount()?(summary.innerHTML=`Global scope controls the only dual pair <code>${target.id}</code> on GPUs ${(target.gpu_indices||[]).join(\", \")} · mode ${target.mode} · port ${target.port} · proxy <code>${target.proxy_prefix}/</code>`,btn&&(btn.disabled=!1,btn.textContent=target.enabled?\"Disable Boot Autostart\":\"Enable Boot Autostart\"),actionButtons.forEach(x=>x.disabled=!1)):scopeIsGlobal()?(summary.innerHTML=\"Global scope selected. Create or choose a dual pair tab to manage arbitrary two-GPU dual presets. The profile and optimization controls below still apply against the active global context.\",btn&&(btn.disabled=!0,btn.textContent=\"Select a GPU or Pair Scope\"),actionButtons.forEach(x=>x.disabled=!0)):target?(summary.innerHTML=`${scopeLabel(target)} · ${target.assignment_text} · port ${target.port} · ${target.running?\"running\":\"stopped\"} · proxy <code>${target.proxy_prefix}/</code> · ${target.enabled?\"autostart enabled\":\"autostart disabled\"}`,btn&&(btn.disabled=!1,btn.textContent=target.enabled?\"Disable Boot Autostart\":\"Enable Boot Autostart\"),actionButtons.forEach(x=>x.disabled=!1)):(summary.textContent=\"No GPU instances configured\",btn&&(btn.disabled=!0,btn.textContent=\"Boot autostart unavailable\"),actionButtons.forEach(x=>x.disabled=!0)),$(\"logInstanceLabel\")&&($(\"logInstanceLabel\").textContent=currentLogLabel())},renderPresetScopeTabs=function(){ensureDynamicPresetLayout();const tabs=$(\"presetScopeTabs\"),summary=$(\"presetScopeSummary\");if(!tabs||!summary)return;tabs.innerHTML=\"\";if([{id:\"GLOBAL\",display_name:\"Global\"},...scopeItems()].forEach(item=>{const btn=document.createElement(\"button\");btn.className=\"subtab\"+(selectedScope===item.id?\" active\":\"\"),btn.textContent=\"GLOBAL\"===item.id?\"Global\":scopeLabel(item),btn.onclick=()=>setScope(item.id,!0),tabs.appendChild(btn)}),scopeIsGlobal())summary.textContent=\"Global scope fans single-GPU presets out across every GPU, dual presets across every two-GPU pair, and multi-GPU presets into the shared runtime.\";else{const current=currentScopeInstance(!0)||currentScopeInstance(!1);summary.textContent=current?`${scopeLabel(current)} selected. Matching ${\"dual\"===current.kind?\"dual\":\"single\"} presets below will apply to this scope.`:\"Select a scope to apply discovered presets.\"}},updateScopedCards=function(){const target=currentScopeInstance(!1);$(\"profileScopeNote\")&&($(\"profileScopeNote\").innerHTML=`${scopeIsGlobal()?\"Global\":scopeLabel(target)} scope: applying a power profile resets the recorded GPU peak values and starts a fresh measurement session.`),$(\"powerScopeNote\")&&($(\"powerScopeNote\").innerHTML=`${scopeIsGlobal()?\"Global\":scopeLabel(target)} scope: optimization and cooling actions use the selected runtime context while keeping host-level power state in sync.`),renderLogSourcePanel()},powerAction=async function(a){const cur=currentScopeInstance(!1);if(![\"stop_container\",\"start_instance\",\"restart_instance\",\"toggle_enabled\"].includes(a)||cur){if(\"stop_container\"!==a||confirm(`Stop ${scopeLabel(cur)} now?`))try{await post(\"/admin/power\",{action:a,instance_id:cur?cur.id:null,enabled:cur?!cur.enabled:void 0})}catch(e){alert(e)}}else alert(\"Select a GPU or Pair scope first.\")},instanceAction=async function(a){await powerAction(a)},toggleInstanceEnabled=async function(){const cur=currentScopeInstance(!1);if(cur)try{await post(\"/admin/power\",{action:\"toggle_enabled\",instance_id:cur.id,enabled:!cur.enabled})}catch(e){alert(e)}else alert(\"Select a GPU or Pair scope first.\")},switchMode=async function(m){const cur=currentScopeInstance(!0);if(!cur||\"dual\"===cur.kind)return void alert(\"Select a single GPU tab to apply a single-GPU preset.\");const blockingPair=pairScopeItems().find(x=>x.running&&(x.gpu_indices||[]).includes(Number(cur.gpu_index))),warning=blockingPair?`\\n\\nWarning: GPU ${cur.gpu_index} is currently occupied by ${blockingPair.id} running ${blockingPair.mode}. Continuing will stop that pair and replace it with ${m} on ${cur.id}.`:\"\";if(confirm(`Assign ${m} to ${cur.id} and start it?${warning}`))try{await post(\"/admin/switch\",{instance_id:cur.id,mode:m})}catch(e){alert(e)}},profile=async function(p){const cur=currentScopeInstance(!1),instanceId=scopeIsGlobal()?legacyGlobalDualScope()?\"GLOBAL\":cur?.id||\"GLOBAL\":cur?.id||null,scopeText=scopeIsGlobal()?\"Global\":scopeLabel(cur);if(confirm(profileDescription(p)+`\\n\\nApply this profile now to ${scopeText} scope and reset the recorded GPU peaks?`))try{await post(\"/admin/profile\",{profile:p,instance_id:instanceId},`/admin/profile ${p} ${instanceId||\"GLOBAL\"}`)}catch(e){alert(e)}},saveGroupForm=async function(){try{const r=await fetch(\"/admin/groups\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({action:\"save\",group:collectGroupForm()})}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||\"group save failed\");applyDirectoryPayload(j),resetGroupForm(!0),setGroupsMsg(\"Saved group \"+j.group.name),refreshStatus().catch(()=>{})}catch(e){alert(\"Group save failed: \"+e)}},deleteGroupByName=async function(name){if(confirm(\"Delete group \"+name+\"?\"))try{const r=await fetch(\"/admin/groups\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({action:\"delete\",name})}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||\"group delete failed\");applyDirectoryPayload(j),selectedGroupName===name&&resetGroupForm(!0),setGroupsMsg(\"Deleted group \"+name),refreshStatus().catch(()=>{})}catch(e){alert(\"Group delete failed: \"+e)}},pairingEnabled=function(){return!!(lastStatus&&lastStatus.server_config&&lastStatus.server_config.gpu_pairing_enabled)},legacyGlobalDualScope=function(){return 2===gpuCount()&&!pairingEnabled()};const UI_STATE_KEY=\"club3090-ui-state\";let uiStateHydrated=!1,uiStateSaveTimer=null,lastQueuedUiStateJson=\"\",instanceBusyState={active:!1,message:\"\"},currentLogSignature=\"\",statusPollTimer=null;function readCachedUiState(){try{return JSON.parse(localStorage.getItem(UI_STATE_KEY)||\"{}\")||{}}catch(e){return{}}}function writeCachedUiState(data){try{localStorage.setItem(UI_STATE_KEY,JSON.stringify(data||{}))}catch(e){}}function readJsonCache(key,fallback){try{const parsed=JSON.parse(localStorage.getItem(key)||\"null\");return parsed&&\"object\"==typeof parsed?parsed:fallback}catch(e){return fallback}}function savePresetSummaryCache(){try{localStorage.setItem(SUMMARY_CACHE_KEY,JSON.stringify(presetSummaryCache))}catch(e){}}function hydratePresetSummaryCache(){const cached=readJsonCache(SUMMARY_CACHE_KEY,null);cached&&(presetSummaryCache={persistent:cached.persistent&&\"object\"==typeof cached.persistent?cached.persistent:{},transient:cached.transient&&\"object\"==typeof cached.transient?cached.transient:{},restartTargets:Array.isArray(cached.restartTargets)?cached.restartTargets:[],lastSeenUptime:Number(cached.lastSeenUptime||0)})}function saveChatState(){try{const safe=currentChatStatePayload();localStorage.setItem(CHAT_STATE_KEY,JSON.stringify(safe)),queueServerChatStateSave(safe)}catch(e){}}async function hydrateChatState(){let cached=null,migratedFromLocalCache=!1;try{const response=await fetch(`/admin/chat-state?_=${Date.now()}`,{cache:\"no-store\"}),payload=await response.json();response.ok&&payload?.ok&&payload?.state&&(cached=payload.state)}catch(e){}if(cached||(cached=readJsonCache(CHAT_STATE_KEY,null)||readJsonCache(LEGACY_CHAT_STATE_KEY,null)||readJsonCache(\"club3090-chat-state-v516\",null),migratedFromLocalCache=!!cached),cached&&Array.isArray(cached.conversations)){const conversations=cached.conversations.map(conversation=>createChatConversation(conversation)).filter(Boolean);conversations.length&&(chatState={...chatState,activeConversationId:String(cached.activeConversationId||conversations[0].id),conversations,promptTemplates:Array.isArray(cached.promptTemplates)?cached.promptTemplates.map(template=>({id:String(template?.id||chatConversationId()),name:String(template?.name||\"\").trim(),text:String(template?.text||\"\")})).filter(template=>template.name||template.text):[]})}else if(cached){const imported=createChatConversation({title:CHAT_UNTITLED_TITLE,presetId:String(cached.presetId||\"\"),apiPresetName:String(cached.apiPresetName||\"\"),params:cached.params&&\"object\"==typeof cached.params?cached.params:{},systemPrompt:String(cached.systemPrompt||\"\"),messages:Array.isArray(cached.messages)?cached.messages:[],attachments:Array.isArray(cached.attachments)?cached.attachments:[],autoCompactEnabled:!1!==cached.autoCompactEnabled,autoCompactThresholdPct:cached.autoCompactThresholdPct});chatState={...chatState,activeConversationId:imported.id,conversations:[imported]}}if(!Array.isArray(chatState.conversations)||!chatState.conversations.length){const firstConversation=createChatConversation();chatState.conversations=[firstConversation],chatState.activeConversationId=firstConversation.id}chatState.conversations.some(conversation=>conversation.id===chatState.activeConversationId)||(chatState.activeConversationId=chatState.conversations[0].id),syncChatStateFromActiveConversation(),chatStateServerReady=!0,migratedFromLocalCache&&saveChatState()}function chatConversations(){return Array.isArray(chatState.conversations)?chatState.conversations:[]}function activeChatConversation(){const rows=chatConversations();return rows.find(conversation=>conversation.id===chatState.activeConversationId)||rows[0]||null}function syncChatStateFromConversation(conversation){const source=conversation||createChatConversation();chatState.presetId=String(source.presetId||\"\"),chatState.apiPresetName=String(source.apiPresetName||\"\"),chatState.messages=cloneChatMessages(source.messages),chatState.attachments=Array.isArray(source.attachments)?source.attachments.map(cloneChatAttachment):[],chatState.params=cloneChatParams(source.params),chatState.systemPrompt=String(source.systemPrompt||\"\"),chatState.autoCompactEnabled=!1!==source.autoCompactEnabled,chatState.autoCompactThresholdPct=clampChatCompactionThreshold(source.autoCompactThresholdPct),chatState.statsCollapsed=!!source.statsCollapsed}function syncChatStateFromActiveConversation(){syncChatStateFromConversation(activeChatConversation())}function syncActiveConversationFromChatState(){const conversation=activeChatConversation();return conversation?(conversation.presetId=String(chatState.presetId||\"\"),conversation.apiPresetName=String(chatState.apiPresetName||\"\"),conversation.messages=cloneChatMessages(chatState.messages),conversation.attachments=Array.isArray(chatState.attachments)?chatState.attachments.map(cloneChatAttachment):[],conversation.params=cloneChatParams(chatState.params),conversation.systemPrompt=String(chatState.systemPrompt||\"\"),conversation.autoCompactEnabled=!1!==chatState.autoCompactEnabled,conversation.autoCompactThresholdPct=clampChatCompactionThreshold(chatState.autoCompactThresholdPct),conversation.statsCollapsed=!!chatState.statsCollapsed,conversation.updatedAt=Date.now(),conversation.lastUsedAt=conversation.updatedAt,conversation):null}function persistChatConversationState(){syncActiveConversationFromChatState(),saveChatState()}function normalizeTabName(name){return\"audit\"===name?\"logs\":[\"overview\",\"system\",\"presets\",\"metrics\",\"users\",\"logs\",\"chat\"].includes(name)?name:\"overview\"}function currentUiState(){return{active_tab:normalizeTabName(activeTabName),selected_scope:selectedScope||\"GLOBAL\",current_log_source:\"audit\"===currentLogSource?\"audit\":\"docker\",show_global_logs:!!showGlobalLogs}}function queueUiStateSave(extra={}){const state={...currentUiState(),...extra},nextJson=JSON.stringify(state);nextJson!==lastQueuedUiStateJson&&(lastQueuedUiStateJson=nextJson,writeCachedUiState(state),uiStateSaveTimer&&clearTimeout(uiStateSaveTimer),uiStateSaveTimer=setTimeout(async()=>{try{await fetch(\"/admin/ui-config\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:nextJson})}catch(e){}},120))}function activeTabButton(name){return\"chat\"===name?$(\"chatLaunchBtn\")||null:[...document.querySelectorAll(\".tab\")].find(btn=>(btn.getAttribute(\"onclick\")||\"\").includes(`'${name}'`)||btn.id===`${name}TabBtn`)||null}function syncHeaderChatButtonAlignment(){const button=$(\"chatLaunchBtn\"),row=button&&\"function\"==typeof button.closest?button.closest(\".header-row\"):null,logsButton=activeTabButton(\"logs\");if(!button||!row||!logsButton)return;const rowRect=row.getBoundingClientRect(),logsRect=logsButton.getBoundingClientRect(),marginRight=Math.max(0,Math.round(rowRect.right-logsRect.right));button.style.marginRight=`${marginRight}px`}function hydrateUiState(cfg){if(uiStateHydrated)return;const state={...readCachedUiState(),...cfg||{}};activeTabName=normalizeTabName(state.active_tab||activeTabName),currentLogSource=\"audit\"===state.current_log_source?\"audit\":\"docker\",showGlobalLogs=\"boolean\"==typeof state.show_global_logs?state.show_global_logs:showGlobalLogs;const ids=new Set(scopeItems().map(x=>x.id)),candidate=state.selected_scope||selectedScope||\"GLOBAL\";selectedScope=\"GLOBAL\"===candidate?\"GLOBAL\":ids.has(candidate)?candidate:singleScopeItems()[0]?.id||pairScopeItems()[0]?.id||\"GLOBAL\",\"GLOBAL\"!==selectedScope&&(selectedInstance=selectedScope),lastQueuedUiStateJson=JSON.stringify(currentUiState()),uiStateHydrated=!0}legacyGlobalPair=function(){return lastStatus&&lastStatus.legacy_global_instance||null};let powerCoolingBusyState={active:!1,message:\"\"};const STATUS_POLL_MS=1e3;function syncPowerCoolingBusyState(){const panel=findPanelByHeading(\"system\",\"Optimizations + Cooling\");panel&&(panel.classList.toggle(\"instance-panel-busy\",!!powerCoolingBusyState.active),[...panel.querySelectorAll(\"button,input,select,textarea\")].forEach(el=>{powerCoolingBusyState.active?el.setAttribute(\"disabled\",\"disabled\"):el.removeAttribute(\"disabled\")}))}function setPowerCoolingBusy(active,message=\"\"){powerCoolingBusyState={active:!!active,message:message||\"\"},syncPowerCoolingBusyState()}async function withPowerCoolingBusy(message,fn){setPowerCoolingBusy(!0,message);try{return await fn()}finally{setPowerCoolingBusy(!1)}}function redrawMetricsSoon(){lastStatus&&(renderMetrics(lastStatus),requestAnimationFrame(()=>{lastStatus&&renderMetrics(lastStatus)}))}function syncInstancesBusyState(){const panel=findPanelByHeading(\"system\",\"Instances\");if(!panel)return;panel.classList.toggle(\"instance-panel-busy\",!!instanceBusyState.active),[...panel.querySelectorAll(\"button,input,select,textarea\")].forEach(el=>{instanceBusyState.active?el.setAttribute(\"disabled\",\"disabled\"):(\"gpuPairingEnabled\"!==el.id||gpuCount()>=2)&&el.removeAttribute(\"disabled\")});const note=$(\"pairingBusyNote\");if(note){const msg=instanceBusyState.message||(2===gpuCount()?\"Keep disabled if you want Global to keep behaving like the shared two-GPU runtime.\":\"Enable this to manage arbitrary dual-GPU pair groups.\");note.innerHTML=instanceBusyState.active?`<span class=\"spinner\" aria-hidden=\"true\"></span>${msg}`:msg}}function setInstancesBusy(active,message=\"\"){instanceBusyState={active:!!active,message:message||\"\"},syncInstancesBusyState()}async function saveGpuPairingSetting(enabled){setInstancesBusy(!0,\"Applying GPU pairing setting...\");try{const r=await fetch(\"/admin/users\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({action:\"save_server_config\",gpu_pairing_enabled:!!enabled})}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||\"GPU pairing update failed\");j.server_config&&(lastStatus||(lastStatus={}),lastStatus.server_config=j.server_config),await refreshStatus(),enabled||setScope(\"GLOBAL\",!1)}catch(e){alert(\"GPU pairing update failed: \"+e)}finally{setInstancesBusy(!1)}}function ensureAuditOverviewCard(){const system=$(\"system\"),overview=findPanelByHeading(\"logs\",\"Audit Overview\")||findPanelByHeading(\"audit\",\"Audit Overview\")||findPanelByHeading(\"system\",\"Audit Overview\");if(system&&overview){const services=findPanelByHeading(\"system\",\"Services\");system.insertBefore(overview,services&&services.nextSibling||system.children[1]||null)}}function ensurePairingToggle(){const panel=findPanelByHeading(\"system\",\"Instances\");if(!panel)return;let row=$(\"pairingToggleRow\");if(!row){row=document.createElement(\"div\"),row.id=\"pairingToggleRow\",row.className=\"actions\";const tabs=$(\"instanceTabs\");tabs&&tabs.parentNode===panel&&tabs.insertAdjacentElement(\"beforebegin\",row)}const count=gpuCount(),enabled=pairingEnabled(),busy=!!instanceBusyState.active,hint=busy?instanceBusyState.message||\"Applying GPU pairing setting...\":2===count?\"Keep disabled if you want Global to keep behaving like the shared two-GPU runtime.\":\"Enable this to manage arbitrary dual-GPU pair groups.\";row.innerHTML=`<label class=\"label\"><input type=\"checkbox\" id=\"gpuPairingEnabled\" ${enabled?\"checked\":\"\"} ${count<2||busy?\"disabled\":\"\"} onchange=\"saveGpuPairingSetting(this.checked)\"> Enable GPU Pairing</label><span class=\"label busy-note\" id=\"pairingBusyNote\">${busy?`<span class=\"spinner\" aria-hidden=\"true\"></span>${hint}`:hint}</span>`}ensureAccessPolicyCard=function(){const card=findPanelByHeading(\"system\",\"Access Policy\");card&&\"1\"!==card.dataset.v414Policy&&(card.dataset.v414Policy=\"1\",card.innerHTML='<h2>Access Policy</h2><div class=\"actions\" id=\"accessPolicyRow\"><label class=\"label\"><input type=\"checkbox\" id=\"auditAllowAnonymousProxy\" onchange=\"mirrorAuthToggles(this.checked)\"> allow requests without per-user API keys</label><button class=\"btn blue\" onclick=\"saveAuthSettings()\">Save Policy</button></div><div class=\"value smallgap\" style=\"margin-top:10px\" id=\"auditPolicyText\">-</div>')},ensureMachineButtons=function(){const systemCard=findPanelByHeading(\"system\",\"System\");if(!systemCard)return;let utilityRow=$(\"systemUtilityRow\");utilityRow||(utilityRow=document.createElement(\"div\"),utilityRow.id=\"systemUtilityRow\",utilityRow.className=\"actions\",systemCard.insertBefore(utilityRow,systemCard.querySelector(\".machine-row\")||null));const machineRow=systemCard.querySelector(\".machine-row\"),buttonDefs=[{label:\"Benchmark\",className:\"btn blue\",action:\"promptBenchmarkRun()\"},{label:\"Run Report\",className:\"btn blue\",action:\"promptReportRun()\"},{label:\"Update\",className:\"btn blue\",action:\"promptUpdateRun()\"}];if(buttonDefs.forEach(def=>{let button=[...systemCard.querySelectorAll(\"button\")].find(item=>(item.textContent||\"\").trim()===def.label);button||(button=document.createElement(\"button\"),button.textContent=def.label),button.className=def.className,button.setAttribute(\"onclick\",def.action),utilityRow.contains(button),utilityRow.appendChild(button)}),[...utilityRow.querySelectorAll(\"button\")].forEach(button=>{const label=(button.textContent||\"\").trim();buttonDefs.some(def=>def.label===label)||button.remove()}),machineRow){let wolButton=[...systemCard.querySelectorAll(\"button\")].find(item=>\"Wake-on-LAN\"===(item.textContent||\"\").trim());wolButton||(wolButton=document.createElement(\"button\"),wolButton.textContent=\"Wake-on-LAN\"),wolButton.className=\"btn amber\",wolButton.setAttribute(\"onclick\",\"wol()\");const firstMachineButton=machineRow.querySelector(\"button\");firstMachineButton&&firstMachineButton!==wolButton?machineRow.insertBefore(wolButton,firstMachineButton):machineRow.contains(wolButton)||machineRow.appendChild(wolButton)}[...systemCard.querySelectorAll(\".actions\")].forEach(actions=>{actions===utilityRow||actions===machineRow||actions.querySelector(\"button\")||actions.remove()})},allPairChoices=function(){const count=gpuCount(),pairs=[];for(let a=0;a<count;a+=1)for(let b=a+1;b<count;b+=1)pairs.push([a,b]);return pairs},ensurePairManager=function(){const panel=findPanelByHeading(\"system\",\"Instances\");if(!panel)return;let bar=$(\"pairManagerBar\");if(!bar){bar=document.createElement(\"div\"),bar.id=\"pairManagerBar\",bar.className=\"actions\";const summary=$(\"instanceSummary\");summary&&summary.parentNode===panel&&summary.insertAdjacentElement(\"afterend\",bar)}if(!pairingEnabled()||gpuCount()<2)return void(bar.innerHTML=\"\");const pair=currentScopeInstance(!0),showDelete=!!pair&&\"dual\"===pair.kind,existing=new Set(pairScopeItems().map(x=>x.id)),quickAdds=allPairChoices().filter(([a,b])=>!existing.has(canonicalPairId(a,b))).map(([a,b])=>`<button class=\"btn blue\" onclick=\"createPairGroup(${a},${b})\">Add Pair ${a}+${b}</button>`).join(\"\");bar.style.margin=\"8px 0 10px\",bar.innerHTML=`${quickAdds||\"\"}<button class=\"btn purple\" onclick=\"createPairGroup()\">Custom Pair Group</button>${showDelete?`<button class=\"btn red\" onclick=\"deleteCurrentPairGroup()\">Delete ${scopeLabel(pair)}</button>`:\"\"}`},ensureV414Layout=function(){ensureV413Layout(),ensureUsersUi(),ensureGroupUi(),ensureAccessPolicyCard(),ensureAuditOverviewCard(),ensureMachineButtons(),ensurePairingToggle(),ensurePairManager(),syncInstancesBusyState(),syncPowerCoolingBusyState(),ensureDynamicPresetLayout(),ensurePresetActionModal()};const logCache=Object.create(null);let statusRefreshPromise=null,pendingForcedStatusRefresh=!1,logConnectToken=0,logExportBusy=!1;function renderLogSourcePanel(){$(\"logSourceDocker\")&&$(\"logSourceDocker\").classList.toggle(\"active\",\"docker\"===currentLogSource),$(\"logSourceAudit\")&&$(\"logSourceAudit\").classList.toggle(\"active\",\"audit\"===currentLogSource),$(\"logsSourceSummary\")&&($(\"logsSourceSummary\").innerHTML=\"audit\"!==currentLogSource?scopeIsGlobal()&&legacyGlobalDualScope()?\"Docker logs selected. The shared live log viewer follows the active global dual runtime.\":\"Docker logs selected. The shared live log viewer follows the currently selected tracked instance.\":\"Audit logs selected. The shared live log viewer follows <code>/opt/club3090-control/audit.log</code>.\")}function trimLogText(text){const value=String(text||\"\");return value.length>9e5?value.slice(-75e4):value}function logIsNearBottom(box=$(\"log\")){return!box||box.scrollHeight-(box.scrollTop+box.clientHeight)<=28}function scrollLogToBottom(box=$(\"log\")){box&&(box.scrollTop=box.scrollHeight)}function logCacheEntry(signature){return logCache[signature]||(logCache[signature]={text:\"\",loaded:!1}),logCache[signature]}function renderCurrentLog(signature,options={}){const box=$(\"log\");if(!box)return;const entry=logCacheEntry(signature),nextValue=entry.loaded?collapseRepeatedLogText(entry.text):\"Connecting...\\n\",changed=box.value!==nextValue;changed&&(box.value=nextValue),searchState.active?changed&&recalculateMatches(!0):changed&&options.follow&&$(\"autoscroll\")&&$(\"autoscroll\").checked&&scrollLogToBottom(box),flushPendingLogJump()}function collapseRepeatedLogText(text){const source=String(text||\"\");if(!source)return\"\";const hasTrailingNewline=source.endsWith(\"\\n\"),lines=source.split(\"\\n\");hasTrailingNewline&&lines.pop();const collapsed=[];for(const line of lines){const previous=collapsed[collapsed.length-1];previous&&previous.raw===line?previous.count+=1:collapsed.push({raw:line,count:1})}return collapsed.map(entry=>entry.count>1?`${entry.raw} (${entry.count})`:entry.raw).join(\"\\n\")+(hasTrailingNewline?\"\\n\":\"\")}function replaceLogBuffer(signature,text){const entry=logCacheEntry(signature),box=signature===currentLogSignature?$(\"log\"):null,shouldFollow=!!box&&!!$(\"autoscroll\")?.checked&&(!entry.loaded||\"Connecting...\\n\"===box.value||logIsNearBottom(box));entry.text=trimLogText(text||\"\"),entry.loaded=!0,signature===currentLogSignature&&renderCurrentLog(signature,{follow:shouldFollow})}function appendLogChunk(signature,text){if(!text)return;const entry=logCacheEntry(signature),box=signature===currentLogSignature?$(\"log\"):null,shouldFollow=!!box&&!!$(\"autoscroll\")?.checked&&logIsNearBottom(box);entry.text=trimLogText((entry.text||\"\")+text),entry.loaded=!0,signature===currentLogSignature&&renderCurrentLog(signature,{follow:shouldFollow})}function syntheticLog(message){appendLog(`[admin-ui ${(new Date).toLocaleTimeString()}] ${message}`)}function adminResultText(payload,rawText){let text=\"\";if(payload&&\"object\"==typeof payload)try{text=JSON.stringify(payload,null,2)}catch(e){text=\"\"}return text||(text=String(rawText||\"\").trim()),text.length>5e3&&(text=text.slice(0,5e3)+\"\\n...<truncated>...\"),text}function logStreamConfig(){if(\"audit\"===currentLogSource)return{signature:\"audit\",url:\"/admin/audit-stream?tail=4000\"};const tracked=trackedLogRuntime(),target=tracked||dockerLogTarget(),explicit=String(selectedLogInstanceId||\"\").trim().toUpperCase(),instanceId=explicit||(tracked&&(tracked.id||tracked.instance_id)?tracked.id||tracked.instance_id:scopeIsGlobal()&&legacyGlobalDualScope()?\"GLOBAL\":target&&target.id);return{signature:`docker:${instanceId||\"primary\"}`,url:\"/admin/logs\"+(instanceId?`?instance=${encodeURIComponent(instanceId)}`:\"\")}}function currentLogExportRequest(){if(\"audit\"===currentLogSource)return{source:\"audit\",instance_id:null};if(currentLogSignature&&currentLogSignature.startsWith(\"docker:\")){const fromSignature=currentLogSignature.slice(7);if(fromSignature&&\"primary\"!==fromSignature)return{source:\"docker\",instance_id:fromSignature}}const explicit=String(selectedLogInstanceId||\"\").trim().toUpperCase();if(explicit)return{source:\"docker\",instance_id:explicit};const tracked=trackedLogRuntime(),target=tracked||dockerLogTarget();return{source:\"docker\",instance_id:(tracked&&(tracked.id||tracked.instance_id)?tracked.id||tracked.instance_id:scopeIsGlobal()&&legacyGlobalDualScope()?\"GLOBAL\":target&&target.id)||null}}async function exportCurrentLog(){if(!logExportBusy){logExportBusy=!0;try{const req=currentLogExportRequest();openApiKeyModal(\"Log Export Link\",(await post(\"/admin/log-export\",req,`/admin/log-export ${req.source} ${req.instance_id||\"host\"}`)).url||\"\",\"Share this link directly for debugging. It points to the currently selected log export.\",{copySuccessText:\"Copied exported log URL to the clipboard.\",showTopClose:!1})}catch(e){alert(e)}finally{logExportBusy=!1}}}function focusAuditLogs(){\"audit\"!==currentLogSource&&setCurrentLogSource(\"audit\"),activateTab(\"logs\",!0)}function clearActiveLogJump(){pendingLogJump=null}function flushPendingLogJump(){if(!pendingLogJump||!$(\"log\"))return;const cfg=logStreamConfig();if(!(pendingLogJump.signature&&pendingLogJump.signature!==cfg.signature||\"audit\"===pendingLogJump.source&&\"audit\"!==currentLogSource)){if(pendingLogJump.query){const box=$(\"log\");if(!box.value||!box.value.toLowerCase().includes(pendingLogJump.query.toLowerCase()))return;searchState.active&&$(\"searchQuery\").value===pendingLogJump.query?searchState.matches.length&&gotoMatch(searchState.index>=0?searchState.index:0):($(\"searchQuery\").value=pendingLogJump.query,runSearchOrNext())}else $(\"autoscroll\").checked&&($(\"log\").scrollTop=$(\"log\").scrollHeight);pendingLogJump=null}}function chooseVariantLogInstanceId(target,selector=\"\"){const targetId=String(target?.id||\"\").trim().toUpperCase();if(targetId&&\"GLOBAL\"!==targetId)return targetId;if(\"GLOBAL\"===targetId&&legacyGlobalDualScope())return\"GLOBAL\";const scopeKind=String(target?.kind||\"\");if(\"dual\"===scopeKind){const pairs=pairScopeItems().filter(row=>!selector||String(row?.mode||\"\")===String(selector));return String(pairs[0]&&pairs[0].id||\"\")}if(\"global\"===scopeKind){const runtime=runtimeStatsRows(lastStatus).find(row=>!selector||String(row?.mode||\"\")===String(selector));return String(runtime&&(runtime.id||runtime.instance_id)||\"\")}const singles=singleScopeItems().filter(row=>!selector||String(row?.mode||\"\")===String(selector));return String(singles[0]&&singles[0].id||\"\")}function openRuntimeLogsAtPoint(instanceId=\"\",query=\"\"){clearActiveLogJump(),searchState.active&&cancelSearch(),\"docker\"!==currentLogSource&&setCurrentLogSource(\"docker\"),instanceId&&(selectedLogInstanceId=String(instanceId).trim().toUpperCase()),activateTab(\"logs\",!0),$(\"autoscroll\").checked=!query,pendingLogJump={source:\"docker\",signature:`docker:${instanceId||\"primary\"}`,query:String(query||\"\").trim()},connectLogs(!0),setTimeout(()=>flushPendingLogJump(),60)}function bestFailureLogQuery(failure){const lines=String(failure?.error||\"\").replace(/\\r/g,\"\").split(\"\\n\").map(line=>line.trim()).filter(Boolean);for(let i=lines.length-1;i>=0;i-=1){const line=lines[i];if(!/^timed out waiting/i.test(line)&&!/^container .* stopped during boot/i.test(line)&&!/^no docker logs/i.test(line))return line}return lines[0]||\"\"}function renderEnhancedGpuMetricCharts(j){const holder=$(\"gpuMetricCharts\");if(!holder||!j.gpus)return;const series=j.series||[],charts=[{key:\"util\",suffix:\"Util\",label:\"util %\",color:\"#72c7ff\"},{key:\"mem_pct\",suffix:\"Mem\",label:\"VRAM %\",color:\"#2fc46b\"},{key:\"temp\",suffix:\"Temp\",label:\"core temp °C\",color:\"#ffde59\"},{key:\"fan\",suffix:\"Fan\",label:\"fan %\",color:\"#a855f7\"},{key:\"power\",suffix:\"Power\",label:\"power W\",color:\"#ff5b6c\"}];holder.innerHTML=charts.map(cat=>j.gpus.map(g=>`<div class=\"chart\"><canvas id=\"cGpu${g.index}${cat.suffix}\"></canvas></div>`).join(\"\")).join(\"\"),charts.forEach(cat=>j.gpus.forEach(g=>drawGpuSeries(`cGpu${g.index}${cat.suffix}`,series,g.index,cat.key,`GPU${g.index} ${cat.label}`,cat.color)))}async function wol(){const mac=prompt(\"MAC address to wake (blank = configured default):\",\"\");if(null!==mac)try{await post(\"/admin/wol\",{mac})}catch(e){alert(e)}}async function machineAction(action){const label=\"reboot\"===action?\"RESTART\":\"SHUT DOWN\";if(confirm(label+\" machine now?\")&&confirm(\"Final confirmation: \"+label+\" now.\"))try{await post(\"/admin/machine\",{action})}catch(e){alert(e)}}function syncActiveTabDisplay(){document.querySelectorAll(\".tabpane\").forEach(x=>x.classList.remove(\"active\")),document.querySelectorAll(\".tab\").forEach(x=>x.classList.remove(\"active\")),$(\"chatLaunchBtn\")&&$(\"chatLaunchBtn\").classList.remove(\"active\");const pane=$(activeTabName);pane&&pane.classList.add(\"active\");const btn=activeTabButton(activeTabName);btn&&btn.classList.add(\"active\"),applyLogVisibility()}function activateTab(name,firstRender=!1){activeTabName=normalizeTabName(name),syncActiveTabDisplay(),(\"logs\"===activeTabName||showGlobalLogs||firstRender)&&connectLogs(!1),\"metrics\"===activeTabName&&redrawMetricsSoon(),\"chat\"===activeTabName&&renderChatUi(),refreshStatus({force:!0}).catch(()=>{}),queueUiStateSave(),setTimeout(()=>{!searchState.active&&$(\"autoscroll\").checked&&$(\"log\")&&($(\"log\").scrollTop=$(\"log\").scrollHeight)},0)}function clearLegacyPollers(){const marker=window.setInterval(()=>{},6e4);window.clearInterval(marker);for(let id=1;id<marker;id+=1)window.clearInterval(id)}async function bootAdminUi(){clearLegacyPollers(),ensureV414Layout(),hydratePresetSummaryCache(),await hydrateChatState(),resetUserForm(!0),resetGroupForm(!0),selectedScope||(selectedScope=singleScopeItems()[0]?.id||pairScopeItems()[0]?.id||\"GLOBAL\"),setScope(selectedScope,!1),refreshStatus().catch(()=>{}),statusPollTimer&&clearInterval(statusPollTimer),statusPollTimer=setInterval(()=>{refreshStatus()},1e3),syncHeaderChatButtonAlignment(),window.addEventListener(\"resize\",syncHeaderChatButtonAlignment),window.addEventListener(\"beforeunload\",()=>{if(logEs)try{logEs.close()}catch(e){}})}function runtimeInventory(){return lastStatus&&lastStatus.runtime_inventory||{models:[],variants:[]}}function inventoryModels(){return lastStatus&&lastStatus.models||runtimeInventory().models||[]}function inventoryVariants(){return lastStatus&&lastStatus.variants||runtimeInventory().variants||[]}function saveSelectedPresetModel(modelId=\"\"){const next=String(modelId||\"\").trim();selectedPresetModelId=next,lastStatus||(lastStatus={}),lastStatus.server_config={...lastStatus.server_config||{},selected_preset_model:next},fetch(\"/admin/users\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({action:\"save_server_config\",selected_preset_model:next})}).then(r=>r.json()).then(j=>{j&&j.ok&&j.server_config&&(lastStatus||(lastStatus={}),lastStatus.server_config=j.server_config)}).catch(()=>{})}function hydrateSelectedPresetModel(){const models=inventoryModels(),valid=new Set(models.map(model=>String(model.model_id||\"\"))),configured=String(lastStatus?.server_config?.selected_preset_model||\"\").trim();if(!selectedPresetModelHydrated)return selectedPresetModelId=valid.has(configured)?configured:\"\",void(selectedPresetModelHydrated=!0);selectedPresetModelId&&valid.has(selectedPresetModelId)||(selectedPresetModelId=valid.has(configured)?configured:\"\")}function selectPresetModel(modelId=\"\"){selectedPresetModelId=String(modelId||\"\").trim(),selectedPresetModelHydrated=!0,renderPresetModelSelector(),renderDynamicPresetModels(),saveSelectedPresetModel(selectedPresetModelId)}function renderPresetModelSelector(){const host=$(\"presetModelSelector\");if(!host)return;const models=inventoryModels();if(!models.length)return host.innerHTML=\"\",void host.classList.add(\"hidden\");host.classList.remove(\"hidden\"),host.innerHTML=`<button class=\"subtab ${selectedPresetModelId?\"\":\"active\"}\" onclick=\"selectPresetModel('')\">Summary</button>${models.map(model=>{const modelId=String(model.model_id||\"\");return`<button class=\"subtab ${modelId===selectedPresetModelId?\"active\":\"\"}\" onclick=\"selectPresetModel('${escapeJs(modelId)}')\">${escapeHtml(model.display_name||modelId)}</button>`}).join(\"\")}`}function variantSelector(variant){return variant&&(variant.upstream_tag||variant.variant_id)||\"\"}function variantMapBySelector(){const map=new Map;return inventoryVariants().forEach(variant=>{const selector=variantSelector(variant);selector&&map.set(selector,variant)}),map}function escapeJs(value){return String(value??\"\").replaceAll(\"\\\\\",\"\\\\\\\\\").replaceAll(\"'\",\"\\\\'\")}function prettyEngineName(engine){return\"llamacpp\"===engine?\"llama.cpp\":String(engine||\"\")}function variantDisplayLabel(variant){if(variant&&variant.upstream_tag)return variant.upstream_tag;const bits=String(variant?.compose_rel_path||\"\").split(\"/\"),raw=(bits[bits.length-1]||\"\").replace(/\\.yml$/i,\"\"),stem=\"docker-compose\"===raw?\"default\":raw||\"preset\";return`${variant?.topology||\"global\"}/${stem}`}function variantMaxCtx(variant){const value=Number(variant?.max_model_len||0);return!Number.isFinite(value)||value<=0?\"n/a\":value>=1e3?`${Math.round(value/1e3)}K`:String(value)}function badgeClass(prefix,value){return`${prefix}-${String(value||\"unknown\").replaceAll(\" \",\"_\").replaceAll(\"/\",\"_\")}`}function installStateLabel(variant){const state=String(variant?.install_state||\"unknown\");return\"ready\"===state?\"ready\":\"requires_download\"===state?\"needs download\":\"unavailable\"===state?\"unavailable\":state}function statusLabel(variant){const kind=String(variant?.status_kind||\"unknown\");return\"production\"===kind?\"production\":\"production_caveat\"===kind?\"production + caveats\":\"preview\"===kind?\"preview\":\"upstream_gated\"===kind?\"upstream gated\":\"deprecated\"===kind?\"deprecated\":\"experimental\"===kind?\"experimental\":\"unknown\"}function currentSwitchFailure(){return lastStatus?.switch_failure||{}}function currentSwitchJob(){return lastStatus?.switch_job||{}}function switchJobElapsedSeconds(job){const started=Number(job?.started_at||0);if(!Number.isFinite(started)||started<=0)return 0;const finished=Number(job?.finished_at||0),end=Number.isFinite(finished)&&finished>0?finished:Date.now()/1e3;return Math.max(0,Math.floor(end-started))}function launchSecondsForVariant(selector,target){const job=currentSwitchJob();if(\"success\"!==job.status||!job.mode)return 0;const jobMode=String(job.mode||\"\"),jobTarget=String(job.target||\"\"),targetId=String(target?.id||\"\");return jobMode!==String(selector||\"\")||jobTarget&&targetId&&jobTarget!==targetId?0:switchJobElapsedSeconds(job)}function trimSummaryEntries(entries=[]){const seen=new Set,out=[];return entries.forEach(entry=>{const selector=String(entry?.selector||\"\").trim();selector&&!seen.has(selector)&&(seen.add(selector),out.push({selector,ts:Number(entry?.ts||Date.now()/1e3)}))}),out.slice(0,5)}function upsertSummaryEntry(storeKey,modelId,selector){const key=String(modelId||\"\").trim(),mode=String(selector||\"\").trim();if(!key||!mode)return;const current=Array.isArray(presetSummaryCache[storeKey]?.[key])?presetSummaryCache[storeKey][key]:[];presetSummaryCache[storeKey][key]=trimSummaryEntries([{selector:mode,ts:Date.now()/1e3},...current.filter(entry=>String(entry?.selector||\"\")!==mode)])}function removeSummaryEntry(modelId,selector){const key=String(modelId||\"\").trim(),mode=String(selector||\"\").trim();[\"persistent\",\"transient\"].forEach(storeKey=>{const current=Array.isArray(presetSummaryCache[storeKey]?.[key])?presetSummaryCache[storeKey][key]:[];presetSummaryCache[storeKey][key]=current.filter(entry=>String(entry?.selector||\"\")!==mode),presetSummaryCache[storeKey][key].length||delete presetSummaryCache[storeKey][key]}),savePresetSummaryCache()}function syncPresetSummaryCacheFromStatus(j){const uptime=Number(j?.uptime_seconds||0);Number.isFinite(presetSummaryCache.lastSeenUptime)&&presetSummaryCache.lastSeenUptime>0&&uptime>0&&uptime+5<presetSummaryCache.lastSeenUptime&&(presetSummaryCache.transient={},presetSummaryCache.restartTargets=[]),presetSummaryCache.lastSeenUptime=uptime;const variants=variantMapBySelector();runtimeStatsRows(j).forEach(runtime=>{const selector=String(runtime?.selector||runtime?.mode||\"\").trim(),variant=variants.get(selector);variant&&(upsertSummaryEntry(\"persistent\",variant.model_id,selector),removeSummaryEntry(variant.model_id,selector),upsertSummaryEntry(\"persistent\",variant.model_id,selector))});const switchJob=j?.switch_job||{},switchMode=String(switchJob.mode||\"\").trim(),switchVariant=variants.get(switchMode);if(switchVariant&&switchMode&&((switchJob.active||\"failed\"===switchJob.status)&&upsertSummaryEntry(\"transient\",switchVariant.model_id,switchMode),\"success\"===switchJob.status)){upsertSummaryEntry(\"persistent\",switchVariant.model_id,switchMode);const currentTransient=Array.isArray(presetSummaryCache.transient[switchVariant.model_id])?presetSummaryCache.transient[switchVariant.model_id]:[];presetSummaryCache.transient[switchVariant.model_id]=currentTransient.filter(entry=>String(entry?.selector||\"\")!==switchMode)}savePresetSummaryCache()}function summaryEntriesForModel(modelId){const key=String(modelId||\"\").trim(),persistent=Array.isArray(presetSummaryCache.persistent[key])?presetSummaryCache.persistent[key]:[];return trimSummaryEntries([...Array.isArray(presetSummaryCache.transient[key])?presetSummaryCache.transient[key]:[],...persistent])}function summaryRunningTargets(){return runtimeStatsRows(lastStatus).map(runtime=>({instance_id:String(runtime?.id||runtime?.instance_id||\"\"),mode:String(runtime?.selector||runtime?.mode||\"\")}))}function runtimeActiveForVariant(selector,target){const normalizedSelector=String(selector||\"\");if(!normalizedSelector||!target)return!1;if(\"GLOBAL\"===target.id){if(\"global\"===target.kind)return runtimeStatsRows(lastStatus).some(row=>String(row?.mode||\"\")===normalizedSelector&&\"GLOBAL\"===String(row?.id||\"\"));if(\"dual\"===target.kind){if(legacyGlobalDualScope()){const legacy=legacyGlobalPair();return!!legacy?.running&&String(legacy?.mode||\"\")===normalizedSelector}const pairs=pairScopeItems();return!!pairs.length&&pairs.every(row=>!!row?.running&&String(row?.mode||\"\")===normalizedSelector)}const singles=singleScopeItems();return!!singles.length&&singles.every(row=>!!row?.running&&String(row?.mode||\"\")===normalizedSelector)}const scoped=scopeItems().find(row=>String(row?.id||\"\")===String(target.id||\"\"));return!!scoped?.running&&String(scoped?.mode||\"\")===normalizedSelector}function handleSwitchJobTransition(previousStatus,currentStatus){const prevJob=previousStatus?.switch_job||{},nextJob=currentStatus?.switch_job||{},prevFailure=previousStatus?.switch_failure||{},nextFailure=currentStatus?.switch_failure||{},successTransition=\"success\"!==prevJob.status&&\"success\"===nextJob.status&&!nextJob.active&&nextJob.mode,failureTransition=\"failed\"!==prevJob.status&&\"failed\"===nextJob.status&&nextJob.mode||Number(prevFailure.ts||0)!==Number(nextFailure.ts||0)&&nextFailure.mode;if(successTransition){const key=`success:${nextJob.mode}:${nextJob.target}:${nextJob.finished_at}`;if(key!==lastSwitchNotificationKey&&(lastSwitchNotificationKey=key,!windowIsFocused())){const seconds=switchJobElapsedSeconds(nextJob);showBrowserNotification(\"Preset Active\",`${nextJob.mode} reached Active in ${seconds}s.`).catch(()=>{})}}else if(failureTransition){const mode=String(nextFailure.mode||nextJob.mode||\"unknown preset\"),key=`failed:${mode}:${Number(nextFailure.ts||nextJob.finished_at||Date.now())}`;if(key!==lastSwitchNotificationKey){lastSwitchNotificationKey=key;showBrowserNotification(\"Preset Error\",`${mode}: ${String(nextFailure.error||nextJob.error||\"Preset launch failed.\").split(\"\\n\")[0].trim()||\"Preset launch failed.\"}`).catch(()=>{})}}}function scopeTargetForVariant(variant){const scope=String(variant?.scope_kind||\"\");if(\"single\"===scope){if(scopeIsGlobal())return{id:\"GLOBAL\",kind:\"global\",display_name:\"Global\"};const current=currentScopeInstance(!0);return current&&\"dual\"!==current.kind?current:null}if(\"dual\"===scope){if(scopeIsGlobal())return gpuCount()<2?null:{id:\"GLOBAL\",kind:\"dual\",display_name:\"Global Dual\"};const current=currentScopeInstance(!1);return current&&\"dual\"===current.kind?current:null}return(\"multi\"===scope||\"global_only\"===scope)&&scopeIsGlobal()?{id:\"GLOBAL\",kind:\"global\",display_name:\"Global\"}:null}function scopeBlockReason(variant){const scope=String(variant?.scope_kind||\"\");return\"single\"===scope?\"Select a GPU scope, or Global to apply this single-GPU preset across every available GPU.\":\"dual\"===scope?\"Select a dual pair scope, or Global to apply this dual preset across every available GPU pair.\":\"multi\"===scope||\"global_only\"===scope?\"Select Global scope before applying this multi-GPU preset.\":\"This preset cannot be applied from the current scope.\"}function sortInventoryVariants(rows){return[...rows||[]].sort((a,b)=>{const activeA=runtimeStatsRows(lastStatus).some(row=>String(row?.mode||\"\")===variantSelector(a))?-1:0,activeB=runtimeStatsRows(lastStatus).some(row=>String(row?.mode||\"\")===variantSelector(b))?-1:0;if(activeA!==activeB)return activeA-activeB;const readyRank=item=>\"ready\"===item?.install_state?0:\"requires_download\"===item?.install_state?1:2,statusRank=item=>\"production\"===item?.status_kind?0:\"production_caveat\"===item?.status_kind?1:\"experimental\"===item?.status_kind?2:3;return readyRank(a)-readyRank(b)||statusRank(a)-statusRank(b)||variantDisplayLabel(a).localeCompare(variantDisplayLabel(b))})}function ensureDynamicPresetLayout(){const presets=$(\"presets\");if(!presets)return;const firstPanel=presets.querySelector(\".panel\");firstPanel&&(firstPanel.id=\"dynamicPresetPanel\",$(\"modelPresetGrid\")||(firstPanel.innerHTML='<div class=\"panel-head\"><h2>Dynamic Model Presets</h2><button class=\"btn green\" onclick=\"promptRuntimeInventoryRebuild()\">Rebuild Dynamic Model DB</button></div><div class=\"preset-help\">Discovered presets are rendered directly from the local <code>/opt/ai/club-3090</code> clone. Global applies single-GPU presets across every GPU, dual presets across every two-GPU pair, and multi-GPU presets to the shared runtime.</div><div class=\"preset-section-label\">Scope</div><div class=\"subtabs\" id=\"presetScopeTabs\"></div><div class=\"value smallgap\" id=\"presetScopeSummary\">-</div><div class=\"preset-section-label\">Models</div><div class=\"subtabs\" id=\"presetModelSelector\"></div><div class=\"value smallgap\" id=\"presetJobSummary\">-</div><div id=\"modelPresetGrid\" class=\"model-grid\"></div>'),$(\"singlePresetCard\")&&$(\"singlePresetCard\").removeAttribute(\"id\"),$(\"dualPresetCard\")&&$(\"dualPresetCard\").remove(),$(\"presetScopePanel\")&&$(\"presetScopePanel\").remove())}currentLogHeading=function(){return\"audit\"===currentLogSource?\"Audit Logs\":\"Docker Logs\"},currentLogLabel=function(){if(\"audit\"===currentLogSource)return\"source: audit\";const explicit=String(selectedLogInstanceId||\"\").trim().toUpperCase();if(explicit)return\"instance: \"+explicit;const tracked=trackedLogRuntime();if(tracked)return\"instance: \"+(tracked.id||tracked.instance_id||\"primary\");if(scopeIsGlobal()&&legacyGlobalDualScope())return\"instance: Global dual\";const cur=dockerLogTarget();return\"instance: \"+(cur&&cur.id||\"primary\")},applyLogVisibility=function(){const isLogs=\"logs\"===activeTabName;document.body.classList.toggle(\"logs-tab\",isLogs),document.body.classList.remove(\"audit-tab\");const card=document.querySelector(\".logs.panel\");card&&card.classList.toggle(\"log-card-hidden\",!isLogs&&!showGlobalLogs),$(\"logTitle\")&&($(\"logTitle\").textContent=currentLogHeading()),$(\"logInstanceLabel\")&&($(\"logInstanceLabel\").textContent=currentLogLabel()),renderLogSourcePanel(),renderLogTracker(),currentLogSignature&&renderCurrentLog(currentLogSignature)},connectLogs=function(force=!1){if(!(\"logs\"===activeTabName||showGlobalLogs)&&!force)return;const cfg=logStreamConfig();if(!force&&logEs&&cfg.signature===currentLogSignature)return void renderCurrentLog(cfg.signature);currentLogSignature=cfg.signature,renderCurrentLog(cfg.signature,{follow:!!$(\"autoscroll\")?.checked});const token=++logConnectToken;if(logEs){try{logEs.close()}catch(e){}logEs=null}const es=new EventSource(cfg.url);logEs=es;const handle=(mode,data)=>{let payload=null;try{payload=JSON.parse(data||\"{}\")}catch(e){}const text=payload&&\"string\"==typeof payload.text?payload.text:String(data||\"\").replaceAll(\"\\\\u0000\",\"\\n\");\"reset\"===mode?replaceLogBuffer(cfg.signature,text):appendLogChunk(cfg.signature,text),flushPendingLogJump()};es.addEventListener(\"reset\",e=>{token===logConnectToken&&handle(\"reset\",e.data)}),es.addEventListener(\"append\",e=>{token===logConnectToken&&handle(\"append\",e.data)}),es.onmessage=e=>{token===logConnectToken&&handle(\"append\",e.data)},es.onerror=()=>{}},setCurrentLogSource=function(source){currentLogSource=\"audit\"===source?\"audit\":\"docker\",applyLogVisibility(),queueUiStateSave({current_log_source:currentLogSource}),connectLogs(!0)},setShowGlobalLogs=function(v){showGlobalLogs=!!v,applyLogVisibility(),queueUiStateSave({show_global_logs:showGlobalLogs}),connectLogs(!1)},setScope=function(scope,reconnect=!0){const ids=new Set(scopeItems().map(x=>x.id));selectedScope=\"GLOBAL\"===scope?\"GLOBAL\":ids.has(scope)?scope:singleScopeItems()[0]?.id||pairScopeItems()[0]?.id||\"GLOBAL\",\"GLOBAL\"!==selectedScope&&(selectedInstance=selectedScope),renderInstances(getInstanceList()),renderPresetScopeTabs(),renderDynamicPresetModels(),updateScopedCards(),applyLogVisibility(),queueUiStateSave(),reconnect&&connectLogs(!0)},post=async function(path,obj,label=\"\"){const requestLabel=label||`${path} ${JSON.stringify(obj||{})}`;syntheticLog(`request sent: ${requestLabel}`);try{const r=await fetch(path,{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify(obj||{})}),text=await r.text();let payload=null;try{payload=JSON.parse(text)}catch(e){}if(!r.ok||payload&&!1===payload.ok)throw new Error(payload&&payload.error||text||`${path} failed`);return syntheticLog(`request finished: ${requestLabel}`),appendLog(`----- admin result -----\\n${adminResultText(payload,text)}\\n------------------------`),payload&&\"audit\"===payload.focus_log_source&&focusAuditLogs(),refreshStatus().catch(()=>{}),payload||text}catch(e){throw syntheticLog(`request failed: ${requestLabel} | ${e.message||e}`),appendLog(`----- admin error -----\\n${e.message||e}\\n-----------------------`),refreshStatus().catch(()=>{}),e}},metricTab=function(e,n){document.querySelectorAll(\".metricpane\").forEach(x=>x.classList.remove(\"active\")),document.querySelectorAll(\".subtab\").forEach(x=>x.classList.remove(\"active\"));const pane=$(n);pane&&pane.classList.add(\"active\"),e&&e.target&&e.target.classList.add(\"active\"),redrawMetricsSoon(),refreshStatus().catch(()=>{})},togglePowerOptimizations=async function(){const enable=$(\"optToggle\")&&$(\"optToggle\").textContent.includes(\"Enable\"),instanceId=scopeIsGlobal()?\"GLOBAL\":currentScopeInstance(!1)&&currentScopeInstance(!1).id||null;try{await withPowerCoolingBusy(enable?\"Applying power optimizations...\":\"Disabling power optimizations...\",()=>post(\"/admin/power\",{action:enable?\"enable_optimizations\":\"disable_optimizations\",instance_id:instanceId},\"/admin/power \"+(enable?\"enable_optimizations\":\"disable_optimizations\")))}catch(e){alert(e)}},toggleFansMax=async function(){const reset=$(\"fanToggle\")&&$(\"fanToggle\").textContent.includes(\"Reset\"),cur=currentScopeInstance(!1),instanceId=scopeIsGlobal()?\"GLOBAL\":cur&&cur.id||null;try{await withPowerCoolingBusy(reset?\"Resetting fans to default...\":\"Setting fans to max...\",()=>post(\"/admin/power\",{action:reset?\"fans_auto\":\"fans_max\",instance_id:instanceId},`/admin/power ${reset?\"fans_auto\":\"fans_max\"} ${instanceId||\"host\"}`))}catch(e){alert(e)}},tab=function(e,n){activateTab(n,!1)},refreshStatus=async function(opts={}){const force=!(!opts||!opts.force);return statusRefreshPromise?(force&&(pendingForcedStatusRefresh=!0),statusRefreshPromise):(statusRefreshPromise=(async()=>{try{ensureV414Layout();const suffix=force?`?force=1&_=${Date.now()}`:\"\",r=await fetch(`/admin/status${suffix}`,{cache:\"no-store\"});if(!r.ok)throw new Error(`status fetch failed (${r.status})`);const j=await r.json(),power=(j.metrics,j.power||{}),previousStatus=lastStatus;lastStatus=j,syncPresetSummaryCacheFromStatus(j),hydrateUiState(j.ui_config||{}),hydrateSelectedPresetModel(),$(\"showGlobalLogs\")&&($(\"showGlobalLogs\").checked=!!showGlobalLogs),$(\"services\").textContent=`vLLM=${j.vllm_service}, control=${j.control_service}, console=${j.console_service}`,renderOverviewStatus(j),renderGpuCards(j.gpus),$(\"optToggle\").textContent=power.optimizations_enabled?\"Disable Power Optimizations\":\"Enable Power Optimizations\",$(\"fanToggle\").textContent=power.fan_manual_override?\"Reset Fans to Default\":\"Set Fans to Max\",renderMetrics(j),renderPresetCatalog(j.presets),renderUsers(j.users||[]),renderGroups(j.groups||[]),renderAudit(j.server_config||{}),renderInstances(j.instances||[]),renderPresetScopeTabs(),updateScopedCards(),renderModelInstallStatus(),renderDynamicPresetModels(),renderChatUi(),syncActiveTabDisplay(),(\"logs\"===activeTabName||showGlobalLogs)&&connectLogs(!1),handleSwitchJobTransition(previousStatus,j),setMsg(\"\")}catch(e){setMsg(\"Status error: \"+e)}finally{statusRefreshPromise=null,pendingForcedStatusRefresh&&(pendingForcedStatusRefresh=!1,refreshStatus({force:!0}).catch(()=>{}))}})(),statusRefreshPromise)},bootAdminUi().catch(e=>{setMsg(\"Boot error: \"+e)});let presetActionHandler=null;function ensurePresetActionModal(){if($(\"presetActionModal\"))return;const modal=document.createElement(\"div\");modal.id=\"presetActionModal\",modal.className=\"club-modal hidden\",modal.innerHTML=`<div class=\"club-modal-card\" role=\"dialog\" aria-modal=\"true\" aria-labelledby=\"presetActionModalTitle\"><div class=\"panel-head\"><h2 id=\"presetActionModalTitle\">Confirm Action</h2><button class=\"iconbtn\" title=\"Close\" aria-label=\"Close\" onclick=\"closePresetActionModal()\">${svgIcon(\"delete\")}</button></div><div class=\"preset-help\" id=\"presetActionModalBody\">-</div><textarea id=\"presetActionModalDetail\" class=\"modal-keybox hidden\" readonly wrap=\"soft\" spellcheck=\"false\"></textarea><div class=\"preset-form-actions\"><button class=\"btn blue\" onclick=\"closePresetActionModal()\">Cancel</button><button class=\"btn green\" id=\"presetActionModalConfirm\">Continue</button></div><div class=\"msg\" id=\"presetActionModalMsg\"></div></div>`,modal.addEventListener(\"click\",event=>{event.target===modal&&closePresetActionModal()}),document.body.appendChild(modal)}function openPresetActionModal(opts={}){ensurePresetActionModal(),presetActionHandler=\"function\"==typeof opts.onConfirm?opts.onConfirm:null,$(\"presetActionModalTitle\").textContent=opts.title||\"Confirm Action\",$(\"presetActionModalBody\").innerHTML=opts.body||\"\",$(\"presetActionModalMsg\").textContent=\"\";const detail=$(\"presetActionModalDetail\");opts.detail?(detail.value=String(opts.detail),detail.scrollTop=0,detail.classList.remove(\"hidden\")):(detail.value=\"\",detail.classList.add(\"hidden\"));const confirmBtn=$(\"presetActionModalConfirm\");confirmBtn.textContent=opts.confirmLabel||\"Continue\",confirmBtn.className=`btn ${opts.confirmClass||\"green\"}`,confirmBtn.onclick=async()=>{if(!presetActionHandler)return closePresetActionModal();confirmBtn.disabled=!0;try{await presetActionHandler(),closePresetActionModal()}catch(e){$(\"presetActionModalMsg\").textContent=String(e||\"\")}finally{confirmBtn.disabled=!1}},$(\"presetActionModal\").classList.remove(\"hidden\")}function closePresetActionModal(){ensurePresetActionModal(),$(\"presetActionModal\").classList.add(\"hidden\"),presetActionHandler=null}function ensureActionChoiceModal(){if($(\"actionChoiceModal\"))return;const modal=document.createElement(\"div\");modal.id=\"actionChoiceModal\",modal.className=\"club-modal hidden\",modal.innerHTML=`<div class=\"club-modal-card\" role=\"dialog\" aria-modal=\"true\" aria-labelledby=\"actionChoiceModalTitle\"><div class=\"panel-head\"><h2 id=\"actionChoiceModalTitle\">Choose Action</h2><button class=\"iconbtn\" title=\"Close\" aria-label=\"Close\" onclick=\"closeActionChoiceModal()\">${svgIcon(\"delete\")}</button></div><div class=\"preset-help\" id=\"actionChoiceModalBody\">-</div><div class=\"preset-form-actions\" id=\"actionChoiceModalChoices\"></div><div class=\"preset-form-actions\"><button class=\"btn blue\" onclick=\"closeActionChoiceModal()\">Cancel</button></div><div class=\"msg\" id=\"actionChoiceModalMsg\"></div></div>`,modal.addEventListener(\"click\",event=>{event.target===modal&&closeActionChoiceModal()}),document.body.appendChild(modal)}function closeActionChoiceModal(){ensureActionChoiceModal(),$(\"actionChoiceModal\").classList.add(\"hidden\")}function openActionChoiceModal(opts={}){ensureActionChoiceModal(),$(\"actionChoiceModalTitle\").textContent=opts.title||\"Choose Action\",$(\"actionChoiceModalBody\").innerHTML=opts.body||\"\",$(\"actionChoiceModalMsg\").textContent=\"\";const host=$(\"actionChoiceModalChoices\");host.innerHTML=\"\",(opts.choices||[]).forEach(choice=>{const button=document.createElement(\"button\");button.className=`btn ${choice.className||\"green\"}`,button.textContent=choice.label||\"Continue\",button.onclick=async()=>{button.disabled=!0;try{await choice.onClick(),closeActionChoiceModal()}catch(e){$(\"actionChoiceModalMsg\").textContent=String(e||\"\")}finally{button.disabled=!1}},host.appendChild(button)}),$(\"actionChoiceModal\").classList.remove(\"hidden\")}function promptRuntimeInventoryRebuild(){openPresetActionModal({title:\"Rebuild Dynamic Model DB\",body:\"This rescans the upstream <code>club-3090</code> checkout, rebuilds the runtime inventory, and refreshes model/preset metadata without touching your downloaded model assets.\",confirmLabel:\"Rebuild\",confirmClass:\"green\",onConfirm:async()=>{await post(\"/admin/rebuild-inventory\",{},\"/admin/rebuild-inventory\"),await refreshStatus({force:!0})}})}function promptBenchmarkRun(){openPresetActionModal({title:\"Run Benchmark\",body:\"This runs the upstream <code>bash scripts/bench.sh</code> helper against the currently active backend and streams the full output into Audit Logs.\",confirmLabel:\"Run Benchmark\",confirmClass:\"blue\",onConfirm:async()=>{await post(\"/admin/benchmark\",{},\"/admin/benchmark\"),setAuditMsg(\"Benchmark started. Output is streaming to Audit Logs.\")}})}function promptReportRun(){openPresetActionModal({title:\"Run Report\",body:\"This runs the upstream <code>bash scripts/report.sh</code> helper for the current runtime and streams the generated report into Audit Logs.\",confirmLabel:\"Run Report\",confirmClass:\"blue\",onConfirm:async()=>{await post(\"/admin/run-report\",{},\"/admin/run-report\"),setAuditMsg(\"Run Report started. Output is streaming to Audit Logs.\")}})}async function startUpdateFlow(scope){const normalized=\"club3090\"===scope?\"club3090\":\"controller\";await post(\"/admin/update\",{scope:normalized},`/admin/update ${normalized}`),setAuditMsg(\"club3090\"===normalized?\"Club-3090 migration launched. Output is streaming to Audit Logs.\":\"Admin script update launched. Output is streaming to Audit Logs.\")}function promptUpdateRun(){openActionChoiceModal({title:\"Run Update\",body:\"Choose which update flow to launch. The admin-script option refreshes only the control layer. The Club-3090 option runs the full <code>--migrate</code> pass. Both stream their output into Audit Logs right away.\",choices:[{label:\"Update Admin Script\",className:\"blue\",onClick:async()=>{await startUpdateFlow(\"controller\")}},{label:\"Migrate Club-3090\",className:\"orange\",onClick:async()=>{await startUpdateFlow(\"club3090\")}}]})}function promptModelInstall(variant){openPresetActionModal({title:`Download ${escapeHtml(variant?.model_id||\"model\")} assets`,body:`${escapeHtml(variantDisplayLabel(variant))} is not ready on disk yet. Download the required assets now?<br><br>${escapeHtml(variant?.install_reason||\"This preset needs additional model files before it can run.\")}`,detail:variant?.install_command||\"\",confirmLabel:\"Download\",confirmClass:\"green\",onConfirm:async()=>{await post(\"/admin/model-install\",{model_id:variant.model_id,variant_id:variant.variant_id,install_command:variant.install_command},`/admin/model-install ${variant.model_id} ${variant.variant_id}`),await refreshStatus({force:!0})}})}async function switchInventoryVariant(selector){const variant=inventoryVariants().find(item=>variantSelector(item)===selector||item.variant_id===selector);if(!variant)return void alert(\"Preset not found in runtime inventory.\");if(\"ready\"!==variant.install_state)return void promptModelInstall(variant);const target=scopeTargetForVariant(variant);if(!target)return void alert(scopeBlockReason(variant));const label=variantDisplayLabel(variant),targetLabel=\"GLOBAL\"===target.id?\"single\"===variant.scope_kind?\"Global scope across every available GPU\":\"dual\"===variant.scope_kind?\"Global scope across every available GPU pair\":\"Global scope\":`${target.id}${target.gpu_indices?` on GPUs ${(target.gpu_indices||[]).join(\", \")}`:\"\"}`;confirm(`Apply ${label} to ${targetLabel}? This will stop any overlapping runtime currently using those GPUs.`)&&(openRuntimeLogsAtPoint(chooseVariantLogInstanceId(target,selector),\"\"),await post(\"/admin/switch\",{instance_id:target.id,mode:selector},`/admin/switch ${target.id} ${label}`),await refreshStatus({force:!0}))}function focusVariantFailure(selector){openRuntimeLogsAtPoint(chooseVariantLogInstanceId(scopeTargetForVariant(inventoryVariants().find(item=>variantSelector(item)===selector)||{}),selector),bestFailureLogQuery(currentSwitchFailure()))}function promptVariantStop(selector,booting=!1){const variant=inventoryVariants().find(item=>variantSelector(item)===selector),label=variantDisplayLabel(variant||{upstream_tag:selector}),target=scopeTargetForVariant(variant||{});openPresetActionModal({title:booting?\"Interrupt Preset Boot\":\"Stop Active Preset\",body:booting?`Interrupt <code>${escapeHtml(label)}</code> before it reaches Active and kill the container${\"GLOBAL\"===target?.id?\"s\":\"\"}?`:`Stop <code>${escapeHtml(label)}</code> and kill the running container${\"GLOBAL\"===target?.id?\"s\":\"\"}?`,confirmLabel:booting?\"Interrupt\":\"Stop\",confirmClass:\"rose\",onConfirm:async()=>{openRuntimeLogsAtPoint(chooseVariantLogInstanceId(target,selector),\"\"),await post(\"/admin/power\",{action:\"stop_container\",instance_id:target?.id||null,mode:selector},`/admin/power stop_container ${target&&target.id||\"GLOBAL\"} ${label}`),await refreshStatus({force:!0})}})}function promptRemoveSummaryPreset(modelId,selector){confirm(`Remove ${selector} from the cached summary list?`)&&(removeSummaryEntry(modelId,selector),renderDynamicPresetModels())}async function stopAllSummaryPresets(){const targets=summaryRunningTargets().filter(item=>item.instance_id&&item.mode);if(targets.length&&confirm(`Stop all ${targets.length} running preset${1===targets.length?\"\":\"s\"}?`)){presetSummaryCache.restartTargets=targets,savePresetSummaryCache();for(const target of targets)await post(\"/admin/power\",{action:\"stop_container\",instance_id:target.instance_id,mode:target.mode},`/admin/power stop_container ${target.instance_id} ${target.mode}`);await refreshStatus({force:!0})}}async function restartAllSummaryPresets(){const targets=Array.isArray(presetSummaryCache.restartTargets)?presetSummaryCache.restartTargets:[];if(targets.length){for(const target of targets)await post(\"/admin/switch\",{instance_id:target.instance_id,mode:target.mode},`/admin/switch ${target.instance_id} ${target.mode}`);presetSummaryCache.restartTargets=[],savePresetSummaryCache(),await refreshStatus({force:!0})}}function renderSummaryActionBar(){return summaryRunningTargets().filter(item=>item.instance_id&&item.mode).length?'<div class=\"summary-action-bar\"><button class=\"btn red\" onclick=\"stopAllSummaryPresets()\">Stop All</button></div>':Array.isArray(presetSummaryCache.restartTargets)&&presetSummaryCache.restartTargets.length?'<div class=\"summary-action-bar\"><button class=\"btn green\" onclick=\"restartAllSummaryPresets()\">Restart All</button></div>':\"\"}function modelFamilyHasActivePreset(modelVariants){const activeSelectors=new Set(runtimeStatsRows(lastStatus).filter(row=>row&&row.running).map(row=>String(row?.selector||row?.mode||\"\")));return(modelVariants||[]).some(variant=>activeSelectors.has(String(variantSelector(variant)||\"\")))}function renderSummaryVariantCard(variant,modelId){const selector=variantSelector(variant),target=scopeTargetForVariant(variant),switchJob=currentSwitchJob(),switchTarget=String(switchJob.target||\"\"),targetId=String(target?.id||\"\"),failed=!(String(currentSwitchFailure().mode||\"\")!==selector||runtimeStatsRows(lastStatus).some(row=>String(row?.mode||\"\")===selector)||targetId&&switchTarget&&switchTarget!==targetId),switching=!(!switchJob.active||String(switchJob.mode||\"\")!==selector||targetId&&switchTarget&&switchTarget!==targetId),active=runtimeActiveForVariant(selector,target)&&!switching&&!failed,buttonLabel=switching?\"Booting...\":active?\"Stop\":failed?\"Restart\":\"Apply\",buttonClass=switching?\"amber\":active||failed?\"rose\":\"blue\",action=active?`promptVariantStop('${escapeJs(selector)}', false)`:switching?`promptVariantStop('${escapeJs(selector)}', true)`:`switchInventoryVariant('${escapeJs(selector)}')`,stateClass=switching?\"state-booting\":active?\"state-active\":failed?\"state-error\":\"state-summary-inactive\",stateLabel=switching?\"booting\":active?\"active\":failed?\"error\":\"inactive\";return`<div class=\"summary-preset-card${active||switching?\"\":\" summary-preset-card-inactive\"}\"><div class=\"summary-preset-head\"><div class=\"summary-preset-title\">${escapeHtml(variantDisplayLabel(variant))}</div><div class=\"preset-actions\">${renderIconButton({title:\"Remove from summary\",action:`promptRemoveSummaryPreset('${escapeJs(modelId)}','${escapeJs(selector)}')`,icon:\"delete\"})}</div></div><div class=\"badge-row\"><span class=\"state-badge ${stateClass}\">${escapeHtml(stateLabel)}</span>${failed?\"\":`<span class=\"status-badge ${badgeClass(\"status\",variant.status_kind)}\">${escapeHtml(statusLabel(variant))}</span>`}</div><div class=\"summary-preset-meta\">${escapeHtml(variant.best_for||variant.quality_summary||\"Cached preset\")}</div><div class=\"variant-actions\"><button class=\"btn ${buttonClass}\" onclick=\"${action}\">${escapeHtml(buttonLabel)}</button></div></div>`}function renderSummaryModelBody(model,modelVariants){const entries=summaryEntriesForModel(model.model_id),bySelector=new Map(modelVariants.map(variant=>[variantSelector(variant),variant])),cards=entries.map(entry=>bySelector.get(String(entry.selector||\"\"))).filter(Boolean).slice(0,5).map(variant=>renderSummaryVariantCard(variant,model.model_id));return cards.length?cards.join(\"\"):'<div class=\"empty-variant-note\">No cached presets for this model yet. Active and booting presets will appear here automatically.</div>'}function renderVariantCard(variant){const selector=variantSelector(variant),target=scopeTargetForVariant(variant),installJob=lastStatus?.model_install_job||{},switchJob=currentSwitchJob(),failure=currentSwitchFailure(),switchTarget=String(switchJob.target||\"\"),targetId=String(target?.id||\"\"),failed=!(String(failure.mode||\"\")!==selector||runtimeStatsRows(lastStatus).some(row=>String(row?.mode||\"\")===selector)||targetId&&switchTarget&&switchTarget!==targetId),switching=!(!switchJob.active||String(switchJob.mode||\"\")!==selector||targetId&&switchTarget&&switchTarget!==targetId),active=runtimeActiveForVariant(selector,target)&&!switching&&!failed,ready=\"ready\"===variant.install_state,installing=!!installJob.active&&installJob.model_id===variant.model_id&&installJob.variant_id===variant.variant_id,disabled=ready&&!target||installing,bootSeconds=switchJobElapsedSeconds(switchJob),buttonLabel=installing?\"Installing...\":switching?`Booting for ${bootSeconds}s...`:ready?active?\"Stop\":failed?\"Restart\":\"Apply\":\"Download\",buttonClass=installing?\"green\":switching?\"amber\":ready?active||failed?\"rose\":\"blue\":\"green\",launchSeconds=active?launchSecondsForVariant(selector,target):0,stateClass=switching?\"state-booting\":active?\"state-active\":failed?\"state-error\":badgeClass(\"state\",variant.install_state),stateLabel=switching?\"booting\":active?\"active\":failed?\"error\":installStateLabel(variant),stateAttrs=failed?` role=\"button\" tabindex=\"0\" title=\"Open the relevant runtime log lines\" onclick=\"focusVariantFailure('${escapeJs(selector)}')\"`:\"\",caveat=variant.caveats?`<div class=\"variant-caveat\"><strong>Caveats:</strong> ${escapeHtml(variant.caveats)}</div>`:\"\",installNote=!ready&&variant.install_reason?`<div class=\"variant-install-note\"><strong>Install:</strong> ${escapeHtml(variant.install_reason)}</div>`:\"\",failureNote=failed?`<div class=\"variant-install-note error-note\"><strong>Last error:</strong> ${escapeHtml(String(failure.error||\"\").split(\"\\n\")[0]||\"Preset launch failed.\")}</div>`:\"\",statusBadge=failed?\"\":`<span class=\"status-badge ${badgeClass(\"status\",variant.status_kind)}\">${escapeHtml(statusLabel(variant))}</span>`,footer=launchSeconds?`<div class=\"variant-footer\"><span class=\"variant-launch-time\">${escapeHtml(formatElapsedLaunch(launchSeconds))}</span></div>`:'<div class=\"variant-footer\"></div>',action=ready?active?`promptVariantStop('${escapeJs(selector)}', false)`:switching?`promptVariantStop('${escapeJs(selector)}', true)`:`switchInventoryVariant('${escapeJs(selector)}')`:`switchInventoryVariant('${escapeJs(selector)}')`;return`<div class=\"variant-card${active?\" active-variant\":\"\"}\"><div class=\"variant-card-head\"><div class=\"variant-card-title\">${escapeHtml(variantDisplayLabel(variant))}</div><div class=\"badge-row\"><span class=\"state-badge ${stateClass}\"${stateAttrs}>${escapeHtml(stateLabel)}</span>${statusBadge}</div></div><div class=\"variant-meta\"><strong>Best for:</strong> ${escapeHtml(variant.best_for||\"No summary yet.\")}</div><div class=\"variant-meta\"><strong>Max ctx:</strong> ${escapeHtml(variantMaxCtx(variant))} <strong>Engine:</strong> ${escapeHtml(prettyEngineName(variant.engine))} <strong>Drafter:</strong> ${escapeHtml(variant.drafter||\"none\")} <strong>KV:</strong> ${escapeHtml(variant.kv_format||\"n/a\")}</div>${caveat}${installNote}${failureNote}<div class=\"variant-actions\"><button class=\"btn ${buttonClass}\" ${disabled?\"disabled\":\"\"} onclick=\"${action}\">${escapeHtml(buttonLabel)}</button></div>${footer}</div>`}function renderVariantGroup(title,rows){const items=sortInventoryVariants(rows),body=items.length?`<div class=\"variant-grid\">${items.map(renderVariantCard).join(\"\")}</div>`:'<div class=\"empty-variant-note\">No presets discovered for this category.</div>';return`<div class=\"variant-group\"><h4>${escapeHtml(`${title} (${items.length} Presets)`)}</h4>${body}</div>`}function renderDynamicPresetModels(){ensureDynamicPresetLayout(),hydrateSelectedPresetModel(),renderPresetModelSelector();const host=$(\"modelPresetGrid\");if(!host)return;const variants=inventoryVariants(),models=inventoryModels();if(!models.length)return void(host.innerHTML='<div class=\"model-card\"><div class=\"empty-variant-note\">No runtime inventory data was found. Rebuild the Dynamic Model DB to rescan the upstream checkout.</div></div>');const visibleModels=selectedPresetModelId?models.filter(model=>String(model.model_id||\"\")===selectedPresetModelId):models;host.innerHTML=`${visibleModels.map(model=>{const modelVariants=variants.filter(row=>row.model_id===model.model_id),selected=String(model.model_id||\"\")===selectedPresetModelId,familyActive=modelFamilyHasActivePreset(modelVariants),presetCount=modelVariants.length,summaryBody=renderSummaryModelBody(model,modelVariants),body=selected?`<div class=\"variant-groups\">${renderVariantGroup(\"Single GPU Docker Presets\",modelVariants.filter(row=>\"single\"===row.category))}${renderVariantGroup(\"Dual GPU Docker Presets\",modelVariants.filter(row=>\"dual\"===row.category))}${renderVariantGroup(\"Multi GPU Docker Presets\",modelVariants.filter(row=>\"multi\"===row.category))}${renderVariantGroup(\"Experimental Docker Presets\",modelVariants.filter(row=>\"experimental\"===row.category))}</div>`:summaryBody;return`<div class=\"model-card${selected?\" selected-model-card\":\" collapsed-model-card\"}${familyActive?\" model-card-active-family\":\"\"}\"><div class=\"model-card-head\"><div><h3>${escapeHtml(model.display_name||model.model_id)} (${presetCount} Presets)</h3><div class=\"model-summary\">${escapeHtml(model.summary||\"No summary available yet.\")}</div></div><div class=\"badge-row\"><span class=\"state-badge ${badgeClass(\"state\",model.installed_state)}\">${escapeHtml(String(model.installed_state||\"unknown\"))}</span></div></div>${body}</div>`}).join(\"\")}${selectedPresetModelId?\"\":renderSummaryActionBar()}`}function renderModelInstallStatus(){const target=$(\"presetJobSummary\");if(!target)return;const job=lastStatus?.model_install_job||{};job.active?target.textContent=`Model install running for ${job.model_id||\"unknown model\"} (${job.variant_id||\"preset\"}). Output is streaming to Audit Logs.`:\"success\"!==job.status?\"failed\"!==job.status?target.textContent=\"Downloads started from this tab stream into Audit Logs and automatically rebuild the Dynamic Model DB on success.\":target.textContent=`${job.summary||\"Model install failed.\"}`:target.textContent=`${job.summary||\"Model install completed successfully.\"}`}function chatConversationTitle(conversation){return String(conversation?.title||\"\").trim()||CHAT_UNTITLED_TITLE}function setSelectOptions(select,html){if(!select)return!1;const nextHtml=String(html||\"\");if(select.dataset.renderedOptions===nextHtml)return!1;const currentValue=String(select.value||\"\");return select.innerHTML=nextHtml,select.dataset.renderedOptions=nextHtml,currentValue&&[...select.options].some(option=>option.value===currentValue)&&(select.value=currentValue),!0}function chatConversationFolders(){return[...new Set(chatConversations().map(conversation=>normalizeConversationFolder(conversation.folder)).filter(Boolean))].sort((left,right)=>left.localeCompare(right))}function renderConversationSelector(){const select=$(\"chatConversationSelect\");if(!select)return;const rows=chatConversations(),rootRows=rows.filter(conversation=>!conversation.folder),grouped=chatConversationFolders().map(folder=>({folder,rows:rows.filter(conversation=>normalizeConversationFolder(conversation.folder)===folder)})).filter(group=>group.rows.length),html=[];rootRows.forEach(conversation=>{html.push(`<option value=\"${escapeHtml(conversation.id)}\" ${conversation.id===chatState.activeConversationId?\"selected\":\"\"}>${escapeHtml(chatConversationTitle(conversation))}</option>`)}),grouped.forEach(group=>{html.push(`<optgroup label=\"${escapeHtml(group.folder)}\">${group.rows.map(conversation=>`<option value=\"${escapeHtml(conversation.id)}\" ${conversation.id===chatState.activeConversationId?\"selected\":\"\"}>${escapeHtml(chatConversationTitle(conversation))}</option>`).join(\"\")}</optgroup>`)}),setSelectOptions(select,html.join(\"\")),chatState.activeConversationId&&[...select.options].some(option=>option.value===chatState.activeConversationId)&&(select.value=chatState.activeConversationId),select.disabled=!!chatState.busy}function selectChatConversation(value){const nextId=String(value||\"\");nextId&&nextId!==chatState.activeConversationId&&!chatState.busy&&(persistChatConversationState(),chatState.activeConversationId=nextId,syncChatStateFromActiveConversation(),saveChatState(),renderChatUi())}function createNewConversation(){if(chatState.busy)return;persistChatConversationState();const conversation=createChatConversation({},activeChatConversation());conversation.title=CHAT_UNTITLED_TITLE,conversation.autoNamed=!1,conversation.compactionSequence=1,conversation.compactedFromId=\"\",chatState.conversations=[...chatConversations(),conversation],chatState.activeConversationId=conversation.id,syncChatStateFromActiveConversation(),saveChatState(),renderChatUi(),setTimeout(()=>$(\"chatInput\")?.focus(),0)}function ensureConversationEditorModal(){if($(\"chatConversationModal\"))return;const modal=document.createElement(\"div\");modal.id=\"chatConversationModal\",modal.className=\"club-modal hidden\",modal.innerHTML=`<div class=\"club-modal-card conversation-modal-card\" role=\"dialog\" aria-modal=\"true\" aria-labelledby=\"chatConversationTitle\"><div class=\"panel-head\"><h2 id=\"chatConversationTitle\">Edit Conversation</h2><button class=\"iconbtn danger-iconbtn\" title=\"Close\" aria-label=\"Close\" onclick=\"closeConversationEditorModal()\">${svgIcon(\"close\")}</button></div><div class=\"formgrid\"><label>Conversation Name<input id=\"chatConversationName\" placeholder=\"${escapeHtml(CHAT_UNTITLED_TITLE)}\" /></label><label>Folder<input id=\"chatConversationFolder\" list=\"chatConversationFolderList\" placeholder=\"optional subfolder\" pattern=\"[A-Za-z0-9 _-]*\" /></label></div><datalist id=\"chatConversationFolderList\"></datalist><div class=\"preset-help\">Use only letters, numbers, spaces, <code>-</code>, and <code>_</code>.</div><div class=\"preset-form-actions\"><button class=\"btn blue\" onclick=\"closeConversationEditorModal()\">Cancel</button><button class=\"btn green\" onclick=\"saveConversationEditorModal()\">OK</button></div><div class=\"msg\" id=\"chatConversationModalMsg\"></div></div>`,modal.addEventListener(\"click\",event=>{event.target===modal&&closeConversationEditorModal()}),document.body.appendChild(modal)}function openConversationEditorModal(){if(chatState.busy)return;ensureConversationEditorModal();const conversation=activeChatConversation();conversation&&($(\"chatConversationName\").value=chatConversationTitle(conversation),$(\"chatConversationFolder\").value=normalizeConversationFolder(conversation.folder),$(\"chatConversationFolderList\").innerHTML=chatConversationFolders().map(folder=>`<option value=\"${escapeHtml(folder)}\"></option>`).join(\"\"),setElementMsg(\"chatConversationModalMsg\",\"\"),$(\"chatConversationModal\").classList.remove(\"hidden\"))}function closeConversationEditorModal(){ensureConversationEditorModal(),$(\"chatConversationModal\").classList.add(\"hidden\")}function saveConversationEditorModal(){const conversation=activeChatConversation();if(!conversation)return;const folderValue=String($(\"chatConversationFolder\")?.value||\"\").trim();if(!isValidConversationFolder(folderValue))return setElementMsg(\"chatConversationModalMsg\",\"Folder names may only use letters, numbers, spaces, - and _.\",\"error\");conversation.title=String($(\"chatConversationName\")?.value||\"\").trim()||CHAT_UNTITLED_TITLE,conversation.folder=normalizeConversationFolder(folderValue),conversation.autoNamed=!isUntitledConversationTitle(conversation.title),conversation.updatedAt=Date.now(),conversation.lastUsedAt=conversation.updatedAt,saveChatState(),renderChatUi(),closeConversationEditorModal()}function deleteActiveConversation(){if(chatState.busy)return;persistChatConversationState();const conversation=activeChatConversation();if(!conversation)return;if(!confirm(`Delete conversation \"${chatConversationTitle(conversation)}\"?`))return;let nextRows=chatConversations().filter(candidate=>candidate.id!==conversation.id);if(!nextRows.length){const replacement=createChatConversation({},conversation);replacement.title=CHAT_UNTITLED_TITLE,replacement.autoNamed=!1,replacement.compactionSequence=1,replacement.compactedFromId=\"\",nextRows=[replacement]}chatState.conversations=nextRows,chatState.activeConversationId=nextRows[0].id,syncChatStateFromActiveConversation(),saveChatState(),renderChatUi()}function fallbackConversationTitle(text,attachments=[]){const clean=String(text||\"\").replace(/\\s+/g,\" \").trim();return clean?clean.slice(0,48):attachments.length?`Files: ${attachments[0]?.name||\"attachment\"}`.slice(0,48):CHAT_UNTITLED_TITLE}function extractAdminChatText(payload){const response=payload?.response||{},choice=Array.isArray(response.choices)?response.choices[0]:null;return choice?.message?.content?String(choice.message.content):choice?.text?String(choice.text):\"\"}function parseConversationMetadataResult(text,fallbackTitleText,attachments=[]){const raw=String(text||\"\").trim();if(!raw)return{title:fallbackConversationTitle(fallbackTitleText,attachments),summary:\"\"};const fenced=raw.match(/```(?:json)?\\s*([\\s\\S]*?)```/i),candidate=fenced?fenced[1]:raw;try{const parsed=JSON.parse(candidate);return{title:String(parsed.title||\"\").trim()||fallbackConversationTitle(fallbackTitleText,attachments),summary:String(parsed.summary||\"\").trim()}}catch(e){return{title:raw.replace(/\\s+/g,\" \").split(/[.\\n]/)[0].trim().slice(0,48)||fallbackConversationTitle(fallbackTitleText,attachments),summary:raw.replace(/\\s+/g,\" \").trim().slice(0,220)}}}async function maybeAutoNameConversation(conversationId){const conversation=chatConversations().find(item=>item.id===conversationId),runtime=activeChatRuntime();if(!conversation||!runtime||conversation.autoNamed||chatConversationTitle(conversation)!==CHAT_UNTITLED_TITLE)return;const firstUser=(conversation.messages||[]).find(item=>\"user\"===item.role),firstAssistant=(conversation.messages||[]).find(item=>\"assistant\"===item.role);if(firstUser&&firstAssistant){try{const response=await fetch(\"/admin/chat\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({instance_id:runtime.id||runtime.instance_id,mode:runtime.selector||runtime.mode,model:runtime.served_model_name||runtime.model_id,api_preset:\"\",params:{temperature:.2,top_p:.8,max_tokens:220},messages:[{role:\"system\",content:'Return only JSON with keys \"title\" and \"summary\". The title must stay under 8 words. The summary must be one short sentence describing the conversation purpose.'},{role:\"user\",content:`User message:\\n${firstUser.text||\"\"}\\n\\nAssistant reply:\\n${firstAssistant.text||\"\"}`}]})}),payload=await response.json(),parsed=parseConversationMetadataResult(response.ok&&payload.ok?extractAdminChatText(payload):\"\",firstUser.text||\"\",chatMessageAttachments(firstUser));conversation.title=parsed.title,conversation.summary=parsed.summary||conversation.summary||\"\"}catch(e){conversation.title=fallbackConversationTitle(firstUser.text||\"\",chatMessageAttachments(firstUser))}conversation.autoNamed=chatConversationTitle(conversation)!==CHAT_UNTITLED_TITLE,conversation.updatedAt=Date.now(),conversation.lastUsedAt=conversation.updatedAt,conversation.id===chatState.activeConversationId&&syncChatStateFromConversation(conversation),saveChatState(),renderChatUi()}}function parseContinuedConversationInfo(title){const text=chatConversationTitle({title}),match=text.match(/^(.*?)(?:\\s+\\(continued(?:\\s+(\\d+))?\\))$/i);return match?{baseTitle:String(match[1]||\"\").trim()||CHAT_UNTITLED_TITLE,sequence:Math.max(1,Number(match[2]||2)||2)}:{baseTitle:text,sequence:1}}function continuedConversationTitle(conversation){const info=parseContinuedConversationInfo(chatConversationTitle(conversation)),nextSequence=Math.max(2,Number(conversation?.compactionSequence||info.sequence||1)+1);return`${info.baseTitle} (continued ${nextSequence})`}function currentChatContextLimit(runtime){const preset=chatApiPresetOptions().find(item=>String(item?.name||\"\")===String(chatState.apiPresetName||\"\")),limits=[Number(runtime?.ctx_size_tokens||0),Number(preset?.params?.truncate_prompt_tokens||0)].filter(value=>Number.isFinite(value)&&value>0);return limits.length?Math.min(...limits):0}function estimateTextTokenCount(text){const clean=String(text||\"\").trim();return clean?Math.max(1,Math.ceil(clean.length/4)):0}function estimateAttachmentTokenCost(attachment){return attachment?\"image\"===attachment.kind?256:estimateTextTokenCount(chatAttachmentTextBlock(attachment))+8:0}function estimateMessageTokenCost(message){let total=estimateTextTokenCount(message?.text||\"\")+12;return chatMessageAttachments(message).forEach(attachment=>{total+=estimateAttachmentTokenCost(attachment)}),\"assistant\"===message?.role&&(total+=estimateTextTokenCount(chatMessageThinkingView(message).reasoningText)),total}function estimatedConversationTokenBaseline(messages=[]){return(messages||[]).reduce((sum,message)=>sum+estimateMessageTokenCost(message),0)}function measuredConversationTokenBaseline(runtime,conversation){const limit=currentChatContextLimit(runtime),measuredInput=Number(conversation?.lastInputTokens??runtime?.last_input_tokens??runtime?.last_total_tokens??0),measuredOutput=Number(conversation?.lastOutputTokens??runtime?.last_output_tokens??0),measuredTotal=Number(conversation?.lastTotalTokens??runtime?.last_total_tokens??0),estimatedBaseline=estimatedConversationTokenBaseline(conversation?.messages||chatState.messages||[]),baselineTokens=Math.max(measuredTotal||0,measuredInput+measuredOutput,estimatedBaseline),kvUsage=Number(conversation?.lastKvCacheUsagePct??runtime?.gpu_kv_cache_usage_pct??0),tokenPct=limit>0&&baselineTokens>0?baselineTokens/limit*100:0;return{baselineTokens,measuredPct:Math.max(Number.isFinite(kvUsage)&&kvUsage>0?kvUsage:0,tokenPct)}}function buildCompactedSystemPrompt(summary,originalPrompt){const parts=[\"Context from an earlier conversation was automatically compacted. Continue seamlessly without asking the user to repeat prior details unless something is genuinely ambiguous.\",`Compacted conversation summary:\\n${String(summary||\"\").trim()}`];return String(originalPrompt||\"\").trim()&&parts.push(`Original system prompt:\\n${String(originalPrompt).trim()}`),parts.join(\"\\n\\n\")}async function maybeCompactChatConversation(runtime,userMessage){if(!chatState.autoCompactEnabled||!(chatState.messages||[]).length)return;const limit=currentChatContextLimit(runtime);if(!limit)return;const baseConversation=activeChatConversation(),thresholdPct=clampChatCompactionThreshold(chatState.autoCompactThresholdPct),measured=measuredConversationTokenBaseline(runtime,baseConversation),projectedTokens=measured.baselineTokens+estimateMessageTokenCost(userMessage);if(Math.max(measured.measuredPct,projectedTokens/limit*100)<thresholdPct)return;setChatMsg(\"Compacting conversation context before sending...\");const summaryResponse=await fetch(\"/admin/chat\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({instance_id:runtime.id||runtime.instance_id,mode:runtime.selector||runtime.mode,model:runtime.served_model_name||runtime.model_id,api_preset:\"\",params:{temperature:.2,top_p:.8,max_tokens:1200},messages:[{role:\"system\",content:\"Summarize the conversation so another assistant can continue it after a context compaction. Preserve the goal, key facts, decisions, code, unresolved work, and any exact strings that must be kept.\"},{role:\"user\",content:(chatState.messages||[]).map(message=>{const attachmentSummary=chatMessageAttachments(message).map(attachment=>\"image\"===attachment?.kind?`[image: ${attachment?.name||\"image\"}]`:`[file: ${attachment?.name||\"attachment\"}]`).join(\" \");return`${String(message.role||\"message\").toUpperCase()}: ${message.text||\"\"}${attachmentSummary?` ${attachmentSummary}`:\"\"}`}).join(\"\\n\\n\")}]})}),summary=extractAdminChatText(await summaryResponse.json())||\"Conversation summary unavailable.\";persistChatConversationState();const preset=chatApiPresetOptions().find(item=>String(item?.name||\"\")===String(chatState.apiPresetName||\"\")),nextConversation=createChatConversation({},baseConversation);nextConversation.compactedFromId=String(baseConversation?.id||\"\"),nextConversation.compactionSequence=Math.max(2,Number(baseConversation?.compactionSequence||1)+1),nextConversation.title=continuedConversationTitle(baseConversation),nextConversation.autoNamed=!0,nextConversation.summary=String(summary||\"\").trim(),nextConversation.apiPresetName=\"\",nextConversation.params=preset?normalizePresetParamsForChat(preset.params||{}):cloneChatParams(chatState.params),nextConversation.systemPrompt=buildCompactedSystemPrompt(summary,String(preset?preset.system_prompt||\"\":chatState.systemPrompt||\"\")),nextConversation.messages=[],nextConversation.attachments=[],chatState.conversations=[...chatConversations(),nextConversation],chatState.activeConversationId=nextConversation.id,syncChatStateFromActiveConversation(),saveChatState(),renderChatUi()}function chatPresetKey(runtime){return`${String(runtime?.id||runtime?.instance_id||\"\")}::${String(runtime?.selector||runtime?.mode||\"\")}`}function activeChatPresets(){return runtimeStatsRows(lastStatus).filter(runtime=>runtime&&runtime.running)}function activeChatRuntime(){const rows=activeChatPresets();if(!rows.length)return null;return rows.find(runtime=>chatPresetKey(runtime)===chatState.presetId)||rows[0]}function updateConversationRuntimeMetrics(conversation,runtime,payload={}){if(!conversation)return;const usage=payload?.usage||{};void 0!==usage.input_tokens&&(conversation.lastInputTokens=Number(usage.input_tokens||0)),void 0!==usage.output_tokens&&(conversation.lastOutputTokens=Number(usage.output_tokens||0)),void 0!==usage.tokens&&(conversation.lastTotalTokens=Number(usage.tokens||0)),void 0!==runtime?.ctx_size_tokens&&(conversation.lastCtxSizeTokens=Number(runtime.ctx_size_tokens||0)),void 0!==runtime?.gpu_kv_cache_usage_pct&&(conversation.lastKvCacheUsagePct=Number(runtime.gpu_kv_cache_usage_pct||0)),conversation.lastRuntimeRequestAt=Date.now()}function setChatMsg(text,tone=\"warning\"){setElementMsg(\"chatMsg\",text||\"\",tone)}function toggleChatOptionsMenu(force=null){chatOptionsMenuOpen=null===force?!chatOptionsMenuOpen:!!force,$(\"chatOptionsMenu\")&&$(\"chatOptionsMenu\").classList.toggle(\"hidden\",!chatOptionsMenuOpen)}function openChatSettingsPanel(){toggleChatOptionsMenu(!1),openChatSettingsModal()}function chatTemplateId(){return`chat-template-${Date.now()}-${Math.random().toString(36).slice(2,8)}`}function normalizePresetParamsForChat(params={}){const normalized={...defaultChatParams(),temperature:void 0!==params.temperature?String(params.temperature):\"\",top_p:void 0!==params.top_p?String(params.top_p):\"\",top_k:void 0!==params.top_k?String(params.top_k):\"\",min_p:void 0!==params.min_p?String(params.min_p):\"\",repetition_penalty:void 0!==params.repetition_penalty?String(params.repetition_penalty):\"\",presence_penalty:void 0!==params.presence_penalty?String(params.presence_penalty):\"\",frequency_penalty:void 0!==params.frequency_penalty?String(params.frequency_penalty):\"\",max_tokens:void 0!==params.max_tokens?String(params.max_tokens):void 0!==params.max_completion_tokens?String(params.max_completion_tokens):\"\",seed:void 0!==params.seed?String(params.seed):\"\"},template=params.chat_template_kwargs||{};return normalized.enable_thinking=!!template.enable_thinking,normalized.preserve_thinking=!!template.preserve_thinking,normalized}function ensureChatSettingsModal(){if($(\"chatSettingsModal\"))return;const modal=document.createElement(\"div\");modal.id=\"chatSettingsModal\",modal.className=\"club-modal hidden\",modal.innerHTML=`<div class=\"club-modal-card chat-settings-modal-card\" role=\"dialog\" aria-modal=\"true\" aria-labelledby=\"chatSettingsTitle\"><div class=\"panel-head\"><h2 id=\"chatSettingsTitle\">Chat Settings</h2><button class=\"iconbtn danger-iconbtn\" title=\"Close\" aria-label=\"Close\" onclick=\"closeChatSettingsModal()\">${svgIcon(\"close\")}</button></div><div class=\"preset-help\" id=\"chatSettingsPresetHint\"></div><div class=\"chat-settings-grid\"><label class=\"chat-settings-span-2\">System Prompt<textarea id=\"chatSystemPrompt\" placeholder=\"Optional system prompt for this conversation\"></textarea></label><div class=\"chat-settings-span-2\"><div class=\"chat-settings-template-row\"><input id=\"chatPromptTemplateName\" class=\"chat-settings-template-name\" placeholder=\"Template name\" /><select id=\"chatPromptTemplateSelect\" class=\"chat-settings-template-select\" aria-label=\"Choose template\"></select><div class=\"chat-settings-template-actions\"><button class=\"btn blue\" onclick=\"loadChatPromptTemplate()\">Load</button><button class=\"btn green\" onclick=\"saveChatPromptTemplate()\">Save Template</button><button class=\"btn red\" onclick=\"deleteChatPromptTemplate()\">Delete</button></div></div><div class=\"chat-settings-note chat-settings-template-note\">Templates are stored locally in this browser so you can save and reuse system prompts.</div><hr class=\"chat-settings-rule\" /></div><label>Temperature<input id=\"chatTemperature\" type=\"number\" step=\"0.01\" min=\"0\" max=\"2\" /></label><label>Top P<input id=\"chatTopP\" type=\"number\" step=\"0.01\" min=\"0\" max=\"1\" /></label><label>Top K<input id=\"chatTopK\" type=\"number\" step=\"1\" min=\"0\" /></label><label>Min P<input id=\"chatMinP\" type=\"number\" step=\"0.01\" min=\"0\" max=\"1\" /></label><label>Repeat Penalty<input id=\"chatRepetitionPenalty\" type=\"number\" step=\"0.01\" min=\"0\" max=\"4\" /></label><label>Presence Penalty<input id=\"chatPresencePenalty\" type=\"number\" step=\"0.01\" min=\"-2\" max=\"2\" /></label><label>Frequency Penalty<input id=\"chatFrequencyPenalty\" type=\"number\" step=\"0.01\" min=\"-2\" max=\"2\" /></label><label>Max Tokens<input id=\"chatMaxTokens\" type=\"number\" step=\"1\" min=\"1\" /></label><label>Enable Thinking<select id=\"chatEnableThinking\"><option value=\"false\">Off</option><option value=\"true\">On</option></select></label><label>Preserve Thinking<select id=\"chatPreserveThinking\"><option value=\"false\">Off</option><option value=\"true\">On</option></select></label><div class=\"chat-settings-span-2\"><hr class=\"chat-settings-rule\" /><div class=\"chat-settings-compact-block\"><div class=\"chat-settings-toggle-row\"><label class=\"toggle-switch\"><input id=\"chatAutoCompactEnabled\" type=\"checkbox\" onchange=\"updateChatCompactionThresholdLabel()\" /><span class=\"toggle-switch-track\"></span></label><span class=\"chat-settings-compact-title\">Automatically compact context when nearing max</span></div><div class=\"chat-threshold-row\"><span class=\"chat-settings-compact-threshold-label\">Threshold:</span><input id=\"chatAutoCompactThreshold\" type=\"range\" min=\"50\" max=\"95\" step=\"1\" value=\"95\" oninput=\"updateChatCompactionThresholdLabel()\" /><output id=\"chatAutoCompactThresholdValue\">95%</output></div><div class=\"chat-settings-note chat-settings-compact-description\">If about to run out of context, summarize the current chat and automatically recall the summary in a new conversation.</div></div></div></div><div class=\"preset-form-actions\"><button class=\"btn blue\" onclick=\"closeChatSettingsModal()\">Cancel</button><button class=\"btn green\" onclick=\"applyChatSettingsModal()\">Apply</button></div><div class=\"msg\" id=\"chatSettingsMsg\"></div></div>`,modal.addEventListener(\"click\",event=>{event.target===modal&&closeChatSettingsModal()}),document.body.appendChild(modal)}function setChatSettingsMsg(text,tone=\"warning\"){setElementMsg(\"chatSettingsMsg\",text||\"\",tone)}function renderChatPromptTemplateOptions(selectedId=\"\"){const select=$(\"chatPromptTemplateSelect\");if(!select)return;const rows=Array.isArray(chatState.promptTemplates)?[...chatState.promptTemplates].sort((left,right)=>String(left?.name||\"\").localeCompare(String(right?.name||\"\"))):[];select.innerHTML=`<option value=\"\">Choose Template</option>${rows.map(template=>`<option value=\"${escapeHtml(template.id)}\" ${template.id===selectedId?\"selected\":\"\"}>${escapeHtml(template.name||\"Template\")}</option>`).join(\"\")}`}function updateChatCompactionThresholdLabel(){const slider=$(\"chatAutoCompactThreshold\"),output=$(\"chatAutoCompactThresholdValue\"),enabled=!!$(\"chatAutoCompactEnabled\")?.checked;slider&&(slider.disabled=!enabled),output&&slider&&(output.value=`${clampChatCompactionThreshold(slider.value)}%`)}function loadChatPromptTemplate(){const template=(chatState.promptTemplates||[]).find(item=>item.id===$(\"chatPromptTemplateSelect\")?.value);if(!template)return setChatSettingsMsg(\"Select a prompt template first.\");$(\"chatPromptTemplateName\").value=template.name||\"\",$(\"chatSystemPrompt\").value=template.text||\"\",setChatSettingsMsg(`Loaded template \"${template.name}\".`)}function saveChatPromptTemplate(){const name=String($(\"chatPromptTemplateName\")?.value||\"\").trim(),text=String($(\"chatSystemPrompt\")?.value||\"\");if(!name)return setChatSettingsMsg(\"Template name is required.\",\"error\");if(!text.trim())return setChatSettingsMsg(\"Template text cannot be empty.\",\"error\");const existing=(chatState.promptTemplates||[]).find(item=>String(item.name||\"\").toLowerCase()===name.toLowerCase());if(existing)existing.name=name,existing.text=text,renderChatPromptTemplateOptions(existing.id);else{const template={id:chatTemplateId(),name,text};chatState.promptTemplates=[...chatState.promptTemplates||[],template],renderChatPromptTemplateOptions(template.id)}saveChatState(),setChatSettingsMsg(`Saved template \"${name}\".`)}function deleteChatPromptTemplate(){const template=(chatState.promptTemplates||[]).find(item=>item.id===$(\"chatPromptTemplateSelect\")?.value);if(!template)return setChatSettingsMsg(\"Select a template to delete.\");confirm(`Delete prompt template \"${template.name}\"?`)&&(chatState.promptTemplates=(chatState.promptTemplates||[]).filter(item=>item.id!==template.id),saveChatState(),renderChatPromptTemplateOptions(),$(\"chatPromptTemplateName\").value=\"\",setChatSettingsMsg(`Deleted template \"${template.name}\".`))}function populateChatSettingsInputs(values=chatState.params){ensureChatSettingsModal();const preset=chatApiPresetOptions().find(item=>String(item?.name||\"\")===String(chatState.apiPresetName||\"\")),sourceParams=preset?{...defaultChatParams(),...normalizePresetParamsForChat(preset.params||{})}:{...defaultChatParams(),...values||{}};chatSettingsDraft={usingPreset:!!preset},$(\"chatSettingsPresetHint\").innerHTML=preset?`Showing settings from API Preset <code>${escapeHtml(preset.name||\"Preset\")}</code>. Applying saves a Direct copy for this conversation and switches the selector to <code>Direct</code>.`:\"These Direct settings are stored locally with this conversation.\",$(\"chatSystemPrompt\").value=String(preset?preset.system_prompt||\"\":chatState.systemPrompt||\"\"),$(\"chatTemperature\").value=sourceParams.temperature||\"\",$(\"chatTopP\").value=sourceParams.top_p||\"\",$(\"chatTopK\").value=sourceParams.top_k||\"\",$(\"chatMinP\").value=sourceParams.min_p||\"\",$(\"chatRepetitionPenalty\").value=sourceParams.repetition_penalty||\"\",$(\"chatPresencePenalty\").value=sourceParams.presence_penalty||\"\",$(\"chatFrequencyPenalty\").value=sourceParams.frequency_penalty||\"\",$(\"chatMaxTokens\").value=sourceParams.max_tokens||\"\",$(\"chatEnableThinking\").value=sourceParams.enable_thinking?\"true\":\"false\",$(\"chatPreserveThinking\").value=sourceParams.preserve_thinking?\"true\":\"false\",$(\"chatAutoCompactEnabled\").checked=!1!==chatState.autoCompactEnabled,$(\"chatAutoCompactThreshold\").value=clampChatCompactionThreshold(chatState.autoCompactThresholdPct),$(\"chatPromptTemplateName\").value=\"\",renderChatPromptTemplateOptions(),updateChatCompactionThresholdLabel()}function openChatSettingsModal(){populateChatSettingsInputs(chatState.params),setChatSettingsMsg(\"\"),$(\"chatSettingsModal\").classList.remove(\"hidden\")}function closeChatSettingsModal(){ensureChatSettingsModal(),$(\"chatSettingsModal\").classList.add(\"hidden\"),chatSettingsDraft=null}function validateChatSettingNumber(label,raw,{min=null,max=null,integer=!1}={}){const text=String(raw??\"\").trim();if(!text)return\"\";const value=integer?Number.parseInt(text,10):Number(text);if(!Number.isFinite(value))throw new Error(`${label} must be a valid number.`);if(integer&&!Number.isInteger(value))throw new Error(`${label} must be a whole number.`);if(null!==min&&value<min)throw new Error(`${label} must be at least ${min}.`);if(null!==max&&value>max)throw new Error(`${label} must be at most ${max}.`);return String(value)}function applyChatSettingsModal(){try{chatState.params={...chatState.params,temperature:validateChatSettingNumber(\"Temperature\",$(\"chatTemperature\").value,{min:0,max:2}),top_p:validateChatSettingNumber(\"Top P\",$(\"chatTopP\").value,{min:0,max:1}),top_k:validateChatSettingNumber(\"Top K\",$(\"chatTopK\").value,{min:0,integer:!0}),min_p:validateChatSettingNumber(\"Min P\",$(\"chatMinP\").value,{min:0,max:1}),repetition_penalty:validateChatSettingNumber(\"Repeat Penalty\",$(\"chatRepetitionPenalty\").value,{min:0,max:4}),presence_penalty:validateChatSettingNumber(\"Presence Penalty\",$(\"chatPresencePenalty\").value,{min:-2,max:2}),frequency_penalty:validateChatSettingNumber(\"Frequency Penalty\",$(\"chatFrequencyPenalty\").value,{min:-2,max:2}),max_tokens:validateChatSettingNumber(\"Max Tokens\",$(\"chatMaxTokens\").value,{min:1,integer:!0}),enable_thinking:\"true\"===$(\"chatEnableThinking\").value,preserve_thinking:\"true\"===$(\"chatPreserveThinking\").value},chatState.systemPrompt=String($(\"chatSystemPrompt\").value||\"\"),chatState.autoCompactEnabled=!!$(\"chatAutoCompactEnabled\").checked,chatState.autoCompactThresholdPct=clampChatCompactionThreshold($(\"chatAutoCompactThreshold\").value),chatSettingsDraft?.usingPreset&&(chatState.apiPresetName=\"\"),persistChatConversationState(),setChatSettingsMsg(\"\"),closeChatSettingsModal(),renderChatUi()}catch(e){setChatSettingsMsg(String(e||\"\"),\"error\")}}function ensureMcpManagerModal(){if($(\"mcpManagerModal\"))return;const modal=document.createElement(\"div\");modal.id=\"mcpManagerModal\",modal.className=\"club-modal hidden\",modal.innerHTML=`<div class=\"club-modal-card\" role=\"dialog\" aria-modal=\"true\" aria-labelledby=\"mcpManagerTitle\"><div class=\"panel-head\"><h2 id=\"mcpManagerTitle\">MCP Servers</h2><button class=\"iconbtn danger-iconbtn\" title=\"Close\" aria-label=\"Close\" onclick=\"closeMcpManagerModal()\">${svgIcon(\"close\")}</button></div><div class=\"preset-help\">Add stdio MCP servers here to expose tools to the local chat interface. New servers are only saved after the control layer can successfully initialize and list their tools.</div><div class=\"formgrid\"><label>Server Name<input id=\"mcpServerName\" placeholder=\"filesystem\" /></label><label>Command<input id=\"mcpServerCommand\" placeholder=\"npx -y @modelcontextprotocol/server-filesystem /path\" /></label></div><div class=\"preset-form-actions\"><button class=\"btn green\" onclick=\"saveMcpServerFromForm()\">Save Server</button></div><div class=\"msg\" id=\"mcpManagerMsg\"></div><div class=\"panel\" style=\"margin-top:12px\"><h2>Configured MCP Servers</h2><div id=\"mcpServerList\" class=\"api-grid\"></div></div></div>`,modal.addEventListener(\"click\",event=>{event.target===modal&&closeMcpManagerModal()}),document.body.appendChild(modal)}function setMcpManagerMsg(text,tone=\"warning\"){setElementMsg(\"mcpManagerMsg\",text||\"\",tone)}function resetMcpServerForm(){mcpManagerState.editingId=\"\",$(\"mcpServerName\")&&($(\"mcpServerName\").value=\"\"),$(\"mcpServerCommand\")&&($(\"mcpServerCommand\").value=\"\"),setMcpManagerMsg(\"\")}function renderMcpServerList(){const host=$(\"mcpServerList\");if(!host)return;const rows=Array.isArray(mcpManagerState.servers)?mcpManagerState.servers:[];host.innerHTML=rows.map(server=>{const tools=Array.isArray(server.tools)?server.tools:[],toolText=tools.length?tools.map(tool=>tool.name).join(\", \"):\"connected\"===server.status?\"no tools reported\":server.error||\"not connected\";return`<div class=\"api-card\"><div class=\"api-card-head\"><h3>${escapeHtml(server.name||server.id)}<br><span class=\"label\">${escapeHtml(server.status||\"unknown\")} · ${server.enabled?\"enabled\":\"disabled\"}</span></h3><span class=\"preset-actions\"><button class=\"iconbtn\" title=\"Edit\" onclick=\"editMcpServer('${escapeJs(server.id)}')\">${svgIcon(\"edit\")}</button><button class=\"iconbtn\" title=\"Delete\" onclick=\"deleteMcpServer('${escapeJs(server.id)}')\">${svgIcon(\"delete\")}</button></span></div><p>${escapeHtml(server.command||\"\")}</p><p class=\"label\">tools: ${escapeHtml(toolText)}</p><div class=\"variant-actions\"><button class=\"btn ${server.enabled?\"amber\":\"green\"}\" onclick=\"toggleMcpServer('${escapeJs(server.id)}', ${server.enabled?\"false\":\"true\"})\">${server.enabled?\"Disable\":\"Enable\"}</button></div></div>`}).join(\"\")||'<div class=\"value\">No MCP servers configured yet.</div>'}async function loadMcpServers(){ensureMcpManagerModal();const response=await fetch(\"/admin/mcp\"),payload=await response.json();if(!response.ok||!payload.ok)throw new Error(payload.error||\"Failed to load MCP servers\");mcpManagerState.servers=Array.isArray(payload.servers)?payload.servers:[],renderMcpServerList()}function editMcpServer(serverId){const row=(mcpManagerState.servers||[]).find(server=>server.id===serverId);row&&(mcpManagerState.editingId=serverId,$(\"mcpServerName\").value=row.name||\"\",$(\"mcpServerCommand\").value=row.command||\"\",setMcpManagerMsg(`Editing MCP server \"${row.name||row.id}\".`))}async function saveMcpServerFromForm(){try{const response=await fetch(\"/admin/mcp\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({action:\"save\",id:mcpManagerState.editingId||\"\",name:$(\"mcpServerName\")?.value||\"\",command:$(\"mcpServerCommand\")?.value||\"\",enabled:!0})}),payload=await response.json();if(!response.ok||!payload.ok)throw new Error(payload.error||\"Failed to save MCP server\");mcpManagerState.servers=Array.isArray(payload.servers)?payload.servers:[],resetMcpServerForm(),renderMcpServerList(),setMcpManagerMsg(\"Saved MCP server.\")}catch(e){setMcpManagerMsg(String(e||\"\"),\"error\")}}async function deleteMcpServer(serverId){if(!confirm(`Delete MCP server ${serverId}?`))return;const response=await fetch(\"/admin/mcp\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({action:\"delete\",id:serverId})}),payload=await response.json();if(!response.ok||!payload.ok)return setMcpManagerMsg(payload.error||\"Failed to delete MCP server\");mcpManagerState.servers=Array.isArray(payload.servers)?payload.servers:[],renderMcpServerList()}async function toggleMcpServer(serverId,enabled){const response=await fetch(\"/admin/mcp\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({action:\"toggle\",id:serverId,enabled:!!enabled})}),payload=await response.json();if(!response.ok||!payload.ok)return setMcpManagerMsg(payload.error||\"Failed to toggle MCP server\",\"error\");mcpManagerState.servers=Array.isArray(payload.servers)?payload.servers:[],renderMcpServerList(),setMcpManagerMsg(enabled?\"Enabled MCP server.\":\"Disabled MCP server.\")}async function openMcpManagerModal(){toggleChatOptionsMenu(!1),ensureMcpManagerModal(),$(\"mcpManagerModal\").classList.remove(\"hidden\"),resetMcpServerForm(),setMcpManagerMsg(\"Loading MCP servers...\");try{await loadMcpServers(),setMcpManagerMsg(\"\")}catch(e){setMcpManagerMsg(String(e||\"\"),\"error\")}}function closeMcpManagerModal(){ensureMcpManagerModal(),$(\"mcpManagerModal\").classList.add(\"hidden\")}function openChatTab(){activateTab(\"chat\",!1),renderChatUi()}function selectChatPreset(value){chatState.presetId=String(value||\"\"),persistChatConversationState(),renderChatUi()}function selectChatApiPreset(value){chatState.apiPresetName=String(value||\"\"),persistChatConversationState(),renderChatUi()}function handleChatInputResize(){const box=$(\"chatInput\");if(!box)return;box.style.height=\"auto\";box.style.height=`${Math.max(88,Math.min(176,box.scrollHeight))}px`}function handleChatInputChange(){handleChatInputResize();const runtime=activeChatRuntime(),hasDraft=!!String($(\"chatInput\")?.value||\"\").trim()||!!(chatState.attachments||[]).length;$(\"chatSendBtn\")&&($(\"chatSendBtn\").disabled=!runtime||!chatState.busy&&!hasDraft)}function handleChatInputKeydown(event){event&&\"Enter\"===event.key&&(event.ctrlKey||event.metaKey)&&(event.preventDefault(),sendChatMessage())}function renderChatPresetSelector(){const select=$(\"chatPresetSelect\");if(!select)return;const rows=activeChatPresets();if(!rows.length)return select.innerHTML='<option value=\"\">No active presets</option>',select.disabled=!0,void(chatState.presetId=\"\");rows.some(runtime=>chatPresetKey(runtime)===chatState.presetId)||(chatState.presetId=chatPresetKey(rows[0])),select.disabled=!1;setSelectOptions(select,rows.map(runtime=>{const key=chatPresetKey(runtime),label=`${variantDisplayLabel({upstream_tag:runtime.selector||runtime.mode})} | ${runtime.id||runtime.instance_id}`;return`<option value=\"${escapeHtml(key)}\" ${key===chatState.presetId?\"selected\":\"\"}>${escapeHtml(label)}</option>`}).join(\"\")),chatState.presetId&&[...select.options].some(option=>option.value===chatState.presetId)&&(select.value=chatState.presetId)}function chatApiPresetOptions(){const presetCatalog=lastStatus?.presets||{};return[...presetCatalog.defaults||[],...presetCatalog.custom||[]]}function renderChatApiPresetSelector(){const select=$(\"chatApiPresetSelect\");if(!select)return;const presets=chatApiPresetOptions(),valid=new Set(presets.map(preset=>String(preset?.name||\"\")));chatState.apiPresetName&&!valid.has(chatState.apiPresetName)&&(chatState.apiPresetName=\"\");setSelectOptions(select,`<option value=\"\" ${chatState.apiPresetName?\"\":\"selected\"}>Direct</option>${presets.map(preset=>{const name=String(preset?.name||\"\"),label=`${name}${preset?.locked?\" - default\":\"\"}`;return`<option value=\"${escapeHtml(name)}\" ${name===chatState.apiPresetName?\"selected\":\"\"}>${escapeHtml(label)}</option>`}).join(\"\")}`),select.value=chatState.apiPresetName||\"\"}function chatRuntimeSupportsVision(runtime){return!!runtime&&!!String(runtime.vision||\"\").trim()}function chatAttachmentId(){return`chat-att-${Date.now()}-${Math.random().toString(36).slice(2,8)}`}function chatAttachmentKindClass(attachment){return\"image\"===attachment?.kind?\"chat-attachment-image\":\"chat-attachment-text\"}function renderChatAttachments(){const host=$(\"chatAttachmentRow\");host&&(host.innerHTML=(chatState.attachments||[]).map((attachment,index)=>`<div class=\"chat-attachment-pill ${chatAttachmentKindClass(attachment)}\"><button class=\"chat-attachment-remove\" title=\"Remove attachment\" aria-label=\"Remove attachment\" onclick=\"removeChatAttachment(${index})\">x</button><span class=\"chat-attachment-name\">${escapeHtml(attachment?.name||`attachment-${index+1}`)}</span></div>`).join(\"\"))}function removeChatAttachment(index){chatState.attachments=(chatState.attachments||[]).filter((_,itemIndex)=>itemIndex!==index),persistChatConversationState(),renderChatAttachments()}function chatTranscriptIsNearBottom(host=$(\"chatTranscript\")){return!host||host.scrollHeight-(host.scrollTop+host.clientHeight)<=36}function ensureChatTranscriptBehavior(){const host=$(\"chatTranscript\");host&&\"1\"!==host.dataset.followBound&&(host.dataset.followBound=\"1\",host.addEventListener(\"scroll\",()=>{chatTranscriptAutoFollow=chatTranscriptIsNearBottom(host)}))}function chatMessageAttachments(message){return Array.isArray(message?.attachments)?message.attachments:Array.isArray(message?.images)?message.images.map(image=>({kind:\"image\",name:image?.name||\"image\",url:image?.url||\"\"})):[]}function normalizeMarkdownUrl(url,{allowDataImage=!0}={}){const raw=String(url||\"\").trim();if(!raw)return\"\";if(allowDataImage&&/^data:image\\//i.test(raw))return raw;if(/^mailto:/i.test(raw))return raw;try{const parsed=new URL(raw,window.location.origin);return/^https?:$/i.test(parsed.protocol)||/^blob:$/i.test(parsed.protocol)?parsed.href:\"\"}catch(e){return\"\"}}function markdownUrlParts(candidate){let url=String(candidate||\"\"),trailing=\"\";for(;url&&/[),.;!?]$/.test(url)&&!/\\([^)]+\\)$/.test(url);)trailing=url.slice(-1)+trailing,url=url.slice(0,-1);return{url,trailing}}function urlLooksLikeImage(url){return/^data:image\\//i.test(url)||/\\.(avif|gif|jpe?g|png|svg|webp)$/i.test(url.split(\"?\")[0])}function urlLooksLikeVideo(url){return/\\.(mp4|m4v|mov|webm|ogv)$/i.test(url.split(\"?\")[0])}function urlLooksLikeAudio(url){return/\\.(mp3|wav|ogg|m4a|flac)$/i.test(url.split(\"?\")[0])}function youtubeEmbedUrl(url){try{const parsed=new URL(url);if(/youtube\\.com$/i.test(parsed.hostname)||/www\\.youtube\\.com$/i.test(parsed.hostname)){const videoId=parsed.searchParams.get(\"v\");if(videoId)return`https://www.youtube.com/embed/${encodeURIComponent(videoId)}`}if(/youtu\\.be$/i.test(parsed.hostname)){const videoId=parsed.pathname.replace(/\\//g,\"\").trim();if(videoId)return`https://www.youtube.com/embed/${encodeURIComponent(videoId)}`}}catch(e){}return\"\"}function richEmbedForUrl(url,altText=\"\"){const safeUrl=normalizeMarkdownUrl(url);if(!safeUrl)return\"\";if(urlLooksLikeImage(safeUrl))return`<div class=\"chat-rich-embed\"><img class=\"chat-markdown-image\" src=\"${escapeHtml(safeUrl)}\" alt=\"${escapeHtml(altText||\"image\")}\" /></div>`;if(urlLooksLikeVideo(safeUrl))return`<div class=\"chat-rich-embed\"><video class=\"chat-markdown-media\" controls preload=\"metadata\" src=\"${escapeHtml(safeUrl)}\"></video></div>`;if(urlLooksLikeAudio(safeUrl))return`<div class=\"chat-rich-embed\"><audio class=\"chat-markdown-media\" controls preload=\"metadata\" src=\"${escapeHtml(safeUrl)}\"></audio></div>`;const youtubeUrl=youtubeEmbedUrl(safeUrl);return youtubeUrl?`<div class=\"chat-rich-embed\"><iframe class=\"chat-markdown-media\" src=\"${escapeHtml(youtubeUrl)}\" title=\"${escapeHtml(altText||\"embedded media\")}\" loading=\"lazy\" allowfullscreen></iframe></div>`:\"\"}function applyBalancedUnderscoreFormatting(text){return String(text||\"\").replace(/(^|[^A-Za-z0-9])___([^\\s_](?:.*?[^\\s_])?)___(?=[^A-Za-z0-9]|$)/g,(_,prefix,body)=>`${prefix}<strong><em>${body}</em></strong>`).replace(/(^|[^A-Za-z0-9])__([^\\s_](?:.*?[^\\s_])?)__(?=[^A-Za-z0-9]|$)/g,(_,prefix,body)=>`${prefix}<strong>${body}</strong>`).replace(/(^|[^A-Za-z0-9])_([^\\s_]+)_(?=[^A-Za-z0-9]|$)/g,(_,prefix,body)=>`${prefix}<em>${body}</em>`)}function renderMarkdownInline(text){const tokens=[],stash=html=>{const token=`@@CHATMDTOKEN${tokens.length}@@`;return tokens.push(html),token};let value=String(text||\"\");value=value.replace(/`([^`]+)`/g,(_,code)=>stash(`<code>${escapeHtml(code)}</code>`)),value=value.replace(/!\\[([^\\]]*)\\]\\(([^)\\s]+)(?:\\s+\"([^\"]*)\")?\\)/g,(_,altText,url)=>stash(`<img class=\"chat-markdown-image\" src=\"${escapeHtml(normalizeMarkdownUrl(url)||\"\")}\" alt=\"${escapeHtml(altText||\"image\")}\" />`)),value=value.replace(/\\[([^\\]]+)\\]\\(([^)\\s]+)(?:\\s+\"([^\"]*)\")?\\)/g,(_,label,url)=>{const safeUrl=normalizeMarkdownUrl(url,{allowDataImage:!1});return safeUrl?stash(`<a href=\"${escapeHtml(safeUrl)}\" target=\"_blank\" rel=\"noreferrer\">${escapeHtml(label)}</a>${richEmbedForUrl(safeUrl,label)}`):escapeHtml(label)}),value=value.replace(/((?:https?:\\/\\/|mailto:)[^\\s<]+)/g,candidate=>{const{url,trailing}=markdownUrlParts(candidate),safeUrl=normalizeMarkdownUrl(url,{allowDataImage:!1});return safeUrl?`${stash(`<a href=\"${escapeHtml(safeUrl)}\" target=\"_blank\" rel=\"noreferrer\">${escapeHtml(url)}</a>${richEmbedForUrl(safeUrl,url)}`)}${escapeHtml(trailing)}`:escapeHtml(candidate)});let html=applyBalancedUnderscoreFormatting(escapeHtml(value).replace(/~~([^~]+)~~/g,\"<del>$1</del>\").replace(/\\*\\*([^*]+)\\*\\*/g,\"<strong>$1</strong>\").replace(/\\*([^*\\n]+)\\*/g,\"<em>$1</em>\"));return html=html.replace(/\\n/g,\"<br />\"),tokens.forEach((token,index)=>{html=html.replaceAll(`@@CHATMDTOKEN${index}@@`,token)}),html}function splitMarkdownTableRow(line){let text=String(line||\"\").trim();return text.startsWith(\"|\")&&(text=text.slice(1)),text.endsWith(\"|\")&&(text=text.slice(0,-1)),text.split(\"|\").map(cell=>cell.trim())}function markdownToHtml(text){const source=String(text||\"\").replace(/\\r\\n/g,\"\\n\").replace(/\\r/g,\"\\n\");if(!source)return\"\";const lines=source.split(\"\\n\"),blocks=[];let index=0;for(;index<lines.length;){const line=String(lines[index]||\"\"),trimmed=line.trim();if(!trimmed){index+=1;continue}const fenceMatch=trimmed.match(/^```(?:\\s*(.*?))?\\s*$/);if(fenceMatch){const inlineTitle=String(fenceMatch[1]||\"\").trim(),rawCodeLines=[];for(index+=1;index<lines.length&&!/^```/.test(String(lines[index]||\"\").trim());)rawCodeLines.push(lines[index]),index+=1;index<lines.length&&(index+=1);let title=inlineTitle,codeLines=rawCodeLines;if(!title&&rawCodeLines.length>1){const firstLine=String(rawCodeLines[0]||\"\").trim();firstLine&&(title=firstLine,codeLines=rawCodeLines.slice(1))}title||(title=\"text\"),blocks.push(`<pre class=\"chat-code\"><div class=\"chat-code-lang\">${escapeHtml(title)}</div><code>${escapeHtml(codeLines.join(\"\\n\"))}</code></pre>`);continue}if(index+1<lines.length&&line.includes(\"|\")&&lines[index+1].includes(\"|\")&&splitMarkdownTableRow(lines[index+1]).every(cell=>/^:?-{3,}:?$/.test(cell))){const headerCells=splitMarkdownTableRow(line),rows=[];for(index+=2;index<lines.length&&String(lines[index]||\"\").includes(\"|\");)rows.push(splitMarkdownTableRow(lines[index])),index+=1;blocks.push(`<table><thead><tr>${headerCells.map(cell=>`<th>${renderMarkdownInline(cell)}</th>`).join(\"\")}</tr></thead><tbody>${rows.map(cells=>`<tr>${cells.map(cell=>`<td>${renderMarkdownInline(cell)}</td>`).join(\"\")}</tr>`).join(\"\")}</tbody></table>`);continue}const headingMatch=trimmed.match(/^(#{1,6})\\s+(.+)$/);if(headingMatch){const level=headingMatch[1].length;blocks.push(`<h${level}>${renderMarkdownInline(headingMatch[2])}</h${level}>`),index+=1;continue}if(/^([-*_]\\s*){3,}$/.test(trimmed)){blocks.push(\"<hr />\"),index+=1;continue}if(/^>\\s?/.test(trimmed)){const quoteLines=[];for(;index<lines.length&&/^>\\s?/.test(String(lines[index]||\"\").trim());)quoteLines.push(String(lines[index]||\"\").replace(/^\\s*>\\s?/,\"\")),index+=1;blocks.push(`<blockquote>${quoteLines.map(quote=>renderMarkdownInline(quote)).join(\"<br />\")}</blockquote>`);continue}if(/^(\\s*)([-+*]|\\d+\\.)\\s+/.test(line)){const ordered=/\\d+\\./.test(trimmed),listItems=[];for(;index<lines.length&&/^(\\s*)([-+*]|\\d+\\.)\\s+/.test(String(lines[index]||\"\"));)listItems.push(String(lines[index]||\"\").replace(/^(\\s*)([-+*]|\\d+\\.)\\s+/,\"\")),index+=1;blocks.push(`<${ordered?\"ol\":\"ul\"}>${listItems.map(item=>`<li>${renderMarkdownInline(item)}</li>`).join(\"\")}</${ordered?\"ol\":\"ul\"}>`);continue}const paragraphLines=[];for(;index<lines.length&&String(lines[index]||\"\").trim();)paragraphLines.push(lines[index]),index+=1;blocks.push(`<p>${renderMarkdownInline(paragraphLines.join(\"\\n\"))}</p>`)}return blocks.join(\"\")}function renderChatTranscript(forceFollow=!1){const host=$(\"chatTranscript\");if(!host)return;ensureChatTranscriptBehavior();const shouldFollow=forceFollow||chatTranscriptAutoFollow||chatTranscriptIsNearBottom(host),turns=[];let currentTurn=null;(chatState.messages||[]).forEach((message,messageIndex)=>{const entry={message,messageIndex};if(\"user\"===message.role||!currentTurn)return currentTurn={number:turns.length+1,messages:[entry]},void turns.push(currentTurn);currentTurn.messages.push(entry)});const nextHtml=turns.map(turn=>{const turnMessages=turn.messages.map(({message,messageIndex})=>{const title=\"assistant\"===message.role?`${message.modelLabel||\"Model\"}:`:\"user\"===message.role?\"User:\":\"System:\",thinkingView=\"assistant\"===message.role?chatMessageThinkingView(message):{reasoningText:\"\",contentText:String(message?.text||\"\")},body=markdownToHtml(thinkingView.contentText||\"\"),thinkingActive=chatMessageThinkingActive(message),thinkingExpanded=void 0!==message.thinkingExpanded?!!message.thinkingExpanded:thinkingActive,thinkingDuration=formatChatThinkingDuration(thinkingActive?Date.now()-Number(message.thinkingStartedAt||Date.now()):message.thinkingDurationMs),thinkingTitle=thinkingDuration?`${thinkingActive?\"Thinking\":\"Thought\"} for ${thinkingDuration}`:thinkingActive?\"Thinking\":\"Thought\",thinkingSubtitle=thinkingActive?\"Reasoning is streaming live.\":thinkingExpanded?\"Tap to collapse.\":\"Tap to expand.\",thinkingCard=thinkingView.reasoningText?`<div class=\"chat-thinking-card ${thinkingActive?\"thinking-live\":\"thinking-done\"} ${thinkingExpanded?\"expanded\":\"collapsed\"}\"><button type=\"button\" class=\"chat-thinking-toggle\" onclick=\"toggleChatReasoning(${messageIndex})\" aria-expanded=\"${thinkingExpanded?\"true\":\"false\"}\"><span class=\"chat-thinking-copy\"><span class=\"chat-thinking-title\">${escapeHtml(thinkingTitle)}</span><span class=\"chat-thinking-subtitle\">${escapeHtml(thinkingSubtitle)}</span></span><span class=\"chat-thinking-chevron\">${svgIcon(thinkingExpanded?\"chevron-up\":\"chevron-right\")}</span></button>${thinkingExpanded?`<div class=\"chat-thinking-body\">${markdownToHtml(thinkingView.reasoningText)}</div>`:\"\"}</div>`:\"\",attachments=chatMessageAttachments(message),imageAttachments=attachments.filter(attachment=>\"image\"===attachment?.kind),fileAttachments=attachments.filter(attachment=>\"image\"!==attachment?.kind),files=fileAttachments.length?`<div class=\"chat-message-attachments\">${fileAttachments.map(attachment=>`<div class=\"chat-message-attachment ${chatAttachmentKindClass(attachment)}\"><span class=\"chat-attachment-name\">${escapeHtml(attachment?.name||\"file\")}</span></div>`).join(\"\")}</div>`:\"\",images=imageAttachments.length?`<div class=\"chat-inline-images\">${imageAttachments.map(image=>`<img src=\"${image.url}\" alt=\"${escapeHtml(image.name||\"image\")}\" />`).join(\"\")}</div>`:\"\";return`<div class=\"chat-message chat-${message.role}\"><div class=\"chat-message-title\">${escapeHtml(title)}</div><div class=\"chat-message-body\">${thinkingCard}${body}${files}${images}</div></div>`}).join(\"\");return`<div class=\"chat-turn\"><div class=\"chat-turn-divider\"><span class=\"chat-turn-label\">Turn #${turn.number}</span></div>${turnMessages}</div>`}).join(\"\");host.innerHTML!==nextHtml&&(host.innerHTML=nextHtml),shouldFollow&&(host.scrollTop=host.scrollHeight),syncChatThinkingTicker()}function renderChatRuntimeStatsLegacy(){const host=$(\"chatRuntimeStats\");if(!host)return;const runtime=activeChatRuntime();host.innerHTML=runtime?`<div class=\"value\">${escapeHtml(runtime.display_name||runtime.id||\"Runtime\")}</div><div class=\"value-subline\">${escapeHtml([runtime.mode||\"-\",runtime.container||\"no container\",Array.isArray(runtime.gpu_indices)&&runtime.gpu_indices.length?`GPUs ${runtime.gpu_indices.join(\", \")}`:\"GPU mapping unavailable\"].join(\" · \"))}</div><div class=\"value-subline\">${formatLastStatusCard(runtime,{}).replace(/<[^>]+>/g,\" \")}</div>${null!==runtime.prompt_tps&&void 0!==runtime.prompt_tps?`<div class=\"value-subline\">${escapeHtml(`prompt ${formatNumber(runtime.prompt_tps,2)} tk/s`)}</div>`:\"\"}${null!==runtime.generation_tps&&void 0!==runtime.generation_tps?`<div class=\"value-subline\">${escapeHtml(`generation ${formatNumber(runtime.generation_tps,2)} tk/s`)}</div>`:\"\"}${null!==runtime.last_total_tokens&&void 0!==runtime.last_total_tokens?`<div class=\"value-subline\">${escapeHtml(`last total ${formatCompactInt(runtime.last_total_tokens)} tokens`)}</div>`:\"\"}`:'<div class=\"empty-variant-note\">Start a preset to test it from the local chat interface.</div>'}function renderChatRuntimeStats(){const host=$(\"chatRuntimeStats\");if(!host)return;const runtime=activeChatRuntime();host.innerHTML=runtime?formatGenerationRuntimeCard(runtime):'<div class=\"empty-variant-note\">Start a preset to test it from the local chat interface.</div>'}function toggleChatStatsCollapsed(){chatState.statsCollapsed=!chatState.statsCollapsed,persistChatConversationState(),renderChatUi()}function renderChatUi(){const toggle=$(\"chatSettingsToggle\");toggle&&(toggle.innerHTML=svgIcon(\"gear\")),$(\"chatOptionsMenu\")&&$(\"chatOptionsMenu\").classList.toggle(\"hidden\",!chatOptionsMenuOpen),renderConversationSelector(),renderChatPresetSelector(),renderChatApiPresetSelector(),renderChatAttachments(),renderChatTranscript(),renderChatRuntimeStats(),handleChatInputResize();const runtime=activeChatRuntime();if($(\"chatStatsCard\")&&$(\"chatStatsCard\").classList.toggle(\"collapsed\",!!chatState.statsCollapsed),$(\"chatStatsToggleBtn\")&&($(\"chatStatsToggleBtn\").innerHTML=svgIcon(chatState.statsCollapsed?\"chevron-down\":\"chevron-up\")),$(\"chatSendBtn\")){const hasDraft=!!String($(\"chatInput\")?.value||\"\").trim()||!!(chatState.attachments||[]).length;$(\"chatSendBtn\").disabled=!runtime||!chatState.busy&&!hasDraft,$(\"chatSendBtn\").classList.toggle(\"is-stop\",!!chatState.busy),$(\"chatSendBtn\").innerHTML=svgIcon(chatState.busy?\"stop\":\"send\")}$(\"chatAttachBtn\")&&($(\"chatAttachBtn\").disabled=chatState.busy),$(\"chatMicBtn\")&&($(\"chatMicBtn\").disabled=chatState.busy,$(\"chatMicBtn\").classList.toggle(\"recording\",!!chatRecognition?.__active)),$(\"chatConversationNewBtn\")&&($(\"chatConversationNewBtn\").disabled=chatState.busy),$(\"chatConversationEditBtn\")&&($(\"chatConversationEditBtn\").disabled=chatState.busy),$(\"chatConversationDeleteBtn\")&&($(\"chatConversationDeleteBtn\").disabled=chatState.busy),syncHeaderChatButtonAlignment()}function chatTextAttachmentName(prefix=\"pasted\"){return`${prefix}-${(new Date).toISOString().replace(/[:.]/g,\"-\")}.md`}function isTextAttachmentFile(file){const type=String(file?.type||\"\").toLowerCase(),name=String(file?.name||\"\").toLowerCase();return type.startsWith(\"text/\")||/(json|javascript|typescript|yaml|xml|csv|x-sh)/.test(type)||/\\.(txt|md|markdown|json|jsonl|csv|tsv|ya?ml|xml|html?|css|jsx?|tsx?|mjs|cjs|py|sh|bash|zsh|log|ini|cfg|conf)$/i.test(name)}function readFileAsDataUrl(file){return new Promise((resolve,reject)=>{const reader=new FileReader;reader.onload=()=>resolve(String(reader.result||\"\")),reader.onerror=()=>reject(reader.error||new Error(`Failed to read ${file?.name||\"file\"}.`)),reader.readAsDataURL(file)})}async function uploadChatImageAttachment(file,source=\"file\"){const response=await fetch(\"/admin/chat-attachments\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({kind:\"image\",name:file?.name||\"image\",mime:file?.type||\"image/*\",source,data_url:await readFileAsDataUrl(file)})}),payload=await response.json();if(!response.ok||!payload?.ok||!payload?.attachment)throw new Error(payload?.error||`Failed to upload ${file?.name||\"image\"}.`);return cloneChatAttachment(payload.attachment)}async function buildChatAttachmentsFromFiles(files,source=\"file\"){const additions=[];for(const file of files||[])if(file)if(String(file.type||\"\").toLowerCase().startsWith(\"image/\"))additions.push(await uploadChatImageAttachment(file,source));else{if(!isTextAttachmentFile(file))throw new Error(`Unsupported attachment type: ${file.name||\"file\"}. Attach text files or images only.`);additions.push({id:chatAttachmentId(),kind:\"text\",name:file.name||`attachment-${additions.length+1}.txt`,mime:file.type||\"text/plain\",text:await file.text(),source})}return additions}function addChatAttachments(additions){Array.isArray(additions)&&additions.length&&(chatState.attachments=[...chatState.attachments||[],...additions],persistChatConversationState(),renderChatAttachments())}function openChatAttachmentPicker(){chatState.busy||$(\"chatAttachmentInput\")?.click()}async function handleChatAttachmentSelect(event){const files=Array.from(event?.target?.files||[]);if(files.length)try{addChatAttachments(await buildChatAttachmentsFromFiles(files)),setChatMsg(\"\")}catch(e){setChatMsg(String(e||\"\"))}finally{event?.target&&(event.target.value=\"\")}}async function handleChatPaste(event){const clipboard=event?.clipboardData;if(!clipboard)return;const files=Array.from(clipboard.files||[]).filter(Boolean);if(files.length){event.preventDefault();try{addChatAttachments(await buildChatAttachmentsFromFiles(files,\"paste\")),setChatMsg(\"\")}catch(e){setChatMsg(String(e||\"\"))}return}const text=String(clipboard.getData(\"text/plain\")||\"\");text.length<1024||(event.preventDefault(),addChatAttachments([{id:chatAttachmentId(),kind:\"text\",name:chatTextAttachmentName(),mime:\"text/markdown\",text,source:\"paste\"}]),setChatMsg(\"Attached the pasted text as a Markdown file.\"))}function speechRecognitionCtor(){return window.SpeechRecognition||window.webkitSpeechRecognition||null}function appendChatInputText(text){const input=$(\"chatInput\");if(!input)return;const current=String(input.value||\"\");input.value=current?`${current}${/\\s$/.test(current)?\"\":\" \"}${text}`:text,input.dispatchEvent(new Event(\"input\",{bubbles:!0}))}function ensureChatRecognition(){if(chatRecognition)return chatRecognition;const Ctor=speechRecognitionCtor();if(!Ctor)return null;const recognition=new Ctor;return recognition.continuous=!0,recognition.interimResults=!1,recognition.lang=navigator.language||\"en-US\",recognition.onstart=()=>{recognition.__active=!0,setChatMsg(\"Listening for dictation...\"),renderChatUi()},recognition.onend=()=>{recognition.__active=!1,chatState.busy||setChatMsg(\"\"),renderChatUi()},recognition.onerror=event=>{recognition.__active=!1,setChatMsg(`Voice dictation error: ${event?.error||\"unknown error\"}`),renderChatUi()},recognition.onresult=event=>{const chunks=[];for(let index=event.resultIndex;index<event.results.length;index+=1){const result=event.results[index];result?.isFinal&&chunks.push(String(result[0]?.transcript||\"\").trim())}const text=chunks.filter(Boolean).join(\" \");text&&appendChatInputText(text)},chatRecognition=recognition,recognition}function toggleChatDictation(){const recognition=ensureChatRecognition();if(recognition)try{recognition.__active?recognition.stop():recognition.start()}catch(e){setChatMsg(String(e||\"Unable to toggle voice dictation.\"))}else setChatMsg(\"Voice dictation is not available in this browser.\")}function chatAttachmentTextBlock(attachment){return`Attached file: ${attachment?.name||\"attachment\"}\\n\\n${attachment?.text||\"\"}`}function activeChatRequestParams(){const preset=chatApiPresetOptions().find(item=>String(item?.name||\"\")===String(chatState.apiPresetName||\"\"));return preset?{...defaultChatParams(),...normalizePresetParamsForChat(preset.params||{})}:cloneChatParams(chatState.params)}function chatMessageReasoningText(message){return String(message?.reasoningText||message?.reasoning_content||message?.reasoning||\"\")}function splitThinkingBlocks(text){const blocks=[],content=String(text||\"\").replace(/<(think|thinking)>([\\s\\S]*?)<\\/\\1>/gi,(_,_tag,body)=>{const clean=String(body||\"\").trim();return clean&&blocks.push(clean),\"\\n\\n\"});return{reasoningText:blocks.join(\"\\n\\n\").trim(),contentText:content.replace(/\\n{3,}/g,\"\\n\\n\").trim()}}function chatMessageThinkingView(message){const inline=splitThinkingBlocks(message?.text||\"\"),direct=chatMessageReasoningText(message).trim(),parts=[];return direct&&parts.push(direct),inline.reasoningText&&!parts.includes(inline.reasoningText)&&parts.push(inline.reasoningText),{reasoningText:parts.join(\"\\n\\n\").trim(),contentText:inline.reasoningText?inline.contentText:String(message?.text||\"\")}}function clampChatThinkingDurationMs(value){const numeric=Number(value);return!Number.isFinite(numeric)||numeric<0?0:Math.round(numeric)}function formatChatThinkingDuration(value){const ms=clampChatThinkingDurationMs(value);if(!ms)return\"\";const seconds=ms/1e3,digits=seconds>=10?0:1,formatted=trimFormattedNumber(seconds.toFixed(digits));return`${formatted} second${\"1\"===formatted?\"\":\"s\"}`}function chatMessageThinkingActive(message){return!!message?.thinkingLive}function finalizeChatThinkingState(message,collapse=!0){message&&(message.thinkingStartedAt?message.thinkingDurationMs=clampChatThinkingDurationMs(Date.now()-Number(message.thinkingStartedAt||0)):message.thinkingDurationMs=clampChatThinkingDurationMs(message.thinkingDurationMs),message.thinkingLive=!1,message.thinkingDone=!!chatMessageThinkingView(message).reasoningText,collapse&&message.thinkingDone&&(message.thinkingExpanded=!1))}function syncChatThinkingTicker(){const needsTicker=!!chatState.busy&&(chatState.messages||[]).some(message=>chatMessageThinkingActive(message));needsTicker&&!chatThinkingTicker?chatThinkingTicker=setInterval(()=>{renderChatTranscript()},250):!needsTicker&&chatThinkingTicker&&(clearInterval(chatThinkingTicker),chatThinkingTicker=null)}function toggleChatReasoning(messageIndex){const idx=Number(messageIndex);if(!Number.isInteger(idx)||idx<0)return;const message=(chatState.messages||[])[idx];if(!message||!chatMessageThinkingView(message).reasoningText)return;const expanded=void 0!==message.thinkingExpanded?!!message.thinkingExpanded:chatMessageThinkingActive(message);message.thinkingExpanded=!expanded,persistChatConversationState(),renderChatTranscript()}function buildChatRequestMessages(messages=chatState.messages||[]){const preserveThinking=!!activeChatRequestParams().preserve_thinking;return(messages||[]).map(message=>{if(\"user\"!==message.role){const view=\"assistant\"===message.role?chatMessageThinkingView(message):{reasoningText:\"\",contentText:String(message?.text||\"\")},payload={role:message.role,content:view.contentText||\"\"};return\"assistant\"===message.role&&preserveThinking&&view.reasoningText&&(payload.reasoning_content=view.reasoningText),payload}const attachments=chatMessageAttachments(message),content=[];return message.text&&content.push({type:\"text\",text:message.text}),attachments.forEach(attachment=>{\"image\"===attachment?.kind&&attachment?.url?content.push({type:\"image_url\",image_url:{url:attachment.url}}):\"text\"===attachment?.kind&&attachment?.text&&content.push({type:\"text\",text:chatAttachmentTextBlock(attachment)})}),content.length?1===content.length&&\"text\"===content[0].type?{role:message.role,content:content[0].text}:{role:message.role,content}:null}).filter(Boolean)}function parseChatStreamFrame(frame){const lines=String(frame||\"\").split(/\\r?\\n/);let eventName=\"message\";const payloadLines=[];for(const line of lines)line&&(line.startsWith(\"event:\")?eventName=line.slice(6).trim():line.startsWith(\"data:\")&&payloadLines.push(line.slice(5).trimStart()));if(!payloadLines.length)return null;const raw=payloadLines.join(\"\\n\");if(\"[DONE]\"===raw)return null;try{return{eventName,payload:JSON.parse(raw)}}catch(e){return{eventName,payload:{text:raw}}}}function stopChatGeneration(){if(chatRequestController){setChatMsg(\"Stopping generation...\");try{chatRequestController.abort()}catch(e){}}}async function sendChatMessage(){if(chatState.busy)return void stopChatGeneration();const runtime=activeChatRuntime(),input=$(\"chatInput\"),text=String(input?.value||\"\").trim(),pendingAttachments=[...chatState.attachments||[]];if(!runtime)return setChatMsg(\"Start a preset before using local chat.\");if(!text&&!pendingAttachments.length)return;if(!chatRuntimeSupportsVision(runtime)&&pendingAttachments.some(attachment=>\"image\"===attachment?.kind))return setChatMsg(\"The selected container does not advertise vision support, so image attachments are disabled for this request.\");const userMessage={role:\"user\",text,attachments:pendingAttachments};try{await maybeCompactChatConversation(runtime,userMessage)}catch(e){return setChatMsg(String(e||\"\"),\"error\")}const assistantMessage={role:\"assistant\",text:\"\",reasoningText:\"\",thinkingStartedAt:0,thinkingDurationMs:0,thinkingLive:!1,thinkingDone:!1,thinkingExpanded:!0,modelLabel:runtime.served_model_name||runtime.model_id||runtime.mode||\"Model\"},shouldAutoNameConversation=0===(chatState.messages||[]).length,requestHistory=[...chatState.messages||[],userMessage];chatState.messages=[...requestHistory,assistantMessage],chatState.attachments=[],chatState.busy=!0,chatTranscriptAutoFollow=!0,input&&(input.value=\"\"),persistChatConversationState(),renderChatUi(),renderChatTranscript(!0),setChatMsg(\"Generating message...\");const assistantIndex=chatState.messages.length-1;try{const requestBody={instance_id:runtime.id||runtime.instance_id,mode:runtime.selector||runtime.mode,model:runtime.served_model_name||runtime.model_id,messages:buildChatRequestMessages(requestHistory),params:{...chatState.params},api_preset:chatState.apiPresetName||\"\"};chatRequestController=new AbortController;const raw=await fetch(\"/admin/chat-stream\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify(requestBody),signal:chatRequestController.signal});if(!raw.ok||!raw.body){let errorText=\"Chat request failed\";try{errorText=(await raw.json()).error||errorText}catch(e){}throw new Error(errorText)}const reader=raw.body.getReader(),decoder=new TextDecoder(\"utf-8\");let buffer=\"\",streamFinished=!1;for(;;){const{value,done}=await reader.read();buffer+=decoder.decode(value||new Uint8Array,{stream:!done});const frames=buffer.split(\"\\n\\n\");buffer=frames.pop()||\"\";for(const frame of frames){const event=parseChatStreamFrame(frame);if(event)if(\"delta\"===event.eventName)chatMessageThinkingActive(chatState.messages[assistantIndex])&&finalizeChatThinkingState(chatState.messages[assistantIndex]),chatState.messages[assistantIndex].text+=String(event.payload?.text||\"\"),renderChatTranscript(!0);else if(\"reasoning\"===event.eventName){const assistant=chatState.messages[assistantIndex];assistant.thinkingStartedAt||(assistant.thinkingStartedAt=Date.now()),assistant.thinkingLive=!0,assistant.thinkingDone=!1,assistant.thinkingExpanded=!0,assistant.reasoningText+=String(event.payload?.text||\"\"),assistant.thinkingDurationMs=clampChatThinkingDurationMs(Date.now()-Number(assistant.thinkingStartedAt||Date.now())),renderChatTranscript(!0)}else if(\"tool\"===event.eventName)chatMessageThinkingActive(chatState.messages[assistantIndex])&&finalizeChatThinkingState(chatState.messages[assistantIndex]),setChatMsg(event.payload?.message||`Running tool ${event.payload?.name||\"\"}...`);else if(\"status\"===event.eventName)setChatMsg(String(event.payload?.message||\"\"));else{if(\"error\"===event.eventName)throw new Error(event.payload?.error||event.payload?.message||\"Chat stream failed.\");if(\"done\"===event.eventName){chatMessageThinkingActive(chatState.messages[assistantIndex])&&finalizeChatThinkingState(chatState.messages[assistantIndex]),updateConversationRuntimeMetrics(activeChatConversation(),runtime,event.payload||{}),streamFinished=!0,setChatMsg(\"\");break}}}if(done||streamFinished)break}if(!streamFinished&&buffer.trim()){const event=parseChatStreamFrame(buffer);if(\"delta\"===event?.eventName)chatMessageThinkingActive(chatState.messages[assistantIndex])&&finalizeChatThinkingState(chatState.messages[assistantIndex]),chatState.messages[assistantIndex].text+=String(event.payload?.text||\"\"),renderChatTranscript(!0);else if(\"reasoning\"===event?.eventName){const assistant=chatState.messages[assistantIndex];assistant.thinkingStartedAt||(assistant.thinkingStartedAt=Date.now()),assistant.thinkingLive=!0,assistant.thinkingDone=!1,assistant.thinkingExpanded=!0,assistant.reasoningText+=String(event.payload?.text||\"\"),assistant.thinkingDurationMs=clampChatThinkingDurationMs(Date.now()-Number(assistant.thinkingStartedAt||Date.now())),renderChatTranscript(!0)}else if(\"tool\"===event?.eventName)chatMessageThinkingActive(chatState.messages[assistantIndex])&&finalizeChatThinkingState(chatState.messages[assistantIndex]),setChatMsg(event.payload?.message||`Running tool ${event.payload?.name||\"\"}...`);else if(\"status\"===event?.eventName)setChatMsg(String(event.payload?.message||\"\"));else{if(\"error\"===event?.eventName)throw new Error(event.payload?.error||event.payload?.message||\"Chat stream failed.\");\"done\"===event?.eventName&&(chatMessageThinkingActive(chatState.messages[assistantIndex])&&finalizeChatThinkingState(chatState.messages[assistantIndex]),updateConversationRuntimeMetrics(activeChatConversation(),runtime,event.payload||{}),setChatMsg(\"\"))}}if((chatMessageThinkingActive(chatState.messages[assistantIndex])||chatState.messages[assistantIndex].reasoningText)&&finalizeChatThinkingState(chatState.messages[assistantIndex]),chatState.messages[assistantIndex].text.trim()||chatMessageThinkingView(chatState.messages[assistantIndex]).reasoningText||(chatState.messages[assistantIndex].text=\"[No text returned]\"),setChatMsg(\"\"),refreshStatus({force:!0}).catch(()=>{}),shouldAutoNameConversation){maybeAutoNameConversation(chatState.activeConversationId).catch(()=>{})}}catch(e){const aborted=\"AbortError\"===e?.name||/aborted|abort/i.test(String(e?.message||e||\"\"));chatMessageThinkingActive(chatState.messages[assistantIndex])&&finalizeChatThinkingState(chatState.messages[assistantIndex],!aborted),String(chatState.messages[assistantIndex]?.text||\"\").trim()||chatMessageThinkingView(chatState.messages[assistantIndex]||{}).reasoningText||(chatState.messages=chatState.messages.filter((_,index)=>index!==assistantIndex)),setChatMsg(aborted?\"Generation stopped.\":String(e||\"\"),aborted?\"warning\":\"error\")}finally{chatState.busy=!1,chatRequestController=null,persistChatConversationState(),renderChatUi()}}switchMode=function(mode){return switchInventoryVariant(mode)},switchDualMode=function(mode){return switchInventoryVariant(mode)},ensureDynamicPresetLayout(),ensurePresetActionModal(),renderPresetScopeTabs(),renderModelInstallStatus(),renderDynamicPresetModels(),refreshStatus({force:!0}).catch(()=>{});</script></body></html>"
 class CommonMixin:
     def log_message(self, fmt, *args):
         return
+    def queue_header(self, name, value):
+        pending = list(getattr(self, "_pending_headers", []) or [])
+        pending.append((str(name), str(value)))
+        self._pending_headers = pending
+    def emit_pending_headers(self):
+        for name, value in list(getattr(self, "_pending_headers", []) or []):
+            self.send_header(name, value)
+        self._pending_headers = []
     def read_json_body(self):
         n = int(self.headers.get("content-length","0") or "0")
         body = self.rfile.read(n) if n else b"{}"
@@ -5111,6 +8995,7 @@ class CommonMixin:
         self.close_connection = True
         self.send_response(code)
         self.send_header("Location", location)
+        self.emit_pending_headers()
         self.send_header("Content-Length", "0")
         self.send_header("Connection", "close")
         self.end_headers()
@@ -5118,6 +9003,7 @@ class CommonMixin:
         self.close_connection = True
         self.send_response(code)
         self.send_header("Content-Type", content_type)
+        self.emit_pending_headers()
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Connection", "close")
         self.end_headers()
@@ -5128,12 +9014,20 @@ class CommonMixin:
 class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     def require_auth(self):
+        client_ip = self.client_address[0] if self.client_address else ""
+        if admin_session_ok(self.headers, client_ip):
+            return True
         auth_header = self.headers.get("Authorization","")
         if check_basic_auth(auth_header):
+            self.queue_header("Set-Cookie", build_admin_session_cookie(create_admin_session(client_ip)))
             return True
-        log_audit("admin_auth_denied", client=(self.client_address[0] if self.client_address else ""), path=self.path)
+        if parse_cookie_header(self.headers.get("Cookie", "")).get(ADMIN_SESSION_COOKIE_NAME):
+            self.queue_header("Set-Cookie", expired_admin_session_cookie())
+        if should_log_admin_auth_denial(client_ip, self.path):
+            log_audit("admin_auth_denied", client=client_ip, path=self.path)
         self.send_response(401)
         self.send_header("WWW-Authenticate", 'Basic realm="club-3090"')
+        self.emit_pending_headers()
         self.send_header("Content-Length", "0")
         self.send_header("Connection", "close")
         self.end_headers()
@@ -5141,6 +9035,10 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
     def send_sse_event(self, event_name, payload):
         body = json.dumps(payload, ensure_ascii=False)
         self.wfile.write(f"event: {event_name}\ndata: {body}\n\n".encode("utf-8", errors="replace"))
+        try:
+            self.wfile.flush()
+        except Exception:
+            pass
         self.wfile.flush()
     def send_sse_comment(self, text="ping"):
         self.wfile.write(f": {text}\n\n".encode("utf-8", errors="replace"))
@@ -5168,6 +9066,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             self.send_header("Content-Type","text/event-stream")
             self.send_header("Cache-Control","no-cache")
             self.send_header("Connection","keep-alive")
+            self.emit_pending_headers()
             self.end_headers()
             self.stream_logs(parsed)
             return
@@ -5178,6 +9077,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             self.send_header("Content-Type","text/event-stream")
             self.send_header("Cache-Control","no-cache")
             self.send_header("Connection","keep-alive")
+            self.emit_pending_headers()
             self.end_headers()
             self.stream_text_file(AUDIT_LOG_FILE, "no audit entries yet; waiting...", initial_tail_lines=parse_tail_lines_param(params, 250))
             return
@@ -5192,6 +9092,20 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             return
         if path == "/admin/groups":
             self.send_json({"ok": True, "groups": list_groups_public(), "users": list_users_public(), "server_config": read_server_config()})
+            return
+        if path == "/admin/mcp":
+            self.send_json({"ok": True, "servers": list_mcp_server_statuses()})
+            return
+        if path == "/admin/chat-state":
+            self.send_json({"ok": True, "state": read_chat_state()})
+            return
+        if path.startswith("/admin/chat-attachments/"):
+            attachment_id = re.sub(r"[^A-Za-z0-9._-]+", "", path.rsplit("/", 1)[-1])
+            payload, content_type = read_chat_attachment_response(attachment_id)
+            if payload is None:
+                self.send_error(404)
+                return
+            self.send_bytes(payload, f"{content_type}; charset=utf-8" if content_type.startswith("text/") else content_type)
             return
         if path == "/admin/control-log":
             try:
@@ -5215,10 +9129,12 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
         if path == "/admin/switch":
             try:
                 data = self.read_json_body()
-                instance_id = data.get("instance_id")
-                mode = data.get("mode")
-                if mode not in MODES:
+                instance_id = str(data.get("instance_id") or "").strip().upper()
+                mode = canonical_mode_selector(data.get("mode"))
+                spec = resolve_variant_spec(mode)
+                if not spec:
                     raise ValueError("Invalid mode")
+                scope_kind = str(spec.get("scope_kind") or "")
                 if is_legacy_global_instance_id(instance_id):
                     if mode not in DUAL_GPU_MODES:
                         raise ValueError("Preset type does not match the selected instance scope")
@@ -5226,6 +9142,111 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                     result = run_switch(mode)
                     log_audit("admin_switch_mode_legacy_global", instance="GLOBAL", mode=mode, stop_rc=rc)
                     self.send_json({"ok": True, "instance": legacy_global_instance_snapshot(), "mode": mode, "output": (stop_msg + "\n" + result)[-12000:], "stopped_instances": ([{"id": "GLOBAL", "rc": rc, "output": stop_msg[-1200:]}] if stop_msg else []), "instances": instances_snapshot(), "running_dual_instances": running_dual_instance_snapshots()})
+                    return
+                if instance_id == "GLOBAL" and scope_kind == "single":
+                    targets = [inst for inst in read_instances_config() if inst.get("kind") == "single"]
+                    if not targets:
+                        raise ValueError("No single-GPU targets are available")
+                    wanted_indices = []
+                    for target in targets:
+                        wanted_indices.extend(target.get("gpu_indices") or [target.get("gpu_index")])
+                    stopped = stop_overlapping_instances(wanted_indices)
+                    updated_targets = [update_instance(target["id"], mode=mode, enabled=True) for target in targets]
+                    outputs = []
+                    _set_switch_job(
+                        active=True,
+                        status="booting",
+                        mode=mode,
+                        target="GLOBAL",
+                        started_at=int(time.time()),
+                        finished_at=0,
+                        error="",
+                    )
+                    try:
+                        for target in updated_targets:
+                            result = start_instance(target["id"], track_switch_job=False)
+                            outputs.append(f"{target['id']}: {(result.get('output') or '')[-2400:]}")
+                        clear_switch_failure(mode)
+                        _set_switch_job(
+                            active=False,
+                            status="success",
+                            mode=mode,
+                            target="GLOBAL",
+                            finished_at=int(time.time()),
+                            error="",
+                        )
+                    except Exception as e:
+                        write_switch_failure(mode, e)
+                        _set_switch_job(
+                            active=False,
+                            status="failed",
+                            mode=mode,
+                            target="GLOBAL",
+                            finished_at=int(time.time()),
+                            error=str(e)[-12000:],
+                        )
+                        raise
+                    log_audit("admin_switch_mode_global_single", instance="GLOBAL", mode=mode, targets=[row["id"] for row in updated_targets], stopped_instances=[row["id"] for row in stopped])
+                    self.send_json({"ok": True, "instance": None, "mode": mode, "output": "\n\n".join(outputs)[-12000:], "stopped_instances": stopped, "instances": instances_snapshot(), "running_dual_instances": running_dual_instance_snapshots()})
+                    return
+                if instance_id == "GLOBAL" and scope_kind == "dual":
+                    gpu_count = detect_gpu_count_runtime()
+                    if gpu_count == 2 and not gpu_pairing_enabled(gpu_count=gpu_count):
+                        rc, stop_msg = stop_legacy_global_instance()
+                        result = run_switch(mode)
+                        log_audit("admin_switch_mode_legacy_global", instance="GLOBAL", mode=mode, stop_rc=rc)
+                        self.send_json({"ok": True, "instance": legacy_global_instance_snapshot(), "mode": mode, "output": (stop_msg + "\n" + result)[-12000:], "stopped_instances": ([{"id": "GLOBAL", "rc": rc, "output": stop_msg[-1200:]}] if stop_msg else []), "instances": instances_snapshot(), "running_dual_instances": running_dual_instance_snapshots()})
+                        return
+                    pair_targets = sequential_global_gpu_pairs(gpu_count)
+                    if not pair_targets:
+                        raise ValueError("At least two GPUs are required before applying a dual preset globally")
+                    stopped = stop_overlapping_instances([idx for pair in pair_targets for idx in pair])
+                    updated_targets = []
+                    outputs = []
+                    _set_switch_job(
+                        active=True,
+                        status="booting",
+                        mode=mode,
+                        target="GLOBAL",
+                        started_at=int(time.time()),
+                        finished_at=0,
+                        error="",
+                    )
+                    try:
+                        for pair in pair_targets:
+                            target = save_pair_instance(pair, mode=mode, enabled=True)
+                            target = update_instance(target["id"], mode=mode, enabled=True)
+                            updated_targets.append(target)
+                            result = start_instance(target["id"], track_switch_job=False)
+                            outputs.append(f"{target['id']}: {(result.get('output') or '')[-2400:]}")
+                        clear_switch_failure(mode)
+                        _set_switch_job(
+                            active=False,
+                            status="success",
+                            mode=mode,
+                            target="GLOBAL",
+                            finished_at=int(time.time()),
+                            error="",
+                        )
+                    except Exception as e:
+                        write_switch_failure(mode, e)
+                        _set_switch_job(
+                            active=False,
+                            status="failed",
+                            mode=mode,
+                            target="GLOBAL",
+                            finished_at=int(time.time()),
+                            error=str(e)[-12000:],
+                        )
+                        raise
+                    log_audit("admin_switch_mode_global_dual", instance="GLOBAL", mode=mode, targets=[row["id"] for row in updated_targets], stopped_instances=[row["id"] for row in stopped])
+                    self.send_json({"ok": True, "instance": None, "mode": mode, "output": "\n\n".join(outputs)[-12000:], "stopped_instances": stopped, "instances": instances_snapshot(), "running_dual_instances": running_dual_instance_snapshots()})
+                    return
+                if instance_id == "GLOBAL" and scope_kind in {"multi", "global_only"}:
+                    stop_msg = cleanup_vllm_containers()
+                    result = run_switch(mode)
+                    log_audit("admin_switch_mode_global", instance="GLOBAL", mode=mode)
+                    self.send_json({"ok": True, "instance": None, "mode": mode, "output": (str(stop_msg) + "\n" + result)[-12000:], "stopped_instances": [], "instances": instances_snapshot(), "running_dual_instances": running_dual_instance_snapshots()})
                     return
                 if instance_id:
                     target = get_instance(instance_id)
@@ -5236,10 +9257,16 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                         raise ValueError("Preset type does not match the selected instance scope")
                     stopped = stop_overlapping_instances(target.get("gpu_indices") or [target.get("gpu_index")])
                     updated = update_instance(instance_id, mode=mode, enabled=True)
-                    result = start_instance(updated["id"], wait=True)
+                    result = start_instance(updated["id"])
                     log_audit("admin_switch_mode", instance=updated["id"], mode=mode, stopped_instances=[row["id"] for row in stopped])
                     self.send_json({"ok": True, "instance": instance_snapshot(updated), "mode": mode, "output": result.get("output", ""), "stopped_instances": stopped, "instances": instances_snapshot(), "running_dual_instances": running_dual_instance_snapshots()})
                 else:
+                    if scope_kind in {"multi", "global_only"}:
+                        stop_msg = cleanup_vllm_containers()
+                        result = run_switch(mode)
+                        log_audit("admin_switch_mode_global", instance="GLOBAL", mode=mode)
+                        self.send_json({"ok": True, "instance": None, "mode": mode, "output": (str(stop_msg) + "\n" + result)[-12000:], "stopped_instances": [], "instances": instances_snapshot(), "running_dual_instances": running_dual_instance_snapshots()})
+                        return
                     if detect_gpu_count_runtime() == 2 and not gpu_pairing_enabled():
                         rc, stop_msg = stop_vllm_container("legacy_dual_switch")
                         result = run_switch(mode)
@@ -5252,9 +9279,80 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                     target = pairs[0]
                     stopped = stop_overlapping_instances(target.get("gpu_indices") or [target.get("gpu_index")])
                     updated = update_instance(target["id"], mode=mode, enabled=True)
-                    result = start_instance(updated["id"], wait=True)
+                    result = start_instance(updated["id"])
                     log_audit("admin_switch_mode_pair_default", instance=updated["id"], mode=mode, stopped_instances=[row["id"] for row in stopped])
                     self.send_json({"ok": True, "instance": instance_snapshot(updated), "mode": mode, "output": result.get("output", ""), "stopped_instances": stopped, "instances": instances_snapshot(), "running_dual_instances": running_dual_instance_snapshots()})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path == "/admin/rebuild-inventory":
+            try:
+                inventory = rebuild_runtime_inventory()
+                log_audit("admin_runtime_inventory_rebuilt", models=len(inventory.get("models") or []), variants=len(inventory.get("variants") or []))
+                self.send_json({"ok": True, "runtime_inventory": inventory, "models": inventory.get("models") or [], "variants": inventory.get("variants") or []})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path == "/admin/model-install":
+            try:
+                data = self.read_json_body()
+                job = start_model_install_job(
+                    data.get("model_id"),
+                    data.get("variant_id"),
+                    data.get("install_command"),
+                )
+                self.send_json({"ok": True, "model_install_job": job, "focus_log_source": "audit"})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path == "/admin/benchmark":
+            try:
+                job = start_admin_task_job("benchmark")
+                self.send_json({"ok": True, "admin_task_job": job, "focus_log_source": "audit"})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path == "/admin/run-report":
+            try:
+                job = start_admin_task_job("report")
+                self.send_json({"ok": True, "admin_task_job": job, "focus_log_source": "audit"})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path == "/admin/update":
+            try:
+                data = self.read_json_body()
+                result = start_self_update_job(data.get("scope"))
+                self.send_json(result)
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path == "/admin/chat-stream":
+            try:
+                data = self.read_json_body()
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+                return
+            stream_admin_chat_request(self, data)
+            return
+        if path == "/admin/chat":
+            try:
+                data = self.read_json_body()
+                self.send_json(run_admin_chat_request(data))
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path == "/admin/chat-state":
+            try:
+                data = self.read_json_body()
+                self.send_json({"ok": True, "state": write_chat_state(data)})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path == "/admin/chat-attachments":
+            try:
+                data = self.read_json_body()
+                self.send_json({"ok": True, "attachment": save_chat_attachment(data)})
             except Exception as e:
                 self.send_json({"ok": False, "error": str(e)}, 500)
             return
@@ -5272,17 +9370,17 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                     if is_legacy_global_instance_id(instance_id):
                         rc, msg = stop_legacy_global_instance()
                     else:
-                        rc, msg = stop_vllm_container("manual_admin", instance_id=instance_id)
+                        rc, msg = stop_runtime_scope(instance_id=instance_id, mode=data.get("mode"))
                     out = {"container_stop_rc": rc, "container_stop_output": msg, "cpu": apply_cpu_idle_power(), "gpu": apply_gpu_idle_power()}
                 elif action == "start_instance":
-                    out = start_legacy_global_instance(wait=True) if is_legacy_global_instance_id(instance_id) else start_instance(instance_id, wait=True)
+                    out = start_legacy_global_instance() if is_legacy_global_instance_id(instance_id) else start_instance(instance_id)
                 elif action == "restart_instance":
                     if is_legacy_global_instance_id(instance_id):
                         stop_legacy_global_instance()
-                        out = start_legacy_global_instance(wait=True)
+                        out = start_legacy_global_instance()
                     else:
                         stop_vllm_container("manual_restart", instance_id=instance_id)
-                        out = start_instance(instance_id, wait=True)
+                        out = start_instance(instance_id)
                 elif action == "toggle_enabled":
                     enabled = bool(data.get("enabled"))
                     if is_legacy_global_instance_id(instance_id) or (not instance_id and detect_gpu_count_runtime() == 2 and not gpu_pairing_enabled(gpu_count=2)):
@@ -5343,12 +9441,52 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             except Exception as e:
                 self.send_json({"ok": False, "error": str(e)}, 500)
             return
+        if path == "/admin/mcp":
+            try:
+                data = self.read_json_body()
+                action = str(data.get("action") or "").strip().lower()
+                rows = sanitize_mcp_servers(read_server_config().get("mcp_servers") or [])
+                if action == "save":
+                    row = {
+                        "id": str(data.get("id") or "").strip() or secrets.token_hex(6),
+                        "name": str(data.get("name") or "").strip() or "mcp-server",
+                        "command": str(data.get("command") or "").strip(),
+                        "enabled": bool(data.get("enabled", True)),
+                    }
+                    validate_mcp_server_row(row)
+                    rows = [item for item in rows if str(item.get("id") or "") != row["id"]] + [row]
+                    write_server_config({"mcp_servers": rows})
+                    log_audit("admin_mcp_saved", server=row["id"], enabled=row["enabled"])
+                elif action == "delete":
+                    server_id = str(data.get("id") or "").strip()
+                    rows = [item for item in rows if str(item.get("id") or "") != server_id]
+                    write_server_config({"mcp_servers": rows})
+                    close_removed_mcp_clients(rows)
+                    log_audit("admin_mcp_deleted", server=server_id)
+                elif action == "toggle":
+                    server_id = str(data.get("id") or "").strip()
+                    enabled = bool(data.get("enabled"))
+                    for row in rows:
+                        if str(row.get("id") or "") == server_id:
+                            row["enabled"] = enabled
+                            if enabled:
+                                validate_mcp_server_row(row)
+                            break
+                    write_server_config({"mcp_servers": rows})
+                    if not enabled:
+                        close_removed_mcp_clients([row for row in rows if row.get("enabled")])
+                    log_audit("admin_mcp_toggled", server=server_id, enabled=enabled)
+                else:
+                    raise ValueError("Invalid MCP action")
+                self.send_json({"ok": True, "servers": list_mcp_server_statuses()})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
         if path == "/admin/ui-config":
             try:
                 data = self.read_json_body()
-                cfg = write_ui_config(data)
-                log_audit("admin_ui_config", keys=sorted(list((data or {}).keys())))
-                self.send_json({"ok": True, "ui_config": cfg})
+                cfg, changed = write_ui_config(data)
+                self.send_json({"ok": True, "ui_config": cfg, "changed": changed})
             except Exception as e:
                 self.send_json({"ok": False, "error": str(e)}, 500)
             return
@@ -5424,6 +9562,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                     self.send_json({"ok": True, "user": user, "api_key": api_key})
                     return
                 if action == "save_server_config":
+                    before_cfg = read_server_config()
                     cfg_data = {}
                     if "allow_proxy_without_api_key" in data:
                         cfg_data["allow_proxy_without_api_key"] = bool(data.get("allow_proxy_without_api_key", True))
@@ -5431,7 +9570,8 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                         cfg_data["gpu_pairing_enabled"] = bool(data.get("gpu_pairing_enabled"))
                     cfg = write_server_config(cfg_data)
                     read_instances_config()
-                    log_audit("admin_server_config", allow_proxy_without_api_key=cfg.get("allow_proxy_without_api_key", True), gpu_pairing_enabled=cfg.get("gpu_pairing_enabled"))
+                    if cfg != before_cfg:
+                        log_audit("admin_server_config", allow_proxy_without_api_key=cfg.get("allow_proxy_without_api_key", True), gpu_pairing_enabled=cfg.get("gpu_pairing_enabled"))
                     self.send_json({"ok": True, "server_config": cfg, "users": list_users_public(), "groups": list_groups_public()})
                     return
                 raise ValueError("Invalid users action")
@@ -5765,9 +9905,9 @@ class ProxyHandler(CommonMixin, BaseHTTPRequestHandler):
                         metrics["failovers"] += 1
                     log_control(f"PROXY failover attempt instance={target_id} mode={(target['mode'] if target else active_mode())} error={e}")
                     if target:
-                        start_instance(target["id"], wait=True)
+                        start_instance(target["id"])
                     else:
-                        run_switch(active_mode(), allow_fallback=False)
+                        run_switch(active_mode())
                     retry_url = f"http://127.0.0.1:{instance_runtime_port(target) if target else active_port()}" + upstream_path
                     retry_req = urllib.request.Request(retry_url, data=body, headers=headers, method=self.command)
                     with urllib.request.urlopen(retry_req, timeout=None) as r2:
@@ -5805,6 +9945,15 @@ class ProxyHandler(CommonMixin, BaseHTTPRequestHandler):
             output_tokens = max(int(response_usage.get("output_tokens") or 0), max(0, int(response_usage.get("tokens") or 0) - int(prompt_tokens)))
             total_tokens = max(int(response_usage.get("tokens") or 0), int(prompt_tokens) + int(output_tokens))
             tool_calls = int(response_usage.get("tool_calls") or 0)
+            log_metrics = runtime_log_metrics_for_container(target.get("container"), force=True) if target and target.get("container") else {}
+            display_tps = first_defined(log_metrics.get("generation_tps"), None)
+            if display_tps not in (None, "", 0, 0.0):
+                try:
+                    display_tps = round(float(display_tps), 2)
+                except Exception:
+                    display_tps = None
+            else:
+                display_tps = None
             with metrics_lock:
                 metrics["active_requests"] = max(0, metrics["active_requests"] - 1)
                 if metrics["active_requests"] <= 0:
@@ -5814,10 +9963,14 @@ class ProxyHandler(CommonMixin, BaseHTTPRequestHandler):
                     metrics["failed_requests"] += 1
                 metrics["last_latency_s"] = latency
                 metrics["last_status"] = status
+                if display_tps not in (None, "", 0, 0.0):
+                    metrics["last_tokens_per_second"] = display_tps
                 recent_requests.appendleft({"time":time.strftime("%H:%M:%S"),"status":status,"latency_s":latency,"preset":preset_name or "raw","path":self.path,"upstream":upstream_path,"instance":target_id,"user":auth_context.get("user_name") or "anonymous"})
                 target_row = dict(target_request_metrics.get(target_metrics_key) or default_target_request_metrics())
                 target_row["last_status"] = status
                 target_row["last_latency_s"] = latency
+                if display_tps not in (None, "", 0, 0.0):
+                    target_row["last_tokens_per_second"] = display_tps
                 target_row["last_input_tokens"] = prompt_tokens
                 target_row["last_output_tokens"] = output_tokens
                 target_row["last_total_tokens"] = total_tokens
@@ -5862,10 +10015,15 @@ def main():
     # This specifically guards the proxy/autostart path that depends on port_open().
     if not callable(globals().get("port_open")):
         raise RuntimeError("internal install error: port_open() is not defined")
+    load_runtime_inventory(force=not os.path.exists(RUNTIME_INVENTORY_FILE), rebuild_if_missing=True)
+    if len(sys.argv) > 1 and sys.argv[1] == "--rebuild-inventory":
+        rebuilt = rebuild_runtime_inventory()
+        print(json.dumps({"ok": True, "models": len(rebuilt.get("models") or []), "variants": len(rebuilt.get("variants") or [])}))
+        return
     if len(sys.argv) > 1 and sys.argv[1] == "--boot-enabled-instances":
         boot_enabled_instances()
         return
-    if DEFAULT_MODE in MODES and read_active_mode_file() is None:
+    if resolve_variant_spec(DEFAULT_MODE) and read_active_mode_file() is None:
         write_active_mode(DEFAULT_MODE)
     read_instances_config()
     log_control("control service starting")
@@ -6151,7 +10309,7 @@ import ast, sys
 path = sys.argv[1]
 tree = ast.parse(open(path, encoding="utf-8").read(), filename=path)
 funcs = {node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
-required = {"port_open","wait_for_port","cleanup_vllm_containers","run_switch","detected_mode","active_port","ensure_vllm_running_for_request","apply_preset","parse_preset_path","set_gpu_fans","set_power_optimizations","set_fan_max_toggle","apply_fan_curve_once","ensure_headless_x_running","run_nvidia_settings","metrics_collector","wake_on_lan","apply_performance_profile","system_stats","read_ui_config","write_ui_config","read_custom_presets","write_custom_presets","get_all_presets","preset_catalog","save_custom_preset","delete_custom_preset","serve","main"}
+required = {"port_open","wait_for_runtime_ready","cleanup_vllm_containers","run_switch","detected_mode","active_port","ensure_vllm_running_for_request","apply_preset","parse_preset_path","set_gpu_fans","set_power_optimizations","set_fan_max_toggle","apply_fan_curve_once","ensure_headless_x_running","run_nvidia_settings","metrics_collector","wake_on_lan","apply_performance_profile","system_stats","read_ui_config","write_ui_config","read_custom_presets","write_custom_presets","get_all_presets","preset_catalog","save_custom_preset","delete_custom_preset","serve","main"}
 missing = sorted(required - funcs)
 if missing:
     raise SystemExit("control.py missing required functions: " + ", ".join(missing))
@@ -6162,6 +10320,48 @@ if grep -q 'urlopen.*health\|/health.*urlopen' "${CONTROL_PY}"; then
   exit 1
 fi
 log_done "Generated files validated"
+
+if [[ "${ACTION}" == "migrate" ]]; then
+  quarantine_non_git_genesis_dirs
+  if [[ "${MIGRATION_BOOTSTRAP_INVENTORY_DONE}" != "1" ]]; then
+    rebuild_runtime_inventory_cli "MIGRATION_BOOTSTRAP_INVENTORY_DONE" "inventory_bootstrap"
+  else
+    append_control_log_line "migrate bootstrap inventory already complete; skipping"
+  fi
+  if [[ "${MIGRATION_SETUP_DONE}" != "1" ]]; then
+    append_control_log_line "migrate setup phase delegated to final update.sh run; skipping standalone setup.sh replay"
+    migration_mark_flag_done "MIGRATION_SETUP_DONE" "setup_delegated_to_update"
+  else
+    append_control_log_line "migrate setup step already complete; skipping"
+  fi
+  if [[ "${MIGRATION_POST_SETUP_INVENTORY_DONE}" != "1" ]]; then
+    append_control_log_line "migrate post-setup inventory phase skipped because update.sh owns the final setup sync"
+    migration_mark_flag_done "MIGRATION_POST_SETUP_INVENTORY_DONE" "inventory_post_setup_skipped"
+  else
+    append_control_log_line "migrate post-setup inventory already complete; skipping"
+  fi
+  if [[ "${MIGRATION_UPDATE_DONE}" != "1" ]]; then
+    log_step "Running upstream update.sh at the end of migration"
+    run_required_update_scripts
+  else
+    append_control_log_line "migrate update.sh step already complete; skipping"
+  fi
+  if [[ "${MIGRATION_FINAL_INVENTORY_DONE}" != "1" ]]; then
+    rebuild_runtime_inventory_cli "MIGRATION_FINAL_INVENTORY_DONE" "inventory_final"
+  else
+    append_control_log_line "migrate final inventory already complete; skipping"
+  fi
+  log_done "Migration setup commands completed"
+else
+  rebuild_runtime_inventory_cli
+  if [[ "${ACTION}" == "install" ]]; then
+    log_step "Running upstream update.sh at the end of install"
+    append_control_log_line "install update.sh command: bash scripts/update.sh"
+    run_live_command "upstream update.sh" "${CLUB3090_DIR}" "bash scripts/update.sh"
+    rebuild_runtime_inventory_cli "" "inventory_post_install_update"
+    log_done "Install repo update completed"
+  fi
+fi
 
 write_control_units() {
   "${SUDO[@]}" tee /etc/systemd/system/club3090-control.service >/dev/null <<UNIT
@@ -6402,7 +10602,7 @@ if [[ "${ACTION}" == "install" ]]; then
   echo
   echo "Installed club-3090 server control services."
   echo "They start unattended before login, but only when booted with kernel arg: club3090.server=1"
-else
+elif [[ "${ACTION}" == "update" ]]; then
   log_step "Refreshing systemd units and managed services for update"
   # Update the vLLM unit too so the next reboot uses the last selected mode.
   # Do not restart it here; that would interrupt a running model session.
@@ -6422,6 +10622,25 @@ else
   echo
   echo "Updated club-3090 multi-instance control plane, proxy, metrics UI, console log follower, and boot unit."
   echo "Running Docker instances were left unchanged; next server boot will restore enabled entries from ${CONTROL_DIR}/instances.json."
+else
+  log_step "Refreshing systemd units and managed services after migrate"
+  write_vllm_unit
+  write_control_units
+  configure_https_frontend
+  cleanup_legacy_fan_test_artifacts
+  log_step "Reloading systemd manager configuration"
+  "${SUDO[@]}" systemctl daemon-reload
+  log_step "Re-enabling managed club-3090 services"
+  enable_managed_units
+  log_step "Refreshing networking and frontend exposure"
+  configure_networking_and_frontend
+  log_step "Starting control-plane services if the server boot flag is active"
+  start_control_plane_services_if_booted
+  migration_mark_flag_done "MIGRATION_SERVICES_REFRESHED" "services_refreshed_after_migrate"
+  finalize_migration_state_success
+  log_done "Migrate actions completed"
+  echo
+  echo "Migrated the upstream club-3090 checkout to a fresh clone, preserved runtime/model assets, rebuilt the dynamic inventory, and refreshed the control plane."
 fi
 
 URL_SCHEME="http"
