@@ -23,8 +23,9 @@ This repository is the server-management layer. It integrates with the upstream 
 - Optional `--online use-https` mode that enables a Caddy-backed self-signed HTTPS frontend for the admin panel and proxy
 
 ## Screenshots
-
-<img width="1080" height="2408" alt="Screenshot_20260509-051933" src="https://github.com/user-attachments/assets/e54baa38-c232-457e-a0da-235638d064a4" />
+Video coming soon.
+<img width="1080" height="2408" alt="image" src="https://github.com/user-attachments/assets/3ee63ab8-7fc9-4db9-8bce-b2d2308a71fa" />
+<img width="1080" height="2408" alt="image" src="https://github.com/user-attachments/assets/85fdb73f-5e1f-4041-b30d-f787b9ec979c" />
 <img width="1080" height="2408" alt="Screenshot_20260508-074059" src="https://github.com/user-attachments/assets/bdb2e054-3da8-43fd-9667-b1101693c90e" />
 <img width="1080" height="2408" alt="Screenshot_20260509-052022" src="https://github.com/user-attachments/assets/7d46da12-21a9-40d1-a7cc-135ea9573bfb" />
 <img width="1080" height="2408" alt="Screenshot_20260509-052048" src="https://github.com/user-attachments/assets/02683f61-144e-48cb-9c22-83765fa87e20" />
