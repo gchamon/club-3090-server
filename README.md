@@ -172,7 +172,7 @@ Here is the simple mental model for the main tabs:
 - `Main`: quick status, running containers, uptime, and GPU overview
 - `System`: service controls, power/fan controls, and machine information
 - `Presets`: download models, start/stop presets, and manage which runtime is active
-- `Chat`: built-in local streaming chat client with full markdown support, configuration and mcp servers
+- `Chat`: built-in local streaming chat client with per-conversation stats caching, richer markdown support, share/export links, configuration, and local or remote MCP servers
 - `Users`: create API users and keys if you want to share the server safely
 - `Metrics`: request counts, usage history, and runtime performance data
 - `Logs`: Docker logs and audit logs for troubleshooting
@@ -306,7 +306,7 @@ bash install-club3090-server.sh --online use-https
 Updates the control layer without intentionally stopping an already-running backend:
 
 ```bash
-`curl -fsSL https://tinyurl.com/club-3090-webserver | bash -s -- --update`
+curl -fsSL https://tinyurl.com/club-3090-webserver | bash -s -- --update
 ```
 
 Or from a local copy:
@@ -420,7 +420,15 @@ That means:
 
 This prevents security bypass around API-key checks, user limits, and per-instance access controls.
 
-If you also pass `use-https`, the installer generates a self-signed certificate under `/opt/club3090-control/tls.crt` and `/opt/club3090-control/tls.key`, binds the Python control service to loopback-only internal ports, and places Caddy in front of it as the public HTTPS endpoint for both admin and proxy traffic.
+If you also pass `use-https`, the installer binds the Python control service to loopback-only internal ports and places Caddy in front of it as the public HTTPS endpoint for both admin and proxy traffic.
+
+When HTTPS mode is enabled, the installer places Caddy in front of the admin UI and proxy on the public admin/proxy ports. Direct IP access uses the self-signed certificate path under `/opt/club3090-control/tls.crt` and `/opt/club3090-control/tls.key` by default. For a browser-trusted certificate, point a DNS or DDNS hostname at the server and set `CLUB3090_HTTPS_HOST` or `CLUB3090_ONLINE_HOST`; Caddy will then request and renew a normal Let's Encrypt certificate for that hostname. Direct IP Let's Encrypt certificates are only attempted with the explicit `--online use-https:cert-ip` mode, or when you explicitly set an IP host and `CLUB3090_ENABLE_IP_LE=true`.
+
+If the server is already on Tailscale, `--online use-https:tailscale` detects the node's MagicDNS name, such as `aardwolf-halfmoon.ts.net`, and writes Caddy routes for that hostname. This avoids router port-forwarding for certificate issuance and is intended for access from devices inside the tailnet. Public internet access still requires Tailscale Funnel or a separately configured public hostname/DDNS path.
+
+`--online use-https:tailscale:enable-funnel` additionally configures Tailscale Funnel. Because Funnel only exposes HTTPS on selected public ports, the installer maps the admin UI to `https://YOUR-NODE.ts.net/admin` on public port `443` and the proxy API to `https://YOUR-NODE.ts.net:8443/v1/chat/completions`. Funnel may require interactive approval in Tailscale or a tailnet policy update the first time it is used.
+
+Tailscale HTTPS modes skip UPnP installation, router port-forwarding, and UPnP cleanup because tailnet/Funnel routing does not depend on router NAT mappings. The installer materializes the Tailscale certificate with `tailscale cert` into `/opt/club3090-control/tailscale.crt` and `/opt/club3090-control/tailscale.key`, then points the hostname-specific Caddy route at those files.
 
 ## Configurable Control Ports
 
@@ -441,7 +449,7 @@ Defaults remain:
 - admin: `8008`
 - proxy: `8009`
 
-The chosen ports are propagated into the generated control service and, when `--online` is used, those same ports are the ones opened in the firewall and requested through UPnP. In `use-https` mode, those public ports are owned by Caddy while the control service moves behind it onto internal loopback-only ports.
+The chosen ports are propagated into the generated control service and, when `--online` is used, those same ports are the ones opened in the firewall and requested through UPnP. In `use-https` mode, those public ports are owned by Caddy while the control service moves behind it onto internal loopback-only ports. The installer also opens ports `80` and `443` when needed so Caddy can complete ACME validation for automatic certificates.
 
 ## Ports and Routing
 
@@ -541,8 +549,8 @@ The admin UI is designed to control the whole server from one place. It exposes:
 - one-click runtime inventory rebuild from the web panel
 - preset-aware model downloads that stream installer output into Audit Logs
 - per-runtime generation stats cards that aggregate the latest latency, throughput, KV-cache, and token counters across all running instances
-- a local inference chat interface with realtime streaming, container and API-preset selection, markdown rendering, multi-attachment image/text upload support, paste-to-Markdown attachment conversion for long pastes, optional browser voice dictation, a compact modal chat-settings editor, and per-container generation stats
-- optional stdio MCP server integration for the local chat interface, with UI-managed add/enable/disable flows so enabled MCP tools can be exposed to the model during chat
+- a local inference chat interface with realtime streaming, container and API-preset selection, richer markdown rendering, multi-attachment image/text upload support, paste-to-Markdown attachment conversion for long pastes, optional browser voice dictation, shareable Markdown conversation exports, a compact modal chat-settings editor, and per-conversation plus per-runtime generation stats
+- optional MCP integration for the local chat interface, with UI-managed add/enable/disable flows for both local stdio commands and remote MCP URLs so enabled tools can be exposed to the model during chat
 - a Users tab for API-key users, quotas, access rules, and proxy-auth policy
 - global power profile management
 - fan control and optimization toggles
