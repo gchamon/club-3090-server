@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="2026-05-13.v5.2.42"
+SCRIPT_VERSION="2026-05-13.v0.5.42"
 
 printf 'Club-3090 Server Installer %s\n' "${SCRIPT_VERSION}"
 
