@@ -172,7 +172,7 @@ Here is the simple mental model for the main tabs:
 - `Main`: quick status, running containers, uptime, and GPU overview
 - `System`: service controls, power/fan controls, and machine information
 - `Presets`: download models, start/stop presets, and manage which runtime is active
-- `Chat`: built-in local streaming chat client with per-conversation stats caching, richer markdown support, share/export links, configuration, and local or remote MCP servers
+- `Chat`: built-in local streaming chat client with server-backed conversation storage, lazy detail loading, per-conversation stats caching, share/export links, configuration, and local or remote MCP servers
 - `Users`: create API users and keys if you want to share the server safely
 - `Metrics`: request counts, usage history, and runtime performance data
 - `Logs`: Docker logs and audit logs for troubleshooting
@@ -550,6 +550,8 @@ The admin UI is designed to control the whole server from one place. It exposes:
 - preset-aware model downloads that stream installer output into Audit Logs
 - per-runtime generation stats cards that aggregate the latest latency, throughput, KV-cache, and token counters across all running instances
 - a local inference chat interface with realtime streaming, container and API-preset selection, richer markdown rendering, multi-attachment image/text upload support, paste-to-Markdown attachment conversion for long pastes, optional browser voice dictation, shareable Markdown conversation exports, a compact modal chat-settings editor, and per-conversation plus per-runtime generation stats
+- chat conversations are stored server-side in `/opt/club3090-control/conversations/state.json`, with the conversation list loading first and individual transcripts fetched on demand to keep large histories responsive
+- assistant transcript bodies now favor a plain-text presentation path for stability, while preserving the expandable reasoning panel, attachments, exports, and per-runtime stats
 - optional MCP integration for the local chat interface, with UI-managed add/enable/disable flows for both local stdio commands and remote MCP URLs so enabled tools can be exposed to the model during chat
 - a Users tab for API-key users, quotas, access rules, and proxy-auth policy
 - global power profile management
@@ -583,6 +585,7 @@ That means:
 - It stores public/auth policy in `/opt/club3090-control/server_config.json`
 - It stores group/plan definitions in `/opt/club3090-control/groups.json`
 - It stores tracked online firewall and UPnP state in `/opt/club3090-control/network_state.json`
+- It stores chat conversations and chat prompt-template state in `/opt/club3090-control/conversations/state.json`
 - It stores API users, quotas, and usage accounting in `/opt/club3090-control/users.json`
 - It stores the loopback automation token in `/opt/club3090-control/local_api_token`
 - It applies the selected power profile before backend startup
