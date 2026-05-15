@@ -184,7 +184,7 @@ After installation, most people will want to do these things:
 1. Log in with their Linux username and password.
 2. Open `Presets`.
 3. Download the model files the desired preset needs.
-4. Click `Apply` on a recommended preset.
+4. Click `Launch` on a recommended preset.
 5. Wait until it becomes `Active`.
 6. Copy the proxy base URL `http://YOUR-SERVER-IP:8009/v1` into their AI client.
 
@@ -206,7 +206,7 @@ Try these checks in order:
 2. Confirm you can log in with your Linux user credentials.
 3. Confirm the preset you selected finished downloading.
 4. Confirm the preset reached `Active`, not just `Booting`.
-5. Read `Logs` and `Audit Logs` for the exact failure message.
+5. Read `Docker Logs` and `Audit Logs` for the exact failure message.
 6. Confirm Docker and the NVIDIA driver are working on the Linux host.
 
 If you changed the upstream repo manually or pulled a new upstream version, run update or migrate again so the control layer and upstream runtime stay in sync.
@@ -233,7 +233,7 @@ The script reads `/etc/os-release` and installs the right package names for the 
 
 ## Supported Runtime Presets
 
-As of `v5.0`, the server no longer ships a hardcoded preset catalog. Instead it scans the local upstream repo under `/opt/ai/club-3090`, parses compose headers and compose files directly, and builds `/opt/club3090-control/runtime_inventory.json`.
+As of `v0.5`, the server no longer ships a hardcoded preset catalog. Instead it scans the local upstream repo under `/opt/ai/club-3090`, parses compose headers and compose files directly, and builds `/opt/club3090-control/runtime_inventory.json`.
 
 That means the Presets tab now reflects whatever models and variants exist in the checked-out upstream repo, including:
 
@@ -549,8 +549,9 @@ The admin UI is designed to control the whole server from one place. It exposes:
 - one-click runtime inventory rebuild from the web panel
 - preset-aware model downloads that stream installer output into Audit Logs
 - per-runtime generation stats cards that aggregate the latest latency, throughput, KV-cache, and token counters across all running instances
-- a local inference chat interface with realtime streaming, container and API-preset selection, richer markdown rendering, multi-attachment image/text upload support, paste-to-Markdown attachment conversion for long pastes, optional browser voice dictation, shareable Markdown conversation exports, a compact modal chat-settings editor, and per-conversation plus per-runtime generation stats
+- a local inference chat interface with realtime streaming, container and API-preset selection, richer markdown rendering, multi-attachment image/text upload support, paste-to-Markdown attachment conversion for long pastes, optional browser voice dictation, shareable Markdown conversation exports, a compact modal chat-settings editor, per-conversation plus per-runtime generation stats, and archived-chat restore flows
 - chat conversations are stored server-side in `/opt/club3090-control/conversations/state.json`, with the conversation list loading first and individual transcripts fetched on demand to keep large histories responsive
+- chat conversations archive by default from the Chats tab so they can be restored later from Chat Options; hold `Shift` while using the archive button for permanent deletion instead
 - assistant transcript bodies now favor a plain-text presentation path for stability, while preserving the expandable reasoning panel, attachments, exports, and per-runtime stats
 - optional MCP integration for the local chat interface, with UI-managed add/enable/disable flows for both local stdio commands and remote MCP URLs so enabled tools can be exposed to the model during chat
 - a Users tab for API-key users, quotas, access rules, and proxy-auth policy
