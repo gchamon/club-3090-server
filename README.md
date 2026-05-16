@@ -2,11 +2,16 @@
 
 Single-file installer for a [club-3090](https://github.com/noonghunna/club-3090) inference host, providing a full-featured browser admin control panel, distro-aware install/update logic, systemd service setup, a reverse proxy that automatically routes requests to the correct containers via a single endpoint with optional configurable vLLM setting presets, live log management, GPU power and fan speed controls, multi-instance GPU orchestration, and API access control for multiple users.
 
-This repository is the server-management layer. It integrates with the upstream [club-3090](https://github.com/noonghunna/club-3090) runtime and, on a fresh install, now clones that upstream repo automatically into `/opt/ai/club-3090` before wiring up the control plane.
+This repository is the server-management layer. It integrates with the upstream [club-3090](https://github.com/noonghunna/club-3090) runtime and, on a fresh install clones that upstream repo automatically into `/opt/ai/club-3090` before wiring up the control plane.
+
+## Important Notes
+
+- Users are encouraged to first deploy [club-3090](https://github.com/noonghunna/club-3090) to /opt/ai/, follow the Quick Start Guide in the original project and ensure that everything works correctly before attempting to deploy Club-3090-Server. If /opt/ai/club-3090 is not found, the script will automatically clone the latest repo for you and deploy it in that location and attempt to run setup.sh and set everything up for you anyway, but it's best to first familiarize yourself with the original project's strengths and ensure it meets your needs and works correctly before attempting to host a server.
+- The latest release of this script may or may not be up to date with the original repo's fast evolving architecture. To avoid unforeseen issues, make sure the commit of [club-3090](https://github.com/noonghunna/club-3090) you're using with club-3090-server matches the expected version from the latest release. You may also simply trust the installer and let it pull the latest commit but your YMMV depending on whether the original project has introduced breaking changes since this script was last updated.
 
 ## What This Script Provides
 
-- Fully self contained installer/updater script that handles everything you need to self-host a club-3090 based inference server, optimized for headless Arch and Debian/Ubuntu based distros with docker logs automatically printed to tty1
+- Fully self contained script that handles everything you need to self-host a club-3090 based inference server, optimized for headless Arch and Debian/Ubuntu based distros
 - A control stack installed under `/opt/club3090-control` and an admin web panel running on `localhost:8008/admin`
 - An OpenAI-compatible proxy on `:8009` so you can chat with the LLM on a unified port regardless of what docker containers are in use.
 - GPU-aware backend selection with per-GPU and multi-instance runtime management for single-card, dual-card or multi-card presets with dynamic runtime inventory discovery from the local `club-3090` checkout
@@ -21,6 +26,7 @@ This repository is the server-management layer. It integrates with the upstream 
 - An optional loopback-only automation API for local tools on the same machine
 - Optional `--online` mode that opens and forwards only the admin/proxy ports to the internet
 - Optional `--online use-https` mode that enables a Caddy-backed self-signed HTTPS frontend for the admin panel and proxy
+- Docker logs automatically printed to tty1 and last instance autostart if the kernel condition club3090.server=1 is active
 
 ## Screenshots
 Video coming soon.
