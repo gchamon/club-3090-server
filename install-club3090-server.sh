@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="2026-05-16.v0.6.68"
+SCRIPT_VERSION="2026-05-16.v0.6.69"
 
 printf 'Club-3090 Server Installer %s\n' "${SCRIPT_VERSION}"
 
@@ -266,6 +266,25 @@ fi
 
 if [[ -n "${HF_TOKEN_VALUE}" ]]; then
   export HF_TOKEN="${HF_TOKEN_VALUE}"
+fi
+
+if [[ "${ACTION}" == "update" || "${ACTION}" == "migrate" ]]; then
+  existing_online_enabled="$(read_existing_server_flag "online_enabled" || true)"
+  existing_https_enabled="$(read_existing_server_flag "https_enabled" || true)"
+  existing_local_api_enabled="$(read_existing_server_flag "local_api_enabled" || true)"
+  existing_https_host="$(cat "${HTTPS_HOST_FILE}" 2>/dev/null || true)"
+  if [[ "${ONLINE_MODE}" != "enable" && "${existing_online_enabled}" == "true" ]]; then
+    ONLINE_MODE="enable"
+  fi
+  if [[ "${ONLINE_TLS_MODE}" != "enable" && "${existing_https_enabled}" == "true" ]]; then
+    ONLINE_TLS_MODE="enable"
+  fi
+  if [[ "${LOCAL_AUTOMATION_MODE}" != "enable" && "${existing_local_api_enabled}" == "true" ]]; then
+    LOCAL_AUTOMATION_MODE="enable"
+  fi
+  if [[ "${ONLINE_TLS_MODE}" == "enable" && "${ONLINE_TLS_TAILSCALE_MODE}" != "enable" && "${existing_https_host}" == *.ts.net ]]; then
+    ONLINE_TLS_TAILSCALE_MODE="enable"
+  fi
 fi
 
 ONLINE_EFFECTIVE_ENABLED="false"
@@ -963,13 +982,14 @@ rebuild_runtime_inventory_cli() {
 }
 
 collect_required_setup_commands() {
-  "${SUDO[@]}" env CLUB3090_DIR="${CLUB3090_DIR}" "${PYTHON_BIN}" - "${CONTROL_DIR}" <<'PYSETUPCMDS'
+  "${SUDO[@]}" env CLUB3090_DIR="${CLUB3090_DIR}" DEFAULT_MODE="${DEFAULT_MODE}" "${PYTHON_BIN}" - "${CONTROL_DIR}" <<'PYSETUPCMDS'
 import json, os, sys
 control_dir = sys.argv[1]
 inventory_path = os.path.join(control_dir, "runtime_inventory.json")
 instances_path = os.path.join(control_dir, "instances.json")
 active_mode_path = os.path.join(control_dir, "active_mode")
 last_good_mode_path = os.path.join(control_dir, "last_good_mode")
+default_mode = str(os.environ.get("DEFAULT_MODE") or "").strip()
 def load_json(path, default):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -989,6 +1009,8 @@ for variant in variants:
         if key:
             lookup[str(key)] = variant
 modes = []
+if default_mode:
+    modes.append(default_mode)
 for value in (read_text(active_mode_path), read_text(last_good_mode_path)):
     if value:
         modes.append(value)
@@ -1011,13 +1033,14 @@ PYSETUPCMDS
 }
 
 collect_required_update_models() {
-  "${SUDO[@]}" env CLUB3090_DIR="${CLUB3090_DIR}" "${PYTHON_BIN}" - "${CONTROL_DIR}" <<'PYUPDATEMODELS'
+  "${SUDO[@]}" env CLUB3090_DIR="${CLUB3090_DIR}" DEFAULT_MODE="${DEFAULT_MODE}" "${PYTHON_BIN}" - "${CONTROL_DIR}" <<'PYUPDATEMODELS'
 import json, os, sys
 control_dir = sys.argv[1]
 inventory_path = os.path.join(control_dir, "runtime_inventory.json")
 instances_path = os.path.join(control_dir, "instances.json")
 active_mode_path = os.path.join(control_dir, "active_mode")
 last_good_mode_path = os.path.join(control_dir, "last_good_mode")
+default_mode = str(os.environ.get("DEFAULT_MODE") or "").strip()
 def load_json(path, default):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -1037,6 +1060,8 @@ for variant in variants:
         if key:
             lookup[str(key)] = variant
 modes = []
+if default_mode:
+    modes.append(default_mode)
 for value in (read_text(active_mode_path), read_text(last_good_mode_path)):
     if value:
         modes.append(value)
@@ -1060,10 +1085,13 @@ PYUPDATEMODELS
 
 run_required_setup_commands() {
   local commands=()
+  local action_label="${ACTION:-install}"
   mapfile -t commands < <(collect_required_setup_commands)
   if [[ "${#commands[@]}" -eq 0 ]]; then
-    append_control_log_line "migrate setup: no required setup commands detected from persisted state"
-    migration_mark_flag_done "MIGRATION_SETUP_DONE" "setup_skipped_no_commands"
+    append_control_log_line "${action_label} setup: no required setup commands detected from runtime inventory"
+    if [[ "${ACTION}" == "migrate" ]]; then
+      migration_mark_flag_done "MIGRATION_SETUP_DONE" "setup_skipped_no_commands"
+    fi
     return 0
   fi
   local cmd
@@ -1072,11 +1100,15 @@ run_required_setup_commands() {
   for cmd in "${commands[@]}"; do
     [[ -n "${cmd}" ]] || continue
     idx=$((idx + 1))
-    migration_update_state "setup_command_${idx}_of_${total}"
-    append_control_log_line "migrate setup command: ${cmd}"
+    if [[ "${ACTION}" == "migrate" ]]; then
+      migration_update_state "setup_command_${idx}_of_${total}"
+    fi
+    append_control_log_line "${action_label} setup command: ${cmd}"
     run_live_command "model setup ${idx}/${total}" "${CLUB3090_DIR}" "${cmd}"
   done
-  migration_mark_flag_done "MIGRATION_SETUP_DONE" "setup_complete"
+  if [[ "${ACTION}" == "migrate" ]]; then
+    migration_mark_flag_done "MIGRATION_SETUP_DONE" "setup_complete"
+  fi
 }
 
 run_required_update_scripts() {
@@ -2106,6 +2138,9 @@ HOP_HEADERS = {"connection","keep-alive","proxy-authenticate","proxy-authorizati
 switch_lock = threading.Lock()
 metrics_lock = threading.Lock()
 runtime_ready_probe_cache = {}
+runtime_bootstrap_marker_cache = {}
+docker_log_path_cache = {}
+chat_audit_context = threading.local()
 auth_cache = {}
 AUTH_CACHE_SECONDS = 120
 ADMIN_SESSION_COOKIE_NAME = "club3090_admin_session"
@@ -2327,11 +2362,33 @@ def log_audit(event_type, **fields):
 def debug_audit(event_type, **fields):
     if not DEBUG_LOGS:
         return
+    if (
+        getattr(chat_audit_context, "suppress_debug", 0)
+        and str(event_type or "").strip().lower().startswith("chat_")
+    ):
+        return
     safe_fields = {"debug": True, "script_version": SCRIPT_VERSION}
     for key, value in fields.items():
         if value not in (None, ""):
             safe_fields[key] = value
     log_audit(f"debug_{str(event_type or '').strip() or 'event'}", **safe_fields)
+
+
+class suppress_chat_debug_audit:
+    def __enter__(self):
+        chat_audit_context.suppress_debug = int(getattr(chat_audit_context, "suppress_debug", 0) or 0) + 1
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        current = int(getattr(chat_audit_context, "suppress_debug", 0) or 0)
+        if current <= 1:
+            try:
+                delattr(chat_audit_context, "suppress_debug")
+            except Exception:
+                chat_audit_context.suppress_debug = 0
+        else:
+            chat_audit_context.suppress_debug = current - 1
+        return False
 
 
 def script_user_agent():
@@ -3555,43 +3612,37 @@ def delete_chat_conversation(conversation_id):
     conversation_id = str(conversation_id or "").strip()
     if not conversation_id:
         raise ValueError("Conversation id is required.")
-    state = read_chat_state()
-    conversations = list(state.get("conversations") or [])
-    archived_conversations = list(state.get("archivedConversations") or [])
-    conversation = next(
-        (row for row in conversations + archived_conversations if str(row.get("id") or "") == conversation_id),
-        None,
-    )
-    if not conversation:
-        raise ValueError("Conversation not found.")
-    next_rows = [row for row in conversations if str(row.get("id") or "") != conversation_id]
-    next_archived_rows = [row for row in archived_conversations if str(row.get("id") or "") != conversation_id]
-    next_active_id = str(state.get("activeConversationId") or "").strip()
-    if next_active_id == conversation_id:
-        next_active_id = str(next_rows[0].get("id") or "") if next_rows else ""
-    next_state = write_chat_state(
-        {
-            "revision": max(0, int(state.get("revision") or 0)) + 1,
-            "activeConversationId": next_active_id,
-            "conversations": next_rows,
-            "archivedConversations": next_archived_rows,
-            "promptTemplates": state.get("promptTemplates") or [],
-        }
-    )
-    debug_audit(
-        "chat_conversation_delete",
-        conversation_id=conversation_id,
-        previous_revision=max(0, int(state.get("revision") or 0)),
-        next_revision=max(0, int(next_state.get("revision") or 0)),
-        remaining_conversation_count=len(next_state.get("conversations") or []),
-        next_active_conversation_id=str(next_state.get("activeConversationId") or "").strip(),
-    )
+    with suppress_chat_debug_audit():
+        state = read_chat_state()
+        conversations = list(state.get("conversations") or [])
+        archived_conversations = list(state.get("archivedConversations") or [])
+        conversation = next(
+            (row for row in conversations + archived_conversations if str(row.get("id") or "") == conversation_id),
+            None,
+        )
+        if not conversation:
+            raise ValueError("Conversation not found.")
+        next_rows = [row for row in conversations if str(row.get("id") or "") != conversation_id]
+        next_archived_rows = [row for row in archived_conversations if str(row.get("id") or "") != conversation_id]
+        next_active_id = str(state.get("activeConversationId") or "").strip()
+        if next_active_id == conversation_id:
+            next_active_id = str(next_rows[0].get("id") or "") if next_rows else ""
+        next_state = write_chat_state(
+            {
+                "revision": max(0, int(state.get("revision") or 0)) + 1,
+                "activeConversationId": next_active_id,
+                "conversations": next_rows,
+                "archivedConversations": next_archived_rows,
+                "promptTemplates": state.get("promptTemplates") or [],
+            }
+        )
     log_audit(
         "admin_chat_delete",
         conversation_id=conversation_id,
         title=str(conversation.get("title") or "").strip() or "Untitled conversation",
-        messages=len(conversation.get("messages") or []),
-        attachments=len(conversation.get("attachments") or []),
+    )
+    append_audit_text_line(
+        f"[chat] deleted conversation {conversation_id} title={str(conversation.get('title') or '').strip() or 'Untitled conversation'}"
     )
     return {
         "ok": True,
@@ -3604,45 +3655,38 @@ def archive_chat_conversation(conversation_id):
     conversation_id = str(conversation_id or "").strip()
     if not conversation_id:
         raise ValueError("Conversation id is required.")
-    state = read_chat_state()
-    conversations = list(state.get("conversations") or [])
-    archived_conversations = list(state.get("archivedConversations") or [])
-    conversation = next((row for row in conversations if str(row.get("id") or "") == conversation_id), None)
-    if not conversation:
-        raise ValueError("Conversation not found.")
-    archived_row = sanitize_chat_conversation(conversation)
-    archived_row["archivedAt"] = int(time.time() * 1000)
-    next_rows = [row for row in conversations if str(row.get("id") or "") != conversation_id]
-    next_archived_rows = [archived_row] + [
-        row for row in archived_conversations if str(row.get("id") or "") != conversation_id
-    ]
-    next_active_id = str(state.get("activeConversationId") or "").strip()
-    if next_active_id == conversation_id:
-        next_active_id = str(next_rows[0].get("id") or "") if next_rows else ""
-    next_state = write_chat_state(
-        {
-            "revision": max(0, int(state.get("revision") or 0)) + 1,
-            "activeConversationId": next_active_id,
-            "conversations": next_rows,
-            "archivedConversations": next_archived_rows,
-            "promptTemplates": state.get("promptTemplates") or [],
-        }
-    )
-    debug_audit(
-        "chat_conversation_archive",
-        conversation_id=conversation_id,
-        previous_revision=max(0, int(state.get("revision") or 0)),
-        next_revision=max(0, int(next_state.get("revision") or 0)),
-        remaining_conversation_count=len(next_state.get("conversations") or []),
-        archived_conversation_count=len(next_state.get("archivedConversations") or []),
-        next_active_conversation_id=str(next_state.get("activeConversationId") or "").strip(),
-    )
+    with suppress_chat_debug_audit():
+        state = read_chat_state()
+        conversations = list(state.get("conversations") or [])
+        archived_conversations = list(state.get("archivedConversations") or [])
+        conversation = next((row for row in conversations if str(row.get("id") or "") == conversation_id), None)
+        if not conversation:
+            raise ValueError("Conversation not found.")
+        archived_row = sanitize_chat_conversation(conversation)
+        archived_row["archivedAt"] = int(time.time() * 1000)
+        next_rows = [row for row in conversations if str(row.get("id") or "") != conversation_id]
+        next_archived_rows = [archived_row] + [
+            row for row in archived_conversations if str(row.get("id") or "") != conversation_id
+        ]
+        next_active_id = str(state.get("activeConversationId") or "").strip()
+        if next_active_id == conversation_id:
+            next_active_id = str(next_rows[0].get("id") or "") if next_rows else ""
+        next_state = write_chat_state(
+            {
+                "revision": max(0, int(state.get("revision") or 0)) + 1,
+                "activeConversationId": next_active_id,
+                "conversations": next_rows,
+                "archivedConversations": next_archived_rows,
+                "promptTemplates": state.get("promptTemplates") or [],
+            }
+        )
     log_audit(
         "admin_chat_archive",
         conversation_id=conversation_id,
         title=str(conversation.get("title") or "").strip() or "Untitled conversation",
-        messages=len(conversation.get("messages") or []),
-        attachments=len(conversation.get("attachments") or []),
+    )
+    append_audit_text_line(
+        f"[chat] archived conversation {conversation_id} title={str(conversation.get('title') or '').strip() or 'Untitled conversation'}"
     )
     return {
         "ok": True,
@@ -3655,42 +3699,35 @@ def restore_chat_conversation(conversation_id):
     conversation_id = str(conversation_id or "").strip()
     if not conversation_id:
         raise ValueError("Conversation id is required.")
-    state = read_chat_state()
-    conversations = list(state.get("conversations") or [])
-    archived_conversations = list(state.get("archivedConversations") or [])
-    conversation = next((row for row in archived_conversations if str(row.get("id") or "") == conversation_id), None)
-    if not conversation:
-        raise ValueError("Archived conversation not found.")
-    restored_row = sanitize_chat_conversation(conversation)
-    restored_row.pop("archivedAt", None)
-    restored_row["updatedAt"] = int(time.time() * 1000)
-    restored_row["lastUsedAt"] = restored_row["updatedAt"]
-    next_rows = [restored_row] + [row for row in conversations if str(row.get("id") or "") != conversation_id]
-    next_archived_rows = [row for row in archived_conversations if str(row.get("id") or "") != conversation_id]
-    next_state = write_chat_state(
-        {
-            "revision": max(0, int(state.get("revision") or 0)) + 1,
-            "activeConversationId": conversation_id,
-            "conversations": next_rows,
-            "archivedConversations": next_archived_rows,
-            "promptTemplates": state.get("promptTemplates") or [],
-        }
-    )
-    debug_audit(
-        "chat_conversation_restore",
-        conversation_id=conversation_id,
-        previous_revision=max(0, int(state.get("revision") or 0)),
-        next_revision=max(0, int(next_state.get("revision") or 0)),
-        conversation_count=len(next_state.get("conversations") or []),
-        archived_conversation_count=len(next_state.get("archivedConversations") or []),
-        next_active_conversation_id=str(next_state.get("activeConversationId") or "").strip(),
-    )
+    with suppress_chat_debug_audit():
+        state = read_chat_state()
+        conversations = list(state.get("conversations") or [])
+        archived_conversations = list(state.get("archivedConversations") or [])
+        conversation = next((row for row in archived_conversations if str(row.get("id") or "") == conversation_id), None)
+        if not conversation:
+            raise ValueError("Archived conversation not found.")
+        restored_row = sanitize_chat_conversation(conversation)
+        restored_row.pop("archivedAt", None)
+        restored_row["updatedAt"] = int(time.time() * 1000)
+        restored_row["lastUsedAt"] = restored_row["updatedAt"]
+        next_rows = [restored_row] + [row for row in conversations if str(row.get("id") or "") != conversation_id]
+        next_archived_rows = [row for row in archived_conversations if str(row.get("id") or "") != conversation_id]
+        next_state = write_chat_state(
+            {
+                "revision": max(0, int(state.get("revision") or 0)) + 1,
+                "activeConversationId": conversation_id,
+                "conversations": next_rows,
+                "archivedConversations": next_archived_rows,
+                "promptTemplates": state.get("promptTemplates") or [],
+            }
+        )
     log_audit(
         "admin_chat_restore",
         conversation_id=conversation_id,
         title=str(conversation.get("title") or "").strip() or "Untitled conversation",
-        messages=len(conversation.get("messages") or []),
-        attachments=len(conversation.get("attachments") or []),
+    )
+    append_audit_text_line(
+        f"[chat] restored conversation {conversation_id} title={str(conversation.get('title') or '').strip() or 'Untitled conversation'}"
     )
     return {
         "ok": True,
@@ -7365,7 +7402,8 @@ def instance_assignment(instance, dual_mode=None):
             "text": f"GPUs {', '.join(str(idx) for idx in gpu_indices)} are reserved for dual preset {runtime_mode}",
             "override": False,
         }
-    for pair in running_dual_instances():
+    active_pairs = dual_mode if isinstance(dual_mode, list) else running_dual_instances()
+    for pair in active_pairs:
         pair_indices = {int(idx) for idx in pair.get("gpu_indices") or []}
         if set(gpu_indices).intersection(pair_indices):
             return {
@@ -7382,13 +7420,13 @@ def instance_assignment(instance, dual_mode=None):
         "override": False,
     }
 
-def instance_snapshot(instance):
+def instance_snapshot(instance, dual_mode=None):
     container = instance_runtime_container_name(instance)
     runtime_mode = instance_runtime_mode(instance)
     runtime_port = instance_runtime_port(instance)
     ready_url = f"http://127.0.0.1:{runtime_port}/v1/models"
     boot_state = runtime_boot_state(container, ready_url)
-    assigned = instance_assignment(instance)
+    assigned = instance_assignment(instance, dual_mode=dual_mode)
     return {
         "id": instance["id"],
         "kind": instance.get("kind", "single"),
@@ -7411,7 +7449,8 @@ def instance_snapshot(instance):
     }
 
 def instances_snapshot():
-    return [instance_snapshot(inst) for inst in visible_instances(read_instances_config())]
+    active_pairs = running_dual_instances()
+    return [instance_snapshot(inst, dual_mode=active_pairs) for inst in visible_instances(read_instances_config())]
 
 def legacy_global_instance_snapshot():
     if detect_gpu_count_runtime() != 2 or gpu_pairing_enabled(gpu_count=2):
@@ -7502,8 +7541,8 @@ def runtime_boot_state(container_name="", ready_url=""):
     try:
         if name:
             ready = bool(state.get("running")) and (
-                _container_bootstrap_complete(name)
-                or _runtime_models_available_once(name, target_url, min_interval=15)
+                _runtime_models_available_once(name, target_url, min_interval=15)
+                or _container_bootstrap_complete(name)
             )
     except Exception:
         ready = False
@@ -7925,22 +7964,19 @@ class RuntimeLogWatcher:
     def _load_initial_snapshot(self):
         try:
             tail_lines = max(0, int(LOG_INITIAL_TAIL_LINES or 0))
-            cmd = ["docker", "logs", "--timestamps"]
-            if tail_lines > 0:
-                cmd += ["--tail", str(tail_lines)]
-            else:
-                cmd += ["--tail", "0"]
-            cmd.append(self.container_name)
-            p = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
+            output, snapshot_error = _docker_logs_tail_snapshot(
+                self.container_name,
+                lines=tail_lines if tail_lines > 0 else 1,
+                include_timestamps=True,
                 timeout=max(1.0, float(LOG_INITIAL_SNAPSHOT_TIMEOUT_SECONDS or 15)),
             )
-            output = p.stdout or ""
+            if tail_lines <= 0:
+                output = ""
         except Exception as e:
             self._set_status(f"could not load docker logs for {self.container_name}: {e}")
+            return "", ""
+        if not output and snapshot_error:
+            self._set_status(f"could not load docker logs for {self.container_name}: {snapshot_error}")
             return "", ""
         last_timestamp = ""
         last_line = ""
@@ -10687,29 +10723,110 @@ def _docker_inspect_state(container_name):
     }
 
 
-def _docker_logs_tail(container_name, lines=80):
+def _docker_log_path(container_name):
     name = str(container_name or "").strip()
     if not name:
         return ""
+    cached = str(docker_log_path_cache.get(name) or "").strip()
+    if cached:
+        return cached
     try:
-        return subprocess.check_output(
-            ["docker", "logs", "--tail", str(max(1, int(lines))), name],
+        log_path = subprocess.check_output(
+            ["docker", "inspect", "--format", "{{.LogPath}}", name],
             text=True,
-            stderr=subprocess.STDOUT,
-            timeout=10,
+            stderr=subprocess.DEVNULL,
+            timeout=4,
+        ).strip()
+    except Exception:
+        return ""
+    if log_path:
+        docker_log_path_cache[name] = log_path
+    return log_path
+
+
+def _docker_logs_tail_via_log_path(container_name, lines=80, include_timestamps=False):
+    log_path = _docker_log_path(container_name)
+    if not log_path or not os.path.exists(log_path):
+        return ""
+    try:
+        raw = subprocess.check_output(
+            ["tail", "-n", str(max(1, int(lines))), log_path],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
         )
     except Exception:
         return ""
+    rendered = []
+    for entry in raw.splitlines():
+        try:
+            payload = json.loads(entry)
+        except Exception:
+            continue
+        text = str(payload.get("log") or "").rstrip("\n")
+        if not text:
+            continue
+        if include_timestamps:
+            stamp = str(payload.get("time") or "").strip()
+            rendered.append(f"{stamp} {text}".strip())
+        else:
+            rendered.append(text)
+    return ("\n".join(rendered) + ("\n" if rendered else ""))
+
+
+def _docker_logs_tail_snapshot(container_name, lines=80, include_timestamps=False, timeout=10):
+    name = str(container_name or "").strip()
+    if not name:
+        return "", ""
+    fallback = _docker_logs_tail_via_log_path(name, lines=lines, include_timestamps=include_timestamps)
+    if fallback:
+        return fallback, ""
+    cmd = ["docker", "logs"]
+    if include_timestamps:
+        cmd.append("--timestamps")
+    cmd += ["--tail", str(max(1, int(lines))), name]
+    try:
+        output = subprocess.check_output(
+            cmd,
+            text=True,
+            stderr=subprocess.STDOUT,
+            timeout=max(1.0, float(timeout or 10)),
+        )
+        return output, ""
+    except Exception as exc:
+        fallback = _docker_logs_tail_via_log_path(name, lines=lines, include_timestamps=include_timestamps)
+        if fallback:
+            return fallback, ""
+        return "", str(exc)
+
+
+def _docker_logs_tail(container_name, lines=80, include_timestamps=False, timeout=10):
+    output, _error = _docker_logs_tail_snapshot(
+        container_name,
+        lines=lines,
+        include_timestamps=include_timestamps,
+        timeout=timeout,
+    )
+    return output
 
 
 def _container_bootstrap_complete(container_name):
-    logs = _docker_logs_tail(container_name, lines=200)
+    name = str(container_name or "").strip()
+    if not name:
+        return False
+    if runtime_bootstrap_marker_cache.get(name):
+        return True
+    logs = _docker_logs_tail(name, lines=200, timeout=3)
     if not logs:
         return False
     marker = str(LOG_BOOTSTRAP_MARKER or "").strip()
     if marker and marker in logs:
+        runtime_bootstrap_marker_cache[name] = True
         return True
-    return "Application startup complete" in logs
+    ready = "Application startup complete" in logs
+    if ready:
+        runtime_bootstrap_marker_cache[name] = True
+    return ready
 
 
 def _runtime_models_available_once(container_name, ready_url, min_interval=15):
@@ -11093,6 +11210,35 @@ def runtime_supports_vision(spec):
 def resolve_admin_chat_target(instance_id="", mode=""):
     target_id = str(instance_id or "").strip().upper()
     selector = canonical_mode_selector(mode) if mode else ""
+    if target_id and target_id != "GLOBAL":
+        instance = get_instance(target_id)
+        if instance and instance_running(instance):
+            return {
+                "id": instance["id"],
+                "kind": instance.get("kind", "single"),
+                "gpu_index": int(instance.get("gpu_index", 0) or 0),
+                "gpu_indices": list(instance.get("gpu_indices") or [instance.get("gpu_index", 0)]),
+                "mode": instance_runtime_mode(instance),
+                "enabled": bool(instance.get("enabled")),
+                "port": instance_runtime_port(instance),
+                "container": instance_runtime_container_name(instance),
+                "running": True,
+                "booting": False,
+            }, resolve_variant_spec(instance.get("mode")) or {}
+    current_mode = active_mode()
+    current_name = current_container()
+    current_port = active_port()
+    if current_name and port_open(current_port, timeout=0.08):
+        if not selector or canonical_mode_selector(current_mode) == selector or is_legacy_global_instance_id(target_id):
+            return {
+                "id": "GLOBAL",
+                "kind": "global",
+                "mode": current_mode,
+                "container": current_name,
+                "port": current_port,
+                "running": True,
+                "gpu_indices": mode_gpu_indices(current_mode, gpu_count=detect_gpu_count_runtime()),
+            }, resolve_variant_spec(current_mode) or {}
     runtime_rows = running_runtime_rows(instances_snapshot(), legacy_global_instance_snapshot())
     if target_id:
         match = next((dict(row) for row in runtime_rows if str(row.get("id") or "").strip().upper() == target_id), None)
@@ -12230,14 +12376,18 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                 action = str(data.get("action") or "").strip().lower()
                 if action not in {"archive", "restore", "delete"}:
                     raise ValueError("Invalid conversation action.")
-                debug_audit("chat_conversation_action", action=action, conversation_id=data.get("conversation_id") or "")
                 conversation_id = data.get("conversation_id") or ""
-                if action == "archive":
-                    self.send_json(archive_chat_conversation(conversation_id))
-                elif action == "restore":
-                    self.send_json(restore_chat_conversation(conversation_id))
-                else:
-                    self.send_json(delete_chat_conversation(conversation_id))
+                with suppress_chat_debug_audit():
+                    debug_audit("chat_conversation_action", action=action, conversation_id=conversation_id)
+                    if action == "archive":
+                        result = archive_chat_conversation(conversation_id)
+                    elif action == "restore":
+                        result = restore_chat_conversation(conversation_id)
+                    else:
+                        result = delete_chat_conversation(conversation_id)
+                if isinstance(result, dict):
+                    result = {**result, "focus_log_source": "audit"}
+                self.send_json(result)
             except Exception as e:
                 debug_audit("chat_conversation_action_error", error=str(e))
                 self.send_json({"ok": False, "error": str(e)}, 500)
@@ -13416,6 +13566,10 @@ if [[ "${ACTION}" == "migrate" ]]; then
 else
   rebuild_runtime_inventory_cli
   if [[ "${ACTION}" == "install" ]]; then
+    log_step "Running required upstream setup.sh commands for install"
+    run_required_setup_commands
+    rebuild_runtime_inventory_cli "" "inventory_post_install_setup"
+    log_done "Install setup commands completed"
     log_step "Running upstream update.sh at the end of install"
     append_control_log_line "install update.sh command: bash scripts/update.sh"
     run_live_command "upstream update.sh" "${CLUB3090_DIR}" "bash scripts/update.sh"
