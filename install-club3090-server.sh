@@ -1,22 +1,32 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="2026-05-17.v0.6.79"
+SCRIPT_VERSION="2026-05-17.v0.6.82"
 CHANGE_LOG_ICONS='{"new_feature":"🟢","fix":"🐞","remove_feature":"🔴","security":"🔒","performance":"⚡","ui_ux":"🖥️","build":"🛠️","update":"🔄","docs":"📝","backend":"🧰","compatibility":"🧩","modified_feature":"⚙️"}'
 CHANGE_LOG_LATEST=$(cat <<'EOF_CHANGE_LOG_LATEST'
-- 🖥️ Locked the admin web panel to the live Logs view while self-updates or migrations are running so conflicting actions cannot be triggered mid-update.
-- 🖥️ Added remote updater awareness in the admin panel, including update-available banners, changelog previews, stronger update button highlighting, and Club-3090 compatibility warnings.
-- 🔄 Reworked the update modal to show latest and release changelogs, renamed the update actions, removed the old cancel flow, and added a direct compatible-version migration action.
-- 🧩 Added `CHANGE_LOG_LATEST`, `CHANGE_LOG_RELEASE`, `CHANGE_LOG_ICONS`, and `CLUB_3090_VERSION` metadata headers to the installer so remote status checks can parse update notes and supported upstream revisions.
-- 🔄 Hardened live update and migrate fetches with explicit no-cache curl headers and added targeted `--club3090-commit` migration support for forcing a compatible upstream checkout.
-- 🛠️ Made `build.py` require explicit version, changelog, icon-map, and Club-3090 compatibility metadata, then validate and smoke-test those headers before shipping artifacts.
-- 🧩 Switched the supported Club-3090 compatibility header to the remote server's deployed upstream revision from `REMOTE.md` instead of the newer local debug checkout.
-- 🛠️ Added build validation that changelog entries must use icons from the declared `CHANGE_LOG_ICONS` categories so updated icon maps are enforced during rebuilds.
-- 🧩 Tightened the compatibility snapshot so only newer local Club-3090 checkouts trigger the red warning bar and compatible-migrate action, while older checkouts stay unaffected.
+- 🛠️ Fixed the release build flow so `build.py` now boots its default version from `base.sh`, applies the requested CLI build identity before validation/output naming, and correctly ships the requested release version and changelog metadata.
 EOF_CHANGE_LOG_LATEST
 )
 CHANGE_LOG_RELEASE=$(cat <<'EOF_CHANGE_LOG_RELEASE'
-No major changes since last release
+v0.6.81
+
+- 🛠️ Moved script-version, changelog, icon-map, and Club-3090 compatibility header rendering into `build.py` so rebuilds now set those installer metadata variables automatically from the supplied build arguments instead of relying on manual edits.
+
+v0.6.80
+
+- 🔄 Fixed the built-in updater so web-panel updates and migrations always fetch and execute the latest live installer from `https://tinyurl.com/club-3090-webserver` instead of re-running the cached local script.
+
+v0.6.79
+
+- 🖥️ Locked the admin web panel to the live Logs view while self-updates or migrations are running so conflicting actions cannot be triggered mid-update.
+- 🖥️ Added remote updater awareness in the admin panel, including update-available banners, changelog previews, stronger update button highlighting, and Club-3090 compatibility warnings.
+- 🔄 Reworked the update modal to show latest and release changelogs, renamed the update actions, removed the old cancel flow, and added a direct compatible-version migration action.
+- 🔄 Added `CHANGE_LOG_LATEST`, `CHANGE_LOG_RELEASE`, `CHANGE_LOG_ICONS`, and `CLUB_3090_VERSION` metadata headers to the installer so remote status checks can parse update notes and supported upstream revisions.
+- 🔄 Hardened live update and migrate fetches with explicit no-cache curl headers and added targeted `--club3090-commit` migration support for forcing a compatible upstream checkout.
+- 🛠️ Made `build.py` require explicit version, changelog, icon-map, and Club-3090 compatibility metadata, then validate and smoke-test those headers before shipping artifacts.
+- 🧰 Updated the supported Club-3090 compatibility header to the currently deployed upstream revision
+- 🛠️ Added build validation that changelog entries must use icons from the declared `CHANGE_LOG_ICONS` categories so updated icon maps are enforced during rebuilds.
+- 🧩 Tightened the compatibility snapshot so only newer local Club-3090 checkouts trigger the red warning bar and compatible-migrate action, while older checkouts stay unaffected.
 EOF_CHANGE_LOG_RELEASE
 )
 CLUB_3090_VERSION='{"release":"v0.6.3-2-g0d59f94","released_at":"2026-05-14T11:47:22Z","commit":"0d59f949e472095e3ecb83ce133eb103d10588d9"}'
@@ -13729,7 +13739,6 @@ UPDATE_LOG_FILE = os.path.join(CONTROL_DIR, "self-update.log")
 UPDATE_STATE_FILE = os.path.join(CONTROL_DIR, "self-update-state.json")
 UPDATE_SECRET_FILE = os.path.join(CONTROL_DIR, "self-update-secret")
 UPDATE_RELOAD_FLAG_FILE = os.path.join(CONTROL_DIR, "self-update-reload-updater")
-LOCAL_SCRIPT_PATH = os.path.join(CONTROL_DIR, "install-club3090-server.sh")
 REMOTE_UPDATE_URL = os.environ.get("CLUB3090_SELF_UPDATE_URL", "https://tinyurl.com/club-3090-webserver")
 UPDATER_BIND_HOST = os.environ.get("CLUB3090_UPDATER_BIND_HOST", "127.0.0.1")
 UPDATER_BIND_PORT = int(os.environ.get("CLUB3090_UPDATER_BIND_PORT", "18010") or "18010")
@@ -13864,18 +13873,13 @@ def build_update_command(scope_name, target_commit=""):
     mode_flag = "--migrate" if normalized == "club3090" else "--update"
     target_commit = "".join(ch for ch in str(target_commit or "").strip() if ch in "0123456789abcdefABCDEF")
     label = "club-3090 migration" if normalized == "club3090" else "admin script update"
-    if os.path.exists(LOCAL_SCRIPT_PATH):
-        extra = f" --club3090-commit {shlex.quote(target_commit)}" if normalized == "club3090" and target_commit else ""
-        command = f"bash {shlex.quote(LOCAL_SCRIPT_PATH)} {mode_flag}{extra}"
-        source = "local"
-    else:
-        extra = f" --club3090-commit {shlex.quote(target_commit)}" if normalized == "club3090" and target_commit else ""
-        command = (
-            f"set -o pipefail; curl -fsSL "
-            f'-H "Cache-Control: no-cache" -H "Pragma: no-cache" '
-            f'{shlex.quote(REMOTE_UPDATE_URL)} | bash -s -- {mode_flag}{extra}'
-        )
-        source = "remote"
+    extra = f" --club3090-commit {shlex.quote(target_commit)}" if normalized == "club3090" and target_commit else ""
+    command = (
+        f"set -o pipefail; curl -fsSL "
+        f'-H "Cache-Control: no-cache" -H "Pragma: no-cache" '
+        f'{shlex.quote(REMOTE_UPDATE_URL)} | bash -s -- {mode_flag}{extra}'
+    )
+    source = "remote"
     return normalized, label, command, source, target_commit
 
 
