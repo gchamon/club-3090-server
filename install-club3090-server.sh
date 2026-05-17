@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="2026-05-16.v0.6.71"
+SCRIPT_VERSION="2026-05-17.v0.6.72"
 
 printf 'Club-3090 Server Installer %s\n' "${SCRIPT_VERSION}"
 
@@ -7426,6 +7426,12 @@ def legacy_global_disable_mode():
     return default_single_mode_selector()
 
 def legacy_global_enabled():
+    if detect_gpu_count_runtime() == 2 and not gpu_pairing_enabled(gpu_count=2):
+        for inst in visible_instances(read_instances_config()):
+            if inst.get("kind") == "dual":
+                continue
+            if instance_running(inst):
+                return False
     file_mode = read_active_mode_file()
     legacy_mode = detect_legacy_dual_mode()
     if file_mode:
@@ -7648,6 +7654,14 @@ def instances_snapshot():
 def legacy_global_instance_snapshot():
     if detect_gpu_count_runtime() != 2 or gpu_pairing_enabled(gpu_count=2):
         return None
+    for inst in visible_instances(read_instances_config()):
+        if inst.get("kind") == "dual":
+            continue
+        runtime_port = instance_runtime_port(inst)
+        ready_url = f"http://127.0.0.1:{runtime_port}/v1/models"
+        boot_state = runtime_boot_state(instance_runtime_container_name(inst), ready_url)
+        if boot_state.get("running") or boot_state.get("booting"):
+            return None
     mode = legacy_global_target_mode()
     running_mode = detect_legacy_dual_mode()
     runtime_mode = running_mode if running_mode in DUAL_GPU_MODES else mode
@@ -12363,6 +12377,8 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                         for target in updated_targets:
                             result = start_instance(target["id"], track_switch_job=False)
                             outputs.append(f"{target['id']}: {(result.get('output') or '')[-2400:]}")
+                        write_active_mode(mode)
+                        write_last_good_mode(mode)
                         clear_switch_failure(mode)
                         _set_switch_job(
                             active=False,
