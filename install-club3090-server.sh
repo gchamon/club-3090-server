@@ -1,13 +1,33 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="2026-05-17.v0.6.82"
+SCRIPT_VERSION="2026-05-17.v0.6.87"
 CHANGE_LOG_ICONS='{"new_feature":"🟢","fix":"🐞","remove_feature":"🔴","security":"🔒","performance":"⚡","ui_ux":"🖥️","build":"🛠️","update":"🔄","docs":"📝","backend":"🧰","compatibility":"🧩","modified_feature":"⚙️"}'
 CHANGE_LOG_LATEST=$(cat <<'EOF_CHANGE_LOG_LATEST'
-- 🛠️ Fixed the release build flow so `build.py` now boots its default version from `base.sh`, applies the requested CLI build identity before validation/output naming, and correctly ships the requested release version and changelog metadata.
+- 🛠️ Simplified `metadata.json` by removing the redundant `script_version` field so `build.py` now derives the shipped installer header automatically from `release_date` plus `version` during rebuilds.
 EOF_CHANGE_LOG_LATEST
 )
 CHANGE_LOG_RELEASE=$(cat <<'EOF_CHANGE_LOG_RELEASE'
+v0.6.86
+
+- 🛠️ Fixed the metadata freshness guard in the no-args release build so it now compares `metadata.json` against a dedicated last-success snapshot instead of the in-progress `build-report.json`, preventing false failures while still blocking rebuilds from unchanged metadata.
+
+v0.6.85
+
+- 🛠️ Added a metadata freshness guard to the no-args release build so `python build.py` now fails if `metadata.json` was not updated since the last successful rebuild, preventing accidental duplicate releases from stale metadata.
+
+v0.6.84
+
+- 🛠️ Strengthened the no-args `build.py` metadata validation so release builds now fail if `CHANGE_LOG_RELEASE` contains the current `CHANGE_LOG_LATEST` text anywhere, preventing accidental duplication of the newest notes into the accumulated release history.
+
+v0.6.83
+
+- 🛠️ Simplified the release build flow so `build.py` now reads all release metadata from a single root `metadata.json` file and always regenerates `web-ui.test.html` during a normal rebuild without needing a separate mode or extra metadata arguments.
+
+v0.6.82
+
+- 🛠️ Fixed the release build flow so `build.py` now boots its default version from `base.sh`, applies the requested CLI build identity before validation/output naming, and correctly ships the requested release version and changelog metadata.
+
 v0.6.81
 
 - 🛠️ Moved script-version, changelog, icon-map, and Club-3090 compatibility header rendering into `build.py` so rebuilds now set those installer metadata variables automatically from the supplied build arguments instead of relying on manual edits.
@@ -21,10 +41,10 @@ v0.6.79
 - 🖥️ Locked the admin web panel to the live Logs view while self-updates or migrations are running so conflicting actions cannot be triggered mid-update.
 - 🖥️ Added remote updater awareness in the admin panel, including update-available banners, changelog previews, stronger update button highlighting, and Club-3090 compatibility warnings.
 - 🔄 Reworked the update modal to show latest and release changelogs, renamed the update actions, removed the old cancel flow, and added a direct compatible-version migration action.
-- 🔄 Added `CHANGE_LOG_LATEST`, `CHANGE_LOG_RELEASE`, `CHANGE_LOG_ICONS`, and `CLUB_3090_VERSION` metadata headers to the installer so remote status checks can parse update notes and supported upstream revisions.
+- 🧩 Added `CHANGE_LOG_LATEST`, `CHANGE_LOG_RELEASE`, `CHANGE_LOG_ICONS`, and `CLUB_3090_VERSION` metadata headers to the installer so remote status checks can parse update notes and supported upstream revisions.
 - 🔄 Hardened live update and migrate fetches with explicit no-cache curl headers and added targeted `--club3090-commit` migration support for forcing a compatible upstream checkout.
 - 🛠️ Made `build.py` require explicit version, changelog, icon-map, and Club-3090 compatibility metadata, then validate and smoke-test those headers before shipping artifacts.
-- 🧰 Updated the supported Club-3090 compatibility header to the currently deployed upstream revision
+- 🧩 Switched the supported Club-3090 compatibility header to the remote server's deployed upstream revision from `REMOTE.md` instead of the newer local debug checkout.
 - 🛠️ Added build validation that changelog entries must use icons from the declared `CHANGE_LOG_ICONS` categories so updated icon maps are enforced during rebuilds.
 - 🧩 Tightened the compatibility snapshot so only newer local Club-3090 checkouts trigger the red warning bar and compatible-migrate action, while older checkouts stay unaffected.
 EOF_CHANGE_LOG_RELEASE
