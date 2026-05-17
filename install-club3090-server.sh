@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="2026-05-16.v0.6.69"
+SCRIPT_VERSION="2026-05-16.v0.6.70"
 
 printf 'Club-3090 Server Installer %s\n' "${SCRIPT_VERSION}"
 
@@ -7042,7 +7042,7 @@ def _configured_scope_targets_for_mode(instance_id="", mode=""):
 def stop_runtime_scope(instance_id=None, mode=None):
     selector = canonical_mode_selector(mode) if mode else ""
     target_id = str(instance_id or "").strip().upper()
-    if is_legacy_global_instance_id(target_id):
+    if is_legacy_global_instance_id(target_id, selector):
         return stop_legacy_global_instance()
     if target_id and target_id != "GLOBAL":
         return stop_instance(target_id)
@@ -7250,12 +7250,23 @@ def legacy_global_enabled():
         return file_mode in DUAL_GPU_MODES
     return legacy_mode in DUAL_GPU_MODES
 
-def is_legacy_global_instance_id(instance_id):
-    return (
-        detect_gpu_count_runtime() == 2
-        and not gpu_pairing_enabled(gpu_count=2)
-        and str(instance_id or "").strip().upper() == "GLOBAL"
-    )
+def is_legacy_global_instance_id(instance_id, mode=None):
+    if (
+        detect_gpu_count_runtime() != 2
+        or gpu_pairing_enabled(gpu_count=2)
+        or str(instance_id or "").strip().upper() != "GLOBAL"
+    ):
+        return False
+    selector = canonical_mode_selector(mode) if mode else ""
+    if selector:
+        spec = resolve_variant_spec(selector) or {}
+        return str(spec.get("scope_kind") or "").strip().lower() in {"dual", "multi", "global_only"}
+    active_selector = canonical_mode_selector(active_mode())
+    if active_selector:
+        active_spec = resolve_variant_spec(active_selector) or {}
+        if str(active_spec.get("scope_kind") or "").strip().lower() == "single":
+            return False
+    return True
 
 def start_legacy_global_instance():
     mode = legacy_global_target_mode()
@@ -7831,7 +7842,7 @@ def parse_tail_lines_param(params, default=250):
 
 def resolve_runtime_log_container(requested_instance_id=""):
     requested = str(requested_instance_id or "").strip().upper()
-    if is_legacy_global_instance_id(requested):
+    if is_legacy_global_instance_id(requested, active_mode()):
         return None, current_container()
     instance = get_instance(requested) if requested else primary_instance()
     container = instance_runtime_container_name(instance) if instance else current_container()
@@ -11229,7 +11240,7 @@ def resolve_admin_chat_target(instance_id="", mode=""):
     current_name = current_container()
     current_port = active_port()
     if current_name and port_open(current_port, timeout=0.08):
-        if not selector or canonical_mode_selector(current_mode) == selector or is_legacy_global_instance_id(target_id):
+        if not selector or canonical_mode_selector(current_mode) == selector or is_legacy_global_instance_id(target_id, selector or current_mode):
             return {
                 "id": "GLOBAL",
                 "kind": "global",
@@ -11244,7 +11255,7 @@ def resolve_admin_chat_target(instance_id="", mode=""):
         match = next((dict(row) for row in runtime_rows if str(row.get("id") or "").strip().upper() == target_id), None)
         if match:
             return match, resolve_variant_spec(match.get("mode")) or {}
-        if is_legacy_global_instance_id(target_id):
+        if is_legacy_global_instance_id(target_id, selector or current_mode):
             legacy = legacy_global_instance_snapshot()
             if legacy and legacy.get("running"):
                 return dict(legacy), resolve_variant_spec(legacy.get("mode")) or {}
@@ -12139,7 +12150,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                 if not spec:
                     raise ValueError("Invalid mode")
                 scope_kind = str(spec.get("scope_kind") or "")
-                if is_legacy_global_instance_id(instance_id):
+                if is_legacy_global_instance_id(instance_id, mode):
                     if mode not in DUAL_GPU_MODES:
                         raise ValueError("Preset type does not match the selected instance scope")
                     rc, stop_msg = stop_legacy_global_instance()
@@ -12422,15 +12433,15 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                 elif action == "idle_clocks":
                     out = {"cpu": apply_cpu_idle_power(), "gpu": apply_gpu_idle_power()}
                 elif action == "stop_container":
-                    if is_legacy_global_instance_id(instance_id):
+                    if is_legacy_global_instance_id(instance_id, data.get("mode")):
                         rc, msg = stop_legacy_global_instance()
                     else:
                         rc, msg = stop_runtime_scope(instance_id=instance_id, mode=data.get("mode"))
                     out = {"container_stop_rc": rc, "container_stop_output": msg, "cpu": apply_cpu_idle_power(), "gpu": apply_gpu_idle_power()}
                 elif action == "start_instance":
-                    out = start_legacy_global_instance() if is_legacy_global_instance_id(instance_id) else start_instance(instance_id)
+                    out = start_legacy_global_instance() if is_legacy_global_instance_id(instance_id, data.get("mode")) else start_instance(instance_id)
                 elif action == "restart_instance":
-                    if is_legacy_global_instance_id(instance_id):
+                    if is_legacy_global_instance_id(instance_id, data.get("mode")):
                         stop_legacy_global_instance()
                         out = start_legacy_global_instance()
                     else:
