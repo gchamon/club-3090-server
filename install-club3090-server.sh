@@ -1,17 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="2026-05-18.v0.6.104"
+SCRIPT_VERSION="2026-05-18.v0.6.105"
 CHANGE_LOG_ICONS='{"new_feature":"🟢","fix":"🐞","remove_feature":"🔴","security":"🔒","performance":"⚡","ui_ux":"🖥️","build_pipeline_improvement":"🛠️","update":"🔄","docs":"📝","backend":"🧰","compatibility":"🧩","modified_feature":"⚙️"}'
 CHANGE_LOG_LATEST=$(cat <<'EOF_CHANGE_LOG_LATEST'
+• 🐞 Fixed the generated systemd service environment so the SHA-pinned GitHub raw template now preserves the full `{sha}` placeholder instead of truncating it, which restores real remote update detection and prevents the green update banner from being silently suppressed.
+• 🔄 Verified the remote server failure mode directly under the live `club3090-control.service` environment, confirmed that the malformed template was causing `fetch_remote_script_metadata(force=True)` to return `update_available: false`, and rebuilt the release around the corrected service wiring.
+• 🧪 Prepared the release specifically for a remote end-to-end updater retest after publishing, so the built-in updater path can now exercise both version discovery and actual script retrieval against the repaired template.
+EOF_CHANGE_LOG_LATEST
+)
+CHANGE_LOG_RELEASE=$(cat <<'EOF_CHANGE_LOG_RELEASE'
+v0.6.104
+
 • 🖥️ Added missing dashed peak overlays and `(↑ max)` treatment to the per-GPU Util and VRAM charts in the GPU Metrics section, bringing them in line with the rest of the metrics surfaces.
 • 🧰 Extended the backend/system network payload with detected Tailscale MagicDNS information and surfaced it under Local IP in the Network panel whenever the server is running on Tailscale.
 • 🐞 Shortened detached-log recovery on mobile by polling for closed log tabs every second, so the in-panel log viewer returns much faster when a mobile browser opens the detach action in a separate tab.
 • 🖥️ Replaced plain browser alerts with a Club-3090 modal alert titled `Club-3090 Server vX.X.X`, so dialogs stop showing the raw host/server title and instead present a consistent product/version identity.
 • 🔄 Hardened update-banner refresh behavior by forcing a fresh status/update probe on page load again and by scoping banner dismissal to the currently advertised remote update version/commit, so new releases can resurface the green update header immediately.
-EOF_CHANGE_LOG_LATEST
-)
-CHANGE_LOG_RELEASE=$(cat <<'EOF_CHANGE_LOG_RELEASE'
+
 v0.6.103
 
 • 🐞 Fixed the root Logs-card resize problem at the bottom edge by keeping the drag session alive after a short hold near the page bottom, so the Docker log viewer now continues growing smoothly instead of stopping after tiny 10-20px nudges.
@@ -15268,7 +15274,7 @@ Environment=CLUB3090_CONTROL_DIR=${CONTROL_DIR}
 Environment=CLUB3090_SELF_UPDATE_REPO_URL=${CLUB3090_SELF_UPDATE_REPO_URL}
 Environment=CLUB3090_SELF_UPDATE_REF=${CLUB3090_SELF_UPDATE_REF}
 Environment=CLUB3090_SELF_UPDATE_BRANCH=${CLUB3090_SELF_UPDATE_BRANCH}
-Environment=CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE=${CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE}
+Environment="CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE=${CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE}"
 Environment=CLUB3090_POWER_IDLE_AFTER_SECONDS=600
 Environment=CLUB3090_CONTAINER_STOP_AFTER_SECONDS=3600
 Environment=CLUB3090_GPU_ACTIVE_POWER_LIMIT_W=280
@@ -15308,7 +15314,7 @@ Environment=CLUB3090_HTTPS_ENABLED=${ONLINE_TLS_EFFECTIVE_ENABLED}
 Environment=CLUB3090_SELF_UPDATE_REPO_URL=${CLUB3090_SELF_UPDATE_REPO_URL}
 Environment=CLUB3090_SELF_UPDATE_REF=${CLUB3090_SELF_UPDATE_REF}
 Environment=CLUB3090_SELF_UPDATE_BRANCH=${CLUB3090_SELF_UPDATE_BRANCH}
-Environment=CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE=${CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE}
+Environment="CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE=${CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE}"
 ExecStart=${UPDATER_PY}
 Restart=always
 RestartSec=3
