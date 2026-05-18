@@ -1,16 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="2026-05-18.v0.6.99"
+SCRIPT_VERSION="2026-05-18.v0.6.100"
 CHANGE_LOG_ICONS='{"new_feature":"🟢","fix":"🐞","remove_feature":"🔴","security":"🔒","performance":"⚡","ui_ux":"🖥️","build":"🛠️","update":"🔄","docs":"📝","backend":"🧰","compatibility":"🧩","modified_feature":"⚙️"}'
 CHANGE_LOG_LATEST=$(cat <<'EOF_CHANGE_LOG_LATEST'
+• 🔄 Reworked the self-updater and remote version checker to resolve the latest `master` commit with `git ls-remote` first, then fetch the installer from a SHA-pinned raw GitHub URL so branch-edge caching no longer serves stale script copies.
+• ⚙️ Split the updater configuration into repository/ref/raw-template settings, and propagated those through the generated services so the control plane and updater daemon both use the same commit-resolved fetch path.
+• 📝 Restored the README and installer header examples back to the short TinyURL commands for humans, while keeping the more reliable SHA-resolved GitHub fetch logic internal to the product code.
+• 🛠️ Rebuilt the integrated installer and reran the complete smoke suite after the updater-flow rewrite.
+EOF_CHANGE_LOG_LATEST
+)
+CHANGE_LOG_RELEASE=$(cat <<'EOF_CHANGE_LOG_RELEASE'
+v0.6.99
+
 • 🔄 Replaced the self-update source everywhere with the direct raw GitHub installer URL, so both remote version checks and the actual updater fetch now hit the real script artifact without the TinyURL redirect layer.
 • 🐞 Removed the in-process 120 second remote update metadata cache from the control panel, so refreshes and update checks no longer get stuck reporting a stale script version after the upstream file changes.
 • 📝 Updated the install, update, and migrate examples in the README to use the same direct raw GitHub script URL as the live updater path.
 • 🛠️ Rebuilt the integrated installer and reran the full smoke suite after the updater-source and cache-removal changes.
-EOF_CHANGE_LOG_LATEST
-)
-CHANGE_LOG_RELEASE=$(cat <<'EOF_CHANGE_LOG_RELEASE'
+
 v0.6.98
 
 • 🖥️ Reworked the log pop-out controls again so both the in-panel detach action and the popup reattach action now render as borderless inline icons aligned with the log card caption instead of labeled buttons.
@@ -131,19 +138,22 @@ v0.6.79
 EOF_CHANGE_LOG_RELEASE
 )
 CLUB_3090_VERSION='{"release":"v0.6.3-2-g0d59f94","released_at":"2026-05-14T11:47:22Z","commit":"0d59f949e472095e3ecb83ce133eb103d10588d9"}'
-CLUB3090_SELF_UPDATE_URL="${CLUB3090_SELF_UPDATE_URL:-https://raw.githubusercontent.com/VykosX/club-3090-server/refs/heads/master/install-club3090-server.sh}"
+CLUB3090_SELF_UPDATE_REPO_URL="${CLUB3090_SELF_UPDATE_REPO_URL:-https://github.com/VykosX/club-3090-server.git}"
+CLUB3090_SELF_UPDATE_REF="${CLUB3090_SELF_UPDATE_REF:-refs/heads/master}"
+CLUB3090_SELF_UPDATE_BRANCH="${CLUB3090_SELF_UPDATE_BRANCH:-master}"
+CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE="${CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE:-https://raw.githubusercontent.com/VykosX/club-3090-server/{sha}/install-club3090-server.sh}"
 
 printf 'Club-3090 Server Installer %s\n' "${SCRIPT_VERSION}"
 
 # club-3090 headless server/control installer
 # Install:
-#   curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" https://raw.githubusercontent.com/VykosX/club-3090-server/refs/heads/master/install-club3090-server.sh | bash
+#   curl -fsSL https://tinyurl.com/club-3090-webserver | bash
 # Update control/admin/proxy/console services only:
-#   curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" https://raw.githubusercontent.com/VykosX/club-3090-server/refs/heads/master/install-club3090-server.sh | bash -s -- --update
+#   curl -fsSL https://tinyurl.com/club-3090-webserver | bash -s -- --update
 # Migrate an existing /opt/ai/club-3090 checkout to a fresh upstream clone:
-#   curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" https://raw.githubusercontent.com/VykosX/club-3090-server/refs/heads/master/install-club3090-server.sh | bash -s -- --migrate
+#   curl -fsSL https://tinyurl.com/club-3090-webserver | bash -s -- --migrate
 # Restart a broken/incomplete migration from scratch:
-#   curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" https://raw.githubusercontent.com/VykosX/club-3090-server/refs/heads/master/install-club3090-server.sh | bash -s -- --migrate restart
+#   curl -fsSL https://tinyurl.com/club-3090-webserver | bash -s -- --migrate restart
 # Custom admin/proxy ports:
 #   bash install-club3090-server.sh --ports 18008:18009
 # Save a Hugging Face token for setup and later admin-panel downloads:
@@ -2354,9 +2364,15 @@ UPDATER_BIND_HOST = os.environ.get("CLUB3090_UPDATER_BIND_HOST", "127.0.0.1")
 UPDATER_BIND_PORT = int(os.environ.get("CLUB3090_UPDATER_BIND_PORT", "18010"))
 SELF_UPDATE_SECRET_FILE = os.path.join(CONTROL_DIR, "self-update-secret")
 LOCAL_INSTALLER_SCRIPT_FILE = os.path.join(CONTROL_DIR, "install-club3090-server.sh")
-REMOTE_UPDATE_URL = os.environ.get(
-    "CLUB3090_SELF_UPDATE_URL",
-    "https://raw.githubusercontent.com/VykosX/club-3090-server/refs/heads/master/install-club3090-server.sh",
+REMOTE_UPDATE_REPO_URL = os.environ.get(
+    "CLUB3090_SELF_UPDATE_REPO_URL",
+    "https://github.com/VykosX/club-3090-server.git",
+)
+REMOTE_UPDATE_REF = os.environ.get("CLUB3090_SELF_UPDATE_REF", "refs/heads/master")
+REMOTE_UPDATE_BRANCH = os.environ.get("CLUB3090_SELF_UPDATE_BRANCH", "master")
+REMOTE_UPDATE_RAW_URL_TEMPLATE = os.environ.get(
+    "CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE",
+    "https://raw.githubusercontent.com/VykosX/club-3090-server/{sha}/install-club3090-server.sh",
 )
 HTTPS_CERT_FILE = os.path.join(CONTROL_DIR, "tls.crt")
 HTTPS_KEY_FILE = os.path.join(CONTROL_DIR, "tls.key")
@@ -3373,7 +3389,34 @@ def compare_script_versions(left, right):
     return (left_tuple > right_tuple) - (left_tuple < right_tuple)
 
 
+def resolve_remote_update_commit(timeout=12):
+    result = subprocess.run(
+        ["git", "ls-remote", REMOTE_UPDATE_REPO_URL, REMOTE_UPDATE_REF],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=max(5, int(timeout or 12)),
+    )
+    output = str(result.stdout or "").strip()
+    if result.returncode != 0 or not output:
+        detail = str(result.stderr or result.stdout or f"git ls-remote exited with {result.returncode}").strip()
+        raise RuntimeError(f"git ls-remote failed: {detail}")
+    sha = output.split()[0].strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", sha):
+        raise RuntimeError(f"git ls-remote returned an invalid commit SHA: {sha!r}")
+    return sha.lower()
+
+
+def remote_update_script_url_for_sha(sha):
+    commit_sha = str(sha or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", commit_sha):
+        raise ValueError("A full 40-character commit SHA is required.")
+    return str(REMOTE_UPDATE_RAW_URL_TEMPLATE or "").format(sha=commit_sha)
+
+
 def fetch_remote_update_script_text(timeout=12):
+    commit_sha = resolve_remote_update_commit(timeout=timeout)
+    remote_url = remote_update_script_url_for_sha(commit_sha)
     curl_cmd = [
         "curl",
         "-fsSL",
@@ -3381,7 +3424,7 @@ def fetch_remote_update_script_text(timeout=12):
         "Cache-Control: no-cache",
         "-H",
         "Pragma: no-cache",
-        REMOTE_UPDATE_URL,
+        remote_url,
     ]
     try:
         result = subprocess.run(
@@ -3392,14 +3435,14 @@ def fetch_remote_update_script_text(timeout=12):
             timeout=max(5, int(timeout or 12)),
         )
         if result.returncode == 0 and str(result.stdout or "").strip():
-            return str(result.stdout or ""), "curl"
+            return str(result.stdout or ""), "curl", commit_sha, remote_url
         curl_error = str(result.stderr or result.stdout or f"curl exited with {result.returncode}").strip()
     except FileNotFoundError:
         curl_error = "curl is not installed"
     except Exception as exc:
         curl_error = str(exc)
     request = urllib.request.Request(
-        REMOTE_UPDATE_URL,
+        remote_url,
         headers={
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
@@ -3408,7 +3451,7 @@ def fetch_remote_update_script_text(timeout=12):
     )
     try:
         with urllib.request.urlopen(request, timeout=max(5, float(timeout or 12))) as response:
-            return response.read().decode("utf-8", errors="replace"), "urllib"
+            return response.read().decode("utf-8", errors="replace"), "urllib", commit_sha, remote_url
     except Exception as exc:
         raise RuntimeError(f"{curl_error}; urllib fallback failed: {exc}")
 
@@ -3416,7 +3459,11 @@ def fetch_remote_update_script_text(timeout=12):
 def fetch_remote_script_metadata(force=False):
     now = time.time()
     result = {
-        "source_url": REMOTE_UPDATE_URL,
+        "source_url": "",
+        "source_repo_url": REMOTE_UPDATE_REPO_URL,
+        "source_ref": REMOTE_UPDATE_REF,
+        "source_branch": REMOTE_UPDATE_BRANCH,
+        "commit_sha": "",
         "fetched_at": int(now),
         "script_version": "",
         "change_log_latest": "",
@@ -3428,8 +3475,10 @@ def fetch_remote_script_metadata(force=False):
         "fetch_method": "",
     }
     try:
-        payload, fetch_method = fetch_remote_update_script_text(timeout=12)
+        payload, fetch_method, commit_sha, remote_url = fetch_remote_update_script_text(timeout=12)
         result["fetch_method"] = fetch_method
+        result["commit_sha"] = commit_sha
+        result["source_url"] = remote_url
         payload = str(payload or "")[:51200]
         parsed = parse_installer_script_metadata(payload)
         result.update(parsed)
@@ -14355,9 +14404,15 @@ UPDATE_LOG_FILE = os.path.join(CONTROL_DIR, "self-update.log")
 UPDATE_STATE_FILE = os.path.join(CONTROL_DIR, "self-update-state.json")
 UPDATE_SECRET_FILE = os.path.join(CONTROL_DIR, "self-update-secret")
 UPDATE_RELOAD_FLAG_FILE = os.path.join(CONTROL_DIR, "self-update-reload-updater")
-REMOTE_UPDATE_URL = os.environ.get(
-    "CLUB3090_SELF_UPDATE_URL",
-    "https://raw.githubusercontent.com/VykosX/club-3090-server/refs/heads/master/install-club3090-server.sh",
+REMOTE_UPDATE_REPO_URL = os.environ.get(
+    "CLUB3090_SELF_UPDATE_REPO_URL",
+    "https://github.com/VykosX/club-3090-server.git",
+)
+REMOTE_UPDATE_REF = os.environ.get("CLUB3090_SELF_UPDATE_REF", "refs/heads/master")
+REMOTE_UPDATE_BRANCH = os.environ.get("CLUB3090_SELF_UPDATE_BRANCH", "master")
+REMOTE_UPDATE_RAW_URL_TEMPLATE = os.environ.get(
+    "CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE",
+    "https://raw.githubusercontent.com/VykosX/club-3090-server/{sha}/install-club3090-server.sh",
 )
 UPDATER_BIND_HOST = os.environ.get("CLUB3090_UPDATER_BIND_HOST", "127.0.0.1")
 UPDATER_BIND_PORT = int(os.environ.get("CLUB3090_UPDATER_BIND_PORT", "18010") or "18010")
@@ -14487,16 +14542,28 @@ def valid_request_secret(handler):
     return bool(supplied) and bool(expected) and secrets.compare_digest(supplied, expected)
 
 
+def shell_single_quote(value):
+    return "'" + str(value or "").replace("'", "'\"'\"'") + "'"
+
+
 def build_update_command(scope_name, target_commit=""):
     normalized = "club3090" if str(scope_name or "").strip().lower() == "club3090" else "controller"
     mode_flag = "--migrate" if normalized == "club3090" else "--update"
     target_commit = "".join(ch for ch in str(target_commit or "").strip() if ch in "0123456789abcdefABCDEF")
     label = "club-3090 migration" if normalized == "club3090" else "admin script update"
     extra = f" --club3090-commit {shlex.quote(target_commit)}" if normalized == "club3090" and target_commit else ""
+    repo_quoted = shell_single_quote(REMOTE_UPDATE_REPO_URL)
+    ref_quoted = shell_single_quote(REMOTE_UPDATE_REF)
+    template_quoted = shell_single_quote(REMOTE_UPDATE_RAW_URL_TEMPLATE)
     command = (
-        f"set -o pipefail; curl -fsSL "
-        f'-H "Cache-Control: no-cache" -H "Pragma: no-cache" '
-        f'{shlex.quote(REMOTE_UPDATE_URL)} | bash -s -- {mode_flag}{extra}'
+        "set -o pipefail; "
+        f"SCRIPT_SHA=\"$(git ls-remote {repo_quoted} {ref_quoted} | awk 'NR==1{{print $1}}')\"; "
+        "if [[ -z \"${SCRIPT_SHA}\" ]]; then echo 'Unable to resolve remote updater commit SHA.' >&2; exit 1; fi; "
+        "if [[ ! \"${SCRIPT_SHA}\" =~ ^[0-9a-fA-F]{40}$ ]]; then echo \"Invalid remote updater commit SHA: ${SCRIPT_SHA}\" >&2; exit 1; fi; "
+        f"SCRIPT_URL=${template_quoted}; "
+        "SCRIPT_URL=\"${SCRIPT_URL//\\{sha\\}/${SCRIPT_SHA}}\"; "
+        "curl -fsSL -H \"Cache-Control: no-cache\" -H \"Pragma: no-cache\" \"${SCRIPT_URL}\" | "
+        f"bash -s -- {mode_flag}{extra}"
     )
     source = "remote"
     return normalized, label, command, source, target_commit
@@ -15154,7 +15221,10 @@ Environment=CLUB3090_PROXY_BIND_PORT=${CONTROL_PROXY_BIND_PORT}
 Environment=CLUB3090_UPDATER_BIND_HOST=${CONTROL_UPDATER_BIND_HOST}
 Environment=CLUB3090_UPDATER_BIND_PORT=${CONTROL_UPDATER_BIND_PORT}
 Environment=CLUB3090_CONTROL_DIR=${CONTROL_DIR}
-Environment=CLUB3090_SELF_UPDATE_URL=${CLUB3090_SELF_UPDATE_URL}
+Environment=CLUB3090_SELF_UPDATE_REPO_URL=${CLUB3090_SELF_UPDATE_REPO_URL}
+Environment=CLUB3090_SELF_UPDATE_REF=${CLUB3090_SELF_UPDATE_REF}
+Environment=CLUB3090_SELF_UPDATE_BRANCH=${CLUB3090_SELF_UPDATE_BRANCH}
+Environment=CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE=${CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE}
 Environment=CLUB3090_POWER_IDLE_AFTER_SECONDS=600
 Environment=CLUB3090_CONTAINER_STOP_AFTER_SECONDS=3600
 Environment=CLUB3090_GPU_ACTIVE_POWER_LIMIT_W=280
@@ -15191,7 +15261,10 @@ Environment=CLUB3090_ADMIN_BIND_PORT=${CONTROL_ADMIN_BIND_PORT}
 Environment=CLUB3090_UPDATER_BIND_HOST=${CONTROL_UPDATER_BIND_HOST}
 Environment=CLUB3090_UPDATER_BIND_PORT=${CONTROL_UPDATER_BIND_PORT}
 Environment=CLUB3090_HTTPS_ENABLED=${ONLINE_TLS_EFFECTIVE_ENABLED}
-Environment=CLUB3090_SELF_UPDATE_URL=${CLUB3090_SELF_UPDATE_URL}
+Environment=CLUB3090_SELF_UPDATE_REPO_URL=${CLUB3090_SELF_UPDATE_REPO_URL}
+Environment=CLUB3090_SELF_UPDATE_REF=${CLUB3090_SELF_UPDATE_REF}
+Environment=CLUB3090_SELF_UPDATE_BRANCH=${CLUB3090_SELF_UPDATE_BRANCH}
+Environment=CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE=${CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE}
 ExecStart=${UPDATER_PY}
 Restart=always
 RestartSec=3
