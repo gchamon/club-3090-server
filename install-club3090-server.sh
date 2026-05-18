@@ -1,16 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="2026-05-18.v0.6.98"
+SCRIPT_VERSION="2026-05-18.v0.6.99"
 CHANGE_LOG_ICONS='{"new_feature":"🟢","fix":"🐞","remove_feature":"🔴","security":"🔒","performance":"⚡","ui_ux":"🖥️","build":"🛠️","update":"🔄","docs":"📝","backend":"🧰","compatibility":"🧩","modified_feature":"⚙️"}'
 CHANGE_LOG_LATEST=$(cat <<'EOF_CHANGE_LOG_LATEST'
+• 🔄 Replaced the self-update source everywhere with the direct raw GitHub installer URL, so both remote version checks and the actual updater fetch now hit the real script artifact without the TinyURL redirect layer.
+• 🐞 Removed the in-process 120 second remote update metadata cache from the control panel, so refreshes and update checks no longer get stuck reporting a stale script version after the upstream file changes.
+• 📝 Updated the install, update, and migrate examples in the README to use the same direct raw GitHub script URL as the live updater path.
+• 🛠️ Rebuilt the integrated installer and reran the full smoke suite after the updater-source and cache-removal changes.
+EOF_CHANGE_LOG_LATEST
+)
+CHANGE_LOG_RELEASE=$(cat <<'EOF_CHANGE_LOG_RELEASE'
+v0.6.98
+
 • 🖥️ Reworked the log pop-out controls again so both the in-panel detach action and the popup reattach action now render as borderless inline icons aligned with the log card caption instead of labeled buttons.
 • 🐞 Fixed the shared resize triangle styling so the 12px grip once again renders a clean full white border around the entire handle instead of dropping part of the outline.
 • 🐞 Corrected the Logs-tab layout so resizing the log viewer grows the parent card there too, rather than stretching only the textarea while the card stayed pinned.
 • ⚙️ Split `show globally` behavior by log source signature, so detaching one source no longer blocks the global-toggle state for other sources or instances.
-EOF_CHANGE_LOG_LATEST
-)
-CHANGE_LOG_RELEASE=$(cat <<'EOF_CHANGE_LOG_RELEASE'
+
 v0.6.97
 
 • 🖥️ Restored the shared chat and log resize grips to 12px corner handles with a 2px white outline plus panel-matched fill, fixed the Logs-tab card so the textarea and parent surface resize together again, and locked Update Logs back to its intended fixed-height non-resizable viewer.
@@ -124,19 +131,19 @@ v0.6.79
 EOF_CHANGE_LOG_RELEASE
 )
 CLUB_3090_VERSION='{"release":"v0.6.3-2-g0d59f94","released_at":"2026-05-14T11:47:22Z","commit":"0d59f949e472095e3ecb83ce133eb103d10588d9"}'
-CLUB3090_SELF_UPDATE_URL="${CLUB3090_SELF_UPDATE_URL:-https://tinyurl.com/club-3090-webserver}"
+CLUB3090_SELF_UPDATE_URL="${CLUB3090_SELF_UPDATE_URL:-https://raw.githubusercontent.com/VykosX/club-3090-server/refs/heads/master/install-club3090-server.sh}"
 
 printf 'Club-3090 Server Installer %s\n' "${SCRIPT_VERSION}"
 
 # club-3090 headless server/control installer
 # Install:
-#   curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" https://tinyurl.com/club-3090-webserver | bash
+#   curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" https://raw.githubusercontent.com/VykosX/club-3090-server/refs/heads/master/install-club3090-server.sh | bash
 # Update control/admin/proxy/console services only:
-#   curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" https://tinyurl.com/club-3090-webserver | bash -s -- --update
+#   curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" https://raw.githubusercontent.com/VykosX/club-3090-server/refs/heads/master/install-club3090-server.sh | bash -s -- --update
 # Migrate an existing /opt/ai/club-3090 checkout to a fresh upstream clone:
-#   curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" https://tinyurl.com/club-3090-webserver | bash -s -- --migrate
+#   curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" https://raw.githubusercontent.com/VykosX/club-3090-server/refs/heads/master/install-club3090-server.sh | bash -s -- --migrate
 # Restart a broken/incomplete migration from scratch:
-#   curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" https://tinyurl.com/club-3090-webserver | bash -s -- --migrate restart
+#   curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" https://raw.githubusercontent.com/VykosX/club-3090-server/refs/heads/master/install-club3090-server.sh | bash -s -- --migrate restart
 # Custom admin/proxy ports:
 #   bash install-club3090-server.sh --ports 18008:18009
 # Save a Hugging Face token for setup and later admin-panel downloads:
@@ -2347,7 +2354,10 @@ UPDATER_BIND_HOST = os.environ.get("CLUB3090_UPDATER_BIND_HOST", "127.0.0.1")
 UPDATER_BIND_PORT = int(os.environ.get("CLUB3090_UPDATER_BIND_PORT", "18010"))
 SELF_UPDATE_SECRET_FILE = os.path.join(CONTROL_DIR, "self-update-secret")
 LOCAL_INSTALLER_SCRIPT_FILE = os.path.join(CONTROL_DIR, "install-club3090-server.sh")
-REMOTE_UPDATE_URL = os.environ.get("CLUB3090_SELF_UPDATE_URL", "https://tinyurl.com/club-3090-webserver")
+REMOTE_UPDATE_URL = os.environ.get(
+    "CLUB3090_SELF_UPDATE_URL",
+    "https://raw.githubusercontent.com/VykosX/club-3090-server/refs/heads/master/install-club3090-server.sh",
+)
 HTTPS_CERT_FILE = os.path.join(CONTROL_DIR, "tls.crt")
 HTTPS_KEY_FILE = os.path.join(CONTROL_DIR, "tls.key")
 DOCKER_LOGROTATE_FILE = "/etc/logrotate.d/club3090-docker-containers"
@@ -2467,7 +2477,6 @@ compose_metadata_cache = {}
 runtime_log_metrics_cache = {}
 runtime_log_metric_memory = {}
 nvlink_status_cache = {"value": {}, "time": 0.0}
-remote_script_metadata_cache = {"value": {}, "time": 0.0}
 tailscale_access_hint_cache = {"value": {}, "time": 0.0}
 target_request_metrics = {}
 runtime_inventory_lock = threading.Lock()
@@ -3189,7 +3198,7 @@ def start_self_update_job(scope, target_commit=""):
     if scope_name not in {"controller", "club3090"}:
         raise ValueError("Invalid update scope")
     target_commit = re.sub(r"[^0-9A-Fa-f]+", "", str(target_commit or "").strip())
-    fetch_remote_script_metadata(force=True, max_age=0)
+    fetch_remote_script_metadata(force=True)
     with admin_task_job_lock:
         if admin_task_job.get("active"):
             raise RuntimeError("Wait for the current admin task to finish before starting an update")
@@ -3404,12 +3413,8 @@ def fetch_remote_update_script_text(timeout=12):
         raise RuntimeError(f"{curl_error}; urllib fallback failed: {exc}")
 
 
-def fetch_remote_script_metadata(force=False, max_age=120):
+def fetch_remote_script_metadata(force=False):
     now = time.time()
-    cached = dict(remote_script_metadata_cache.get("value") or {})
-    cached_time = float(remote_script_metadata_cache.get("time") or 0.0)
-    if cached and not force and (now - cached_time) < max(15.0, float(max_age or 120)):
-        return cached
     result = {
         "source_url": REMOTE_UPDATE_URL,
         "fetched_at": int(now),
@@ -3431,8 +3436,6 @@ def fetch_remote_script_metadata(force=False, max_age=120):
         result["update_available"] = compare_script_versions(parsed.get("script_version"), SCRIPT_VERSION) > 0
     except Exception as exc:
         result["error"] = str(exc)
-    remote_script_metadata_cache["value"] = dict(result)
-    remote_script_metadata_cache["time"] = now
     return result
 
 
@@ -10157,7 +10160,7 @@ def build_status_snapshot(force_remote_metadata=False):
         series = list(series_points)
     runtime_inventory = load_runtime_inventory()
     local_installer_metadata = read_local_installer_metadata()
-    remote_update_metadata = fetch_remote_script_metadata(force=force_remote_metadata, max_age=120)
+    remote_update_metadata = fetch_remote_script_metadata(force=force_remote_metadata)
     upstream_services = discover_upstream_services(force=False, max_age=30.0)
     current_mode = active_mode()
     ap = active_port()
@@ -10303,7 +10306,7 @@ def build_status_error_snapshot(error, previous=None):
         "script_version": SCRIPT_VERSION,
         "control_started_at": int(previous.get("control_started_at") or startup_time),
         "local_installer_metadata": previous.get("local_installer_metadata") if isinstance(previous.get("local_installer_metadata"), dict) else read_local_installer_metadata(),
-        "remote_update": previous.get("remote_update") if isinstance(previous.get("remote_update"), dict) else fetch_remote_script_metadata(force=False, max_age=120),
+        "remote_update": previous.get("remote_update") if isinstance(previous.get("remote_update"), dict) else fetch_remote_script_metadata(force=False),
         "club3090_compat": previous.get("club3090_compat") if isinstance(previous.get("club3090_compat"), dict) else {},
         "uptime_seconds": int(time.time() - startup_time),
         "vllm_service": str(previous.get("vllm_service") or "unknown"),
@@ -14352,7 +14355,10 @@ UPDATE_LOG_FILE = os.path.join(CONTROL_DIR, "self-update.log")
 UPDATE_STATE_FILE = os.path.join(CONTROL_DIR, "self-update-state.json")
 UPDATE_SECRET_FILE = os.path.join(CONTROL_DIR, "self-update-secret")
 UPDATE_RELOAD_FLAG_FILE = os.path.join(CONTROL_DIR, "self-update-reload-updater")
-REMOTE_UPDATE_URL = os.environ.get("CLUB3090_SELF_UPDATE_URL", "https://tinyurl.com/club-3090-webserver")
+REMOTE_UPDATE_URL = os.environ.get(
+    "CLUB3090_SELF_UPDATE_URL",
+    "https://raw.githubusercontent.com/VykosX/club-3090-server/refs/heads/master/install-club3090-server.sh",
+)
 UPDATER_BIND_HOST = os.environ.get("CLUB3090_UPDATER_BIND_HOST", "127.0.0.1")
 UPDATER_BIND_PORT = int(os.environ.get("CLUB3090_UPDATER_BIND_PORT", "18010") or "18010")
 CONTROL_ADMIN_BIND_PORT = int(os.environ.get("CLUB3090_ADMIN_BIND_PORT", "8008") or "8008")
