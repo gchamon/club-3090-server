@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="2026-05-21.v0.8.5"
+SCRIPT_VERSION="2026-05-21.v0.8.6"
 CHANGE_LOG_ICONS='{"new_feature":"🟢","fix":"🐞","remove_feature":"🔴","security":"🔒","performance":"⚡","ui_ux":"🖥️","build_pipeline_improvement":"🛠️","test":"🧪","update":"🔄","docs":"📝","backend":"🧰","compatibility":"🧩","modified_feature":"⚙️"}'
 CHANGE_LOG_LATEST=$(cat <<'EOF_CHANGE_LOG_LATEST'
-• 🐞 Fixed the self-update completion path so the updater now reads the freshly written server/service state before running readiness waits, instead of trusting stale startup env from the long-lived updater daemon.
-• 🐞 Stopped controller-only updates from waiting on a removed or disabled Caddy service when HTTPS is off, which was the real source of the multi-minute post-install stall seen on the live host after the `v0.8.x` migration.
-• 🐞 Hardened `--update` / `--migrate` mode-state restoration so the installer now preserves prior `--online use-https` behavior from the deployed systemd/Caddy topology as well as `server_config.json`, preventing a bad persisted flag from silently downgrading the machine back to plain HTTP.
-• 🧪 Rebuilt the release artifacts and reran the full local smoke suite after the updater-wait and HTTPS-state fixes so the shipped `v0.8.5` output matches the corrected behavior.
+• 🐞 Parallelized Global single/dual preset launches so the controller now fans out Docker boots across every eligible GPU or pair at once instead of waiting for each container to reach ready before starting the next one.
+• 🐞 Reworked model-download tracking into a real multi-job flow, which allows multiple model installs to run concurrently, keeps each job visible in status, and stops one new download request from freezing the others' Audit Log progress.
+• 🐞 Added a local Hugging Face fallback chain for Qwen 3.6 35B-A3B AutoRound downloads, fixing the stale upstream repo slug that was producing the `Qwen/Qwen3-MoE-A3B-Instruct-AutoRound-Int4-mixed` not-found failure on the live remote host.
+• 🖥️ Fixed the Model Summary selector regression, regrouped NVLink + multi-GPU presets under Advanced Docker Presets, corrected preview/experimental/badge handling, added the blocked-launch hardware warning modal, and refreshed the Setup Assistant wording/logic including the gated Hugging Face custom-import lane.
+• 🧪 Rebuilt the release artifacts and reran the full local smoke suite after the runtime, inventory, and preset-UI fixes so the shipped `v0.8.6` output matches the corrected behavior.
 EOF_CHANGE_LOG_LATEST
 )
 CLUB_3090_VERSION='{"release":"v0.8.3-15-gb1b8513","released_at":"2026-05-21T05:40:59+05:00","commit":"b1b851318f3b53113f3386fb86169afb7c086de9"}'
@@ -2277,7 +2278,7 @@ CHAT_STATE_FILE = os.path.join(CHAT_CONVERSATIONS_DIR, "state.json")
 CHAT_ATTACHMENTS_DIR = os.path.join(CHAT_CONVERSATIONS_DIR, "attachments")
 CHAT_STATE_BACKUP_DIR = os.path.join(CHAT_CONVERSATIONS_DIR, "backups")
 CODE_SYNTAX_CONFIG_FILE = os.path.join(CONTROL_DIR, "code_syntax.json")
-CODE_SYNTAX_CONFIG_GZIP_BASE64 = "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"
+CODE_SYNTAX_CONFIG_GZIP_BASE64 = "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"
 MCP_PROTOCOL_VERSION = "2025-03-26"
 LOCAL_API_TOKEN_FILE = os.path.join(CONTROL_DIR, "local_api_token")
 INSTANCES_DIR = os.path.join(CONTROL_DIR, "instances")
@@ -2451,6 +2452,7 @@ AUDIT_TEXT_FILTERED_EVENTS = {
 model_install_job = {
     "active": False,
     "status": "idle",
+    "job_id": "",
     "model_id": "",
     "variant_id": "",
     "command": "",
@@ -2460,6 +2462,9 @@ model_install_job = {
     "summary": "",
     "inventory_rebuild_ok": None,
 }
+MODEL_INSTALL_JOB_HISTORY_LIMIT = 12
+model_install_jobs = {}
+model_install_job_order = collections.deque(maxlen=MODEL_INSTALL_JOB_HISTORY_LIMIT)
 custom_model_job_lock = threading.Lock()
 custom_model_job = {
     "active": False,
@@ -2888,6 +2893,87 @@ def model_install_job_snapshot():
         return dict(model_install_job)
 
 
+def model_install_jobs_snapshot():
+    with model_install_job_lock:
+        return [
+            dict(model_install_jobs[job_id])
+            for job_id in reversed(model_install_job_order)
+            if job_id in model_install_jobs
+        ]
+
+
+def model_install_jobs_active():
+    with model_install_job_lock:
+        return any(bool(job.get("active")) for job in model_install_jobs.values())
+
+
+def _refresh_model_install_job_summary_locked():
+    active_jobs = [
+        dict(job)
+        for job in model_install_jobs.values()
+        if bool(job.get("active"))
+    ]
+    latest_job = None
+    for job_id in reversed(model_install_job_order):
+        job = model_install_jobs.get(job_id)
+        if job:
+            latest_job = dict(job)
+            break
+    if active_jobs:
+        active_jobs.sort(
+            key=lambda job: (
+                int(job.get("started_at") or 0),
+                str(job.get("job_id") or ""),
+            )
+        )
+        summary = dict(active_jobs[0])
+        summary["active"] = True
+        summary["summary"] = (
+            f"{len(active_jobs)} model download job"
+            f"{'' if len(active_jobs) == 1 else 's'} running"
+        )
+    elif latest_job:
+        summary = dict(latest_job)
+    else:
+        summary = {
+            "active": False,
+            "status": "idle",
+            "job_id": "",
+            "model_id": "",
+            "variant_id": "",
+            "command": "",
+            "started_at": 0,
+            "finished_at": 0,
+            "return_code": None,
+            "summary": "",
+            "inventory_rebuild_ok": None,
+        }
+    model_install_job.clear()
+    model_install_job.update(summary)
+
+
+def _set_model_install_job_entry(job_id, **updates):
+    with model_install_job_lock:
+        key = str(job_id or "").strip()
+        if not key:
+            raise ValueError("model install job id is required")
+        current = dict(model_install_jobs.get(key) or {})
+        current.update(updates)
+        current["job_id"] = key
+        model_install_jobs[key] = current
+        if key in model_install_job_order:
+            try:
+                model_install_job_order.remove(key)
+            except ValueError:
+                pass
+        model_install_job_order.append(key)
+        retained = set(model_install_job_order)
+        for stale_key in [job_key for job_key in list(model_install_jobs.keys()) if job_key not in retained]:
+            model_install_jobs.pop(stale_key, None)
+        _refresh_model_install_job_summary_locked()
+        return dict(current)
+
+
 def _set_model_install_job(**updates):
     with model_install_job_lock:
         model_install_job.update(updates)
@@ -2932,10 +3018,11 @@ def switch_job_active():
         return bool(switch_job.get("active"))
 
 
-def _run_model_install_job(model_id, variant_id, install_command):
+def _run_model_install_job(job_id, model_id, variant_id, install_command):
     prefix = f"[model-install {model_id}]"
     append_audit_text_line(f"{prefix} starting {install_command}")
-    _set_model_install_job(
+    _set_model_install_job_entry(
+        job_id,
         active=True,
         status="running",
         model_id=model_id,
@@ -2979,7 +3066,8 @@ def _run_model_install_job(model_id, variant_id, install_command):
     else:
         append_audit_text_line(f"{prefix} command failed with return code {rc}")
     summary = f"Model install {'completed' if rc == 0 else 'failed'} (rc={rc})"
-    _set_model_install_job(
+    _set_model_install_job_entry(
+        job_id,
         active=False,
         status=("success" if rc == 0 else "failed"),
         finished_at=int(time.time()),
@@ -3018,30 +3106,36 @@ def start_model_install_job(model_id, variant_id, install_command):
         if admin_task_job.get("active"):
             raise RuntimeError("Wait for the current admin task to finish before starting a model install")
     with model_install_job_lock:
-        if model_install_job.get("active"):
-            raise RuntimeError("A model install job is already running")
-        model_install_job.update(
-            {
-                "active": True,
-                "status": "queued",
-                "model_id": model_id,
-                "variant_id": variant_id,
-                "command": expected_command,
-                "started_at": int(time.time()),
-                "finished_at": 0,
-                "return_code": None,
-                "summary": "Queued model install job",
-                "inventory_rebuild_ok": None,
-            }
-        )
+        for job in model_install_jobs.values():
+            if not bool(job.get("active")):
+                continue
+            if (
+                str(job.get("model_id") or "") == str(model_id or "")
+                and str(job.get("variant_id") or "") == str(variant_id or "")
+            ):
+                raise RuntimeError("This preset is already downloading")
+    job_id = f"model-install-{int(time.time() * 1000)}-{secrets.token_hex(3)}"
+    _set_model_install_job_entry(
+        job_id,
+        active=True,
+        status="queued",
+        model_id=model_id,
+        variant_id=variant_id,
+        command=expected_command,
+        started_at=int(time.time()),
+        finished_at=0,
+        return_code=None,
+        summary="Queued model install job",
+        inventory_rebuild_ok=None,
+    )
     threading.Thread(
         target=_run_model_install_job,
-        args=(str(model_id), str(variant_id), expected_command),
+        args=(job_id, str(model_id), str(variant_id), expected_command),
         name=f"club3090-model-install-{_selector_token(model_id)}",
         daemon=True,
     ).start()
-    log_audit("model_install_job_started", model_id=model_id, variant_id=variant_id)
-    return model_install_job_snapshot()
+    log_audit("model_install_job_started", job_id=job_id, model_id=model_id, variant_id=variant_id)
+    return dict(model_install_jobs_snapshot()[0] if model_install_jobs_snapshot() else {})
 
 
 def _run_custom_model_add_job(job_request):
@@ -3162,8 +3256,7 @@ def start_custom_model_add_job(data):
     with admin_task_job_lock:
         if admin_task_job.get("active"):
             raise RuntimeError("Wait for the current admin task to finish before importing a custom model")
-    with model_install_job_lock:
-        if model_install_job.get("active"):
+    if model_install_jobs_active():
             raise RuntimeError("Wait for the current model install job to finish before importing a custom model")
     with custom_model_job_lock:
         if custom_model_job.get("active"):
@@ -3257,8 +3350,7 @@ def start_custom_model_remove_job(record_id):
     with admin_task_job_lock:
         if admin_task_job.get("active"):
             raise RuntimeError("Wait for the current admin task to finish before removing a custom model")
-    with model_install_job_lock:
-        if model_install_job.get("active"):
+    if model_install_jobs_active():
             raise RuntimeError("Wait for the current model install job to finish before removing a custom model")
     with custom_model_job_lock:
         if custom_model_job.get("active"):
@@ -3410,8 +3502,7 @@ def start_admin_task_job(task_name):
     with admin_task_job_lock:
         if admin_task_job.get("active"):
             raise RuntimeError("Another admin task is already running")
-    with model_install_job_lock:
-        if model_install_job.get("active"):
+    if model_install_jobs_active():
             raise RuntimeError("Wait for the current model install job to finish before starting this task")
     _set_admin_task_job(
         active=True,
@@ -3481,8 +3572,7 @@ def start_self_update_job(scope, target_commit=""):
     with admin_task_job_lock:
         if admin_task_job.get("active"):
             raise RuntimeError("Wait for the current admin task to finish before starting an update")
-    with model_install_job_lock:
-        if model_install_job.get("active"):
+    if model_install_jobs_active():
             raise RuntimeError("Wait for the current model install job to finish before starting an update")
     prefix = f"[self-update {scope_name}]"
     subprocess.run(["systemctl", "start", "club3090-updater.service"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
@@ -5612,6 +5702,33 @@ def _known_hf_download_command(model_dir_root, repo_id, subdir):
     return f'hf download {repo_id} --local-dir "{target_dir}"'
 
 
+def _known_hf_download_command_with_fallbacks(model_dir_root, repo_ids, subdir):
+    candidates = [str(repo_id or "").strip() for repo_id in (repo_ids or []) if str(repo_id or "").strip()]
+    if not candidates:
+        return ""
+    commands = [_known_hf_download_command(model_dir_root, repo_id, subdir) for repo_id in dict.fromkeys(candidates)]
+    if len(commands) == 1:
+        return commands[0]
+    return "( " + " || ".join(commands) + " )"
+
+
+def _preferred_weight_repo_candidates(model_id, weights_variant, repos=None):
+    candidates = []
+    key = (str(model_id or "").strip(), str(weights_variant or "").strip())
+    if key == ("qwen3.6-35b-a3b", "autoround_int4"):
+        candidates.extend(
+            [
+                "Intel/Qwen3.6-35B-A3B-int4-mixed-AutoRound",
+                "Intel/Qwen3.6-35B-A3B-int4-AutoRound",
+            ]
+        )
+    for repo_id in repos or []:
+        repo_text = str(repo_id or "").strip()
+        if repo_text:
+            candidates.append(repo_text)
+    return list(dict.fromkeys(candidates))
+
+
 def _path_has_model_assets(path):
     text = str(path or "").strip()
     if not text:
@@ -5675,7 +5792,7 @@ def _profile_guided_install_state_for_variant(variant, model_dir_root, model_pro
     if model is None or not weight_meta:
         return None
     base_subdir = str(weight_meta.get("path") or "").strip()
-    target_repos = list(weight_meta.get("hf_repos") or [])
+    target_repos = _preferred_weight_repo_candidates(model_id, weights_variant, weight_meta.get("hf_repos") or [])
     drafter_id = str(spec.get("profile_drafter_id") or spec.get("drafter_profile") or "").strip()
     drafter_download = _drafter_download_meta(model_profiles, drafter_id)
     drafter_repo = str(drafter_download.get("hf_repo") or "").strip()
@@ -5692,7 +5809,7 @@ def _profile_guided_install_state_for_variant(variant, model_dir_root, model_pro
         }
     commands = []
     if target_repos and base_subdir:
-        commands.append(_known_hf_download_command(model_dir_root, target_repos[0], base_subdir))
+        commands.append(_known_hf_download_command_with_fallbacks(model_dir_root, target_repos, base_subdir))
     if drafter_repo and drafter_subdir:
         commands.append(_known_hf_download_command(model_dir_root, drafter_repo, drafter_subdir))
     install_command = " && ".join(dict.fromkeys([cmd for cmd in commands if cmd]))
@@ -5998,19 +6115,23 @@ def _variant_status_text(profile, status_hints, registry_key, registry_entry, mo
     status_text = str((profile or {}).get("status") or "").strip() or str(status_hints or "").strip()
     if status_text:
         return status_text
-    weights_variant = str((registry_entry or {}).get("weights_variant") or "").strip()
-    weight_status = _profile_weight_status_text(model_profiles, (registry_entry or {}).get("model"), weights_variant)
-    if weight_status:
-        if "preview" in str(registry_key or "").lower():
-            return "preview"
-        return weight_status
-    key_text = str(registry_key or "").strip().lower()
+    key_text = " ".join(
+        [
+            str(registry_key or "").strip().lower(),
+            str((registry_entry or {}).get("compose_path") or "").strip().lower(),
+            str((registry_entry or {}).get("compose_rel_path") or "").strip().lower(),
+        ]
+    )
     if "preview" in key_text:
         return "preview"
     if "experimental" in key_text:
         return "experimental"
     if "blocked" in key_text:
         return "hardware-blocked"
+    weights_variant = str((registry_entry or {}).get("weights_variant") or "").strip()
+    weight_status = _profile_weight_status_text(model_profiles, (registry_entry or {}).get("model"), weights_variant)
+    if weight_status:
+        return weight_status
     if registry_entry:
         return "production"
     return ""
@@ -8970,13 +9091,94 @@ def instance_stop_subprocess_env():
     env["COMPOSE_BIN"] = COMPOSE_BIN
     return env
 
+def _instance_launch(instance):
+    spec = instance_variant_spec(instance)
+    ensure_variant_install_ready(spec)
+    cmd = instance_compose_args(instance) + ["up", "-d", "--force-recreate"]
+    rc, out = run_cmd(
+        cmd,
+        timeout=1800,
+        cwd=instance_compose_project_dir(instance),
+        env=instance_subprocess_env(instance),
+    )
+    log_control(f"INSTANCE start {instance['id']} mode={instance['mode']} rc={rc}: {out[-4000:]}")
+    if rc != 0:
+        raise RuntimeError(out or f"docker compose up failed for {instance['id']}")
+    return {"instance": instance, "output": out[-4000:]}
+
+
+def _instance_wait_until_ready(instance):
+    wait_for_runtime_ready(
+        instance_container_name(instance),
+        instance_ready_url(instance),
+        timeout=900,
+    )
+    clear_switch_failure(instance["mode"])
+
+
+def start_instances_parallel(instances):
+    targets = [dict(instance) for instance in (instances or []) if instance]
+    if not targets:
+        return {"started": [], "failed": []}
+    started = [None] * len(targets)
+    failed = []
+    launch_threads = []
+
+    def launch_worker(index, instance):
+        try:
+            started[index] = _instance_launch(instance)
+        except Exception as exc:
+            failed.append({"instance": dict(instance), "error": str(exc)})
+
+    for index, instance in enumerate(targets):
+        thread = threading.Thread(
+            target=launch_worker,
+            args=(index, instance),
+            name=f"club3090-launch-{str(instance.get('id') or index).lower()}",
+            daemon=True,
+        )
+        launch_threads.append(thread)
+        thread.start()
+    for thread in launch_threads:
+        thread.join()
+
+    ready_threads = []
+
+    def ready_worker(result):
+        try:
+            _instance_wait_until_ready(result["instance"])
+        except Exception as exc:
+            failed.append({"instance": dict(result["instance"]), "error": str(exc)})
+
+    for result in [row for row in started if row]:
+        thread = threading.Thread(
+            target=ready_worker,
+            args=(result,),
+            name=f"club3090-ready-{str(result['instance'].get('id') or 'instance').lower()}",
+            daemon=True,
+        )
+        ready_threads.append(thread)
+        thread.start()
+    for thread in ready_threads:
+        thread.join()
+
+    failed_ids = {
+        str(entry.get("instance", {}).get("id") or "").strip().upper()
+        for entry in failed
+    }
+    successful = [
+        row
+        for row in started
+        if row and str(row["instance"].get("id") or "").strip().upper() not in failed_ids
+    ]
+    return {"started": successful, "failed": failed}
+
+
 def start_instance(instance_id, track_switch_job=True):
     instance = get_instance(instance_id)
     if not instance:
         raise ValueError(f"Unknown instance: {instance_id}")
     try:
-        spec = instance_variant_spec(instance)
-        ensure_variant_install_ready(spec)
         if track_switch_job:
             _set_switch_job(
                 active=True,
@@ -8987,17 +9189,8 @@ def start_instance(instance_id, track_switch_job=True):
                 finished_at=0,
                 error="",
             )
-        cmd = instance_compose_args(instance) + ["up", "-d", "--force-recreate"]
-        rc, out = run_cmd(cmd, timeout=1800, cwd=instance_compose_project_dir(instance), env=instance_subprocess_env(instance))
-        log_control(f"INSTANCE start {instance['id']} mode={instance['mode']} rc={rc}: {out[-4000:]}")
-        if rc != 0:
-            raise RuntimeError(out or f"docker compose up failed for {instance['id']}")
-        wait_for_runtime_ready(
-            instance_container_name(instance),
-            instance_ready_url(instance),
-            timeout=900,
-        )
-        clear_switch_failure(instance["mode"])
+        result = _instance_launch(instance)
+        _instance_wait_until_ready(instance)
         if track_switch_job:
             _set_switch_job(
                 active=False,
@@ -9007,7 +9200,7 @@ def start_instance(instance_id, track_switch_job=True):
                 finished_at=int(time.time()),
                 error="",
             )
-        return {"instance": instance, "output": out[-4000:]}
+        return result
     except Exception as e:
         write_switch_failure(instance["mode"], e)
         if track_switch_job:
@@ -9203,14 +9396,15 @@ def boot_enabled_instances():
     outputs = []
     rows = visible_instances(read_instances_config())
     file_mode = read_active_mode_file()
-    for inst in rows:
-        if not inst.get("enabled"):
-            continue
-        try:
-            result = start_instance(inst["id"])
-            outputs.append(f"{inst['id']} started: {(result.get('output') or '')[-800:]}")
-        except Exception as e:
-            outputs.append(f"{inst['id']} failed: {e}")
+    enabled_rows = [inst for inst in rows if inst.get("enabled")]
+    if enabled_rows:
+        result = start_instances_parallel(enabled_rows)
+        for row in result.get("started") or []:
+            inst = row.get("instance") or {}
+            outputs.append(f"{inst.get('id') or 'instance'} started: {str(row.get('output') or '')[-800:]}")
+        for row in result.get("failed") or []:
+            inst = row.get("instance") or {}
+            outputs.append(f"{inst.get('id') or 'instance'} failed: {row.get('error')}")
     if not outputs and file_mode:
         spec = resolve_variant_spec(file_mode)
         if spec and str(spec.get("scope_kind") or "") in {"multi", "global_only"}:
@@ -11442,6 +11636,7 @@ def build_status_snapshot(force_remote_metadata=False):
         "nvlink": detect_nvlink_status(),
         "upstream_services": upstream_services,
         "model_install_job": model_install_job_snapshot(),
+        "model_install_jobs": model_install_jobs_snapshot(),
         "custom_model_job": custom_model_job_snapshot(),
         "admin_task_job": admin_task_job_snapshot(),
         "single_gpu_modes": list(SINGLE_GPU_MODES),
@@ -11509,6 +11704,7 @@ def build_status_error_snapshot(error, previous=None):
         "nvlink": dict(previous.get("nvlink") or {}),
         "upstream_services": list(previous.get("upstream_services") or []),
         "model_install_job": previous.get("model_install_job") if isinstance(previous.get("model_install_job"), dict) else model_install_job_snapshot(),
+        "model_install_jobs": list(previous.get("model_install_jobs") or model_install_jobs_snapshot()),
         "custom_model_job": previous.get("custom_model_job") if isinstance(previous.get("custom_model_job"), dict) else custom_model_job_snapshot(),
         "admin_task_job": previous.get("admin_task_job") if isinstance(previous.get("admin_task_job"), dict) else admin_task_job_snapshot(),
         "single_gpu_modes": list(previous.get("single_gpu_modes") or SINGLE_GPU_MODES),
@@ -14412,9 +14608,18 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                         error="",
                     )
                     try:
-                        for target in updated_targets:
-                            result = start_instance(target["id"], track_switch_job=False)
-                            outputs.append(f"{target['id']}: {(result.get('output') or '')[-2400:]}")
+                        launch_result = start_instances_parallel(updated_targets)
+                        for row in launch_result.get("started") or []:
+                            target = row.get("instance") or {}
+                            outputs.append(f"{target.get('id') or 'instance'}: {str(row.get('output') or '')[-2400:]}")
+                        partial_failures = launch_result.get("failed") or []
+                        if partial_failures:
+                            outputs.extend(
+                                f"{str((row.get('instance') or {}).get('id') or 'instance')}: {str(row.get('error') or '')[-2400:]}"
+                                for row in partial_failures
+                            )
+                        if not launch_result.get("started"):
+                            raise RuntimeError("\n\n".join(outputs).strip() or "All global single-GPU launches failed.")
                         write_active_mode(mode)
                         write_last_good_mode(mode)
                         clear_switch_failure(mode)
@@ -14462,8 +14667,18 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                             target = save_pair_instance(pair, mode=mode, enabled=True)
                             target = update_instance(target["id"], mode=mode, enabled=True)
                             updated_targets.append(target)
-                            result = start_instance(target["id"], track_switch_job=False)
-                            outputs.append(f"{target['id']}: {(result.get('output') or '')[-2400:]}")
+                        launch_result = start_instances_parallel(updated_targets)
+                        for row in launch_result.get("started") or []:
+                            target = row.get("instance") or {}
+                            outputs.append(f"{target.get('id') or 'instance'}: {str(row.get('output') or '')[-2400:]}")
+                        partial_failures = launch_result.get("failed") or []
+                        if partial_failures:
+                            outputs.extend(
+                                f"{str((row.get('instance') or {}).get('id') or 'instance')}: {str(row.get('error') or '')[-2400:]}"
+                                for row in partial_failures
+                            )
+                        if not launch_result.get("started"):
+                            raise RuntimeError("\n\n".join(outputs).strip() or "All global dual-GPU launches failed.")
                         write_active_mode(mode)
                         write_last_good_mode(mode)
                         clear_switch_failure(mode)
@@ -14542,7 +14757,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                     data.get("variant_id"),
                     data.get("install_command"),
                 )
-                self.send_json({"ok": True, "model_install_job": job, "focus_log_source": "audit"})
+                self.send_json({"ok": True, "model_install_job": job, "model_install_jobs": model_install_jobs_snapshot(), "focus_log_source": "audit"})
             except Exception as e:
                 self.send_json({"ok": False, "error": str(e)}, 500)
             return
