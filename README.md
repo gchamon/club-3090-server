@@ -15,8 +15,10 @@ This repository is the server-management layer. It integrates with the upstream 
 - A control stack installed under `/opt/club3090-control` and an admin web panel running on `localhost:8008/admin`
 - An OpenAI-compatible proxy on `:8009` so you can chat with the LLM on a unified port regardless of what docker containers are in use.
 - GPU-aware backend selection with per-GPU and multi-instance runtime management for single-card, dual-card or multi-card presets with dynamic runtime inventory discovery from the local `club-3090` checkout
+- A modern scope model built around `GLOBAL`, `GPU<n>`, and `PAIRx_y` targets, including built-in sequential auto-pairs and custom user-defined pairs
+- A Presets experience that includes model-summary relaunch surfaces, Setup Assistant recommendations, selector-scoped launch overrides, and a first-class Custom Model import path backed by upstream `pull.sh`
 - Built-in local inference chat with server-persisted conversations across browsers/devices, per-conversation saved settings, folders, automatic conversation naming, system-prompt templates, rich markdown/media rendering, collapsible thinking trace rendering, local attachments, and automatic context compaction/rollover
-- Live Docker and audit log streaming that stays aware of multiple backend containers
+- Live Docker, Audit, and Debug log streaming that stays aware of multiple backend containers, including an interactive debug-shell lane with autocomplete, history, upload/download helpers, and zip-based folder transfers
 - Preset launch state that only flips to `Active` after the backend fully finishes booting, with boot/error browser notifications and fast failure reporting when a compose never actually starts a container
 - UI-driven model download/setup jobs with stdout/stderr streamed into Audit Logs
 - Hardware metrics, uptime, health reporting, and backend auto-start and manual control, as well as full server remote management controls
@@ -250,6 +252,51 @@ That means the Presets tab now reflects whatever models and variants exist in th
 
 Upstream switch tags such as `vllm/default`, `vllm/dual`, `vllm/gemma-mtp`, and `llamacpp/default` are still recognized when present, but the control layer can also launch compose variants that are only discoverable by scanning the repo tree.
 
+Since the broader `v0.8.x` migration, the inventory path is also registry/profile-aware, so the admin panel can surface richer upstream metadata such as:
+
+- preview, production, experimental, and caveat-marked variants
+- structured launch defaults pulled from compose/profile metadata instead of a local hardcoded table
+- family summaries and model-summary relaunch cards
+- built-in and custom API-preset aware routes
+- Custom Model imports that register as persistent local runtime cards once upstream import succeeds
+
+## Preset UX And Scope Model
+
+The older single-mode/legacy-dual distinction has gradually been replaced by a clearer scope-oriented control model.
+
+The admin panel now thinks in terms of:
+
+- `GLOBAL`: fan a compatible preset out across every eligible target automatically
+- `GPU0`, `GPU1`, `GPU2`, ...: explicit single-card targets
+- `PAIR0_1`, `PAIR2_3`, ...: dual-card targets
+- built-in automatic sequential pairs plus custom user-defined pairs
+
+Important behaviors added across the `v0.7.x` and `v0.8.x` series include:
+
+- built-in auto-pairs are preserved separately from custom pairs
+- Global single-card and Global dual-card launches fan out in parallel instead of waiting for each target to finish before starting the next one
+- generated compose overrides now keep host GPU reservation separate from the in-container CUDA ordinal view, which is critical for higher-index GPUs and pairs
+- preset cards can expose selector-scoped Launch Settings overrides sourced from compose/profile metadata
+- per-runtime Generation Statistics reflect the actual launched context and runtime state rather than only a static catalog guess
+- Setup Assistant / Preset Recommendation Survey can recommend curated presets based on detected hardware and desired rollout style
+
+If you use many presets often, the Summary view is also worth calling out. It keeps a relaunch-oriented cache of recent and active presets per model, including temporary boot entries and bulk stop/restart actions.
+
+## Custom Model Imports
+
+One of the biggest `v0.8.x` additions is the first-class Custom Model flow in the Presets tab.
+
+Instead of manually treating every non-curated model as a one-off local hack, the panel now supports:
+
+- a dedicated `[+] Custom Model` entry point
+- import flows that delegate to upstream `scripts/pull.sh`
+- streaming import progress and gate/caveat output into Audit Logs
+- reference-profile guidance so imports can reuse a known-good compose shape
+- persistent registration of successful imports as local runtime cards
+- removal flows that clean up the registered runtime state instead of leaving orphaned cards behind
+
+This keeps the UI model-first while still deferring the actual import/evaluation logic to upstream Club-3090.
+
 ## Install
 
 Default install:
@@ -413,6 +460,13 @@ On multi-GPU systems, this lets you run:
 
 This is intentionally separate from the legacy dual-GPU presets. If no per-GPU single-card instances are enabled, the control service can still fall back to the old upstream dual-mode flow.
 
+In newer releases this model also extends cleanly into the scope-based control plane:
+
+- instance relaunch, boot tracking, and log handoff are scope-aware
+- popout log viewers keep the selected runtime target instead of collapsing back to a generic bootstrap snapshot
+- runtime readiness for non-vLLM stacks such as llama.cpp and ik-llama is tracked by real local API reachability, not only by vLLM-style log markers
+- higher-index GPU scopes and pair scopes are protected by the remapped env/export fixes added during the `v0.8.4x` cycle
+
 ## Online Exposure Model
 
 When you install or update with `--online`, the script treats the control service as the only public surface.
@@ -550,23 +604,31 @@ The admin UI is designed to control the whole server from one place. It exposes:
 - per-instance GPU subtabs for multi-GPU systems
 - dynamic model cards for upstream-discovered single, dual, multi, and experimental presets
 - model-summary view that caches up to the latest five active or previously active presets per model as a quick relaunch surface, including temporary boot entries and bulk stop/restart controls
+- Setup Assistant / Preset Recommendation Survey for guided preset selection from detected hardware and workload intent
+- first-class Custom Model import, registration, and removal flows
 - per-instance preset assignment for single-card runtimes
 - per-instance start, restart, stop, and boot-autostart toggles with boot-progress log handoff, active/booting/error state badges, and launch-time reporting
 - one-click runtime inventory rebuild from the web panel
 - preset-aware model downloads that stream installer output into Audit Logs
+- selector-scoped Launch Settings / engine-switch override editing sourced from compose/profile defaults
 - per-runtime generation stats cards that aggregate the latest latency, throughput, KV-cache, and token counters across all running instances
 - a local inference chat interface with realtime streaming, container and API-preset selection, richer markdown rendering, multi-attachment image/text upload support, paste-to-Markdown attachment conversion for long pastes, optional browser voice dictation, shareable Markdown conversation exports, a compact modal chat-settings editor, per-conversation plus per-runtime generation stats, and archived-chat restore flows
 - chat conversations are stored server-side in `/opt/club3090-control/conversations/state.json`, with the conversation list loading first and individual transcripts fetched on demand to keep large histories responsive
 - chat conversations archive by default from the Chats tab so they can be restored later from Chat Options; hold `Shift` while using the archive button for permanent deletion instead
 - assistant transcript bodies now favor a plain-text presentation path for stability, while preserving the expandable reasoning panel, attachments, exports, and per-runtime stats
+- live chat recovery across refreshes, including persisted partial assistant output and server-side stream-state tracking
+- per-conversation stop/recovery handling so refreshed pages can still abort an active server-side generation
+- chat transcript auto-follow, fit-to-content resize helpers, and lighter live streaming paths for long responses
 - optional MCP integration for the local chat interface, with UI-managed add/enable/disable flows for both local stdio commands and remote MCP URLs so enabled tools can be exposed to the model during chat
 - a Users tab for API-key users, quotas, access rules, and proxy-auth policy
 - global power profile management
 - fan control and optimization toggles
 - Wake-on-LAN support
 - machine restart and shutdown controls
+- self-update controls that read shipped release metadata directly from `build/metadata.json`
 - custom API preset creation, editing, and deletion
 - live Docker and Audit logs streaming with search tools
+- an interactive Debug Logs shell lane with inline ghost completion, command history, file upload/download helpers, and shell-aware zip transfers for files, folders, and glob patterns
 - shared searchable audit-log streaming backed by `/opt/club3090-control/audit.log`
 
 Authentication uses Linux usernames and passwords through `pamtester`.
@@ -582,6 +644,35 @@ That means:
 - multiple backend containers can be tailed correctly
 - logs remain usable even when container names differ by instance or runtime
 - the admin panel can subscribe to the selected instance's log stream
+
+The browser-side logging stack is also much richer now than the early `v0.7.x` path:
+
+- Docker, Audit, Debug, updater, and upstream-service streams can all be switched in-panel
+- detached/popped-out viewers stay pinned to the same runtime target
+- Audit Logs carry long-running installer and model-download progress instead of stalling on carriage-return updates
+- Debug Logs include an interactive bash command box with autocomplete, history, and transfer actions
+- the debug-shell transfer helpers can upload files, zip and upload folders, and zip/download explicit files, folders, or glob-expanded results from the current shell working directory
+
+## Chat Experience
+
+The built-in local chat client has grown significantly since early `v0.7.x`. In addition to basic local chat, it now includes:
+
+- server-persisted conversations with lazy transcript loading
+- per-conversation state recovery after refreshes or network interruptions
+- per-conversation and per-runtime generation statistics
+- support for reasoning/thinking traces with collapsible display
+- image and text attachments, including paste-to-Markdown conversion for long pasted text
+- optional browser voice dictation
+- share/export flows for conversation Markdown
+- optional local and remote MCP tool integration
+- streaming paths that prioritize transcript stability and progressively lighter render/update behavior during long generations
+
+The chat renderer and syntax pipeline also received a long series of fixes across the `v0.7.x` and `v0.8.x` line:
+
+- streamed fenced code and inline code render more reliably while text is still arriving
+- syntax colors now come from the normalized `code_syntax.json` theme/config instead of brittle embedded fallbacks
+- Markdown list/inline-span split bugs were fixed for live streaming
+- HTML/XML fenced blocks, footnotes, Mermaid export helpers, and admonition rendering were all improved
 
 ## Runtime Behavior
 
@@ -601,6 +692,9 @@ That means:
 - It can downclock hardware during idle windows
 - It can restore enabled per-GPU instances on boot
 - It can fall back to the last known-good legacy mode if a startup attempt fails
+- It can persist and resume migration/update state with metadata-aware self-update handling
+- It can rebuild the upstream-derived runtime inventory after repo/profile changes
+- It can keep shipped metadata, changelog text, and code-syntax config synchronized with the browser/admin payloads
 
 ## Installed Services
 
@@ -653,3 +747,8 @@ These services are gated by the kernel command-line flag `club3090.server=1`, so
 
 - [`install-club3090-server.sh`](./install-club3090-server.sh): full installer/updater
 - [`README.md`](./README.md): feature and usage reference
+- [`control/`](./control): split-source Python backend modules used to build the shipped control plane
+- [`web/`](./web): split-source HTML/CSS/JS for the admin panel
+- [`build/`](./build): build pipeline, metadata, and smoke tests used to compose the shipped single-file installer
+
+The project has used a split-source build pipeline since the `v0.7.0` refactor, but still ships a single integrated installer artifact. Day-to-day development happens in `control/`, `web/`, and `build/`, then `build/build.py` regenerates the monolithic script and bundled assets.
