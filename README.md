@@ -22,6 +22,7 @@ This repository is the server-management layer. It integrates with the upstream 
 - Preset launch state that only flips to `Active` after the backend fully finishes booting, with boot/error browser notifications and fast failure reporting when a compose never actually starts a container
 - UI-driven model download/setup jobs with stdout/stderr streamed into Audit Logs
 - Hardware metrics, uptime, health reporting, and backend auto-start and manual control, as well as full server remote management controls
+- Optional GDDR6/GDDR6X junction and VRAM temperature telemetry in the Main GPU cards and Metrics graphs, using a vendored helper source/header compiled locally when supported
 - Power presets, fan speed control, idle downclocking, and system information for remote server management
 - Create dynamic instances and run multiple docker containers per GPU or GPU Pairs and be able to run inference on a single unified endpoint with different configurable vLLM setting presets 
 - Optional per-user API key authentication, access control, and optional quota enforcement
@@ -29,6 +30,7 @@ This repository is the server-management layer. It integrates with the upstream 
 - Optional `--online` mode that opens and forwards only the admin/proxy ports to the internet
 - Optional `--online use-https` mode that enables a Caddy-backed self-signed HTTPS frontend for the admin panel and proxy
 - Docker logs automatically printed to tty1 and last instance autostart if the kernel condition club3090.server=1 is active
+- Optional `--skip-temps` installer switch for operators who do not want the extra temperature helper, dependency install, bootloader `iomem=relaxed` staging, or reboot notice
 
 ## Screenshots
 Video coming soon.
@@ -64,6 +66,8 @@ Make sure your Linux machine already has:
 - a normal Linux user account that can use `sudo`
 
 If you plan to download gated Hugging Face models, also have your Hugging Face token ready.
+
+By default the installer also prepares optional GDDR6/GDDR6X junction and VRAM temperature telemetry for supported NVIDIA cards. It vendors the helper source and NVIDIA NVML header inside the installer, compiles the helper locally against the host NVIDIA/libpci libraries, stages the required `iomem=relaxed` kernel command-line flag when it is not already active, and tells you to reboot only when that reboot is needed for the new readings to work.
 
 ### Step 1: Run the installer
 
@@ -145,7 +149,7 @@ If something fails, the preset will show `Error` and the logs will show what hap
 
 For most beginners:
 
-- Use a single-GPU preset if you only want one model running on one GPU, or the global scope to automatically distribute presets to alll available GPUs.
+- Use a single-GPU preset if you only want one model running on one GPU, or the global scope to automatically distribute presets to all available GPUs.
 - Use the default or recommended preset first before trying special variants like long-context, dual-card, turbo, or DFlash
 - Test if inference is working correctly via the built-in chat interface and watch the generated statistics
 
@@ -252,10 +256,12 @@ That means the Presets tab now reflects whatever models and variants exist in th
 
 Upstream switch tags such as `vllm/default`, `vllm/dual`, `vllm/gemma-mtp`, and `llamacpp/default` are still recognized when present, but the control layer can also launch compose variants that are only discoverable by scanning the repo tree.
 
-Since the broader `v0.8.x` migration, the inventory path is also registry/profile-aware, so the admin panel can surface richer upstream metadata such as:
+Since the broader `v0.8.x` and `v0.9.x` migrations, the inventory path is also registry/profile-aware and understands the newer nested upstream compose hierarchy, so the admin panel can surface richer upstream metadata such as:
 
 - preview, production, experimental, and caveat-marked variants
 - structured launch defaults pulled from compose/profile metadata instead of a local hardcoded table
+- compose-registry aliases, shared profile resources, and newer upstream families such as `autoround-int4`, `awq`, `unsloth-q4km`, `ubergarm-iq4ks`, and `ex0bit-prism`
+- profile-driven asset planning for model paths, draft models, projectors, Hugging Face cache-backed assets, directory-backed vLLM resources, and setup-script driven resources
 - family summaries and model-summary relaunch cards
 - built-in and custom API-preset aware routes
 - Custom Model imports that register as persistent local runtime cards once upstream import succeeds
@@ -277,6 +283,7 @@ Important behaviors added across the `v0.7.x` and `v0.8.x` series include:
 - Global single-card and Global dual-card launches fan out in parallel instead of waiting for each target to finish before starting the next one
 - generated compose overrides now keep host GPU reservation separate from the in-container CUDA ordinal view, which is critical for higher-index GPUs and pairs
 - preset cards can expose selector-scoped Launch Settings overrides sourced from compose/profile metadata
+- preset cards show richer disk/download status, shared-resource markers, provenance tooltips, and safer delete dialogs that preview the exact files and reclaim size
 - per-runtime Generation Statistics reflect the actual launched context and runtime state rather than only a static catalog guess
 - Setup Assistant / Preset Recommendation Survey can recommend curated presets based on detected hardware and desired rollout style
 
@@ -349,11 +356,20 @@ Public internet exposure:
 bash install-club3090-server.sh --online
 ```
 
-Public internet exposure with TLS layewr:
+Public internet exposure with TLS layer:
 
 ```bash
 bash install-club3090-server.sh --online use-https
 ```
+
+Skip optional junction/VRAM temperature telemetry setup and keep the old install/update behavior:
+
+```bash
+bash install-club3090-server.sh --skip-temps
+```
+
+`--skip-temps` bypasses helper unpacking, compiler/libpci dependency installation, bootloader `iomem=relaxed` staging, and the related reboot notice.
+
 ## Update
 
 Updates the control layer without intentionally stopping an already-running backend:
@@ -407,9 +423,10 @@ bash install-club3090-server.sh --migrate restart
 - clones a fresh upstream `club-3090` repo into the original path
 - preserves `models-cache`, safe compose cache directories, and `.env`
 - logs the resolved old and new `MODEL_DIR` paths during migration and mirrors preserved weights into the effective post-merge model directory when it differs from the repo-local default
+- normalizes older preserved Qwen GGUF assets into the paths expected by the newer upstream compose/profile tree
 - preserves old Genesis patch trees in the migration backup instead of copying them back into the fresh repo before `setup.sh` reclones them
 - rebuilds the dynamic runtime inventory
-- re-runs only the model setup commands required by the currently configured presets
+- replays the required upstream setup commands and re-runs only the model setup commands required by the currently configured presets
 - writes resumable migration state to `/opt/club3090-control/migration-state.env`
 - emits continuous step-by-step progress and heartbeat messages during long-running phases like clone, setup, and update
 - resumes interrupted migrations automatically on the next `--migrate`
@@ -601,6 +618,7 @@ The admin UI is designed to control the whole server from one place. It exposes:
 - current active backend, service state, and uptime
 - request counters and recent latency/token metrics
 - GPU, RAM, CPU, storage, and network telemetry
+- optional GPU core, junction/hotspot, and VRAM temperature telemetry when the helper is installed and the kernel allows MMIO access
 - per-instance GPU subtabs for multi-GPU systems
 - dynamic model cards for upstream-discovered single, dual, multi, and experimental presets
 - model-summary view that caches up to the latest five active or previously active presets per model as a quick relaunch surface, including temporary boot entries and bulk stop/restart controls
@@ -610,8 +628,9 @@ The admin UI is designed to control the whole server from one place. It exposes:
 - per-instance start, restart, stop, and boot-autostart toggles with boot-progress log handoff, active/booting/error state badges, and launch-time reporting
 - one-click runtime inventory rebuild from the web panel
 - preset-aware model downloads that stream installer output into Audit Logs
+- direct Hugging Face downloads, setup-script downloads, and missing-size file probes report progress through the same Audit Log job path
 - selector-scoped Launch Settings / engine-switch override editing sourced from compose/profile defaults
-- per-runtime generation stats cards that aggregate the latest latency, throughput, KV-cache, and token counters across all running instances
+- per-runtime generation stats cards that aggregate live latency, TTFT, throughput, context fill, KV-cache usage, prefix-cache, speculative/MTP drafted and accepted tokens, acceptance rate, and token counters across all running instances
 - a local inference chat interface with realtime streaming, container and API-preset selection, richer markdown rendering, multi-attachment image/text upload support, paste-to-Markdown attachment conversion for long pastes, optional browser voice dictation, shareable Markdown conversation exports, a compact modal chat-settings editor, per-conversation plus per-runtime generation stats, and archived-chat restore flows
 - chat conversations are stored server-side in `/opt/club3090-control/conversations/state.json`, with the conversation list loading first and individual transcripts fetched on demand to keep large histories responsive
 - chat conversations archive by default from the Chats tab so they can be restored later from Chat Options; hold `Shift` while using the archive button for permanent deletion instead
@@ -626,6 +645,7 @@ The admin UI is designed to control the whole server from one place. It exposes:
 - Wake-on-LAN support
 - machine restart and shutdown controls
 - self-update controls that read shipped release metadata directly from `build/metadata.json`
+- update flows lock the panel onto updater logs while the updater is running and resume update monitoring after a page reload
 - custom API preset creation, editing, and deletion
 - live Docker and Audit logs streaming with search tools
 - an interactive Debug Logs shell lane with inline ghost completion, command history, file upload/download helpers, and shell-aware zip transfers for files, folders, and glob patterns
@@ -652,10 +672,11 @@ The browser-side logging stack is also much richer now than the early `v0.7.x` p
 - Audit Logs carry long-running installer and model-download progress instead of stalling on carriage-return updates
 - Debug Logs include an interactive bash command box with autocomplete, history, and transfer actions
 - the debug-shell transfer helpers can upload files, zip and upload folders, and zip/download explicit files, folders, or glob-expanded results from the current shell working directory
+- updater logs remain selected during self-update runs so duplicate updates and accidental log-source switches are avoided
 
 ## Chat Experience
 
-The built-in local chat client has grown significantly since early `v0.7.x`. In addition to basic local chat, it now includes:
+The built-in local chat client has grown significantly since early `v0.7.x` and the `v0.9.x` stabilization pass. In addition to basic local chat, it now includes:
 
 - server-persisted conversations with lazy transcript loading
 - per-conversation state recovery after refreshes or network interruptions
@@ -666,8 +687,9 @@ The built-in local chat client has grown significantly since early `v0.7.x`. In 
 - share/export flows for conversation Markdown
 - optional local and remote MCP tool integration
 - streaming paths that prioritize transcript stability and progressively lighter render/update behavior during long generations
+- incremental stream-metrics handling so per-message and conversation Generation Statistics update before the final response completes
 
-The chat renderer and syntax pipeline also received a long series of fixes across the `v0.7.x` and `v0.8.x` line:
+The chat renderer and syntax pipeline also received a long series of fixes across the `v0.7.x`, `v0.8.x`, and `v0.9.x` lines:
 
 - streamed fenced code and inline code render more reliably while text is still arriving
 - syntax colors now come from the normalized `code_syntax.json` theme/config instead of brittle embedded fallbacks
@@ -695,6 +717,7 @@ The chat renderer and syntax pipeline also received a long series of fixes acros
 - It can persist and resume migration/update state with metadata-aware self-update handling
 - It can rebuild the upstream-derived runtime inventory after repo/profile changes
 - It can keep shipped metadata, changelog text, and code-syntax config synchronized with the browser/admin payloads
+- It can compile and install the optional vendored `gputemps` helper under `/opt/club3090-control/bin/gputemps` for junction/hotspot and VRAM temperature telemetry
 
 ## Installed Services
 
@@ -726,6 +749,10 @@ These services are gated by the kernel command-line flag `club3090.server=1`, so
 - `/opt/club3090-control/network_state.json`
 - `/opt/club3090-control/Caddyfile`
 - `/opt/club3090-control/local_api_token`
+- `/opt/club3090-control/bin/gputemps`
+- `/opt/club3090-control/include/nvml.h`
+- `/opt/club3090-control/src/gputemps/gputemps.c`
+- `/opt/club3090-control/src/gputemps/nvml.h`
 - `/opt/club3090-control/control.log`
 - `/opt/club3090-control/audit.log`
 - `/etc/systemd/system/club3090-vllm.service`
@@ -740,6 +767,8 @@ These services are gated by the kernel command-line flag `club3090.server=1`, so
 - The design goal is to avoid forking upstream runtime files wherever possible
 - Docker and NVIDIA drivers should be installed before first use
 - Headless fan control depends on `nvidia-settings` and a private Xorg display
+- Extra junction/VRAM telemetry depends on a locally compiled helper that links against the host NVIDIA Management Library and libpci; the installer vendors the helper source/header, installs only the compile/link packages when the helper is missing, and can be bypassed with `--skip-temps`
+- The `iomem=relaxed` kernel switch is required for that extra telemetry on systems that otherwise block GPU MMIO mapping. It is useful on trusted single-user inference hosts, but it does relax a kernel I/O-memory safety boundary, so security-sensitive or shared systems may prefer `--skip-temps`
 - The installer attempts to install `nvidia-settings`, Xorg, `pamtester`, OpenSSL, Caddy, `miniupnpc`, and firewall tooling as needed, and exits safely with a clear error if a required dependency still cannot be installed
 - The control layer is intended for unattended inference hosts and physical server consoles
 
@@ -750,5 +779,6 @@ These services are gated by the kernel command-line flag `club3090.server=1`, so
 - [`control/`](./control): split-source Python backend modules used to build the shipped control plane
 - [`web/`](./web): split-source HTML/CSS/JS for the admin panel
 - [`build/`](./build): build pipeline, metadata, and smoke tests used to compose the shipped single-file installer
+- [`build/vendor/`](./build/vendor): vendored helper source/header payloads embedded into the installer for optional junction/VRAM temperature telemetry
 
-The project has used a split-source build pipeline since the `v0.7.0` refactor, but still ships a single integrated installer artifact. Day-to-day development happens in `control/`, `web/`, and `build/`, then `build/build.py` regenerates the monolithic script and bundled assets.
+The project has used a split-source build pipeline since the `v0.7.0` refactor, but still ships a single integrated installer artifact. Day-to-day development happens in `control/`, `web/`, and `build/`, then `build/build.py` regenerates the monolithic script and bundled assets. Shipped control, updater, admin UI, code-syntax, and optional temperature-helper payloads are compressed into the installer so release artifacts stay deterministic and do not depend on helper repositories being reachable during install.
