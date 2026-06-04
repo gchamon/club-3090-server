@@ -936,6 +936,7 @@ applyLogVisibility = function () {
     logEs = null;
   }
   syncAllDetachedLogPopups();
+  applyMetricsVisibility();
 };
 function logStreamConfig() {
   if (currentLogSource === "update") {
@@ -1845,4 +1846,5 @@ function syncActiveTabDisplay() {
   const btn = activeTabButton(activeTabName);
   if (btn) btn.classList.add("active");
   applyLogVisibility();
+  applyMetricsVisibility();
 }

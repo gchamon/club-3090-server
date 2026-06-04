@@ -14,16 +14,17 @@ from pathlib import Path
 
 
 BUILD_DIR = Path(__file__).resolve().parent
-ROOT = BUILD_DIR.parent
-CONTROL_SOURCE_DIR = ROOT / "control"
-WEB_SOURCE_DIR = ROOT / "web"
+SRC_DIR = BUILD_DIR.parent
+ROOT = SRC_DIR.parent
+CONTROL_SOURCE_DIR = SRC_DIR / "control"
+WEB_SOURCE_DIR = SRC_DIR / "web"
 VENDOR_SOURCE_DIR = BUILD_DIR / "vendor"
 LOGS_DIR = ROOT / "logs"
 SCRIPT_SOURCE_NAME = "base.sh"
 SCRIPT_OUTPUT_NAME = "install-club3090-server.sh"
 SCRIPT_SOURCE_PATH = BUILD_DIR / SCRIPT_SOURCE_NAME
 SCRIPT_OUTPUT_PATH = ROOT / SCRIPT_OUTPUT_NAME
-METADATA_FILE = BUILD_DIR / "metadata.json"
+METADATA_FILE = ROOT / "metadata.json"
 UPDATER_SOURCE_PATH = BUILD_DIR / "updater.py"
 UPDATER_OUTPUT_PATH = ROOT / "updater.py"
 CONTROL_OUTPUT_PATH = ROOT / "control.py"
@@ -90,6 +91,7 @@ AUTHORITATIVE_FILES = [
     SCRIPT_SOURCE_NAME,
     SCRIPT_OUTPUT_NAME,
     "build.py",
+    "metadata.json",
     "package.json",
     "package-lock.json",
     "v07_CHECKLIST.MD",
@@ -139,6 +141,7 @@ def configure_build_identity(version: str, script_version: str) -> None:
         SCRIPT_SOURCE_NAME,
         SCRIPT_OUTPUT_NAME,
         "build.py",
+        "metadata.json",
         "package.json",
         "package-lock.json",
         "v07_CHECKLIST.MD",
@@ -219,10 +222,16 @@ def bump_patch_version(version: str) -> str:
     if not match:
         raise ValueError(f"metadata.json version must use major.minor.patch with an optional letter suffix, got {version!r}")
     major, minor, patch = (int(part) for part in match.groups()[:3])
-    suffix = match.group(4) or ""
-    if suffix:
-        return f"{major}.{minor}.{patch}{bump_version_suffix(suffix)}"
     return f"{major}.{minor}.{patch + 1}"
+
+
+def bump_iterative_version(version: str) -> str:
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)([a-z]*)", str(version or "").strip())
+    if not match:
+        raise ValueError(f"metadata.json version must use major.minor.patch with an optional letter suffix, got {version!r}")
+    major, minor, patch = (int(part) for part in match.groups()[:3])
+    suffix = match.group(4) or ""
+    return f"{major}.{minor}.{patch}{bump_version_suffix(suffix)}"
 
 
 def base_release_version(version: str) -> str:
@@ -262,13 +271,18 @@ def normalize_release_change_entries(changes: list[str]) -> list[str]:
     return entries
 
 
-def update_metadata_for_build(changes: list[str], *, release_date: str | None = None) -> tuple[dict[str, str], str]:
+def update_metadata_for_build(
+    changes: list[str],
+    *,
+    iterative: bool = False,
+    release_date: str | None = None,
+) -> tuple[dict[str, str], str]:
     raw_text = read_text(METADATA_FILE)
     payload = json.loads(raw_text)
     current_version = str(payload.get("version") or "").strip()
     current_latest = sanitize_metadata_text(payload.get("change_log_latest") or "")
     current_release = sanitize_metadata_text(payload.get("change_log_release") or "")
-    next_version = bump_patch_version(current_version)
+    next_version = bump_iterative_version(current_version) if iterative else bump_patch_version(current_version)
     current_base_version = base_release_version(current_version)
     next_base_version = base_release_version(next_version)
     next_release_date = str(release_date or date.today().isoformat()).strip()
@@ -302,7 +316,8 @@ def update_metadata_for_build(changes: list[str], *, release_date: str | None = 
     payload["change_log_latest"] = next_latest
     payload["change_log_release"] = "\n\n".join(section for section in release_sections if section.strip())
     write_text(METADATA_FILE, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-    detail = f"metadata.json updated automatically from v{current_version} to v{next_version} using {len(normalize_release_change_entries(changes))} supplied change entr{'y' if len(normalize_release_change_entries(changes)) == 1 else 'ies'}"
+    build_mode = "iterative letter suffix" if iterative else "patch version bump"
+    detail = f"metadata.json updated automatically from v{current_version} to v{next_version} using {len(normalize_release_change_entries(changes))} supplied change entr{'y' if len(normalize_release_change_entries(changes)) == 1 else 'ies'} via {build_mode}"
     return load_build_metadata_inputs(), detail
 
 

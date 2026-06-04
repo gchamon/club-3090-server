@@ -101,7 +101,7 @@ REMOTE_UPDATE_RAW_URL_TEMPLATE = os.environ.get(
 )
 REMOTE_UPDATE_METADATA_URL_TEMPLATE = os.environ.get(
     "CLUB3090_SELF_UPDATE_METADATA_URL_TEMPLATE",
-    "https://raw.githubusercontent.com/VykosX/club-3090-server/{sha}/build/metadata.json",
+    "https://raw.githubusercontent.com/VykosX/club-3090-server/{sha}/metadata.json",
 )
 HTTPS_CERT_FILE = os.path.join(CONTROL_DIR, "tls.crt")
 HTTPS_KEY_FILE = os.path.join(CONTROL_DIR, "tls.key")
@@ -4926,6 +4926,21 @@ def remote_update_metadata_url_for_sha(sha):
         raise ValueError("A full 40-character commit SHA is required.")
     return str(REMOTE_UPDATE_METADATA_URL_TEMPLATE or "").format(sha=commit_sha)
 
+
+def remote_update_metadata_url_for_ref():
+    ref = str(REMOTE_UPDATE_REF or "").strip()
+    if not ref:
+        return ""
+    repo_match = re.fullmatch(
+        r"https://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?",
+        str(REMOTE_UPDATE_REPO_URL or "").strip(),
+    )
+    if not repo_match:
+        return ""
+    owner = repo_match.group(1)
+    repo = repo_match.group(2)
+    return f"https://raw.githubusercontent.com/{owner}/{repo}/{ref}/metadata.json"
+
 def fetch_remote_text(remote_url, timeout=12):
     curl_cmd = [
         "curl",
@@ -4967,11 +4982,22 @@ def fetch_remote_text(remote_url, timeout=12):
 
 
 def fetch_remote_update_metadata_text(commit_sha, timeout=12):
-    remote_url = remote_update_metadata_url_for_sha(commit_sha)
-    if not remote_url:
+    candidates = []
+    ref_url = remote_update_metadata_url_for_ref()
+    sha_url = remote_update_metadata_url_for_sha(commit_sha)
+    for remote_url in (ref_url, sha_url):
+        if remote_url and remote_url not in candidates:
+            candidates.append(remote_url)
+    if not candidates:
         raise RuntimeError("remote metadata URL is empty")
-    payload, fetch_method = fetch_remote_text(remote_url, timeout=timeout)
-    return payload, fetch_method, remote_url
+    failures = []
+    for remote_url in candidates:
+        try:
+            payload, fetch_method = fetch_remote_text(remote_url, timeout=timeout)
+            return payload, fetch_method, remote_url
+        except Exception as exc:
+            failures.append(f"{remote_url}: {exc}")
+    raise RuntimeError("; ".join(failures) if failures else "remote metadata fetch failed")
 
 
 def fetch_remote_script_metadata(force=False):

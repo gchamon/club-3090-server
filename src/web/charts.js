@@ -49,6 +49,102 @@ function persistentGpuMetricPeakValue(status, index, key) {
   const value = Number(row?.[key] || 0);
   return Number.isFinite(value) && value > 0 ? value : 0;
 }
+window.metricsPopupStates = window.metricsPopupStates || Object.create(null);
+let detachedMetricsPopupClosedPollTimer = null;
+let metricsRenderDocument = null;
+var METRICS_POPUP_WIDTH = 1280;
+var METRICS_POPUP_HEIGHT = 920;
+function metricsElement(id) {
+  const doc = metricsRenderDocument || document;
+  return doc?.getElementById ? doc.getElementById(id) : null;
+}
+function popupMetricsState(signature) {
+  if (!signature) return null;
+  if (!window.metricsPopupStates[signature]) {
+    window.metricsPopupStates[signature] = {
+      signature,
+      paneId: "mMain",
+      title: "Metrics",
+      label: "Main",
+      win: null,
+      lastActiveAt: 0,
+    };
+  }
+  return window.metricsPopupStates[signature];
+}
+function popupMetricsWindowOpen(signature = "") {
+  if (signature) {
+    const state = window.metricsPopupStates[signature];
+    return !!(state?.win && !state.win.closed);
+  }
+  return Object.values(window.metricsPopupStates).some((state) => state?.win && !state.win.closed);
+}
+function popupMetricsWindowActive(signature = "") {
+  const states = signature
+    ? [window.metricsPopupStates[signature]].filter(Boolean)
+    : Object.values(window.metricsPopupStates);
+  return states.some((state) => {
+    const win = state?.win;
+    if (!win || win.closed) return false;
+    try {
+      if (win.document?.hidden) return false;
+      if (typeof win.document?.hasFocus === "function" && win.document.hasFocus()) return true;
+    } catch (e) {}
+    return Date.now() - Number(state?.lastActiveAt || 0) < 2000;
+  });
+}
+function metricPaneLabel(paneId = "mMain") {
+  return {
+    mMain: "Main",
+    mGpu: "GPUs",
+    mCpuRam: "CPU+RAM",
+    mSystem: "System",
+    mNetwork: "Network",
+  }[String(paneId || "mMain")] || "Main";
+}
+function normalizeMetricPaneId(paneId = "") {
+  const normalized = String(paneId || "").trim();
+  return ["mMain", "mGpu", "mCpuRam", "mSystem", "mNetwork"].includes(normalized)
+    ? normalized
+    : "mMain";
+}
+function activeMetricPaneId(doc = document) {
+  const active = doc?.querySelector?.(".metricpane.active");
+  return normalizeMetricPaneId(active?.id || "mMain");
+}
+function setActiveMetricPaneInDocument(doc, paneId) {
+  const nextPaneId = normalizeMetricPaneId(paneId);
+  doc?.querySelectorAll?.(".metricpane")?.forEach((node) => {
+    node.classList.toggle("active", node.id === nextPaneId);
+  });
+  doc?.querySelectorAll?.("[data-metric-pane]")?.forEach((node) => {
+    node.classList.toggle("active", node.getAttribute("data-metric-pane") === nextPaneId);
+  });
+  return nextPaneId;
+}
+function currentMetricsPopupTarget() {
+  const paneId = activeMetricPaneId(document);
+  return {
+    signature: `metrics:${paneId}`,
+    paneId,
+    title: "Metrics",
+    label: metricPaneLabel(paneId),
+  };
+}
+function metricsPopoutButtonSvg(detached = false) {
+  return detached
+    ? '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 19H5v-5m0 5 7-7" fill="none" /><path d="M14 17h3a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2H9a2 2 0 0 0-2 2v3" fill="none" /></svg>'
+    : '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 5h5v5m0-5-7 7" fill="none" /><path d="M10 7H7a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-3" fill="none" /></svg>';
+}
+function withMetricsRenderDocument(doc, fn) {
+  const previous = metricsRenderDocument;
+  metricsRenderDocument = doc || null;
+  try {
+    return fn();
+  } finally {
+    metricsRenderDocument = previous;
+  }
+}
 const storageBrowserState = {
   rootPath: "",
   relativePath: "",
@@ -794,6 +890,337 @@ function storageEditorRedo() {
     document.execCommand("redo");
   }
 }
+function metricsPopupPanelHtml() {
+  return `<div class="subtabs">
+            <button class="subtab active" data-metric-pane="mMain">Main</button>
+            <button class="subtab" data-metric-pane="mGpu">GPUs</button>
+            <button class="subtab" data-metric-pane="mCpuRam">CPU+RAM</button>
+            <button class="subtab" data-metric-pane="mSystem">System</button>
+            <button class="subtab" data-metric-pane="mNetwork">Network</button>
+          </div>
+          <div id="mMain" class="metricpane active">
+            <div class="chartgrid">
+              <div class="chart"><canvas id="cGpu"></canvas></div>
+              <div class="chart"><canvas id="cMem"></canvas></div>
+              <div class="chart"><canvas id="cLatency"></canvas></div>
+              <div class="chart"><canvas id="cTps"></canvas></div>
+            </div>
+          </div>
+          <div id="mGpu" class="metricpane">
+            <div id="gpuMetricCharts" class="gpu-chartgrid"></div>
+          </div>
+          <div id="mCpuRam" class="metricpane">
+            <div id="ramInfo" class="value smallgap"></div>
+            <div class="chartgrid">
+              <div class="chart tall"><canvas id="cCpu"></canvas></div>
+              <div class="chart tall"><canvas id="cRam"></canvas></div>
+            </div>
+            <div id="cpuCores" class="coregrid"></div>
+          </div>
+          <div id="mSystem" class="metricpane">
+            <div class="chartgrid">
+              <div class="chart"><canvas id="cSystemUtil"></canvas></div>
+            </div>
+            <div class="panel">
+              <h2>System Information</h2>
+              <div id="systemInfo" class="value"></div>
+            </div>
+            <div class="panel">
+              <h2>Storage</h2>
+              <div id="diskInfo"></div>
+            </div>
+          </div>
+          <div id="mNetwork" class="metricpane">
+            <div id="netInfo" class="netgrid"></div>
+            <div class="chartgrid">
+              <div class="chart"><canvas id="cNetDown"></canvas></div>
+              <div class="chart"><canvas id="cNetUp"></canvas></div>
+            </div>
+          </div>`;
+}
+function popupWindowNameForMetricsSignature(signature) {
+  const token = String(signature || "metrics")
+    .replace(/[^A-Za-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return `club3090-metrics-${token || "viewer"}`;
+}
+function detachedMetricsPopupHtml(state) {
+  return `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>${escapeHtml(state?.title || "Metrics")}</title>
+    <style>
+      :root { color-scheme: dark; --bg:#0b0f14; --panel:#121923; --line:#273243; --text:#e8eef7; --muted:#9dafc3; --field:#081018; }
+      * { box-sizing:border-box; }
+      html, body { margin:0; min-height:100%; background:var(--bg); color:var(--text); font-family:system-ui,-apple-system,Segoe UI,Arial,sans-serif; overflow:hidden; }
+      body { padding:12px; }
+      .popup-card { height:calc(100vh - 24px); overflow:auto; background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:12px; }
+      .popup-head { display:flex; align-items:flex-start; justify-content:space-between; gap:10px; margin-bottom:10px; }
+      .popup-title-row { display:flex; align-items:center; gap:8px; }
+      .popup-title { font-size:20px; font-weight:800; margin:0; }
+      .popup-meta { color:var(--muted); font-size:12px; line-height:1.35; }
+      .popup-actions { display:flex; align-items:center; gap:8px; }
+      .popup-btn { display:inline-flex; align-items:center; justify-content:center; width:20px; height:20px; padding:0; border:0; background:transparent; color:var(--muted); cursor:pointer; }
+      .popup-btn:hover, .popup-btn:focus-visible { color:#eef4ff; outline:none; }
+      .popup-btn svg { width:18px; height:18px; stroke:currentColor; stroke-width:2; stroke-linecap:round; stroke-linejoin:round; fill:none; }
+      .subtabs { display:flex; gap:6px; overflow-x:auto; margin-bottom:10px; }
+      .subtab { border:1px solid #34445a; background:#1b2635; color:#eef4ff; border-radius:10px; padding:9px 11px; font-size:13px; cursor:pointer; white-space:nowrap; }
+      .subtab.active { background:#203149; border-color:#3d6fa3; }
+      .metricpane { display:none; }
+      .metricpane.active { display:block; }
+      .panel { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:12px; box-shadow:0 8px 30px #0004; margin-bottom:10px; }
+      .panel h2 { font-size:14px; margin:0 0 10px; }
+      .chartgrid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+      .gpu-chartgrid { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:10px; }
+      .chart { height:145px; background:#081018; border:1px solid #213044; border-radius:12px; padding:8px; }
+      .chart.tall { height:220px; }
+      canvas { width:100%; height:100%; }
+      .value { font-weight:700; font-size:13px; overflow-wrap:anywhere; }
+      .smallgap { margin-bottom:5px; }
+      .coregrid { display:grid; grid-template-columns:repeat(auto-fill, minmax(90px, 1fr)); gap:6px; }
+      .stat { background:#0b1119; border:1px solid #222d3c; border-radius:10px; padding:8px; }
+      .label { color:var(--muted); font-size:11px; }
+      .storage-list { display:grid; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); gap:10px; align-items:start; }
+      .storage-section { display:flex; flex-direction:column; gap:10px; }
+      .storage-card { background:#0b1119; border:1px solid #243144; border-radius:12px; padding:10px; min-width:0; overflow:hidden; }
+      .storage-card.user-facing { background:#10243a; border-color:#2a72a8; }
+      .storage-card-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:6px; }
+      .storage-title { font-weight:800; color:#d9ecff; overflow-wrap:anywhere; min-width:0; }
+      .storage-meta { color:#9dafc3; font-size:12px; margin-bottom:6px; overflow-wrap:anywhere; }
+      .storage-sizes { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:6px; margin-bottom:8px; }
+      .storage-sizes .stat { padding:6px; min-width:0; }
+      .diskbar { height:7px; background:#081018; border-radius:99px; overflow:hidden; margin-top:5px; }
+      .diskbar span { display:block; height:100%; background:#2fc46b; }
+      .netgrid + .chartgrid { margin-top:10px; }
+    </style>
+  </head>
+  <body>
+    <div class="popup-card">
+      <div class="popup-head">
+        <div>
+          <div class="popup-title-row">
+            <button class="popup-btn" type="button" id="popupMetricsReattachBtn" title="Reattach metrics" aria-label="Reattach metrics">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M10 19H5v-5m0 5 7-7" />
+                <path d="M14 17h3a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2H9a2 2 0 0 0-2 2v3" />
+              </svg>
+            </button>
+            <h1 class="popup-title" id="popupMetricsTitle">Metrics</h1>
+          </div>
+          <div class="popup-meta" id="popupMetricsLabel"></div>
+        </div>
+        <div class="popup-actions">
+          <button class="popup-btn" type="button" id="popupMetricsResetBtn" title="Clear recorded metrics" aria-label="Clear recorded metrics">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M5 7h14M9 7V5h6v2m-7 3v7m4-7v7m4-7v7M7 7l1 12h8l1-12" />
+            </svg>
+          </button>
+        </div>
+      </div>
+      ${metricsPopupPanelHtml()}
+    </div>
+    <script>
+      (() => {
+        const signature = ${JSON.stringify(String(state?.signature || ""))};
+        const notify = () => {
+          try {
+            if (window.opener && !window.opener.closed && typeof window.opener.markDetachedMetricsPopupActive === "function") {
+              window.opener.markDetachedMetricsPopupActive(signature);
+            }
+          } catch (e) {}
+        };
+        window.addEventListener("focus", notify);
+        window.addEventListener("pointerdown", notify, true);
+        window.addEventListener("keydown", notify, true);
+        document.addEventListener("visibilitychange", notify);
+        document.getElementById("popupMetricsReattachBtn")?.addEventListener("click", () => {
+          try {
+            if (window.opener && !window.opener.closed && typeof window.opener.closeDetachedMetricsPopup === "function") {
+              window.opener.closeDetachedMetricsPopup(signature);
+            } else {
+              window.close();
+            }
+          } catch (e) {
+            window.close();
+          }
+        });
+        document.getElementById("popupMetricsResetBtn")?.addEventListener("click", () => {
+          try {
+            if (window.opener && !window.opener.closed && typeof window.opener.promptClearRecordedMetrics === "function") {
+              window.opener.promptClearRecordedMetrics();
+            }
+          } catch (e) {}
+          notify();
+        });
+        document.querySelectorAll("[data-metric-pane]")?.forEach((button) => {
+          button.addEventListener("click", () => {
+            try {
+              if (window.opener && !window.opener.closed && typeof window.opener.replaceDetachedMetricsPopupPane === "function") {
+                const changed = window.opener.replaceDetachedMetricsPopupPane(signature, String(button.getAttribute("data-metric-pane") || ""));
+                if (changed) {
+                  window.close();
+                  return;
+                }
+              }
+            } catch (e) {}
+            notify();
+          });
+        });
+        window.addEventListener("beforeunload", () => {
+          try {
+            if (window.opener && !window.opener.closed && typeof window.opener.notifyDetachedMetricsPopupClosed === "function") {
+              window.opener.notifyDetachedMetricsPopupClosed(signature);
+            }
+          } catch (e) {}
+        });
+        notify();
+      })();
+    <\/script>
+  </body>
+</html>`;
+}
+function popupMetricsDocument(state) {
+  const win = state?.win;
+  if (!win || win.closed) return null;
+  try {
+    return win.document || null;
+  } catch (e) {
+    return null;
+  }
+}
+function ensureDetachedMetricsPopupWindow(state) {
+  if (!state) return null;
+  if (state.win && !state.win.closed) return state.win;
+  const features = [
+    "popup=yes",
+    "toolbar=no",
+    "location=no",
+    "menubar=no",
+    "status=no",
+    "resizable=yes",
+    "scrollbars=yes",
+    `width=${METRICS_POPUP_WIDTH}`,
+    `height=${METRICS_POPUP_HEIGHT}`,
+  ].join(",");
+  const win = window.open("", popupWindowNameForMetricsSignature(state.signature), features);
+  if (!win) throw new Error("The browser blocked the metrics popup window.");
+  state.win = win;
+  try {
+    win.document.open();
+    win.document.write(detachedMetricsPopupHtml(state));
+    win.document.close();
+  } catch (e) {}
+  return win;
+}
+function renderDetachedMetricsPopup(state, status = lastStatus) {
+  const doc = popupMetricsDocument(state);
+  if (!doc) return;
+  if (doc.title !== String(state.title || "Metrics")) doc.title = String(state.title || "Metrics");
+  const title = doc.getElementById("popupMetricsTitle");
+  const label = doc.getElementById("popupMetricsLabel");
+  if (title && title.textContent !== String(state.title || "Metrics")) title.textContent = String(state.title || "Metrics");
+  if (label && label.textContent !== String(state.label || "")) label.textContent = String(state.label || "");
+  setActiveMetricPaneInDocument(doc, state.paneId);
+  withMetricsRenderDocument(doc, () => renderMetrics(status || lastStatus || {}, { skipPopups: true }));
+}
+function markDetachedMetricsPopupActive(signature) {
+  const state = window.metricsPopupStates[String(signature || "")];
+  if (!state) return;
+  state.lastActiveAt = Date.now();
+}
+function notifyDetachedMetricsPopupClosed(signature) {
+  const state = window.metricsPopupStates[String(signature || "")];
+  if (!state) return;
+  state.win = null;
+  delete window.metricsPopupStates[String(signature || "")];
+  applyMetricsVisibility();
+}
+function pollDetachedMetricsPopupClosures() {
+  Object.keys(window.metricsPopupStates).forEach((signature) => {
+    const state = window.metricsPopupStates[String(signature || "")];
+    if (!state) return;
+    if (!state.win || state.win.closed) notifyDetachedMetricsPopupClosed(signature);
+  });
+}
+function closeDetachedMetricsPopup(signature) {
+  const key = String(signature || "");
+  const state = window.metricsPopupStates[key];
+  if (!state) return;
+  const win = state.win;
+  state.win = null;
+  delete window.metricsPopupStates[key];
+  if (win && !win.closed) {
+    try {
+      win.close();
+    } catch (e) {}
+  }
+  applyMetricsVisibility();
+}
+function replaceDetachedMetricsPopupPane(signature, paneId) {
+  const state = window.metricsPopupStates[String(signature || "")];
+  const nextPaneId = normalizeMetricPaneId(paneId);
+  if (!state || !nextPaneId || nextPaneId === state.paneId) return false;
+  closeDetachedMetricsPopup(signature);
+  setActiveMetricPaneInDocument(document, nextPaneId);
+  const target = currentMetricsPopupTarget();
+  const nextState = popupMetricsState(target.signature);
+  nextState.paneId = target.paneId;
+  nextState.title = target.title;
+  nextState.label = target.label;
+  ensureDetachedMetricsPopupWindow(nextState);
+  nextState.lastActiveAt = Date.now();
+  renderDetachedMetricsPopup(nextState, lastStatus);
+  applyMetricsVisibility();
+  refreshStatus({ force: true, includeSeries: true }).catch(() => {});
+  return true;
+}
+function syncDetachedMetricsPopup(signature, status = lastStatus) {
+  const state = window.metricsPopupStates[String(signature || "")];
+  if (!state) return;
+  if (!state.win || state.win.closed) {
+    notifyDetachedMetricsPopupClosed(signature);
+    return;
+  }
+  renderDetachedMetricsPopup(state, status);
+}
+function syncAllDetachedMetricsPopups(status = lastStatus) {
+  Object.keys(window.metricsPopupStates).forEach((signature) => syncDetachedMetricsPopup(signature, status));
+}
+function currentMetricsPaneDetached() {
+  return popupMetricsWindowOpen(currentMetricsPopupTarget().signature);
+}
+function applyMetricsVisibility() {
+  const isMetrics = activeTabName === "metrics";
+  document.body.classList.toggle("metrics-tab", isMetrics);
+  const section = $("metrics");
+  const detached = currentMetricsPaneDetached();
+  if (section) section.classList.toggle("metrics-card-hidden", isMetrics && detached);
+  if ($("metricsPopoutBtn")) {
+    $("metricsPopoutBtn").title = detached ? "Reattach metrics" : "Pop out metrics";
+    $("metricsPopoutBtn").setAttribute("aria-label", $("metricsPopoutBtn").title);
+    $("metricsPopoutBtn").classList.toggle("active", detached);
+    $("metricsPopoutBtn").innerHTML = metricsPopoutButtonSvg(detached);
+  }
+  syncAllDetachedMetricsPopups();
+}
+function toggleMetricsPopout() {
+  const target = currentMetricsPopupTarget();
+  if (popupMetricsWindowOpen(target.signature)) {
+    closeDetachedMetricsPopup(target.signature);
+    return;
+  }
+  const state = popupMetricsState(target.signature);
+  state.paneId = target.paneId;
+  state.title = target.title;
+  state.label = target.label;
+  ensureDetachedMetricsPopupWindow(state);
+  state.lastActiveAt = Date.now();
+  renderDetachedMetricsPopup(state, lastStatus);
+  applyMetricsVisibility();
+  refreshStatus({ force: true, includeSeries: true }).catch(() => {});
+}
 function toggleStorageEditorWrap() {
   storageBrowserState.wrapText = !storageBrowserState.wrapText;
   renderStorageEditorModal();
@@ -858,7 +1285,7 @@ function handleStorageEditorHexPaste(event) {
   applyStorageEditorHexPaste(event.clipboardData?.getData("text") || "", event.target);
 }
 function draw(id, data, key, label, color, options = {}) {
-  const c = $(id);
+  const c = metricsElement(id);
   if (!c) return;
   const ctx = c.getContext("2d"),
     dpr = devicePixelRatio || 1,
@@ -1011,7 +1438,7 @@ function currentStatusMetricPoint(status = {}) {
     gpus,
   };
 }
-function renderMetrics(j) {
+function renderMetrics(j, options = {}) {
   const currentPoint = currentStatusMetricPoint(j);
   const s = (j.series && j.series.length) ? [...j.series, currentPoint] : [currentPoint];
   draw("cGpu", s, "gpu_util", "GPU util %", "#72c7ff", {
@@ -1074,14 +1501,14 @@ function renderMetrics(j) {
     valueFormatter: (current, peak) =>
       `${formatChartValue(current, 2)} (${UI_ARROW_UP} ${formatChartValue(peak, 2)})`,
   });
-  if ($("ramInfo"))
-    $("ramInfo").textContent =
+  if (metricsElement("ramInfo"))
+    metricsElement("ramInfo").textContent =
       j.system && j.system.memory
         ? `Used ${mibToGiB(j.system.memory.used_mib)} / ${mibToGiB(j.system.memory.total_mib)} GB (${j.system.memory.used_pct}%)`
         : "";
   const cores = (j.system && j.system.cpu && j.system.cpu.cores) || [];
-  if ($("cpuCores"))
-    $("cpuCores").innerHTML = cores
+  if (metricsElement("cpuCores"))
+    metricsElement("cpuCores").innerHTML = cores
       .map(
         (c) =>
           `<div class="stat"><div class="label">Core ${c.core}</div><div class="value">${c.usage_pct}%</div><div class="meter"><span style="width:${c.usage_pct}%"></span></div></div>`,
@@ -1121,7 +1548,7 @@ function renderMetrics(j) {
       : "";
     return `<div class="${cls}"><div class="storage-card-head"><div class="storage-title">${title}</div>${actionRow}</div><div class="storage-meta">${meta}</div><div class="storage-sizes"><div class="stat"><div class="label">Free</div><div class="value">${free}</div></div><div class="stat"><div class="label">Used</div><div class="value">${used}</div></div><div class="stat"><div class="label">Total</div><div class="value">${total}</div></div></div><div class="diskbar"><span style="width:${pct}%"></span></div><div class="label">${pctLabel}</div></div>`;
   }
-  if ($("diskInfo")) {
+  if (metricsElement("diskInfo")) {
     const physical = disks.filter(
       (d) => d.kind === "disk" || d.type === "disk",
     );
@@ -1133,7 +1560,7 @@ function renderMetrics(j) {
         if (aRoot !== bRoot) return aRoot ? -1 : 1;
         return String(a?.path || a?.name || "").localeCompare(String(b?.path || b?.name || ""));
       });
-    $("diskInfo").innerHTML =
+    metricsElement("diskInfo").innerHTML =
       `<div class="storage-section"><div class="panel"><h2>Disks</h2><div class="storage-list">${physical.map(storageCard).join("") || '<div class="value">No physical disks found</div>'}</div></div><div class="panel"><h2>Volumes</h2><div class="storage-list">${volumes.map(storageCard).join("") || '<div class="value">No volumes found</div>'}</div></div></div>`;
   }
   const net = (j.system && j.system.network) || {};
@@ -1153,8 +1580,8 @@ function renderMetrics(j) {
     seriesPeakValue(s, "net_tx_mbps"),
     seriesPeakValue(s, "net_tx_kbps") / 1000,
   );
-  if ($("netInfo"))
-    $("netInfo").innerHTML =
+  if (metricsElement("netInfo"))
+    metricsElement("netInfo").innerHTML =
       `<div class="stat"><div class="label">Local IP</div><div class="value">${net.local_ip || "unknown"}</div></div>${net.magic_dns ? `<div class="stat"><div class="label">Tailscale MagicDNS</div><div class="value">${escapeHtml(net.magic_dns)}</div></div>` : ""}<div class="stat"><div class="label">Internet IP</div><div class="value">${net.public_ip || "unknown"}</div></div><div class="stat"><div class="label">Download (${UI_ARROW_UP} max)</div><div class="value">${formatMbpsValue(netDownCurrent)} (${UI_ARROW_UP} ${formatMbpsValue(safeNetDownPeak)} max)</div></div><div class="stat"><div class="label">Upload (${UI_ARROW_UP} max)</div><div class="value">${formatMbpsValue(netUpCurrent)} (${UI_ARROW_UP} ${formatMbpsValue(safeNetUpPeak)} max)</div></div>`;
   const info = (j.system && j.system.info) || {};
   const cpuPackages = Array.isArray(info.cpu_packages) ? info.cpu_packages : [];
@@ -1177,10 +1604,10 @@ function renderMetrics(j) {
     info.vram_total_mib !== undefined
       ? `Available VRAM: ${mibToGiB(info.vram_free_mib || 0)} / ${mibToGiB(info.vram_total_mib)} GB`
       : "Available VRAM: unknown";
-  if ($("systemInfo"))
-    $("systemInfo").innerHTML =
+  if (metricsElement("systemInfo"))
+    metricsElement("systemInfo").innerHTML =
       `OS: ${info.os || "unknown"}<br>Kernel: ${info.kernel || "unknown"}<br>Host: ${info.hostname || "unknown"}<br>User: ${info.username || "unknown"}<br>Machine: ${info.machine || "unknown"}<br>${cpuPackageText}<br>GPUs: ${info.gpus || "unknown"}<br>${memorySummary}<br>${vramSummary}<br>Board/Product: ${info.board || "-"} / ${info.product || "-"}<br>BIOS: ${info.bios || "-"}`;
-  const holder = $("gpuMetricCharts");
+  const holder = metricsElement("gpuMetricCharts");
   if (holder && j.gpus) {
     const hasGpuMetric = (key) =>
       (j.gpus || []).some((gpu) => Number(gpu?.[key] || 0) > 0) ||
@@ -1297,5 +1724,6 @@ function renderMetrics(j) {
         );
       }),
     );
-}
+  }
+  if (!options.skipPopups) syncAllDetachedMetricsPopups(j);
 }

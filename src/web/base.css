@@ -254,6 +254,45 @@ label.label input[type="checkbox"] {
 .metricpane.active {
   display: block;
 }
+.metric-popout-btn {
+  display: none;
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  min-width: 20px;
+  min-height: 20px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  border-radius: 0;
+  color: var(--muted);
+  box-shadow: none;
+}
+body.metrics-tab .metric-popout-btn {
+  display: inline-flex;
+}
+.metric-popout-btn.active {
+  color: #72c7ff;
+}
+.metric-popout-btn:hover,
+.metric-popout-btn:focus-visible {
+  background: transparent;
+  border-color: transparent;
+  color: #eef4ff;
+  box-shadow: none;
+}
+.metric-popout-btn svg {
+  width: 18px;
+  height: 18px;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  fill: none;
+}
+.metrics-card-hidden {
+  display: none !important;
+}
 .logs {
   min-height: 0;
   display: flex;
@@ -4179,5 +4218,34 @@ canvas {
   .logs-tab .logs.panel {
     height: auto;
     min-height: 0;
+  }
+}
+@media (max-width: 720px) {
+  .variant-settings-cluster {
+    flex: 1 1 100%;
+    width: 100%;
+    min-width: 0;
+    flex-wrap: wrap;
+    justify-content: flex-start;
+    margin-left: 0;
+  }
+  .variant-settings-cluster > .iconbtn:first-of-type,
+  .variant-settings-cluster > .variant-cache-clear-btn:first-of-type,
+  .variant-settings-cluster > .variant-settings-btn:first-of-type {
+    margin-left: auto;
+  }
+  .preset-disk-label,
+  .preset-tps-label {
+    min-width: 0;
+    max-width: 100%;
+    white-space: normal;
+  }
+  .preset-disk-label {
+    flex: 1 1 140px;
+    justify-content: flex-start;
+  }
+  .preset-tps-label {
+    flex: 1 1 180px;
+    justify-content: flex-start;
   }
 }

@@ -3035,7 +3035,7 @@ assert len(payload.encode("utf-8")) > 52000, len(payload.encode("utf-8"))
 module.fetch_remote_update_metadata_text = lambda commit_sha, timeout=12: (
     payload,
     "smoke",
-    f"https://example.invalid/{commit_sha}/build/metadata.json",
+    f"https://example.invalid/{commit_sha}/metadata.json",
 )
 
 result = module.fetch_remote_script_metadata(force=True)

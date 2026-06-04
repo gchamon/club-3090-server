@@ -38,7 +38,8 @@ async function manualRefreshStatus() {
 }
 function statusRequestProfile(options = {}) {
   const tab = normalizeTabName(activeTabName);
-  const includeSeries = !!options.includeSeries || tab === "metrics";
+  const includeSeries =
+    !!options.includeSeries || tab === "metrics" || popupMetricsWindowActive();
   return {
     tab,
     hidden: document.hidden && !popupLogWindowActive() ? "1" : "0",
@@ -48,6 +49,7 @@ function statusRequestProfile(options = {}) {
   };
 }
 function statusPollDelayMs() {
+  if (popupMetricsWindowActive()) return STATUS_POLL_FOREGROUND_FAST_MS;
   if (popupLogWindowActive()) return STATUS_POLL_FOREGROUND_FAST_MS;
   if (document.hidden) return STATUS_POLL_BACKGROUND_MS;
   if (Number(lastStatus?.metrics?.active_requests || 0) > 0) {
@@ -133,7 +135,7 @@ refreshStatus = async function (opts = {}) {
       safeRenderStep(
         "metrics",
         () => {
-          if (activeTabName === "metrics") renderMetrics(j);
+          if (activeTabName === "metrics" || popupMetricsWindowOpen()) renderMetrics(j);
         },
         renderErrors,
       );
@@ -199,7 +201,10 @@ async function bootAdminUi() {
   scheduleLogCacheRefresh();
   if (detachedLogPopupClosedPollTimer) clearInterval(detachedLogPopupClosedPollTimer);
   detachedLogPopupClosedPollTimer = setInterval(
-    () => pollDetachedLogPopupClosures(),
+    () => {
+      pollDetachedLogPopupClosures();
+      pollDetachedMetricsPopupClosures();
+    },
     DETACHED_LOG_POPUP_CLOSED_POLL_MS,
   );
   syncHeaderChatButtonAlignment();
@@ -221,6 +226,14 @@ async function bootAdminUi() {
           state.es.close();
         } catch (e) {}
       }
+      if (state?.win && !state.win.closed) {
+        try {
+          state.win.close();
+        } catch (e) {}
+      }
+    });
+    Object.keys(window.metricsPopupStates || {}).forEach((signature) => {
+      const state = window.metricsPopupStates[signature];
       if (state?.win && !state.win.closed) {
         try {
           state.win.close();

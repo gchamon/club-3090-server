@@ -694,8 +694,16 @@ def main(argv: list[str] | None = None) -> int:
         required=True,
         help="User-facing release note bullet for this new version. Repeat for multiple bullets.",
     )
+    parser.add_argument(
+        "--iterative",
+        action="store_true",
+        help="Keep the current numeric version and advance only the optional letter suffix (for example v0.9.32 -> v0.9.32a). Without this switch, builds advance the numeric patch version (for example v0.9.32 -> v0.9.33).",
+    )
     args = parser.parse_args(argv)
-    metadata, metadata_update_detail = update_metadata_for_build(args.changes)
+    metadata, metadata_update_detail = update_metadata_for_build(
+        args.changes,
+        iterative=bool(args.iterative),
+    )
     configure_build_identity(metadata["version"], metadata["script_version"])
     return build_release(metadata=metadata, metadata_update_detail=metadata_update_detail)
 
