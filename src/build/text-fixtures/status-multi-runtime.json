@@ -1,0 +1,289 @@
+{
+    "vllm_service":  "active",
+    "control_service":  "active",
+    "console_service":  "active",
+    "metrics":  {
+                    "active_requests":  2
+                },
+    "power":  {
+                  "profile":  "turbo",
+                  "optimizations_enabled":  true,
+                  "fan_manual_override":  true
+              },
+    "gpus":  [
+                 {
+                     "index":  0,
+                     "name":  "NVIDIA GeForce RTX 3090",
+                     "vendor":  "Palit",
+                     "temp_c":  42,
+                     "temp_peak_c":  61,
+                     "temp_junction_c":  55,
+                     "temp_junction_peak_c":  72,
+                     "temp_vram_c":  58,
+                     "temp_vram_peak_c":  79,
+                     "mem_free_mib":  18000,
+                     "mem_used_mib":  6576,
+                     "mem_total_mib":  24576,
+                     "mem_pct":  26.7,
+                     "power_w":  210.3,
+                     "power_peak_w":  282.1,
+                     "power_limit_w":  350,
+                     "fan_pct":  80,
+                     "core_clock_mhz":  1540,
+                     "core_clock_peak_mhz":  1815,
+                     "mem_clock_mhz":  9501,
+                     "mem_clock_peak_mhz":  9751,
+                     "util_pct":  72
+                 },
+                 {
+                     "index":  1,
+                     "name":  "NVIDIA GeForce RTX 3090",
+                     "vendor":  "ZOTAC",
+                     "temp_c":  44,
+                     "temp_peak_c":  63,
+                     "temp_junction_c":  57,
+                     "temp_junction_peak_c":  74,
+                     "temp_vram_c":  61,
+                     "temp_vram_peak_c":  80,
+                     "mem_free_mib":  17600,
+                     "mem_used_mib":  6976,
+                     "mem_total_mib":  24576,
+                     "mem_pct":  28.4,
+                     "power_w":  218.9,
+                     "power_peak_w":  289.7,
+                     "power_limit_w":  350,
+                     "fan_pct":  82,
+                     "core_clock_mhz":  1560,
+                     "core_clock_peak_mhz":  1830,
+                     "mem_clock_mhz":  9501,
+                     "mem_clock_peak_mhz":  9751,
+                     "util_pct":  81
+                 }
+             ],
+    "users":  [
+                  {
+                      "name":  "alice",
+                      "enabled":  true,
+                      "groups":  [
+                                     "default"
+                                 ],
+                      "allowed_targets":  [
+                                              "GPU0"
+                                          ],
+                      "effective_allowed_targets":  [
+                                                        "GPU0"
+                                                    ],
+                      "has_api_key":  true,
+                      "api_key_available":  true,
+                      "usage":  {
+                                    "window_5h":  {
+                                                      "requests":  12,
+                                                      "score":  18.2,
+                                                      "input_tokens":  12000,
+                                                      "output_tokens":  6400,
+                                                      "tool_calls":  1,
+                                                      "thinking_seconds":  3.5
+                                                  },
+                                    "window_week":  {
+                                                        "requests":  48,
+                                                        "score":  92.1,
+                                                        "input_tokens":  64000,
+                                                        "output_tokens":  32800,
+                                                        "tool_calls":  4,
+                                                        "thinking_seconds":  12.1
+                                                    }
+                                },
+                      "limits":  {
+
+                                 },
+                      "effective_limits":  {
+
+                                           }
+                  }
+              ],
+    "groups":  [
+                   {
+                       "name":  "default",
+                       "enabled":  true,
+                       "allowed_targets":  [
+                                               "GPU0",
+                                               "PAIR0_1"
+                                           ],
+                       "limits":  {
+
+                                  },
+                       "resolved_limits":  {
+
+                                           }
+                   }
+               ],
+    "server_config":  {
+                          "allow_proxy_without_api_key":  false,
+                          "selected_preset_model":  "qwen3.6-27b"
+                      },
+    "instances":  [
+                      {
+                          "id":  "GPU0",
+                          "kind":  "single",
+                          "gpu_index":  0,
+                          "gpu_indices":  [
+                                              0
+                                          ],
+                          "assignment_text":  "GPU 0",
+                          "proxy_prefix":  "gpu0",
+                          "mode":  "vllm/default",
+                          "port":  8200,
+                          "enabled":  true,
+                          "running":  true
+                      },
+                      {
+                          "id":  "PAIR0_1",
+                          "kind":  "dual",
+                          "gpu_indices":  [
+                                              0,
+                                              1
+                                          ],
+                          "assignment_text":  "GPUs 0 + 1",
+                          "proxy_prefix":  "pair0-1",
+                          "mode":  "vllm/dual-dflash",
+                          "port":  8300,
+                          "enabled":  true,
+                          "running":  true,
+                          "assignment_scope":  "pair"
+                      }
+                  ],
+    "presets":  {
+                    "defaults":  [
+
+                                 ],
+                    "custom":  [
+
+                               ]
+                },
+    "ui_config":  {
+                      "active_tab":  "logs",
+                      "current_log_source":  "docker",
+                      "selected_scope":  "PAIR0_1",
+                      "show_global_logs":  true
+                  },
+    "series":  [
+
+               ],
+    "system":  {
+                   "cpu":  {
+                               "cores":  [
+
+                                         ]
+                           },
+                   "memory":  {
+                                  "used_mib":  8192,
+                                  "total_mib":  65536,
+                                  "used_pct":  12.5
+                              },
+                   "disks":  [
+
+                             ],
+                   "network":  {
+                                   "local_ip":  "192.168.0.100",
+                                   "public_ip":  "203.0.113.10",
+                                   "rx_kbps":  240,
+                                   "tx_kbps":  85
+                               },
+                   "info":  {
+                                "os":  "Ubuntu",
+                                "kernel":  "6.8.0",
+                                "hostname":  "club3090",
+                                "username":  "root",
+                                "machine":  "x86_64",
+                                "cpu_model":  "Ryzen",
+                                "board":  "X570",
+                                "product":  "Workstation",
+                                "bios":  "1.0.0",
+                                "gpus":  "RTX 3090, RTX 3090"
+                            }
+               },
+    "models":  [
+
+               ],
+    "variants":  [
+
+                 ],
+    "instance_runtime_metrics":  {
+                                     "GPU0":  {
+                                                  "id":  "GPU0",
+                                                  "running":  true,
+                                                  "gpu_indices":  [
+                                                                      0
+                                                                  ],
+                                                  "display_name":  "GPU0",
+                                                  "mode":  "vllm/default",
+                                                  "container":  "club3090-gpu0-vllm-default",
+                                                  "last_status":  200,
+                                                  "last_latency_s":  0.38,
+                                                  "last_tokens_per_second":  54.2
+                                              },
+                                     "PAIR0_1":  {
+                                                     "id":  "PAIR0_1",
+                                                     "running":  true,
+                                                     "gpu_indices":  [
+                                                                         0,
+                                                                         1
+                                                                     ],
+                                                     "display_name":  "Pair 0 + 1",
+                                                     "mode":  "vllm/dual-dflash",
+                                                     "container":  "club3090-pair0_1-vllm-dual-dflash",
+                                                     "last_status":  200,
+                                                     "last_latency_s":  0.61,
+                                                     "last_tokens_per_second":  98.7
+                                                 }
+                                 },
+    "running_runtimes":  [
+                             {
+                                 "id":  "GPU0",
+                                 "running":  true,
+                                 "gpu_indices":  [
+                                                     0
+                                                 ],
+                                 "display_name":  "GPU0",
+                                 "mode":  "vllm/default",
+                                 "container":  "club3090-gpu0-vllm-default",
+                                 "last_status":  200,
+                                 "last_latency_s":  0.38,
+                                 "last_tokens_per_second":  54.2,
+                                 "last_request_at":  1778402200
+                             },
+                             {
+                                 "id":  "PAIR0_1",
+                                 "running":  true,
+                                 "gpu_indices":  [
+                                                     0,
+                                                     1
+                                                 ],
+                                 "display_name":  "Pair 0 + 1",
+                                 "mode":  "vllm/dual-dflash",
+                                 "container":  "club3090-pair0_1-vllm-dual-dflash",
+                                 "last_status":  200,
+                                 "last_latency_s":  0.61,
+                                 "last_tokens_per_second":  98.7,
+                                 "last_request_at":  1778402205
+                             }
+                         ],
+    "containers":  [
+                       "club3090-gpu0-vllm-default",
+                       "club3090-pair0_1-vllm-dual-dflash"
+                   ],
+    "active_modes":  [
+                         "vllm/default",
+                         "vllm/dual-dflash"
+                     ],
+    "active_mode":  "vllm/default",
+    "active_port":  8200,
+    "container":  "club3090-gpu0-vllm-default",
+    "gpu_count":  2,
+    "model_install_job":  {
+                              "active":  true,
+                              "status":  "running",
+                              "model_id":  "qwen3.6-27b",
+                              "variant_id":  "single/default"
+                          }
+}

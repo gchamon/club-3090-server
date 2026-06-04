@@ -1,0 +1,877 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Club-3090 Server</title>
+    <style>/* injected by build.py from web-ui.css */</style>
+  </head>
+  <body>
+    <div id="updateNoticeHost" class="update-notice-host"></div>
+    <header>
+      <div class="top">
+        <div class="top-main">
+          <div class="brand">Club-3090 Server &bull; __SCRIPT_VERSION__</div>
+          <div class="header-row">
+            <div class="pill" id="summary">loading...</div>
+            <button
+              class="iconbtn header-chat-btn"
+              id="chatLaunchBtn"
+              title="Open chat"
+              aria-label="Open chat"
+              onclick="openChatTab()"
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M5 18V6h14v9H8l-3 3Zm3-7h8m-8 3h5" fill="none" />
+              </svg>
+            </button>
+          </div>
+        </div>
+      </div>
+      <div class="tabs">
+        <button class="tab active" onclick="tab(event, 'overview')">Main</button
+        ><button class="tab" onclick="tab(event, 'system')">System</button
+        ><button class="tab" onclick="tab(event, 'presets')">Presets</button
+        ><button class="tab" id="usersTabBtn" onclick="tab(event, 'users')">
+          Users</button
+        ><button class="tab" onclick="tab(event, 'metrics')">Metrics</button
+        ><button class="tab" onclick="tab(event, 'logs')">Logs</button>
+      </div>
+    </header>
+    <main class="container">
+      <section id="overview" class="tabpane content-tab active">
+        <div class="panel">
+          <h2>Status</h2>
+          <div class="grid">
+            <div class="stat">
+              <div class="label">Mode</div>
+              <div class="value" id="mode">-</div>
+            </div>
+            <div class="stat">
+              <div class="label">Containers</div>
+              <div class="value" id="container">-</div>
+            </div>
+            <div class="stat">
+              <div class="label">Requests</div>
+              <div class="value" id="req">-</div>
+            </div>
+            <div class="stat">
+              <div class="label">Uptime</div>
+              <div class="value" id="uptime">-</div>
+            </div>
+            <div class="stat">
+              <div class="label">Power</div>
+              <div class="value" id="powerbox">-</div>
+            </div>
+            <div class="stat">
+              <div class="label">Users</div>
+              <div class="value" id="last">-</div>
+            </div>
+          </div>
+          <div class="msg" id="msg"></div>
+        </div>
+        <div class="panel">
+          <h2>Generation Stats</h2>
+          <div id="generationStatsContent" class="value">-</div>
+        </div>
+        <div id="gpuCards" class="gpu-cards"></div>
+      </section>
+      <section id="system" class="tabpane content-tab">
+        <div class="panel">
+          <h2>Audit Overview</h2>
+          <div class="grid">
+            <div class="stat">
+              <div class="label">Admin UI</div>
+              <div class="value" id="auditAdminEndpoint">-</div>
+            </div>
+            <div class="stat">
+              <div class="label">Proxy</div>
+              <div class="value" id="auditProxyEndpoint">-</div>
+            </div>
+            <div class="stat">
+              <div class="label">Exposure</div>
+              <div class="value" id="auditExposure">-</div>
+            </div>
+            <div class="stat">
+              <div class="label">Local Automation</div>
+              <div class="value" id="auditLocalApi">-</div>
+            </div>
+          </div>
+          <div class="value smallgap" id="auditSummary">-</div>
+          <div class="msg" id="auditMsg"></div>
+        </div>
+        <div class="panel">
+          <h2>Access Policy</h2>
+          <div class="actions" id="accessPolicyRow">
+            <label class="label"
+              ><input
+                type="checkbox"
+                id="auditAllowAnonymousProxy"
+                onchange="mirrorAuthToggles(this.checked)"
+              />
+              allow requests without per-user API keys</label
+            ><button class="btn blue" onclick="saveAuthSettings()">
+              Save Policy
+            </button>
+          </div>
+          <div
+            class="value smallgap"
+            style="margin-top: 10px"
+            id="auditPolicyText"
+          >
+            -
+          </div>
+        </div>
+        <div class="panel">
+          <h2>System</h2>
+          <div class="actions machine-row">
+            <button class="btn amber" onclick="wol()">Wake-on-LAN</button
+            ><button class="btn blue" id="systemUpdateBtn" onclick="promptUpdateRun()">
+              Update</button
+            ><button class="btn red" onclick="machineAction('reboot')">
+              Restart Machine</button
+            ><button class="btn red" onclick="machineAction('shutdown')">
+              Shutdown Machine
+            </button>
+          </div>
+        </div>
+        <div class="panel">
+          <h2>Instances</h2>
+          <div class="subtabs" id="instanceTabs"></div>
+          <div class="value smallgap" id="instanceSummary">-</div>
+          <div class="actions" id="instanceActionRow">
+            <button class="btn blue" onclick="instanceAction('start_instance')">
+              Start</button
+            ><button
+              class="btn amber"
+              onclick="instanceAction('restart_instance')"
+            >
+              Restart</button
+            ><button class="btn red" onclick="instanceAction('stop_container')">
+              Stop</button
+            ><button
+              class="btn green"
+              id="instanceEnableBtn"
+              onclick="toggleInstanceEnabled()"
+            >
+              Disable Boot Autostart
+            </button
+            ><span
+              class="instance-action-separator hidden"
+              id="instanceUtilitySeparator"
+              aria-hidden="true"
+            ></span
+            ><button
+              class="btn blue hidden"
+              id="instanceBenchmarkBtn"
+              onclick="promptBenchmarkRun()"
+            >
+              Benchmark</button
+            ><button
+              class="btn blue hidden"
+              id="instanceReportBtn"
+              onclick="promptReportRun()"
+            >
+              Run Report</button
+            ><button
+              class="btn blue hidden"
+              id="instanceRebenchBtn"
+              onclick="promptRebenchRun()"
+            >
+              Rebench
+            </button>
+          </div>
+          <div class="panel" style="margin-top:12px">
+            <h2>Power Profiles</h2>
+            <div class="actions" id="profileActionRow">
+              <button class="btn green" onclick="profile('eco')">Eco</button
+              ><button
+                class="btn profile-balanced"
+                onclick="profile('balanced')"
+              >
+                Balanced</button
+              ><button
+                class="btn default-profile"
+                onclick="profile('default')"
+              >
+                Default</button
+              ><button class="btn orange" onclick="profile('turbo')">
+                Turbo
+              </button>
+            </div>
+          </div>
+          <div class="panel">
+            <h2>Optimizations + Cooling</h2>
+            <div class="actions" id="powerCoolingActionRow">
+              <button
+                class="btn green"
+                id="optToggle"
+                onclick="togglePowerOptimizations()"
+              >
+                Disable Power Optimizations</button
+              ><button
+                class="btn green"
+                id="fanToggle"
+                onclick="toggleFansMax()"
+              >
+                Set Fans to Max
+              </button>
+            </div>
+          </div>
+          <div class="msg" id="instanceMsg"></div>
+        </div>
+        <div class="panel" id="systemServicesPanel">
+          <h2>Services</h2>
+          <div class="system-service-sections" id="services">
+            <div class="service-section-card" id="serverServicesCard" data-collapsed="false">
+              <div class="service-section-head">
+                <div class="service-section-title">Server Services</div>
+                <button type="button" class="iconbtn service-section-toggle" id="serverServicesToggle" title="Collapse server services" aria-label="Collapse server services" aria-expanded="true" onclick="toggleSystemServiceSection('server')">
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="m6 15 6-6 6 6" fill="none" />
+                  </svg>
+                </button>
+              </div>
+              <div class="service-section-body" id="serverServices">-</div>
+            </div>
+            <div class="service-section-card" id="club3090ServicesCard" data-collapsed="false">
+              <div class="service-section-head">
+                <div class="service-section-title">Club3090 Services</div>
+                <button type="button" class="iconbtn service-section-toggle" id="club3090ServicesToggle" title="Collapse Club3090 services" aria-label="Collapse Club3090 services" aria-expanded="true" onclick="toggleSystemServiceSection('club3090')">
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="m6 15 6-6 6 6" fill="none" />
+                  </svg>
+                </button>
+              </div>
+              <div class="service-section-body" id="club3090Services">-</div>
+            </div>
+          </div>
+          <div class="msg" id="servicesMsg"></div>
+        </div>
+      </section>
+      <section id="presets" class="tabpane content-tab">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Model Presets</h2>
+            <div class="actions">
+              <button class="btn blue" onclick="openSetupAssistantModal()">
+                Setup Assistant
+              </button>
+              <button
+                class="btn green"
+                onclick="promptRuntimeInventoryRebuild()"
+              >
+                Rebuild Model DB
+              </button>
+            </div>
+          </div>
+          <div class="preset-help">
+            Discovered presets are rendered directly from the local
+            <code>/opt/ai/club-3090</code> clone. Global applies single-GPU
+            presets across every GPU, dual presets across every two-GPU pair,
+            and multi-GPU presets to the shared runtime. Use
+            the Custom Model button to bridge upstream
+            <code>pull.sh</code> into this panel without changing the core UI
+            flow.
+          </div>
+          <div class="preset-section-label">Scope</div>
+          <div class="subtabs" id="presetScopeTabs"></div>
+          <div class="value smallgap" id="presetScopeSummary">-</div>
+          <div class="preset-section-label">Models</div>
+          <div class="subtabs" id="presetModelSelector"></div>
+          <div class="value smallgap" id="presetJobSummary">-</div>
+          <div id="modelPresetGrid" class="model-grid"></div>
+        </div>
+        <div class="panel">
+          <h2>API Presets</h2>
+          <div class="preset-help">
+            Default presets are locked. Custom presets are exposed as
+            <code>:8009/v1/&lt;name&gt;</code> and
+            <code>:8009/&lt;name&gt;</code>. Both forms work with
+            <code>short-</code> and <code>concise-</code> prefixes.
+          </div>
+          <div id="apiPresetGrid" class="api-grid"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Custom Preset Templates</h2>
+            <button
+              class="add-preset-btn"
+              title="Create preset"
+              aria-label="Create preset"
+              onclick="openPresetEditor()"
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 5v14M5 12h14" fill="none" />
+              </svg>
+            </button>
+          </div>
+          <div id="presetIntro" class="preset-intro">
+            Create custom endpoint templates for different workloads or clients.
+            Each preset saves generation parameters like temperature, sampling,
+            thinking mode, penalties, and token limits, then exposes them as
+            custom OpenAI-compatible endpoints such as
+            <code>:8009/v1/my_preset</code> and <code>:8009/my_preset</code>.
+            Short and concise prefixes work with custom presets too.
+          </div>
+          <div id="presetEditor" class="preset-editor">
+            <div class="formgrid">
+              <label
+                >Endpoint name<input
+                  id="presetName"
+                  placeholder="my_coding" /></label
+              ><label
+                >Description<input
+                  id="presetDescription"
+                  placeholder="What this preset is for" /></label
+              ><label class="preset-form-span-2"
+                >System Prompt<textarea
+                  id="presetSystemPrompt"
+                  placeholder="Optional preset system prompt"
+                ></textarea></label
+              ><label
+                >Temperature<input
+                  id="presetTemperature"
+                  type="number"
+                  step="0.01"
+                  placeholder="0.7" /></label
+              ><label
+                >Top P<input
+                  id="presetTopP"
+                  type="number"
+                  step="0.01"
+                  placeholder="0.95" /></label
+              ><label
+                >Top K<input
+                  id="presetTopK"
+                  type="number"
+                  step="1"
+                  placeholder="20" /></label
+              ><label
+                >Min P<input
+                  id="presetMinP"
+                  type="number"
+                  step="0.01"
+                  placeholder="0" /></label
+              ><label
+                >Thinking<select id="presetThinking">
+                  <option value="false">Disabled</option>
+                  <option value="true">Enabled</option>
+                </select></label
+              ><label
+                >Preserve Thinking<select id="presetPreserveThinking">
+                  <option value="false">No</option>
+                  <option value="true">Yes</option>
+                </select></label
+              ><label
+                >Repetition penalty<input
+                  id="presetRepetitionPenalty"
+                  type="number"
+                  step="0.01"
+                  placeholder="1.0" /></label
+              ><label
+                >Presence penalty<input
+                  id="presetPresencePenalty"
+                  type="number"
+                  step="0.01"
+                  placeholder="0" /></label
+              ><label
+                >Frequency penalty<input
+                  id="presetFrequencyPenalty"
+                  type="number"
+                  step="0.01"
+                  placeholder="0" /></label
+              ><label
+                >Max context / prompt tokens<input
+                  id="presetMaxCtx"
+                  type="number"
+                  step="1"
+                  placeholder="truncate_prompt_tokens" /></label
+              ><label
+                >Max reply tokens<input
+                  id="presetMaxTokens"
+                  type="number"
+                  step="1"
+                  placeholder="max_tokens" /></label
+              ><label
+                >Min reply tokens<input
+                  id="presetMinTokens"
+                  type="number"
+                  step="1"
+                  placeholder="min_tokens" /></label
+              ><label
+                >Logprobs<input
+                  id="presetLogprobs"
+                  type="number"
+                  step="1"
+                  placeholder="optional" /></label
+              ><label
+                >Top logprobs<input
+                  id="presetTopLogprobs"
+                  type="number"
+                  step="1"
+                  placeholder="optional" /></label
+              ><label
+                >Length penalty<input
+                  id="presetLengthPenalty"
+                  type="number"
+                  step="0.01"
+                  placeholder="optional" /></label
+              ><label
+                >Ignore EOS<select id="presetIgnoreEos">
+                  <option value="">Default</option>
+                  <option value="false">No</option>
+                  <option value="true">Yes</option>
+                </select></label
+              ><label
+                >Skip special tokens<select id="presetSkipSpecial">
+                  <option value="">Default</option>
+                  <option value="true">Yes</option>
+                  <option value="false">No</option>
+                </select></label
+              ><label
+                >Include stop text<select id="presetIncludeStop">
+                  <option value="">Default</option>
+                  <option value="false">No</option>
+                  <option value="true">Yes</option>
+                </select></label
+              ><label
+                >Stop strings<input
+                  id="presetStop"
+                  placeholder="one per line or comma-separated"
+              /></label>
+            </div>
+            <div class="preset-form-actions">
+              <button
+                id="presetSaveBtn"
+                class="btn green"
+                onclick="savePresetFromForm()"
+              >
+                💾 Save</button
+              ><button class="btn red" onclick="closePresetEditor()">
+                ❌ Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+      <section id="users" class="tabpane content-tab"></section>
+      <section id="chat" class="tabpane content-tab">
+        <div class="panel chat-panel">
+          <div class="panel-head chat-panel-head">
+            <h2>Chat</h2>
+            <div class="chat-head-actions">
+              <div class="chat-conversation-strip">
+                <select
+                  id="chatConversationSelect"
+                  class="chat-conversation-select"
+                  aria-label="Conversation"
+                  onchange="selectChatConversation(this.value)"
+                ></select>
+                <button
+                  class="iconbtn"
+                  id="chatConversationNewBtn"
+                  title="New conversation"
+                  aria-label="New conversation"
+                  onclick="createNewConversation()"
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M12 5v14M5 12h14" fill="none" />
+                  </svg>
+                </button>
+                <button
+                  class="iconbtn"
+                  id="chatConversationEditBtn"
+                  title="Rename or move conversation"
+                  aria-label="Rename or move conversation"
+                  onclick="openConversationEditorModal()"
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M4 20h4l10-10-4-4L4 16v4zM14 6l4 4" fill="none" />
+                  </svg>
+                </button>
+                <button
+                  class="iconbtn"
+                  id="chatConversationShareBtn"
+                  title="Share conversation"
+                  aria-label="Share conversation"
+                  onclick="shareActiveConversation()"
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M8 12.5 15.5 7M8 12.5l7.5 4.5" fill="none" />
+                    <circle cx="6" cy="12.5" r="3" fill="currentColor" stroke="none" />
+                    <circle cx="18" cy="5.5" r="3" fill="currentColor" stroke="none" />
+                    <circle cx="18" cy="18.5" r="3" fill="currentColor" stroke="none" />
+                  </svg>
+                </button>
+                <button
+                  class="iconbtn"
+                  id="chatConversationDeleteBtn"
+                  title="Archive conversation"
+                  aria-label="Archive conversation"
+                  onclick="handleActiveConversationArchiveOrDelete(event)"
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M4 7h16v3H4zm2 3h12v9H6zm4 3h4" fill="none" />
+                  </svg>
+                </button>
+                <span class="chat-head-separator" aria-hidden="true">|</span>
+                <div class="chat-head-menu">
+                  <button
+                    class="iconbtn"
+                    id="chatSettingsToggle"
+                    title="Chat options"
+                    aria-label="Chat options"
+                    onclick="toggleChatOptionsMenu()"
+                  >
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M12 8.5a3.5 3.5 0 1 0 0 7a3.5 3.5 0 0 0 0-7Zm8 3.5l-2.1.8a6.9 6.9 0 0 1-.6 1.4l.9 2l-2.1 2.1l-2-.9a6.9 6.9 0 0 1-1.4.6L12 20l-1.1-2.1a6.9 6.9 0 0 1-1.4-.6l-2 .9l-2.1-2.1l.9-2a6.9 6.9 0 0 1-.6-1.4L4 12l2.1-1.1a6.9 6.9 0 0 1 .6-1.4l-.9-2l2.1-2.1l2 .9a6.9 6.9 0 0 1 1.4-.6L12 4l1.1 2.1a6.9 6.9 0 0 1 1.4.6l2-.9l2.1 2.1l-.9 2a6.9 6.9 0 0 1 .6 1.4L20 12Z" fill="none" />
+                    </svg>
+                  </button>
+                  <div class="chat-options-menu hidden" id="chatOptionsMenu">
+                    <button class="btn blue" onclick="openArchivedConversationsModal()">
+                      Archived Chats
+                    </button>
+                    <div class="chat-options-separator" aria-hidden="true"></div>
+                    <button class="btn blue" onclick="openMcpManagerModal()">
+                      MCP Servers
+                    </button>
+                    <button class="btn blue" onclick="openChatSettingsPanel()">
+                      Chat Settings
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="chat-shell">
+            <div class="chat-main">
+              <div class="chat-toolbar">
+                <label
+                  >Container
+                  <select id="chatPresetSelect" onchange="selectChatPreset(this.value)"></select>
+                </label>
+                <label
+                  >API Preset
+                  <select id="chatApiPresetSelect" onchange="selectChatApiPreset(this.value)"></select>
+                </label>
+              </div>
+              <div class="msg chat-status-msg" id="chatMsg"></div>
+              <div class="resizable-surface resizable-surface-chat">
+                <div class="chat-transcript" id="chatTranscript"></div>
+                <div class="chat-transcript-footer">
+                  <label class="label chat-transcript-autoscroll">
+                    <input
+                      type="checkbox"
+                      id="chatAutoscroll"
+                      checked
+                      onchange="setChatTranscriptAutoscroll(this.checked)"
+                    />
+                    auto-scroll
+                  </label>
+                </div>
+                <button
+                  type="button"
+                  class="surface-resize-handle"
+                  id="chatTranscriptResizeHandle"
+                  aria-label="Resize chat transcript"
+                  title="Resize chat transcript"
+                ></button>
+              </div>
+              <div class="chat-input-wrap">
+                <div class="chat-composer-row">
+                  <textarea
+                    id="chatInput"
+                    rows="4"
+                    placeholder="Send a test message to the selected active preset..."
+                    oninput="handleChatInputChange()"
+                    onpaste="handleChatPaste(event)"
+                  ></textarea>
+                  <div class="chat-action-stack">
+                    <button
+                      class="iconbtn chat-action-btn chat-send-btn"
+                      onclick="sendChatMessage()"
+                      id="chatSendBtn"
+                      title="Send message"
+                      aria-label="Send message"
+                    >
+                      <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M4 12 19 5l-3.8 5.4L19 12l-3.8 1.6L19 19 4 12Z" fill="currentColor" stroke="none" />
+                      </svg>
+                    </button>
+                    <button
+                      class="iconbtn chat-action-btn chat-mic-btn"
+                      onclick="toggleChatDictation()"
+                      id="chatMicBtn"
+                      title="Voice dictation"
+                      aria-label="Voice dictation"
+                    >
+                      <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M12 15a3 3 0 0 0 3-3V7a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3Zm0 0v4m-4-4a4 4 0 0 0 8 0" fill="none" />
+                      </svg>
+                    </button>
+                    <button
+                      class="iconbtn chat-action-btn chat-attach-btn"
+                      onclick="openChatAttachmentPicker()"
+                      id="chatAttachBtn"
+                      title="Attach files or images"
+                      aria-label="Attach files or images"
+                    >
+                      <svg viewBox="-3 0 28 28" aria-hidden="true">
+                        <path d="M8 12.5 14.5 6a3.5 3.5 0 1 1 5 5L10.5 20a5 5 0 1 1-7-7L13 3.5" fill="none" />
+                      </svg>
+                    </button>
+                  </div>
+                </div>
+                <input
+                  id="chatAttachmentInput"
+                  type="file"
+                  multiple
+                  class="hidden-file-input"
+                  accept="image/*,.txt,.md,.markdown,.json,.jsonl,.csv,.tsv,.yaml,.yml,.xml,.html,.css,.js,.mjs,.cjs,.ts,.tsx,.jsx,.py,.sh,.bash,.zsh,.log,.ini,.cfg,.conf"
+                  onchange="handleChatAttachmentSelect(event)"
+                />
+                <div class="chat-attachment-rail" id="chatAttachmentRow"></div>
+              </div>
+              <div class="chat-stats-card" id="chatStatsCard">
+                <div class="chat-stats-head">
+                  <div class="chat-stats-title" id="chatStatsTitle">Generation Stats</div>
+                  <button
+                    class="iconbtn chat-stats-toggle"
+                    id="chatStatsToggleBtn"
+                    title="Collapse generation stats"
+                    aria-label="Collapse generation stats"
+                    onclick="toggleChatStatsCollapsed()"
+                  >
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="m6 15 6-6 6 6" fill="none" />
+                    </svg>
+                  </button>
+                </div>
+                <div class="chat-runtime-stats" id="chatRuntimeStats">-</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+      <section id="metrics" class="tabpane content-tab">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Metrics</h2>
+            <div class="preset-actions">
+              <button
+                class="iconbtn"
+                id="metricsResetBtn"
+                title="Clear recorded metrics"
+                aria-label="Clear recorded metrics"
+                onclick="promptClearRecordedMetrics()"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M5 7h14M9 7V5h6v2m-7 3v7m4-7v7m4-7v7M7 7l1 12h8l1-12" fill="none" />
+                </svg>
+              </button>
+            </div>
+          </div>
+          <div class="subtabs">
+            <button class="subtab active" onclick="metricTab(event, 'mMain')">
+              Main</button
+            ><button class="subtab" onclick="metricTab(event, 'mGpu')">
+              GPUs</button
+            ><button class="subtab" onclick="metricTab(event, 'mCpuRam')">
+              CPU+RAM</button
+            ><button class="subtab" onclick="metricTab(event, 'mSystem')">
+              System</button
+            ><button class="subtab" onclick="metricTab(event, 'mNetwork')">
+              Network
+            </button>
+          </div>
+          <div id="mMain" class="metricpane active">
+            <div class="chartgrid">
+              <div class="chart"><canvas id="cGpu"></canvas></div>
+              <div class="chart"><canvas id="cMem"></canvas></div>
+              <div class="chart"><canvas id="cLatency"></canvas></div>
+              <div class="chart"><canvas id="cTps"></canvas></div>
+            </div>
+          </div>
+          <div id="mGpu" class="metricpane">
+            <div id="gpuMetricCharts" class="gpu-chartgrid"></div>
+          </div>
+          <div id="mCpuRam" class="metricpane">
+            <div id="ramInfo" class="value smallgap"></div>
+            <div class="chartgrid">
+              <div class="chart tall"><canvas id="cCpu"></canvas></div>
+              <div class="chart tall"><canvas id="cRam"></canvas></div>
+            </div>
+            <div id="cpuCores" class="coregrid"></div>
+          </div>
+          <div id="mSystem" class="metricpane">
+            <div class="chartgrid">
+              <div class="chart"><canvas id="cSystemUtil"></canvas></div>
+            </div>
+            <div class="panel">
+              <h2>System Information</h2>
+              <div id="systemInfo" class="value"></div>
+            </div>
+            <div class="panel">
+              <h2>Storage</h2>
+              <div id="diskInfo"></div>
+            </div>
+          </div>
+          <div id="mNetwork" class="metricpane">
+            <div id="netInfo" class="netgrid"></div>
+            <div class="chartgrid">
+              <div class="chart"><canvas id="cNetDown"></canvas></div>
+              <div class="chart"><canvas id="cNetUp"></canvas></div>
+            </div>
+          </div>
+        </div>
+      </section>
+      <section id="logs" class="tabpane"></section>
+      <section class="panel logtools">
+        <h2>Log Management</h2>
+        <div class="searchbox">
+          <button
+            class="btn"
+            id="searchPrev"
+            onclick="previousMatch()"
+            disabled
+          >
+            ⏪</button
+          ><input
+            id="searchQuery"
+            placeholder="Search log text"
+            onkeydown="if (event.key === 'Enter') runSearchOrNext();"
+          /><button class="btn" id="searchNext" onclick="runSearchOrNext()">
+            🔍</button
+          ><span style="border-left: 1px solid #34445a; height: 28px"></span
+          ><button class="btn" id="refreshBtn" onclick="manualRefreshStatus()">
+            ♻️</button
+          ><button class="btn" id="clearBtn" onclick="clearOrCancelLog()">
+            🗑️
+          </button>
+        </div>
+      </section>
+      <section class="logs panel" id="logCard">
+        <div class="loghead">
+          <div class="logheadtitle">
+            <button
+              type="button"
+              class="iconbtn log-popout-btn"
+              id="logPopoutBtn"
+              onclick="toggleLogPopout()"
+              title="Pop out logs"
+              aria-label="Pop out logs"
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M14 5h5v5m0-5-7 7" fill="none" />
+                <path d="M10 7H7a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-3" fill="none" />
+              </svg>
+            </button>
+            <h2 id="logTitle">Docker Logs</h2>
+          </div>
+          <div class="logheadchecks">
+            <select
+              id="logInstanceSelect"
+              class="log-instance-select hidden"
+              onchange="setDockerLogInstance(this.value)"
+              aria-label="Docker log instance selector"
+            ></select
+            ><span class="label" id="logInstanceLabel">instance: primary</span
+            ><label class="label"
+              ><input
+                type="checkbox"
+                id="showGlobalLogs"
+                checked
+                onchange="setShowGlobalLogs(this.checked)"
+              />
+              show globally</label
+            ><label class="label"
+              ><input type="checkbox" id="autoscroll" checked />
+              auto-scroll</label
+            >
+          </div>
+        </div>
+        <div class="resizable-surface resizable-surface-log" id="logSurface">
+          <textarea id="log" class="log" readonly wrap="soft">
+Connecting...</textarea
+          >
+          <button
+            type="button"
+            class="surface-resize-handle"
+            id="logResizeHandle"
+            aria-label="Resize log viewer"
+            title="Resize log viewer"
+          ></button>
+        </div>
+        <div class="chat-input-wrap log-command-wrap hidden" id="logCommandWrap">
+          <div class="chat-composer-row">
+            <div class="log-command-editor" id="logCommandEditor">
+              <pre
+                id="logCommandGhost"
+                class="log-command-ghost"
+                aria-hidden="true"
+              ></pre>
+              <textarea
+                id="logCommandInput"
+                rows="3"
+                placeholder="Run a bash command in the control service debug shell. Use follow-up sends for interactive prompts, like password input."
+              ></textarea>
+            </div>
+            <div class="chat-action-stack">
+              <button
+                class="iconbtn chat-action-btn chat-send-btn"
+                onclick="sendDebugLogCommand()"
+                id="logCommandSendBtn"
+                title="Send command"
+                aria-label="Send command"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M4 12 19 5l-3.8 5.4L19 12l-3.8 1.6L19 19 4 12Z" fill="currentColor" stroke="none" />
+                </svg>
+              </button>
+              <button
+                class="iconbtn chat-action-btn"
+                onclick="openDebugTransferUploadPicker(event)"
+                id="logTransferUploadBtn"
+                title="Upload files to the current debug-shell folder"
+                aria-label="Upload files to the current debug-shell folder"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M12 19V7m0 0-4 4m4-4 4 4M5 19h14" fill="none" />
+                </svg>
+              </button>
+              <button
+                class="iconbtn chat-action-btn"
+                onclick="downloadDebugTransferFiles()"
+                id="logTransferDownloadBtn"
+                title="Download file paths listed in the shell field"
+                aria-label="Download file paths listed in the shell field"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M12 5v12m0 0-4-4m4 4 4-4M5 19h14" fill="none" />
+                </svg>
+              </button>
+            </div>
+          </div>
+          <input
+            id="logTransferUploadInput"
+            type="file"
+            multiple
+            class="hidden-file-input"
+            onchange="handleDebugTransferUploadSelect(event)"
+          />
+          <input
+            id="logTransferUploadFolderInput"
+            type="file"
+            multiple
+            webkitdirectory
+            directory
+            class="hidden-file-input"
+            onchange="handleDebugTransferUploadSelect(event)"
+          />
+        </div>
+      </section>
+    </main>
+    <script>// injected by build.py from web-ui.js</script>
+  </body>
+</html>
