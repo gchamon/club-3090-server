@@ -26,6 +26,10 @@ def resolve_log_source(source="docker", instance_id="", service_id=""):
         return {"source": "audit", "instance": None, "container": "", "service": {}, "label": "Audit"}
     if source_name == "debug":
         return {"source": "debug", "instance": None, "container": "", "service": {}, "label": "Debug"}
+    if source_name == "benchmarks":
+        return {"source": "benchmarks", "instance": None, "container": "", "service": {}, "label": "Benchmarks"}
+    if source_name == "script":
+        return {"source": "script", "instance": None, "container": "", "service": {}, "label": "Script"}
     if source_name == "service":
         service = resolve_upstream_service(service_id, force=True)
         container = str((service or {}).get("container_name") or "").strip()
@@ -56,6 +60,14 @@ def read_selected_log_snapshot(source="docker", instance_id="", service_id="", t
             "signature": "debug",
             "text": query_text_log_file(DEBUG_LOG_FILE, tail_lines=tail_lines),
         }
+    if source_name == "benchmarks":
+        return {
+            "source": source_name,
+            "signature": "benchmarks",
+            **benchmark_log_only_snapshot(tail_lines=tail_lines),
+        }
+    if source_name == "script":
+        return script_log_snapshot(tail_lines=tail_lines)
     if source_name == "service":
         service = resolved.get("service") or {}
         service_id_text = str(service.get("id") or service_id or "").strip().lower()
@@ -388,4 +400,3 @@ def compose_variant_metadata(mode):
     with slow_cache_lock:
         compose_metadata_cache[cache_key] = dict(meta)
     return dict(meta)
-

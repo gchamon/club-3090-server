@@ -26,17 +26,55 @@ class CommonMixin:
         self.send_header("Content-Length", "0")
         self.send_header("Connection", "close")
         self.end_headers()
+    def accepts_gzip_response(self):
+        accepted = str(self.headers.get("Accept-Encoding", "") or "").lower()
+        return any(part.strip().split(";", 1)[0] == "gzip" for part in accepted.split(","))
+    def should_gzip_response(self, payload, content_type="", code=200):
+        if code < 200 or code in {204, 304}:
+            return False
+        if not payload or len(payload) < 1024:
+            return False
+        lowered = str(content_type or "").split(";", 1)[0].strip().lower()
+        return (
+            lowered.startswith("text/") or
+            lowered in {
+                "application/json",
+                "application/javascript",
+                "application/xml",
+                "image/svg+xml",
+            }
+        )
     def send_bytes(self, payload, content_type="application/octet-stream", code=200):
         self.close_connection = True
+        body = bytes(payload or b"")
+        gzip_response = False
+        if self.accepts_gzip_response() and self.should_gzip_response(body, content_type, code):
+            try:
+                compressed = gzip.compress(body, compresslevel=5)
+                if len(compressed) < len(body):
+                    body = compressed
+                    gzip_response = True
+            except Exception:
+                gzip_response = False
         self.send_response(code)
         self.send_header("Content-Type", content_type)
+        if gzip_response:
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Vary", "Accept-Encoding")
         self.emit_pending_headers()
-        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Content-Length", str(len(body)))
         self.send_header("Connection", "close")
         self.end_headers()
-        self.wfile.write(payload)
+        self.write_response_bytes(body)
+    def write_response_bytes(self, payload):
+        try:
+            self.wfile.write(payload)
+            return True
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            self.close_connection = True
+            return False
     def send_json(self, obj, code=200):
-        self.send_bytes(json.dumps(obj, indent=2).encode("utf-8"), "application/json", code)
+        self.send_bytes(json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8"), "application/json", code)
     def send_stream(self, file_path, content_type="application/octet-stream", download_name="", code=200, cleanup_path=""):
         target = str(file_path or "").strip()
         if not target or not os.path.exists(target):
@@ -57,13 +95,165 @@ class CommonMixin:
                     chunk = handle.read(1024 * 256)
                     if not chunk:
                         break
-                    self.wfile.write(chunk)
+                    if not self.write_response_bytes(chunk):
+                        break
         finally:
             if cleanup_path:
                 try:
                     os.remove(cleanup_path)
                 except Exception:
                     pass
+    def send_file_range(self, file_path, content_type="application/octet-stream", download_name="", inline=True):
+        target = str(file_path or "").strip()
+        if not target or not os.path.exists(target):
+            raise FileNotFoundError(target or "stream file")
+        size = int(os.path.getsize(target) or 0)
+        start = 0
+        end = max(0, size - 1)
+        partial = False
+        range_header = str(self.headers.get("Range", "") or "").strip()
+        if range_header.startswith("bytes=") and size > 0:
+            match = re.match(r"bytes=(\d*)-(\d*)$", range_header)
+            if match:
+                raw_start, raw_end = match.groups()
+                if raw_start == "" and raw_end:
+                    suffix = min(size, max(0, int(raw_end or 0)))
+                    start = max(0, size - suffix)
+                    end = size - 1
+                    partial = True
+                else:
+                    start = max(0, int(raw_start or 0))
+                    end = min(size - 1, int(raw_end or size - 1))
+                    if start <= end:
+                        partial = True
+                    else:
+                        self.send_response(416)
+                        self.send_header("Content-Range", f"bytes */{size}")
+                        self.emit_pending_headers()
+                        self.send_header("Content-Length", "0")
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        return
+        length = max(0, end - start + 1) if size > 0 else 0
+        self.close_connection = True
+        self.send_response(206 if partial else 200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Accept-Ranges", "bytes")
+        disposition = "inline" if inline else "attachment"
+        if download_name:
+            self.send_header("Content-Disposition", f'{disposition}; filename="{os.path.basename(download_name)}"')
+        if partial:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.emit_pending_headers()
+        self.send_header("Content-Length", str(length))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        with open(target, "rb") as handle:
+            handle.seek(start)
+            remaining = length
+            while remaining > 0:
+                chunk = handle.read(min(1024 * 256, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                if not self.write_response_bytes(chunk):
+                    break
+
+def admin_service_worker_script():
+    version_json = json.dumps(str(SCRIPT_VERSION or "unknown"))
+    return f"""
+const CLUB3090_SW_VERSION = {version_json};
+const CACHE_NAME = `club3090-admin-shell-${{CLUB3090_SW_VERSION}}`;
+const SHELL_URL = "/admin";
+const NAVIGATION_TIMEOUT_MS = 10 * 1000;
+
+async function normalizedShellResponse(response) {{
+  if (!response || !response.ok) return null;
+  const body = await response.clone().arrayBuffer();
+  const headers = new Headers(response.headers);
+  headers.set("Cache-Control", "max-age=31536000");
+  headers.set("X-Club3090-Cached-Shell", CLUB3090_SW_VERSION);
+  return new Response(body, {{
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  }});
+}}
+
+async function cacheAdminShell() {{
+  const cache = await caches.open(CACHE_NAME);
+  const response = await fetch(new Request(SHELL_URL, {{ credentials: "include", cache: "no-store" }}));
+  const shell = await normalizedShellResponse(response);
+  if (shell) await cache.put(SHELL_URL, shell);
+}}
+
+async function cachedAdminShell() {{
+  const cache = await caches.open(CACHE_NAME);
+  return (await cache.match(SHELL_URL)) || (await caches.match(SHELL_URL));
+}}
+
+async function networkFirstAdminNavigation(request) {{
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), NAVIGATION_TIMEOUT_MS);
+  try {{
+    const response = await fetch(new Request(request, {{ signal: controller.signal, cache: "no-store" }}));
+    clearTimeout(timer);
+    if (response && response.ok) {{
+      const cache = await caches.open(CACHE_NAME);
+      const shell = await normalizedShellResponse(response);
+      if (shell) await cache.put(SHELL_URL, shell).catch(() => {{}});
+    }} else if (response && [502, 503, 504].includes(Number(response.status))) {{
+      const fallback = await cachedAdminShell();
+      if (fallback) return fallback;
+    }}
+    return response;
+  }} catch (error) {{
+    clearTimeout(timer);
+    const fallback = await cachedAdminShell();
+    if (fallback) return fallback;
+    throw error;
+  }}
+}}
+
+self.addEventListener("install", (event) => {{
+  event.waitUntil((async () => {{
+    await cacheAdminShell().catch(() => {{}});
+    await self.skipWaiting();
+  }})());
+}});
+
+self.addEventListener("activate", (event) => {{
+  event.waitUntil((async () => {{
+    const names = await caches.keys();
+    await Promise.all(names.map((name) => name.startsWith("club3090-admin-shell-") && name !== CACHE_NAME ? caches.delete(name) : Promise.resolve(false)));
+    await cacheAdminShell().catch(() => {{}});
+    await self.clients.claim();
+  }})());
+}});
+
+self.addEventListener("message", (event) => {{
+  if (event && event.data && event.data.type === "CACHE_ADMIN_SHELL") {{
+    event.waitUntil(cacheAdminShell().catch(() => {{}}));
+  }}
+}});
+
+self.addEventListener("fetch", (event) => {{
+  const request = event.request;
+  if (!request || request.method !== "GET" || request.mode !== "navigate") return;
+  const url = new URL(request.url);
+  if (!url.pathname.startsWith("/admin") || url.pathname === "/admin/sw.js") return;
+  event.respondWith(networkFirstAdminNavigation(request));
+}});
+""".strip() + "\n"
+
+def admin_favicon_svg():
+    return (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
+        '<rect width="64" height="64" rx="12" fill="#0b1220"/>'
+        '<path d="M18 42V22h28v7h-6v-2H24v10h16v-3h6v8H18z" fill="#7dd3fc"/>'
+        '<path d="M28 46h20v-6H34v-4h12v-6H28v16z" fill="#a7f3d0"/>'
+        '</svg>'
+    )
 
 class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -89,20 +279,81 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
         return False
     def send_sse_event(self, event_name, payload):
         body = json.dumps(payload, ensure_ascii=False)
-        self.wfile.write(f"event: {event_name}\ndata: {body}\n\n".encode("utf-8", errors="replace"))
         try:
+            self.wfile.write(f"event: {event_name}\ndata: {body}\n\n".encode("utf-8", errors="replace"))
             self.wfile.flush()
-        except Exception:
-            pass
-        self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            self.close_connection = True
+            raise
     def send_sse_comment(self, text="ping"):
-        self.wfile.write(f": {text}\n\n".encode("utf-8", errors="replace"))
-        self.wfile.flush()
+        try:
+            self.wfile.write(f": {text}\n\n".encode("utf-8", errors="replace"))
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            self.close_connection = True
+            raise
+    def admin_stream_client_key(self, label):
+        forwarded = str(self.headers.get("X-Forwarded-For") or "").split(",", 1)[0].strip()
+        client_ip = forwarded or (self.client_address[0] if self.client_address else "")
+        user_agent = re.sub(r"\s+", " ", str(self.headers.get("User-Agent") or "").strip())[:120]
+        return f"{client_ip}|{user_agent}|{str(label or '').strip()}"
+    def begin_admin_stream(self, label):
+        key = self.admin_stream_client_key(label)
+        stop_event = threading.Event()
+        with admin_stream_registry_lock:
+            old_event = admin_stream_registry.get(key)
+            if old_event is not None:
+                try:
+                    old_event.set()
+                except Exception:
+                    pass
+            admin_stream_registry[key] = stop_event
+        return key, stop_event
+    def end_admin_stream(self, key, stop_event):
+        with admin_stream_registry_lock:
+            if admin_stream_registry.get(key) is stop_event:
+                admin_stream_registry.pop(key, None)
+        self.close_connection = True
+    def admin_stream_stopped(self, stop_event):
+        return bool(stop_event is not None and stop_event.is_set())
     def do_GET(self):
-        if not self.require_auth():
-            return
         parsed = urlsplit(self.path)
         path = parsed.path
+        if path == "/favicon.ico":
+            self.queue_header("Cache-Control", "public, max-age=86400")
+            self.send_bytes(admin_favicon_svg().encode("utf-8"), "image/svg+xml; charset=utf-8")
+            return
+        if path == "/admin/update-status":
+            params = parse_admin_query_params(parsed)
+            requested_token = str(params.get("token") or "").strip()
+            update_state = read_self_update_state()
+            update_token = str(update_state.get("token") or "").strip()
+            if not requested_token or not update_token or requested_token != update_token:
+                self.send_json({"ok": False, "error": "Invalid update token"}, 403)
+                return
+            self.send_json({"ok": True, "self_update": update_state})
+            return
+        if path == "/admin/sw.js":
+            self.queue_header("Cache-Control", "no-store, no-cache, must-revalidate")
+            self.queue_header("Service-Worker-Allowed", "/admin")
+            self.send_bytes(admin_service_worker_script().encode("utf-8"), "application/javascript; charset=utf-8")
+            return
+        if not self.require_auth():
+            return
+        if path == "/admin/update-signal":
+            update_state = read_self_update_state()
+            self.send_json({
+                "ok": True,
+                "self_update": {
+                    "active": bool(update_state.get("active")),
+                    "status": update_state.get("status"),
+                    "scope": update_state.get("scope"),
+                    "token": update_state.get("token"),
+                    "stream_url": update_state.get("stream_url"),
+                    "status_url": update_state.get("status_url"),
+                },
+            })
+            return
         if path == "/":
             self.redirect("/admin")
             return
@@ -116,13 +367,59 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             params = parse_admin_query_params(parsed)
             force = str(params.get("force") or "").strip().lower() in {"1", "true", "yes", "on"}
             request_options = parse_status_request_options(params)
+            refresh_remote_metadata = str(params.get("refresh_remote_update") or "").strip().lower() in {"1", "true", "yes", "on"}
             started_at = time.time()
-            payload = shape_status_snapshot(get_status_snapshot(force=force), request_options)
+            if (
+                request_options.get("tab") == "metrics"
+                and request_options.get("include_series")
+                and not request_options.get("include_inventory")
+            ):
+                snapshot = get_lightweight_status_snapshot(series_limit=request_options.get("series_limit"))
+            else:
+                snapshot = get_status_snapshot(force=force, refresh_remote_metadata=refresh_remote_metadata)
+            payload = shape_status_snapshot(
+                snapshot,
+                request_options,
+            )
             payload["access_hint"] = tailscale_access_hint_for_client(self.client_address[0] if self.client_address else "")
             elapsed = time.time() - started_at
             if elapsed >= 1.0 or payload.get("status_error"):
                 log_control(f"ADMIN status served force={force} elapsed={round(elapsed, 3)}s status_error={bool(payload.get('status_error'))}")
             self.send_json(payload)
+            return
+        if path == "/admin/benchmarks":
+            params = parse_admin_query_params(parsed)
+            live_only = str(params.get("live") or "").strip().lower() in {"1", "true", "yes", "on"}
+            inventory_flags = [params.get("full"), params.get("inventory"), params.get("include_inventory")]
+            force_full = any(str(flag or "").strip().lower() in {"1", "true", "yes", "on"} for flag in inventory_flags)
+            compact_requested = any(str(flag or "").strip().lower() in {"0", "false", "no", "off"} for flag in inventory_flags)
+            include_scores = str(params.get("scores") or params.get("include_scores") or "").strip().lower() in {"1", "true", "yes", "on"}
+            include_logs = str(params.get("logs") or params.get("include_logs") or params.get("include_details") or "").strip().lower() in {"1", "true", "yes", "on"}
+            active_job = benchmark_job_active()
+            if live_only or compact_requested or (active_job and not force_full):
+                base = benchmarks_status_snapshot(include_scores=include_scores) if include_scores else {}
+                self.send_json({"ok": True, "benchmarks": benchmarks_live_status_overlay(base, include_logs=include_logs)})
+            else:
+                self.send_json({"ok": True, "benchmarks": benchmarks_snapshot(include_logs=include_logs, include_scores=include_scores)})
+            return
+        if path == "/admin/scripts":
+            params = parse_admin_query_params(parsed)
+            include_internal = str(params.get("include_internal") or "").strip().lower() in {"1", "true", "yes", "on"}
+            self.send_json({"ok": True, "scripts": discover_upstream_scripts(include_internal=include_internal), "include_internal": include_internal, "job": script_job_snapshot()})
+            return
+        if path == "/admin/scripts/jobs":
+            self.send_json({"ok": True, "job": script_job_snapshot()})
+            return
+        if path == "/admin/scripts/log":
+            params = parse_admin_query_params(parsed)
+            self.send_json({"ok": True, **script_log_snapshot(job_id=params.get("job_id") or "", tail_lines=parse_tail_lines_param(params, 500))})
+            return
+        if path == "/admin/benchmarks/detail":
+            params = parse_admin_query_params(parsed)
+            try:
+                self.send_json(benchmark_detail(params.get("selector") or ""))
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
             return
         if path == "/admin/log-bootstrap":
             params = parse_admin_query_params(parsed)
@@ -134,36 +431,81 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             self.send_json({"ok": True, **payload})
             return
         if path == "/admin/logs":
-            self.close_connection = False
+            params = parse_admin_query_params(parsed)
+            if str(params.get("source") or "").strip().lower() == "benchmarks":
+                stream_key, stop_event = self.begin_admin_stream("logs:benchmarks")
+                self.close_connection = True
+                self.send_response(200)
+                self.send_header("Content-Type","text/event-stream")
+                self.send_header("Cache-Control","no-cache")
+                self.send_header("Connection","close")
+                self.emit_pending_headers()
+                self.end_headers()
+                try:
+                    self.stream_dynamic_text_file(benchmark_active_script_log_file, "no benchmark script output yet; waiting...", initial_tail_lines=parse_tail_lines_param(params, 250), stop_event=stop_event)
+                finally:
+                    self.end_admin_stream(stream_key, stop_event)
+                return
+            if str(params.get("source") or "").strip().lower() == "script":
+                requested_job_id = str(params.get("job_id") or "").strip()
+                stream_key, stop_event = self.begin_admin_stream(f"logs:script:{requested_job_id or 'latest'}")
+                self.close_connection = True
+                self.send_response(200)
+                self.send_header("Content-Type","text/event-stream")
+                self.send_header("Cache-Control","no-cache")
+                self.send_header("Connection","close")
+                self.emit_pending_headers()
+                self.end_headers()
+                try:
+                    self.stream_dynamic_text_file(lambda: script_current_log_file(requested_job_id), "no script output yet; waiting...", initial_tail_lines=parse_tail_lines_param(params, 250), stop_event=stop_event)
+                finally:
+                    self.end_admin_stream(stream_key, stop_event)
+                return
+            requested_source = str(params.get("source") or "docker").strip().lower()
+            requested_instance = str(params.get("instance") or "").strip().upper()
+            requested_service = str(params.get("service") or "").strip().lower()
+            stream_key, stop_event = self.begin_admin_stream(f"logs:{requested_source}:{requested_instance}:{requested_service}")
+            self.close_connection = True
             self.send_response(200)
             self.send_header("Content-Type","text/event-stream")
             self.send_header("Cache-Control","no-cache")
-            self.send_header("Connection","keep-alive")
+            self.send_header("Connection","close")
             self.emit_pending_headers()
             self.end_headers()
-            self.stream_logs(parsed)
+            try:
+                self.stream_logs(parsed, stop_event=stop_event)
+            finally:
+                self.end_admin_stream(stream_key, stop_event)
             return
         if path == "/admin/audit-stream":
             params = parse_admin_query_params(parsed)
-            self.close_connection = False
+            stream_key, stop_event = self.begin_admin_stream("logs:audit")
+            self.close_connection = True
             self.send_response(200)
             self.send_header("Content-Type","text/event-stream")
             self.send_header("Cache-Control","no-cache")
-            self.send_header("Connection","keep-alive")
+            self.send_header("Connection","close")
             self.emit_pending_headers()
             self.end_headers()
-            self.stream_text_file(AUDIT_LOG_FILE, "no audit entries yet; waiting...", initial_tail_lines=parse_tail_lines_param(params, 250))
+            try:
+                self.stream_text_file(AUDIT_LOG_FILE, "no audit entries yet; waiting...", initial_tail_lines=parse_tail_lines_param(params, 250), stop_event=stop_event)
+            finally:
+                self.end_admin_stream(stream_key, stop_event)
             return
         if path == "/admin/debug-stream":
             params = parse_admin_query_params(parsed)
-            self.close_connection = False
+            stream_key, stop_event = self.begin_admin_stream("logs:debug")
+            self.close_connection = True
             self.send_response(200)
             self.send_header("Content-Type","text/event-stream")
             self.send_header("Cache-Control","no-cache")
-            self.send_header("Connection","keep-alive")
+            self.send_header("Connection","close")
             self.emit_pending_headers()
             self.end_headers()
-            self.stream_text_file(DEBUG_LOG_FILE, "no debug entries yet; waiting...", initial_tail_lines=parse_tail_lines_param(params, 250))
+            try:
+                self.stream_text_file(DEBUG_LOG_FILE, "no debug entries yet; waiting...", initial_tail_lines=parse_tail_lines_param(params, 250), stop_event=stop_event)
+            finally:
+                self.end_admin_stream(stream_key, stop_event)
             return
         if path == "/admin/presets":
             self.send_json({"ok": True, "presets": preset_catalog()})
@@ -202,6 +544,37 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             self.queue_header("Pragma", "no-cache")
             self.send_bytes(payload, "application/json; charset=utf-8")
             return
+        if path == "/admin/storage-browser/preview":
+            params = parse_admin_query_params(parsed)
+            try:
+                row = resolve_storage_browser_file(params.get("root_path"), params.get("relative_path") or "")
+                self.queue_header("Cache-Control", "no-store")
+                self.send_file_range(
+                    row.get("path"),
+                    row.get("mime") or "application/octet-stream",
+                    row.get("name") or "preview",
+                    inline=True,
+                )
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 404)
+            return
+        if path == "/admin/storage-browser/subtitle":
+            params = parse_admin_query_params(parsed)
+            try:
+                row = read_storage_browser_subtitle_payload(
+                    params.get("root_path"),
+                    params.get("relative_path") or "",
+                    params.get("external_relative_path") or "",
+                    params.get("embedded_stream_index"),
+                )
+                if not row.get("found"):
+                    self.send_json({"ok": False, "error": "Subtitle not found."}, 404)
+                    return
+                self.queue_header("Cache-Control", "no-store")
+                self.send_bytes(row.get("payload") or b"", row.get("content_type") or "text/vtt; charset=utf-8")
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 404)
+            return
         if path == "/admin/chat-conversation":
             params = parse_admin_query_params(parsed)
             debug_audit("chat_conversation_get", conversation_id=params.get("conversation_id") or params.get("id") or "")
@@ -211,6 +584,21 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             params = parse_admin_query_params(parsed)
             conversation_id = params.get("conversation_id") or params.get("id") or ""
             self.send_json({"ok": True, "stream": read_admin_chat_stream_state(conversation_id)})
+            return
+        if path in {"/admin/ai-studio/generation", "/admin/image-studio/generation"}:
+            params = parse_admin_query_params(parsed)
+            try:
+                self.send_json({"ok": True, "generation": image_studio_generation_status(params.get("job_id") or params.get("id") or "")})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 404)
+            return
+        if path in {"/admin/ai-studio/gallery", "/admin/image-studio/gallery"}:
+            params = parse_admin_query_params(parsed)
+            try:
+                limit = int(params.get("limit") or 120)
+            except Exception:
+                limit = 120
+            self.send_json({"ok": True, "items": image_studio_gallery_items(limit)})
             return
         if path.startswith("/admin/chat-attachments/"):
             attachment_id = re.sub(r"[^A-Za-z0-9._-]+", "", path.rsplit("/", 1)[-1])
@@ -249,6 +637,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
         if path == "/admin/switch":
             try:
                 data = self.read_json_body()
+                ensure_benchmark_idle("Preset launch")
                 instance_id = str(data.get("instance_id") or "").strip().upper()
                 mode = canonical_mode_selector(data.get("mode"))
                 spec = resolve_variant_spec(mode)
@@ -410,9 +799,17 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             return
         if path == "/admin/rebuild-inventory":
             try:
-                inventory = rebuild_runtime_inventory()
+                ensure_benchmark_idle("Model DB rebuild")
+                inventory = enrich_runtime_inventory_cache_sizes(rebuild_runtime_inventory())
+                benchmark_inventory = benchmark_rebuild_inventory_state_file(reason="runtime inventory rebuilt from admin")
                 log_audit("admin_runtime_inventory_rebuilt", models=len(inventory.get("models") or []), variants=len(inventory.get("variants") or []))
-                self.send_json({"ok": True, "runtime_inventory": inventory, "models": inventory.get("models") or [], "variants": inventory.get("variants") or []})
+                self.send_json({
+                    "ok": True,
+                    "runtime_inventory": inventory,
+                    "benchmark_inventory": benchmark_compact_inventory_state_summary(benchmark_inventory),
+                    "models": inventory.get("models") or [],
+                    "variants": inventory.get("variants") or [],
+                })
             except Exception as e:
                 self.send_json({"ok": False, "error": str(e)}, 500)
             return
@@ -480,6 +877,22 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             except Exception as e:
                 self.send_json({"ok": False, "error": str(e)}, 500)
             return
+        if path == "/admin/model-cache/delete":
+            try:
+                ensure_benchmark_idle("Model cache deletion")
+                data = self.read_json_body()
+                result = delete_model_cache_paths(data.get("paths") or [])
+                inventory = enrich_runtime_inventory_cache_sizes(load_runtime_inventory(force=True))
+                self.send_json({
+                    **result,
+                    "runtime_inventory": inventory,
+                    "models": inventory.get("models") or [],
+                    "variants": inventory.get("variants") or [],
+                    "focus_log_source": "audit",
+                }, 200 if result.get("ok") else 500)
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
         if path == "/admin/preset-caches/plan":
             try:
                 data = self.read_json_body()
@@ -490,6 +903,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             return
         if path == "/admin/preset-caches/delete":
             try:
+                ensure_benchmark_idle("Preset cache deletion")
                 data = self.read_json_body()
                 result = delete_preset_caches(data.get("selector"), data.get("variant_id"))
                 self.send_json({**result, "focus_log_source": "audit"}, 200 if result.get("ok") else 500)
@@ -498,6 +912,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             return
         if path == "/admin/custom-models":
             try:
+                ensure_benchmark_idle("Custom model changes")
                 data = self.read_json_body()
                 action = str(data.get("action") or "").strip().lower()
                 if action == "add":
@@ -512,34 +927,186 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             except Exception as e:
                 self.send_json({"ok": False, "error": str(e)}, 500)
             return
-        if path == "/admin/benchmark":
+        if path == "/admin/custom-presets":
             try:
+                ensure_benchmark_idle("Custom preset changes")
                 data = self.read_json_body()
-                job = start_admin_task_job("benchmark", data.get("instance_id"))
-                self.send_json({"ok": True, "admin_task_job": job, "focus_log_source": "audit"})
+                action = str(data.get("action") or "").strip().lower()
+                if action == "duplicate":
+                    self.send_json({**duplicate_custom_preset(data), "focus_log_source": "audit"})
+                    return
+                if action == "delete":
+                    self.send_json({**delete_custom_preset_record(data.get("selector") or data.get("id") or ""), "focus_log_source": "audit"})
+                    return
+                raise ValueError("Invalid custom preset action")
             except Exception as e:
                 self.send_json({"ok": False, "error": str(e)}, 500)
             return
-        if path == "/admin/run-report":
+        if path == "/admin/benchmarks/start":
             try:
                 data = self.read_json_body()
-                job = start_admin_task_job("report", data.get("instance_id"))
-                self.send_json({"ok": True, "admin_task_job": job, "focus_log_source": "audit"})
+                if image_studio_activity_active(max_age=0):
+                    raise RuntimeError("Stop active AI Studio generations before starting Model Scores benchmarks.")
+                snapshot = start_benchmark_job(
+                    data.get("mode") or "quick",
+                    selectors=data.get("selectors") or ([data.get("selector")] if data.get("selector") else None),
+                    include_completed=bool(data.get("include_completed", False)),
+                    include_deprecated=bool(data.get("include_deprecated", BENCHMARK_INCLUDE_APPROVED_DEPRECATED_BY_DEFAULT)),
+                    include_experimental=bool(data.get("include_experimental", BENCHMARK_INCLUDE_EXPERIMENTAL_BY_DEFAULT)),
+                    thermal_cooldown=bool(data.get("thermal_cooldown", True)),
+                    mock=bool(data.get("mock", False)),
+                    step_scope=data.get("step_scope") or "",
+                    selected_stages=data.get("stages") or {},
+                )
+                self.send_json({"ok": True, "benchmarks": snapshot, "focus_log_source": "benchmarks"})
             except Exception as e:
                 self.send_json({"ok": False, "error": str(e)}, 500)
             return
-        if path == "/admin/rebench":
+        if path == "/admin/benchmarks/cancel":
             try:
                 data = self.read_json_body()
-                job = start_admin_task_job("rebench", data.get("instance_id"), data.get("variant"))
-                self.send_json({"ok": True, "admin_task_job": job, "focus_log_source": "audit"})
+                self.send_json({"ok": True, "benchmarks": cancel_benchmark_job(force=bool(data.get("force", False))), "focus_log_source": "benchmarks"})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path == "/admin/benchmarks/queue":
+            try:
+                data = self.read_json_body()
+                snapshot = update_benchmark_queue(
+                    selectors=data.get("selectors") or [],
+                    order=data.get("order") or data.get("selectors") or [],
+                    stages=data.get("stages") or {},
+                )
+                self.send_json({"ok": True, "benchmarks": snapshot, "focus_log_source": "benchmarks"})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path == "/admin/benchmarks/rerun":
+            try:
+                data = self.read_json_body()
+                snapshot = enqueue_benchmark_rerun(
+                    data.get("selector") or "",
+                    mode=data.get("mode") or "quick",
+                    step_scope=data.get("step_scope") or data.get("metric_id") or data.get("category") or "",
+                    selected_stages=data.get("selected_stages") or data.get("stages") or [],
+                    append=bool(data.get("append") or str(data.get("position") or "").strip().lower() in {"append", "tail", "end"}),
+                )
+                self.send_json({"ok": True, "benchmarks": snapshot, "focus_log_source": "benchmarks"})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path == "/admin/benchmarks/revalidate-compliance":
+            try:
+                data = self.read_json_body()
+                self.send_json({**benchmark_revalidate_compliance_result(data.get("selector") or "", data.get("mode") or "quick"), "focus_log_source": "benchmarks"})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path == "/admin/benchmarks/clear":
+            try:
+                data = self.read_json_body()
+                self.send_json({"ok": True, "benchmarks": clear_benchmark_result(data.get("selector") or "")})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path == "/admin/scripts/run":
+            try:
+                data = self.read_json_body()
+                job = start_script_job(data.get("script_id") or "", args=data.get("args") or "", instance_id=data.get("instance_id") or "")
+                self.send_json({"ok": True, "script_job": job, "focus_log_source": "script"})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path in {"/admin/ai-studio/setup", "/admin/image-studio/setup"}:
+            try:
+                self.send_json({"ok": True, "script_job": start_image_studio_setup_job(), "focus_log_source": "script"})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path in {"/admin/ai-studio/start", "/admin/image-studio/start"}:
+            try:
+                self.send_json({"ok": True, "script_job": start_image_studio_runtime_job(), "focus_log_source": "script"})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path in {"/admin/ai-studio/stop", "/admin/image-studio/stop"}:
+            try:
+                self.send_json({"ok": True, "script_job": stop_image_studio_runtime_job(), "focus_log_source": "script"})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path in {"/admin/ai-studio/download", "/admin/image-studio/download"}:
+            try:
+                data = self.read_json_body()
+                self.send_json({"ok": True, "script_job": start_image_studio_model_download_job(data.get("model_key") or ""), "focus_log_source": "script"})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path in {"/admin/ai-studio/remove", "/admin/image-studio/remove"}:
+            try:
+                self.send_json({"ok": True, "script_job": start_image_studio_remove_job(), "focus_log_source": "script"})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path in {"/admin/ai-studio/generate", "/admin/image-studio/generate"}:
+            try:
+                self.send_json({"ok": True, "generation": start_image_studio_generation(self.read_json_body())})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path in {"/admin/ai-studio/plan", "/admin/image-studio/plan"}:
+            try:
+                self.send_json({"ok": True, "plan": plan_image_studio_interactive(self.read_json_body())})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path in {"/admin/ai-studio/backend-plan", "/admin/image-studio/backend-plan"}:
+            try:
+                self.send_json({"ok": True, "generation": start_image_studio_backend_plan(self.read_json_body())})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path in {"/admin/ai-studio/cancel", "/admin/image-studio/cancel"}:
+            try:
+                data = self.read_json_body()
+                self.send_json({"ok": True, "generation": cancel_image_studio_generation(data.get("job_id") or data.get("id") or "")})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path in {"/admin/ai-studio/gallery/delete", "/admin/image-studio/gallery/delete"}:
+            try:
+                data = self.read_json_body()
+                self.send_json({"ok": True, **delete_image_studio_gallery_artifact(data.get("root_path") or "/", data.get("relative_path") or "")})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path == "/admin/scripts/cancel":
+            try:
+                data = self.read_json_body()
+                self.send_json({"ok": True, "script_job": cancel_script_job(data.get("job_id") or ""), "focus_log_source": "script"})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path == "/admin/scripts/remove":
+            try:
+                data = self.read_json_body()
+                self.send_json({"ok": True, "script_job": remove_script_job(data.get("job_id") or ""), "focus_log_source": "script"})
             except Exception as e:
                 self.send_json({"ok": False, "error": str(e)}, 500)
             return
         if path == "/admin/update":
             try:
                 data = self.read_json_body()
-                result = start_self_update_job(data.get("scope"), data.get("target_commit"))
+                scope_name = _selector_token(data.get("scope"))
+                benchmark_active = benchmark_job_active()
+                if scope_name == "club3090" and benchmark_active:
+                    message = "Stop Model Scores benchmarking before migrating Club-3090."
+                    append_audit_text_line(f"Rejected Club-3090 migration while Model Scores benchmarking is active.")
+                    self.send_json({"ok": False, "error": message}, 409)
+                    return
+                if benchmark_active:
+                    append_audit_text_line("Self-update requested while Model Scores benchmarking is active; leaving benchmark queue and runtimes untouched.")
+                result = start_self_update_job(scope_name or data.get("scope"), data.get("target_commit"))
                 self.send_json(result)
             except Exception as e:
                 self.send_json({"ok": False, "error": str(e)}, 500)
@@ -556,6 +1123,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             return
         if path == "/admin/chat-stream":
             try:
+                ensure_benchmark_idle("Chat")
                 data = self.read_json_body()
             except Exception as e:
                 self.send_json({"ok": False, "error": str(e)}, 500)
@@ -564,6 +1132,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             return
         if path == "/admin/chat":
             try:
+                ensure_benchmark_idle("Chat")
                 data = self.read_json_body()
                 self.send_json(run_admin_chat_request(data))
             except Exception as e:
@@ -646,11 +1215,37 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                 if action == "read_file":
                     self.send_json(read_storage_browser_file(data.get("root_path"), data.get("relative_path") or ""))
                     return
+                if action == "media_metadata":
+                    self.send_json(read_storage_browser_media_metadata(data.get("root_path"), data.get("relative_path") or ""))
+                    return
+                if action == "read_file_chunk":
+                    self.send_json(
+                        read_storage_browser_file_chunk(
+                            data.get("session_id"),
+                            data.get("offset") or 0,
+                            data.get("limit") or STORAGE_BROWSER_CHUNK_BYTES,
+                        )
+                    )
+                    return
                 if action == "save_file":
                     self.send_json(save_storage_browser_file(data.get("root_path"), data.get("relative_path") or "", data.get("text") or ""))
                     return
                 if action == "save_binary_file":
                     self.send_json(save_storage_browser_binary_file(data.get("root_path"), data.get("relative_path") or "", data.get("hex") or ""))
+                    return
+                if action == "save_file_chunk":
+                    self.send_json(
+                        save_storage_browser_file_chunk(
+                            data.get("session_id"),
+                            data.get("offset") or 0,
+                            data.get("text"),
+                            data.get("base64"),
+                            data.get("expected_bytes") or 0,
+                        )
+                    )
+                    return
+                if action == "close_file_session":
+                    self.send_json(close_storage_browser_file_session(data.get("session_id")))
                     return
                 if action == "create_folder":
                     self.send_json(create_storage_browser_folder(data.get("root_path"), data.get("relative_path") or "", data.get("name") or ""))
@@ -680,6 +1275,30 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
         if path == "/admin/storage-browser/download":
             try:
                 data = self.read_json_body()
+                action = str(data.get("action") or "fetch").strip().lower()
+                if action == "plan":
+                    self.send_json(prepare_storage_browser_download_plan(data.get("root_path"), data.get("entries") or []))
+                    return
+                if action == "start":
+                    started = start_storage_browser_download_job(data.get("root_path"), data.get("entries") or [])
+                    self.send_json(started)
+                    return
+                if action == "status":
+                    self.send_json({"ok": True, "job": storage_browser_download_job_status(data.get("job_id"))})
+                    return
+                if action == "fetch_job":
+                    job = storage_browser_download_job_status(data.get("job_id"))
+                    if not job:
+                        raise ValueError("Download job not found.")
+                    if str(job.get("status") or "") != "ready":
+                        raise ValueError("Download job is not ready yet.")
+                    self.send_stream(
+                        job.get("file_path"),
+                        content_type="application/zip",
+                        download_name=job.get("archive_name") or "",
+                        cleanup_path=job.get("cleanup_path") or "",
+                    )
+                    return
                 download = prepare_storage_browser_download(data.get("root_path"), data.get("entries") or [])
                 self.send_stream(
                     download.get("file_path"),
@@ -753,6 +1372,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
         if path == "/admin/power":
             try:
                 data = self.read_json_body()
+                ensure_benchmark_idle("Power action")
                 action = data.get("action")
                 instance_id = data.get("instance_id")
                 log_control(f"POWER action requested action={action} instance={instance_id}")
@@ -810,6 +1430,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
         if path == "/admin/profile":
             try:
                 data = self.read_json_body()
+                ensure_benchmark_idle("Power profile")
                 profile_name = data.get("profile")
                 instance_id = str(data.get("instance_id") or "").strip().upper()
                 log_control(f"PROFILE request received name={profile_name} instance={instance_id or 'GLOBAL'}")
@@ -895,6 +1516,14 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                 data = self.read_json_body()
                 cfg, changed = write_ui_config(data)
                 self.send_json({"ok": True, "ui_config": cfg, "changed": changed})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path == "/admin/resource-colors":
+            try:
+                data = self.read_json_body()
+                colors = write_resource_color_config(data.get("resource_colors") or {})
+                self.send_json({"ok": True, "resource_colors": colors})
             except Exception as e:
                 self.send_json({"ok": False, "error": str(e)}, 500)
             return
@@ -1070,19 +1699,57 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                 if action == "reboot":
                     log_audit("admin_machine", action="reboot")
                     self.send_json({"ok": True, "action": "reboot", "message": "Reboot command accepted"})
-                    threading.Thread(target=lambda: (time.sleep(1), subprocess.run(["systemctl", "reboot"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)), daemon=True).start()
+                    threading.Thread(
+                        target=lambda: (
+                            time.sleep(1),
+                            subprocess.run(
+                                ["systemctl", "reboot"],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                timeout=10,
+                            ),
+                        ),
+                        daemon=True,
+                    ).start()
+                    return
+                if action == "force_reboot":
+                    log_audit("admin_machine", action="force_reboot")
+                    self.send_json({"ok": True, "action": "force_reboot", "message": "Force reboot command accepted"})
+                    threading.Thread(
+                        target=lambda: (
+                            time.sleep(1),
+                            subprocess.run(
+                                ["bash", "-lc", "echo 1 >/proc/sys/kernel/sysrq; echo b >/proc/sysrq-trigger"],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                timeout=10,
+                            ),
+                        ),
+                        daemon=True,
+                    ).start()
                     return
                 if action == "shutdown":
                     log_audit("admin_machine", action="shutdown")
                     self.send_json({"ok": True, "action": "shutdown", "message": "Shutdown command accepted"})
-                    threading.Thread(target=lambda: (time.sleep(1), subprocess.run(["systemctl", "poweroff"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)), daemon=True).start()
+                    threading.Thread(
+                        target=lambda: (
+                            time.sleep(1),
+                            subprocess.run(
+                                ["systemctl", "poweroff"],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                timeout=10,
+                            ),
+                        ),
+                        daemon=True,
+                    ).start()
                     return
                 raise ValueError("Invalid machine action")
             except Exception as e:
                 self.send_json({"ok": False, "error": str(e)}, 500)
             return
         self.send_error(404)
-    def stream_logs(self, parsed):
+    def stream_logs(self, parsed, stop_event=None):
         params = parse_admin_query_params(parsed)
         requested = str(params.get("instance") or "").strip().upper()
         requested_source = str(params.get("source") or "docker").strip().lower()
@@ -1093,8 +1760,9 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
         client_seq = 0
         waiting_sent = False
         while True:
+            if self.admin_stream_stopped(stop_event):
+                return
             resolved = resolve_log_source(requested_source, requested, requested_service)
-            instance = resolved.get("instance")
             container = str(resolved.get("container") or "").strip()
             source_label = str(resolved.get("label") or requested_source or "source")
             if not container:
@@ -1113,7 +1781,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                         self.send_sse_comment()
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
                     return
-                time.sleep(2)
+                time.sleep(1 if stop_event is not None else 2)
                 continue
             waiting_sent = False
             watcher = get_runtime_log_watcher(container)
@@ -1125,7 +1793,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                 client_generation = -1
                 client_seq = 0
             try:
-                watcher.wait_for_change(client_generation, client_seq, timeout=15)
+                watcher.wait_for_change(client_generation, client_seq, timeout=1 if stop_event is not None else 15)
                 snapshot = watcher.snapshot()
                 if snapshot["generation"] != client_generation:
                     self.send_sse_event("reset", {"text": snapshot["text"]})
@@ -1143,12 +1811,15 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                 else:
                     self.send_sse_comment()
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                self.close_connection = True
                 return
-    def stream_text_file(self, path, empty_message="waiting...", initial_tail_lines=250):
+    def stream_text_file(self, path, empty_message="waiting...", initial_tail_lines=250, stop_event=None):
         sent_reset = False
         offset = 0
         idle_since = time.time()
         while True:
+            if self.admin_stream_stopped(stop_event):
+                return
             try:
                 if not os.path.exists(path):
                     if not sent_reset:
@@ -1190,6 +1861,63 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                             self.send_sse_comment()
                             idle_since = time.time()
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                self.close_connection = True
+                return
+            time.sleep(1)
+    def stream_dynamic_text_file(self, path_fn, empty_message="waiting...", initial_tail_lines=250, stop_event=None):
+        current_path = ""
+        sent_reset = False
+        offset = 0
+        idle_since = time.time()
+        tail_lines = int(initial_tail_lines or 0)
+        while True:
+            if self.admin_stream_stopped(stop_event):
+                return
+            try:
+                next_path = str(path_fn() or "").strip()
+                if next_path != current_path:
+                    current_path = next_path
+                    sent_reset = False
+                    offset = 0
+                    tail_lines = int(initial_tail_lines or 0)
+                if not current_path or not os.path.exists(current_path):
+                    if not sent_reset:
+                        self.send_sse_event("reset", {"text": str(empty_message or "waiting...").rstrip("\n") + "\n"})
+                        sent_reset = True
+                    else:
+                        self.send_sse_comment()
+                    time.sleep(2)
+                    continue
+                with open(current_path, "r", encoding="utf-8", errors="replace") as f:
+                    if offset <= 0:
+                        if tail_lines > 0:
+                            lines = collections.deque(f, maxlen=tail_lines)
+                            text = "".join(lines)
+                        else:
+                            text = ""
+                            f.seek(0, os.SEEK_END)
+                        self.send_sse_event("reset", {"text": text or (str(empty_message or "waiting...").rstrip("\n") + "\n")})
+                        offset = f.tell()
+                        sent_reset = True
+                        tail_lines = 0
+                        idle_since = time.time()
+                    else:
+                        size_now = os.path.getsize(current_path)
+                        if size_now < offset:
+                            offset = 0
+                            sent_reset = False
+                            continue
+                        f.seek(offset)
+                        chunk = f.read()
+                        if chunk:
+                            self.send_sse_event("append", {"text": chunk})
+                            offset = f.tell()
+                            idle_since = time.time()
+                        elif time.time() - idle_since >= 15:
+                            self.send_sse_comment()
+                            idle_since = time.time()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                self.close_connection = True
                 return
             time.sleep(1)
 
@@ -1221,6 +1949,12 @@ class LocalApiHandler(CommonMixin, BaseHTTPRequestHandler):
             return
         if path == "/server-config":
             self.send_json({"ok": True, "server_config": read_server_config()})
+            return
+        if path == "/power":
+            self.send_json({"ok": True, "power": power_status()})
+            return
+        if path == "/benchmarks":
+            self.send_json({"ok": True, "benchmarks": benchmarks_active_safe_snapshot()})
             return
         if path == "/audit-log":
             tail = int(params.get("tail") or 300)
@@ -1280,6 +2014,137 @@ class LocalApiHandler(CommonMixin, BaseHTTPRequestHandler):
                 cfg = write_server_config(data or {})
                 self.send_json({"ok": True, "server_config": cfg})
                 return
+            if path == "/power":
+                ensure_benchmark_idle("Local API power action")
+                action = data.get("action")
+                instance_id = data.get("instance_id")
+                log_control(f"LOCAL POWER action requested action={action} instance={instance_id}")
+                if action == "active":
+                    out = {"cpu": apply_cpu_active_power(), "gpu": apply_gpu_active_power()}
+                elif action == "idle_clocks":
+                    out = {"cpu": apply_cpu_idle_power(), "gpu": apply_gpu_idle_power()}
+                elif action == "stop_container":
+                    if str(instance_id or "").strip().upper() == "GLOBAL":
+                        out = global_scope_power_action(action)
+                    else:
+                        rc, msg = stop_runtime_scope(instance_id=instance_id, mode=data.get("mode"))
+                        out = {"container_stop_rc": rc, "container_stop_output": msg, "cpu": apply_cpu_idle_power(), "gpu": apply_gpu_idle_power()}
+                elif action == "start_instance":
+                    out = global_scope_power_action(action) if str(instance_id or "").strip().upper() == "GLOBAL" else start_instance(instance_id)
+                elif action == "restart_instance":
+                    if str(instance_id or "").strip().upper() == "GLOBAL":
+                        out = global_scope_power_action(action)
+                    else:
+                        stop_vllm_container("local_api_restart", instance_id=instance_id)
+                        out = start_instance(instance_id)
+                elif action == "toggle_enabled":
+                    enabled = bool(data.get("enabled"))
+                    if str(instance_id or "").strip().upper() == "GLOBAL":
+                        out = global_scope_power_action(action, enabled=enabled)
+                    else:
+                        inst = update_instance(instance_id, enabled=enabled)
+                        out = {"instance": instance_snapshot(inst)}
+                elif action == "disable_optimizations":
+                    out = set_power_optimizations(False, instance_id=instance_id)
+                elif action == "enable_optimizations":
+                    out = set_power_optimizations(True, instance_id=instance_id)
+                elif action == "fans_max":
+                    out = {"fans": set_fan_max_toggle(True, instance_id=instance_id)}
+                elif action == "fans_auto":
+                    out = {"fans": set_fan_max_toggle(False, instance_id=instance_id)}
+                elif action == "free_gpu":
+                    out = {
+                        "gpu_resources": free_gpu_runtime_resources(data.get("gpu_index")),
+                        "cpu": apply_cpu_idle_power(),
+                        "gpu": apply_gpu_idle_power(skip_fans=True),
+                    }
+                else:
+                    raise ValueError("Invalid power action")
+                log_audit(
+                    "local_api_power_action",
+                    action=action,
+                    instance=instance_id,
+                    result_summary=summarize_audit_result(out),
+                )
+                self.send_json({"ok": True, "action": action, "result": out, "power": power_status()})
+                return
+            if path == "/profile":
+                ensure_benchmark_idle("Local API power profile")
+                profile_name = data.get("profile")
+                instance_id = str(data.get("instance_id") or "").strip().upper()
+                log_control(f"LOCAL PROFILE request received name={profile_name} instance={instance_id or 'GLOBAL'}")
+                out = apply_performance_profile(profile_name)
+                log_audit(
+                    "local_api_profile",
+                    profile=profile_name,
+                    instance=instance_id or "GLOBAL",
+                    result_summary=summarize_audit_result(out),
+                )
+                self.send_json({"ok": True, "profile": profile_name, "result": out, "power": power_status()})
+                return
+            if path in {"/benchmarks", "/benchmarks/start", "/benchmarks/speed", "/benchmarks/category", "/benchmarks/queue", "/benchmarks/rerun"}:
+                default_action = "speed" if path.endswith("/speed") else ("start" if path.endswith("/start") else "")
+                if path.endswith("/category"):
+                    default_action = "category"
+                if path.endswith("/queue"):
+                    default_action = "queue"
+                if path.endswith("/rerun"):
+                    default_action = "rerun"
+                action = str(data.get("action") or default_action).strip().lower()
+                if action == "rerun":
+                    self.send_json({
+                        "ok": True,
+                        "benchmarks": enqueue_benchmark_rerun(
+                            data.get("selector") or "",
+                            mode=data.get("mode") or "quick",
+                            step_scope=data.get("step_scope") or data.get("metric_id") or data.get("category") or "",
+                            selected_stages=data.get("selected_stages") or data.get("stages") or [],
+                            append=bool(data.get("append") or str(data.get("position") or "").strip().lower() in {"append", "tail", "end"}),
+                        ),
+                    })
+                    return
+                if action == "queue":
+                    self.send_json({
+                        "ok": True,
+                        "benchmarks": update_benchmark_queue(
+                            selectors=data.get("selectors") or [],
+                            order=data.get("order") or data.get("selectors") or [],
+                            stages=data.get("stages") or {},
+                        ),
+                    })
+                    return
+                if action in {"", "start", "speed", "category"}:
+                    step_scope = (
+                        "speed"
+                        if action == "speed"
+                        else (data.get("metric_id") or data.get("category") or data.get("step_scope") or "")
+                    )
+                    snapshot = start_benchmark_job(
+                        data.get("mode") or "quick",
+                        selectors=data.get("selectors") or ([data.get("selector")] if data.get("selector") else None),
+                        include_completed=bool(data.get("include_completed", False)),
+                        include_deprecated=bool(data.get("include_deprecated", BENCHMARK_INCLUDE_APPROVED_DEPRECATED_BY_DEFAULT)),
+                        include_experimental=bool(data.get("include_experimental", BENCHMARK_INCLUDE_EXPERIMENTAL_BY_DEFAULT)),
+                        thermal_cooldown=bool(data.get("thermal_cooldown", True)),
+                        mock=bool(data.get("mock", False)),
+                        step_scope=step_scope,
+                        selected_stages=data.get("stages") or {},
+                    )
+                    self.send_json({"ok": True, "benchmarks": snapshot})
+                    return
+                if action == "cancel":
+                    self.send_json({"ok": True, "benchmarks": cancel_benchmark_job()})
+                    return
+                if action == "clear":
+                    self.send_json({"ok": True, "benchmarks": clear_benchmark_result(data.get("selector") or "")})
+                    return
+                raise ValueError("Invalid benchmarks action")
+            if path == "/benchmarks/cancel":
+                self.send_json({"ok": True, "benchmarks": cancel_benchmark_job()})
+                return
+            if path == "/benchmarks/clear":
+                self.send_json({"ok": True, "benchmarks": clear_benchmark_result(data.get("selector") or "")})
+                return
             raise ValueError("Unknown local API path")
         except Exception as e:
             self.send_json({"ok": False, "error": str(e)}, 500)
@@ -1331,12 +2196,35 @@ class ProxyHandler(CommonMixin, BaseHTTPRequestHandler):
         log_watcher = None
         log_stream_start_generation = -1
         log_stream_start_seq = 0
+        swap_lock_acquired = False
+        swap_handled_model = False
+        queued_for_swap = False
+        original_body = body
         target = get_instance(instance_id) if instance_id else primary_instance()
-        target_id = target["id"] if target else "GLOBAL"
+        target_id = str((target or {}).get("id") or "GLOBAL").strip().upper()
         target_spec = resolve_variant_spec(target.get("mode")) if target else resolve_variant_spec(active_mode())
-        if body is not None and (upstream_path.startswith("/v1/chat/completions") or upstream_path.startswith("/v1/completions")):
+        if benchmark_job_active():
+            self.send_json({
+                "error": "Model Scores benchmarking is active; proxy inference is temporarily disabled.",
+                "benchmarks": read_benchmark_state(),
+            }, 503)
+            return
+        is_completion_request = body is not None and proxy_completion_path(upstream_path)
+        server_swap_enabled = proxy_swap_feature_enabled()
+        requested_selector = proxy_requested_selector(body, preset_name) if is_completion_request else ""
+        requested_target = None
+        requested_spec = None
+        if requested_selector:
+            requested_target, requested_spec = proxy_running_target_for_selector(requested_selector, instance_id=instance_id)
+            if requested_target:
+                target = requested_target
+                target_spec = requested_spec or target_spec
+            elif server_swap_enabled:
+                target_spec = requested_spec or resolve_variant_spec(requested_selector) or target_spec
+        if is_completion_request:
             body = apply_preset(body, preset_name, cap, target_spec)
-        target_metrics_key = str(target_id or "").strip().upper()
+            if requested_selector and requested_target:
+                body = proxy_rewrite_body_model_for_selector(body, requested_selector)
         request_usage = extract_request_usage(body) if body is not None and is_quota_counted_path(upstream_path) else {}
         auth_result = authorize_proxy_request(self.headers, instance_id, upstream_path, request_usage=request_usage)
         if auth_result[0] is False:
@@ -1344,11 +2232,110 @@ class ProxyHandler(CommonMixin, BaseHTTPRequestHandler):
             self.send_json(payload, code)
             return
         auth_context = auth_result[1]
+        if is_completion_request and requested_selector and not requested_target:
+            requested_target, requested_spec = proxy_running_target_for_selector(requested_selector, instance_id=instance_id)
+            if requested_target:
+                target = requested_target
+                target_spec = requested_spec or target_spec
+                body = apply_preset(original_body, preset_name, cap, target_spec)
+                body = proxy_rewrite_body_model_for_selector(body, requested_selector)
+                request_usage = extract_request_usage(body) if is_quota_counted_path(upstream_path) else request_usage
+        swap_allowed = bool(server_swap_enabled and (auth_context.get("permissions") or {}).get("proxy_swap"))
+        if is_completion_request and requested_selector and not requested_target and server_swap_enabled and not swap_allowed:
+            log_audit(
+                "proxy_swap_denied",
+                reason="permission_missing",
+                user=auth_context.get("user_name") or "anonymous",
+                requested_model=requested_selector,
+                path=upstream_path,
+            )
+            self.send_json({
+                "error": "API key is not allowed to auto-load inactive presets through the proxy.",
+                "requested_model": requested_selector,
+                "permission": "proxy_swap",
+            }, 403)
+            return
+        if is_completion_request and requested_selector and not requested_target and swap_allowed:
+            target_spec = requested_spec or resolve_variant_spec(requested_selector) or target_spec
+            body = apply_preset(original_body, preset_name, cap, target_spec)
+            body = proxy_rewrite_body_model_for_selector(body, requested_selector)
+            request_usage = extract_request_usage(body) if is_quota_counted_path(upstream_path) else request_usage
         with metrics_lock:
             metrics["total_requests"] += 1
             metrics["active_requests"] += 1
             metrics["last_preset"] = preset_name or "raw"
             metrics["last_path"] = self.path
+        needs_model = upstream_path.startswith("/v1/models") or is_completion_request
+        try:
+            if needs_model:
+                if is_completion_request and requested_selector and swap_allowed:
+                    live_target, live_spec = proxy_running_target_for_selector(requested_selector, instance_id=instance_id)
+                    if live_target:
+                        target = live_target
+                        target_spec = live_spec or target_spec
+                        swap_handled_model = True
+                    else:
+                        with metrics_lock:
+                            metrics["queued_requests"] += 1
+                            request_queue.append({"time": time.strftime("%H:%M:%S"), "path": self.path, "preset": requested_selector, "instance": target_id, "state": "proxy-swap"})
+                        if not proxy_swap_lock.acquire(timeout=1800):
+                            with metrics_lock:
+                                metrics["queued_requests"] = max(0, metrics["queued_requests"] - 1)
+                            raise TimeoutError(f"Timed out waiting for proxy swap queue before loading {requested_selector}")
+                        swap_lock_acquired = True
+                        try:
+                            live_target, live_spec = proxy_running_target_for_selector(requested_selector, instance_id=instance_id)
+                            if live_target:
+                                target = live_target
+                                target_spec = live_spec or target_spec
+                            else:
+                                queued_for_swap = True
+                                self.queue_header("X-Club3090-Queued", "true")
+                                self.queue_header("X-Club3090-Queued-Reason", "preset-load")
+                                self.queue_header("X-Club3090-Target-Model", requested_selector)
+                                log_control(f"PROXY queued preset swap requested={requested_selector} instance={target_id} path={self.path}")
+                                target, target_spec = ensure_proxy_swap_target(requested_selector, instance_id=instance_id)
+                            swap_handled_model = True
+                        finally:
+                            with metrics_lock:
+                                metrics["queued_requests"] = max(0, metrics["queued_requests"] - 1)
+                if not swap_handled_model:
+                    with metrics_lock:
+                        metrics["queued_requests"] += 1
+                        request_queue.append({"time": time.strftime("%H:%M:%S"), "path": self.path, "preset": preset_name or "raw", "instance": target_id})
+                    try:
+                        ensure_vllm_running_for_request(target["id"] if target else None)
+                    finally:
+                        with metrics_lock:
+                            metrics["queued_requests"] = max(0, metrics["queued_requests"] - 1)
+        except Exception as startup_error:
+            status = 502
+            latency = round(time.time() - start, 3)
+            if swap_lock_acquired:
+                try:
+                    proxy_swap_lock.release()
+                except RuntimeError:
+                    pass
+                swap_lock_acquired = False
+            with metrics_lock:
+                metrics["queued_requests"] = max(0, metrics["queued_requests"] - 1)
+                metrics["active_requests"] = max(0, metrics["active_requests"] - 1)
+                metrics["failed_requests"] += 1
+                metrics["last_latency_s"] = latency
+                metrics["last_status"] = status
+            record_user_usage(auth_context.get("user_name"), auth_context.get("count_request", False), status, request_usage, response_usage, latency)
+            log_control(f"PROXY startup failed requested={requested_selector or ''} instance={target_id} queued={queued_for_swap} error={startup_error}")
+            self.send_json({
+                "error": str(startup_error),
+                "queued": bool(queued_for_swap),
+                "requested_model": requested_selector,
+                "active_mode": active_mode(),
+                "active_port": active_port(),
+            }, 502)
+            return
+        target_id = str((target or {}).get("id") or "GLOBAL").strip().upper()
+        target_metrics_key = str(target_id or "").strip().upper()
+        with metrics_lock:
             target_request_metrics.setdefault(target_metrics_key, default_target_request_metrics())
         if target and target.get("container"):
             log_watcher = get_runtime_log_watcher(target.get("container"))
@@ -1356,14 +2343,6 @@ class ProxyHandler(CommonMixin, BaseHTTPRequestHandler):
                 log_snapshot = log_watcher.snapshot()
                 log_stream_start_generation = int(log_snapshot.get("generation") or 0)
                 log_stream_start_seq = int(log_snapshot.get("seq") or 0)
-        needs_model = upstream_path.startswith("/v1/models") or (body is not None and (upstream_path.startswith("/v1/chat/completions") or upstream_path.startswith("/v1/completions")))
-        if needs_model:
-            with metrics_lock:
-                metrics["queued_requests"] += 1
-                request_queue.append({"time": time.strftime("%H:%M:%S"), "path": self.path, "preset": preset_name or "raw", "instance": target_id})
-            ensure_vllm_running_for_request(target["id"] if target else None)
-            with metrics_lock:
-                metrics["queued_requests"] = max(0, metrics["queued_requests"] - 1)
         url = f"http://127.0.0.1:{instance_runtime_port(target) if target else active_port()}" + upstream_path
         headers = {k:v for k,v in self.headers.items() if k.lower() not in HOP_HEADERS}
         for secret_header in ("Authorization", "authorization", "X-API-Key", "x-api-key", "api-key"):
@@ -1384,6 +2363,7 @@ class ProxyHandler(CommonMixin, BaseHTTPRequestHandler):
                     for k,v in r.headers.items():
                         if k.lower() not in HOP_HEADERS:
                             self.send_header(k,v)
+                    self.emit_pending_headers()
                     self.send_header("X-Club3090-Instance", target_id)
                     self.send_header("Connection","close")
                     self.end_headers()
@@ -1417,6 +2397,7 @@ class ProxyHandler(CommonMixin, BaseHTTPRequestHandler):
                     for k,v in r.headers.items():
                         if k.lower() not in HOP_HEADERS and k.lower() != "content-length":
                             self.send_header(k,v)
+                    self.emit_pending_headers()
                     self.send_header("Content-Length", str(len(payload_bytes)))
                     self.send_header("X-Club3090-Instance", target_id)
                     self.send_header("Connection","close")
@@ -1458,6 +2439,7 @@ class ProxyHandler(CommonMixin, BaseHTTPRequestHandler):
                 response_usage[key] = max(int(response_usage.get(key) or 0), int(parsed_usage.get(key) or 0))
             self.send_response(e.code)
             self.send_header("Content-Type", e.headers.get("Content-Type","text/plain"))
+            self.emit_pending_headers()
             self.send_header("Content-Length", str(len(payload)))
             self.send_header("Connection","close")
             self.end_headers()
@@ -1471,10 +2453,10 @@ class ProxyHandler(CommonMixin, BaseHTTPRequestHandler):
                     with metrics_lock:
                         metrics["failovers"] += 1
                     log_control(f"PROXY failover attempt instance={target_id} mode={(target['mode'] if target else active_mode())} error={e}")
-                    if target:
+                    if target and target_id != "GLOBAL":
                         start_instance(target["id"])
                     else:
-                        run_switch(active_mode())
+                        run_switch(str((target or {}).get("mode") or active_mode()))
                     retry_url = f"http://127.0.0.1:{instance_runtime_port(target) if target else active_port()}" + upstream_path
                     retry_req = urllib.request.Request(retry_url, data=body, headers=headers, method=self.command)
                     with urllib.request.urlopen(retry_req, timeout=None) as r2:
@@ -1483,6 +2465,7 @@ class ProxyHandler(CommonMixin, BaseHTTPRequestHandler):
                         for k,v in r2.headers.items():
                             if k.lower() not in HOP_HEADERS:
                                 self.send_header(k,v)
+                        self.emit_pending_headers()
                         self.send_header("X-Club3090-Instance", target_id)
                         self.send_header("Connection","close")
                         self.end_headers()
@@ -1600,6 +2583,13 @@ class ProxyHandler(CommonMixin, BaseHTTPRequestHandler):
                 record_preset_tps_sample(str((target or {}).get("mode") or active_mode()), display_tps)
             record_user_usage(auth_context.get("user_name"), auth_context.get("count_request", False), status, request_usage, response_usage, latency)
             log_control(f"REQ user={(auth_context.get('user_name') or 'anonymous')} instance={target_id} status={status} latency={latency}s preset={preset_name or 'raw'} path={self.path} upstream={upstream_path} input_tokens={prompt_tokens} output_tokens={output_tokens} total_tokens={total_tokens} tool_calls={tool_calls}")
+            if swap_lock_acquired:
+                try:
+                    proxy_swap_lock.release()
+                except RuntimeError:
+                    pass
+                if queued_for_swap:
+                    log_control(f"PROXY queued preset swap completed requested={requested_selector} instance={target_id} status={status}")
 
 def build_server(port, handler, bind="0.0.0.0"):
     server = ThreadingHTTPServer((bind, port), handler)
@@ -1615,7 +2605,20 @@ def serve(server, label="server"):
     log_control(f"{label} listening on {sock[0]}:{sock[1]}")
     server.serve_forever()
 
+def startup_power_primer_blocked_by_benchmark():
+    try:
+        state = read_benchmark_state()
+        if state.get("active") or benchmark_worker_service_active():
+            log_control("STARTUP power primer skipped because a benchmark worker is active")
+            append_benchmark_log("[startup] control power primer skipped while benchmark worker is active")
+            return True
+    except Exception as e:
+        log_control(f"STARTUP benchmark power-primer check error: {e}")
+    return False
+
 def startup_power_primer():
+    if startup_power_primer_blocked_by_benchmark():
+        return
     try:
         restore_persisted_performance_profile(apply_now=False)
         apply_cpu_active_power()
@@ -1625,6 +2628,57 @@ def startup_power_primer():
         apply_gpu_active_power(skip_fans=True)
     except Exception as e:
         log_control(f"STARTUP gpu power primer error: {e}")
+    try:
+        restore_persisted_fan_state(apply_now=True)
+    except Exception as e:
+        log_control(f"STARTUP fan state restore error: {e}")
+
+def start_control_background_loops():
+    def metrics_bootstrap():
+        try:
+            ensure_metrics_history_loaded()
+        except Exception as e:
+            log_control(f"metrics history load error: {e}")
+        try:
+            build_series_point()
+        except Exception as e:
+            log_control(f"initial metrics snapshot error: {e}")
+        metrics_collector()
+
+    def status_bootstrap():
+        try:
+            refresh_status_snapshot()
+        except Exception as e:
+            log_control(f"initial status snapshot error: {e}")
+        status_snapshot_collector()
+
+    def docker_logrotate_bootstrap():
+        try:
+            refresh_docker_logrotate_config()
+        except Exception as e:
+            log_control(f"docker logrotate bootstrap error: {e}")
+        docker_logrotate_refresher()
+
+    threading.Thread(target=idle_watchdog, daemon=True).start()
+    threading.Thread(target=image_studio_power_watchdog, daemon=True).start()
+    threading.Thread(target=metrics_bootstrap, daemon=True).start()
+    threading.Thread(target=status_bootstrap, daemon=True).start()
+    threading.Thread(target=docker_logrotate_bootstrap, daemon=True).start()
+    threading.Thread(target=startup_power_primer, daemon=True).start()
+
+def startup_runtime_inventory_bootstrap():
+    try:
+        inventory_exists = os.path.exists(RUNTIME_INVENTORY_FILE)
+        inventory = load_runtime_inventory(force=not inventory_exists, rebuild_if_missing=not inventory_exists)
+        if not (isinstance(inventory, dict) and inventory.get("variants")):
+            log_control("STARTUP runtime inventory cache missing or empty; background rebuild starting")
+            inventory = rebuild_runtime_inventory()
+        if resolve_variant_spec(DEFAULT_MODE) and read_active_mode_file() is None:
+            write_active_mode(DEFAULT_MODE)
+        read_instances_config()
+        log_control(f"STARTUP runtime inventory ready models={len((inventory or {}).get('models') or [])} variants={len((inventory or {}).get('variants') or [])}")
+    except Exception as e:
+        log_control(f"STARTUP runtime inventory bootstrap error: {e}")
 
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--audit-log":
@@ -1640,41 +2694,56 @@ def main():
         ok = refresh_docker_logrotate_config()
         print(json.dumps({"ok": bool(ok), "path": DOCKER_LOGROTATE_FILE, "retention_days": max(1, int(DOCKER_LOG_RETENTION_DAYS or 7))}))
         return
+    if len(sys.argv) > 1 and sys.argv[1] == "--docker-pull-space-preflight":
+        cli_docker_pull_space_preflight(sys.argv[2:])
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "--docker-compose-pull-space-preflight":
+        cli_docker_compose_pull_space_preflight(sys.argv[2:])
+        return
     os.makedirs(CONTROL_DIR, exist_ok=True)
     os.makedirs(INSTANCES_DIR, exist_ok=True)
+    ensure_runtime_config_file()
     ensure_code_syntax_config_file()
     restore_persisted_performance_profile(apply_now=False)
+    restore_persisted_fan_state(apply_now=False)
     write_server_config(read_server_config())
     ensure_local_api_token()
+    if len(sys.argv) > 1 and sys.argv[1] == "--benchmark-worker":
+        run_benchmark_worker_service()
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "--rederive-benchmark-scores":
+        load_runtime_inventory(force=not os.path.exists(RUNTIME_INVENTORY_FILE), rebuild_if_missing=True)
+        print(json.dumps(rederive_benchmark_scores(force="--force" in sys.argv[2:]), ensure_ascii=False))
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "--cleanup-benchmark-global-results":
+        print(json.dumps(benchmark_archive_unreferenced_global_results(reason="cli"), ensure_ascii=False))
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "--rebuild-benchmark-inventory":
+        load_runtime_inventory(force=not os.path.exists(RUNTIME_INVENTORY_FILE), rebuild_if_missing=True)
+        rebuilt = benchmark_rebuild_inventory_state_file(reason="cli")
+        print(json.dumps(benchmark_compact_inventory_state_summary(rebuilt), ensure_ascii=False))
+        return
+    recover_benchmark_state_on_startup()
     # Hard fail early if an update somehow produced an incomplete control script.
     # This specifically guards the proxy/autostart path that depends on port_open().
     if not callable(globals().get("port_open")):
         raise RuntimeError("internal install error: port_open() is not defined")
-    load_runtime_inventory(force=not os.path.exists(RUNTIME_INVENTORY_FILE), rebuild_if_missing=True)
+    if len(sys.argv) > 1 and sys.argv[1] == "--migrate-custom-presets":
+        backup_dir = sys.argv[2] if len(sys.argv) > 2 else ""
+        result = migrate_missing_custom_presets_from_backup(backup_dir)
+        benchmark_archive_unreferenced_global_results(reason="custom-preset-migration")
+        benchmark_rebuild_inventory_state_file(reason="custom preset migration")
+        print(json.dumps(result))
+        return
     if len(sys.argv) > 1 and sys.argv[1] == "--rebuild-inventory":
         rebuilt = rebuild_runtime_inventory()
         print(json.dumps({"ok": True, "models": len(rebuilt.get("models") or []), "variants": len(rebuilt.get("variants") or [])}))
         return
     if len(sys.argv) > 1 and sys.argv[1] == "--boot-enabled-instances":
+        load_runtime_inventory(force=not os.path.exists(RUNTIME_INVENTORY_FILE), rebuild_if_missing=True)
         boot_enabled_instances()
         return
-    if resolve_variant_spec(DEFAULT_MODE) and read_active_mode_file() is None:
-        write_active_mode(DEFAULT_MODE)
-    read_instances_config()
     log_control("control service starting")
-    try:
-        build_series_point()
-    except Exception as e:
-        log_control(f"initial metrics snapshot error: {e}")
-    try:
-        refresh_status_snapshot()
-    except Exception as e:
-        log_control(f"initial status snapshot error: {e}")
-    refresh_docker_logrotate_config()
-    threading.Thread(target=idle_watchdog, daemon=True).start()
-    threading.Thread(target=metrics_collector, daemon=True).start()
-    threading.Thread(target=status_snapshot_collector, daemon=True).start()
-    threading.Thread(target=docker_logrotate_refresher, daemon=True).start()
     cfg = read_server_config()
     admin_server = build_server(ADMIN_BIND_PORT, AdminHandler, ADMIN_BIND_HOST)
     if cfg.get("local_api_enabled", False):
@@ -1683,7 +2752,8 @@ def main():
         threading.Thread(target=serve, args=(local_api_server, "local-api"), daemon=True).start()
     proxy_server = build_server(PROXY_BIND_PORT, ProxyHandler, PROXY_BIND_HOST)
     threading.Thread(target=serve, args=(proxy_server, "proxy"), daemon=True).start()
-    threading.Thread(target=startup_power_primer, daemon=True).start()
+    threading.Thread(target=startup_runtime_inventory_bootstrap, daemon=True).start()
+    start_control_background_loops()
     serve(admin_server, "admin")
 
 if __name__ == "__main__":

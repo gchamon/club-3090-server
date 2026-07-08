@@ -1,8 +1,23 @@
+import glob
+import os
+import re
+import sys
+import time
+
+try:
+    from control.shared import *  # type: ignore
+except Exception:
+    if "CLUB3090_DIR" not in globals():
+        _CONTROL_DIR = os.path.dirname(os.path.abspath(__file__))
+        if _CONTROL_DIR not in sys.path:
+            sys.path.insert(0, _CONTROL_DIR)
+        from shared import *  # type: ignore
+
+
 def _service_display_name(service_id):
     mapping = {
         "openwebui": "Open WebUI",
         "litellm": "LiteLLM",
-        "ollama": "Ollama",
         "qdrant": "Qdrant",
         "searxng": "SearxNG",
         "comfyui": "ComfyUI",
@@ -161,6 +176,7 @@ def default_dual_mode_selector():
 def default_server_config():
     return {
         "allow_proxy_without_api_key": True,
+        "proxy_swap_enabled": True,
         "online_enabled": False,
         "upnp_enabled": False,
         "https_enabled": False,
@@ -172,6 +188,8 @@ def default_server_config():
         "selected_preset_model": "",
         "hidden_preset_selectors": [],
         "active_power_profile": current_profile,
+        "fan_manual_override": False,
+        "fan_override_instance_id": "GLOBAL",
         "preset_launch_overrides": {},
         "mcp_servers": [],
     }
@@ -268,6 +286,7 @@ def read_server_config():
         if key in data:
             merged[key] = data[key]
     merged["allow_proxy_without_api_key"] = bool(merged.get("allow_proxy_without_api_key", True))
+    merged["proxy_swap_enabled"] = bool(merged.get("proxy_swap_enabled", True))
     merged["online_enabled"] = bool(merged.get("online_enabled", False))
     merged["upnp_enabled"] = bool(merged.get("upnp_enabled", False))
     merged["https_enabled"] = bool(merged.get("https_enabled", False))
@@ -284,6 +303,8 @@ def read_server_config():
     merged["active_power_profile"] = str(data.get("active_power_profile") or current_profile or "balanced").strip().lower()
     if merged["active_power_profile"] not in PERFORMANCE_PROFILES:
         merged["active_power_profile"] = "balanced"
+    merged["fan_manual_override"] = bool(data.get("fan_manual_override", False))
+    merged["fan_override_instance_id"] = str(data.get("fan_override_instance_id") or "GLOBAL").strip().upper() or "GLOBAL"
     merged["preset_launch_overrides"] = sanitize_preset_launch_overrides(data.get("preset_launch_overrides") or {})
     merged["mcp_servers"] = sanitize_mcp_servers(data.get("mcp_servers") or [])
     return merged
@@ -292,7 +313,7 @@ def read_server_config():
 def write_server_config(data):
     current = read_server_config()
     original = dict(current)
-    for key in ("allow_proxy_without_api_key", "online_enabled", "upnp_enabled", "https_enabled", "local_api_enabled"):
+    for key in ("allow_proxy_without_api_key", "proxy_swap_enabled", "online_enabled", "upnp_enabled", "https_enabled", "local_api_enabled"):
         if key in data:
             current[key] = bool(data[key])
     if "local_api_port" in data:
@@ -311,6 +332,10 @@ def write_server_config(data):
         next_profile = str(data.get("active_power_profile") or "").strip().lower()
         if next_profile in PERFORMANCE_PROFILES:
             current["active_power_profile"] = next_profile
+    if "fan_manual_override" in data:
+        current["fan_manual_override"] = bool(data.get("fan_manual_override", False))
+    if "fan_override_instance_id" in data:
+        current["fan_override_instance_id"] = str(data.get("fan_override_instance_id") or "GLOBAL").strip().upper() or "GLOBAL"
     if "preset_launch_overrides" in data:
         current["preset_launch_overrides"] = sanitize_preset_launch_overrides(data.get("preset_launch_overrides") or {})
     if "mcp_servers" in data:
@@ -341,6 +366,68 @@ def preset_launch_env_overrides(spec):
     }
 
 
+def preset_builtin_launch_env_overrides(spec, selector=""):
+    row = spec if isinstance(spec, dict) else {}
+    selector = str(
+        selector
+        or row.get("selector")
+        or row.get("upstream_tag")
+        or row.get("registry_key")
+        or row.get("variant_id")
+        or ""
+    ).strip()
+    if selector == "vllm/qwen-a3b-preview-single":
+        return {"MAX_MODEL_LEN": "4096", "GPU_MEMORY_UTILIZATION": "0.95"}
+    if selector == "vllm/bounded-thinking":
+        return {"MAX_MODEL_LEN": "131072"}
+    if selector == "vllm/gemma-12b-qat-w4a16-single":
+        return {
+            # The upstream/model config advertises 262144, but the vLLM QAT
+            # single-card lane measured a real fillable ceiling around 214K on
+            # 3090 BF16 KV. 232K keeps the stress ladder's 0.92x rung inside
+            # that validated capacity instead of crashing at ~241K.
+            "MAX_MODEL_LEN": "232000",
+            "MAX_NUM_SEQS": "4",
+            "GPU_MEMORY_UTILIZATION": "0.92",
+        }
+    if selector == "vllm/gemma-int8-mtp":
+        return {"MAX_MODEL_LEN": "131072"}
+    preserved_nightly_selectors = {
+        "vllm/dual-dflash",
+        "vllm/dual-dflash-noviz",
+        "vllm/dual-turbo",
+        "custom/vllm-dual-dflash",
+        "custom/vllm-dual-dflash-noviz",
+        "custom/vllm-dual-turbo",
+        "custom/vllm-dual-dflash-old",
+        "custom/vllm-dual-dflash-noviz-old",
+        "custom/vllm-dual-turbo-old",
+        "custom/vllm-dual-tq3-mtp-genesis",
+    }
+    profile_engine_id = str(row.get("profile_engine_id") or row.get("engine_profile") or row.get("engine_id") or "").strip()
+    if selector in preserved_nightly_selectors or (
+        selector.startswith("custom/vllm-dual-") and profile_engine_id in {"vllm-nightly-dflash", "vllm-nightly-mtp"}
+    ):
+        env = {"VLLM_IMAGE": "vllm/vllm-openai:v0.22.0"}
+        if "turbo" in selector:
+            env["VLLM_ENFORCE_EAGER"] = "1"
+            env["MAX_MODEL_LEN"] = "81920"
+        return env
+    if selector == "ik-llama/prism-pro-dq-dual-vision":
+        return {"CTX_SIZE": "150000"}
+    if selector == "ik-llama/apex-mtp-compact-long":
+        return {
+            "CTX_SIZE": "196608",
+            "NP": "1",
+            "UBATCH_SIZE": "1024",
+        }
+    if selector == "beellama/gemma-dflash-dual":
+        return {"CTX_SIZE": "150000"}
+    if selector == "beellama/gemma-dflash":
+        return {"CTX_SIZE": "102400"}
+    return {}
+
+
 def preset_launch_command_override(spec):
     row = spec if isinstance(spec, dict) else {}
     selector = str(
@@ -354,4 +441,42 @@ def preset_launch_command_override(spec):
         return ""
     overrides = read_server_config().get("preset_launch_overrides") or {}
     command_text = str((overrides.get(selector) or {}).get("command_text") or "").replace("\r", "").strip()
-    return command_text
+    if command_text:
+        return command_text
+    return preset_builtin_command_override(row, selector)
+
+
+def preset_builtin_command_override(row, selector):
+    command_text = str((row if isinstance(row, dict) else {}).get("default_engine_switches") or "").replace("\r", "").strip()
+    if not command_text:
+        return ""
+    if selector == "vllm/dual-carnice-bf16mtp":
+        return append_command_flag(command_text, "--language-model-only")
+    if selector == "vllm/gemma-12b-qat-w4a16-single":
+        return remove_command_option_pair(command_text, "--speculative-config")
+    return ""
+
+
+def remove_command_option_pair(command_text, option, value=None):
+    lines = [str(line or "").strip() for line in str(command_text or "").splitlines() if str(line or "").strip()]
+    output = []
+    idx = 0
+    changed = False
+    while idx < len(lines):
+        current = lines[idx]
+        if current == option:
+            next_value = lines[idx + 1] if idx + 1 < len(lines) else ""
+            if value is None or next_value == value:
+                idx += 2 if next_value else 1
+                changed = True
+                continue
+        output.append(current)
+        idx += 1
+    return "\n".join(output).strip() if changed else ""
+
+
+def append_command_flag(command_text, flag):
+    lines = [str(line or "").strip() for line in str(command_text or "").splitlines() if str(line or "").strip()]
+    if not lines or flag in lines:
+        return "\n".join(lines).strip()
+    return "\n".join(lines + [flag]).strip()

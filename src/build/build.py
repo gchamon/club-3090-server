@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -13,7 +14,100 @@ from build_support import *
 from smoke_tests import *
 
 
-def cleanup_root_artifacts(report: BuildReport) -> None:
+SMOKE_TEST_REGISTRY = [
+    (1, "runtime_inventory_split_import_smoke", "Runtime inventory split import smoke"),
+    (2, "changelog_icon_smoke", "Changelog icon metadata smoke"),
+    (3, "control_subprocess_timeout_smoke", "Control subprocess timeout smoke"),
+    (4, "ui_boot_smoke_source", "Source UI boot smoke"),
+    (5, "ui_service_actions_smoke", "UI service actions smoke"),
+    (6, "ui_boot_smoke_shipped", "Shipped UI boot smoke"),
+    (7, "ui_ship_html_smoke", "Shipped HTML fixture smoke"),
+    (8, "api_contract_smoke", "Control API contract smoke"),
+    (9, "remote_update_metadata_smoke", "Remote update metadata smoke"),
+    (10, "model_install_progress_smoke", "Model install progress smoke"),
+    (11, "runtime_inventory_registry_smoke", "Runtime inventory registry smoke"),
+    (12, "chat_state_race_smoke", "Chat state race smoke"),
+    (13, "admin_auth_failure_cache_smoke", "Admin auth persistent-session smoke"),
+    (14, "audit_log_filter_smoke", "Audit log filter smoke"),
+    (15, "log_bootstrap_tail_smoke", "Log bootstrap tail smoke"),
+    (16, "log_query_cli_smoke", "Log query CLI smoke"),
+    (17, "debug_transfer_expansion_smoke", "Debug transfer expansion smoke"),
+    (18, "storage_browser_chunk_smoke", "Storage browser chunk smoke"),
+    (19, "docker_logrotate_refresh_smoke", "Docker logrotate refresh smoke"),
+]
+SMOKE_TEST_ID_TO_NAME = {str(test_id): name for test_id, name, _label in SMOKE_TEST_REGISTRY}
+SMOKE_TEST_NAME_TO_ID = {name: test_id for test_id, name, _label in SMOKE_TEST_REGISTRY}
+SMOKE_TEST_LABELS = {name: label for test_id, name, label in SMOKE_TEST_REGISTRY}
+
+
+def smoke_test_list_text() -> str:
+    return "\n".join(
+        f"{test_id:02d} {name} - {label}"
+        for test_id, name, label in SMOKE_TEST_REGISTRY
+    )
+
+
+def parse_smoke_test_selection(values: list[str] | None) -> set[str] | None:
+    if not values:
+        return None
+    selected: set[str] = set()
+    invalid: list[str] = []
+    for raw_value in values:
+        for token in str(raw_value or "").split(","):
+            key = token.strip()
+            if not key:
+                continue
+            if key.lower() in {"all", "*"}:
+                return None
+            if key in SMOKE_TEST_ID_TO_NAME:
+                selected.add(SMOKE_TEST_ID_TO_NAME[key])
+            elif key.lstrip("0") in SMOKE_TEST_ID_TO_NAME:
+                selected.add(SMOKE_TEST_ID_TO_NAME[key.lstrip("0")])
+            elif key in SMOKE_TEST_NAME_TO_ID:
+                selected.add(key)
+            else:
+                invalid.append(key)
+    if invalid:
+        raise ValueError(
+            "Unknown --smoke-tests value(s): "
+            + ", ".join(invalid)
+            + "\nAvailable smoke tests:\n"
+            + smoke_test_list_text()
+        )
+    if not selected:
+        raise ValueError("--smoke-tests was provided but no smoke test IDs were selected")
+    return selected
+
+
+class SmokeTestSelector:
+    def __init__(self, selected: set[str] | None = None) -> None:
+        self.selected = set(selected or []) if selected else None
+
+    def limited(self) -> bool:
+        return self.selected is not None
+
+    def enabled(self, name: str) -> bool:
+        return self.selected is None or name in self.selected
+
+    def skip(self, report: BuildReport, name: str) -> bool:
+        if self.enabled(name):
+            return False
+        test_id = SMOKE_TEST_NAME_TO_ID.get(name)
+        id_text = f"#{test_id:02d} " if test_id is not None else ""
+        report.add_test(name, "skipped", f"Skipped by --smoke-tests; {id_text}{SMOKE_TEST_LABELS.get(name, name)} was not selected")
+        return True
+
+    def selected_detail(self) -> str:
+        if self.selected is None:
+            return "all smoke tests enabled"
+        rows = [
+            f"#{SMOKE_TEST_NAME_TO_ID[name]:02d} {name}"
+            for name in sorted(self.selected, key=lambda item: SMOKE_TEST_NAME_TO_ID.get(item, 9999))
+        ]
+        return "selected smoke tests: " + ", ".join(rows)
+
+
+def cleanup_root_artifacts(report: BuildReport, *, remove_artifacts: bool = False) -> None:
     keep = {name.lower() for name in AUTHORITATIVE_FILES}
     generated = {name.lower() for name in GENERATED_ROOT_OUTPUTS}
     for name in GENERATED_ROOT_OUTPUTS:
@@ -42,6 +136,12 @@ def cleanup_root_artifacts(report: BuildReport) -> None:
                 report.removed_root_artifacts.append(path.name)
             except Exception as exc:
                 report.warn(f"cleanup skipped for {path.name}: {exc}")
+    if remove_artifacts and ARTIFACTS_DIR.exists():
+        try:
+            shutil.rmtree(ARTIFACTS_DIR)
+            report.removed_root_artifacts.append(ARTIFACTS_DIR.name)
+        except Exception as exc:
+            report.warn(f"cleanup skipped for {ARTIFACTS_DIR.name}: {exc}")
 
 
 def compile_build_modules() -> None:
@@ -53,6 +153,68 @@ def compile_build_modules() -> None:
     ):
         if path.exists():
             compile(read_text(path), str(path), "exec")
+
+
+def upstream_checkout_dirs() -> list[Path]:
+    checkouts = []
+    for path in sorted(ROOT.iterdir(), key=lambda row: row.name.lower()):
+        if path.is_dir() and path.name.startswith("club-3090"):
+            checkouts.append(path)
+    return checkouts
+
+
+def validate_upstream_checkout_clean(report: BuildReport) -> bool:
+    checkouts = [path for path in upstream_checkout_dirs() if (path / ".git").exists()]
+    if not checkouts:
+        report.add_test("upstream_checkout_clean", "skipped", "No club-3090 Git worktrees were found")
+        return True
+    dirty_files = []
+    inspected = []
+    for checkout in checkouts:
+        inspected.append(checkout.name)
+        for args in (
+            ["git", "-C", str(checkout), "diff", "--name-only"],
+            ["git", "-C", str(checkout), "diff", "--cached", "--name-only"],
+            ["git", "-C", str(checkout), "ls-files", "--others", "--exclude-standard"],
+        ):
+            try:
+                result = subprocess.run(
+                    args,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=10,
+                )
+            except Exception as exc:
+                report.add_test("upstream_checkout_clean", "failed", f"could not inspect {checkout.name}: {exc}")
+                return False
+            if result.returncode != 0:
+                detail = (result.stdout or f"git inspection failed for {checkout.name}").strip()[-1200:]
+                report.add_test("upstream_checkout_clean", "failed", f"{checkout.name}: {detail}")
+                return False
+            dirty_files.extend(
+                f"{checkout.name}/{str(line or '').strip()}"
+                for line in str(result.stdout or "").splitlines()
+                if str(line or "").strip()
+            )
+    dirty_files = sorted(set(dirty_files))
+    if dirty_files:
+        report.add_test(
+            "upstream_checkout_clean",
+            "failed",
+            "Upstream checkout files are dirty; put compatibility adaptations in our control/installer layer instead: "
+            + ", ".join(dirty_files[:30]),
+        )
+        return False
+    report.add_test(
+        "upstream_checkout_clean",
+        "passed",
+        "No tracked, staged, or untracked files in club-3090 upstream checkouts were modified: "
+        + ", ".join(inspected),
+    )
+    return True
 
 
 def backup_release_artifacts(
@@ -75,10 +237,12 @@ def backup_release_artifacts(
 ) -> None:
     backup_dir = ROOT / "backups" / f"backups_{support.BACKUP_TAG}"
     backup_dir.mkdir(parents=True, exist_ok=True)
+    backup_artifacts_dir = backup_dir / ARTIFACTS_DIR.name
+    backup_artifacts_dir.mkdir(parents=True, exist_ok=True)
     write_text(backup_dir / f"install-club3090-server-{support.VERSION_TAG}.sh", built_script)
     write_text(backup_dir / SCRIPT_SOURCE_NAME, script_source)
     write_text(backup_dir / "control.py", control_source)
-    write_text(backup_dir / "control.ship.py", built_control)
+    write_text(backup_artifacts_dir / "control.ship.py", built_control)
     write_text(backup_dir / "updater.py", updater_source)
     write_text(backup_dir / "web-ui.html", html_source)
     write_text(backup_dir / "web-ui.css", css_source)
@@ -87,8 +251,8 @@ def backup_release_artifacts(
     write_text(backup_dir / "web-ui.bundle.html", bundle_html)
     write_text(backup_dir / "web-ui.min.css", min_css)
     write_text(backup_dir / "web-ui.min.js", min_js)
-    write_text(backup_dir / "web-ui.ship.raw.html", ship_raw_html)
-    write_text(backup_dir / "web-ui.ship.html", ship_html)
+    write_text(backup_artifacts_dir / "web-ui.ship.raw.html", ship_raw_html)
+    write_text(backup_artifacts_dir / "web-ui.ship.html", ship_html)
     write_text(backup_dir / TEST_HTML_PATH.name, test_html)
     write_text(backup_dir / "build-report.json", json.dumps(report.__dict__, indent=2))
 
@@ -113,9 +277,16 @@ def backup_release_artifacts(
         )
 
 
-def build_release(*, metadata: dict[str, str] | None = None, metadata_update_detail: str = "") -> int:
+def build_release(
+    *,
+    metadata: dict[str, str] | None = None,
+    metadata_update_detail: str = "",
+    remove_artifacts: bool = False,
+    smoke_test_selector: SmokeTestSelector | None = None,
+) -> int:
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     metadata = metadata or load_build_metadata_inputs()
+    smoke_test_selector = smoke_test_selector or SmokeTestSelector()
     report = BuildReport(version=metadata["version"], script_version=metadata["script_version"])
     report.metadata_hash = str(metadata.get("hash") or "")
     report.metadata_mtime = float(metadata.get("mtime") or 0.0)
@@ -133,11 +304,34 @@ def build_release(*, metadata: dict[str, str] | None = None, metadata_update_det
         "passed",
         metadata_update_detail or "metadata.json loaded for build",
     )
+    if smoke_test_selector.limited():
+        report.add_test(
+            "smoke_test_selection",
+            "passed",
+            smoke_test_selector.selected_detail(),
+        )
+    if not validate_upstream_checkout_clean(report):
+        flush_build_report(report, "build failed: upstream checkout has direct modifications")
+        print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
+        return 1
 
     change_log_latest_text = metadata["change_log_latest"]
     change_log_icons_text = metadata["change_log_icons"]
     club3090_version_text = metadata["club3090_version"]
     control_source = compose_control_source()
+    club3090_compat = json.loads(club3090_version_text or "{}")
+    compat_marker = "SCRIPT_CLUB3090_COMPAT = {}"
+    if control_source.count(compat_marker) != 1:
+        report.add_test("control_compat_metadata", "failed", "control source compatibility marker is missing or duplicated")
+        flush_build_report(report, "build failed: control compatibility metadata")
+        print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
+        return 1
+    control_source = control_source.replace(
+        compat_marker,
+        f"SCRIPT_CLUB3090_COMPAT = {club3090_compat!r}",
+        1,
+    )
+    report.add_test("control_compat_metadata", "passed", "embedded tested Club-3090 compatibility metadata into control.py")
     updater_source = read_text(UPDATER_SOURCE_PATH)
     html_source = read_text(WEB_BASE_HTML_PATH)
     css_source = read_text(WEB_BASE_CSS_PATH)
@@ -173,6 +367,18 @@ def build_release(*, metadata: dict[str, str] | None = None, metadata_update_det
         print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
         return 1
     report.add_test("script_metadata_contract", "passed", "base.sh/build.py metadata match the required build arguments")
+    tailscale_ip_contract = (
+        'emit_tailscale_ip_routes="true"' in script_source_raw
+        and 'https://${tailscale_ip}:${ADMIN_PORT}' in script_source_raw
+        and 'https://${tailscale_ip}:${PROXY_PORT}' in script_source_raw
+        and 'tls ${TLS_CERT_FILE} ${TLS_KEY_FILE}' in script_source_raw
+    )
+    if not tailscale_ip_contract:
+        report.add_test("tailscale_ip_tls_fallback", "failed", "base.sh is missing the direct Tailscale-IP self-signed HTTPS fallback routes")
+        flush_build_report(report, "build failed: Tailscale-IP TLS fallback contract")
+        print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
+        return 1
+    report.add_test("tailscale_ip_tls_fallback", "passed", "Direct Tailscale-IP HTTPS routes retain the self-signed fallback certificate")
 
     report.warnings.extend(scan_duplicate_functions(WEB_JS_OUTPUT_PATH, js_source))
     report.warnings.extend(scan_potential_dead_code(js_source, html_source, css_source))
@@ -184,6 +390,13 @@ def build_release(*, metadata: dict[str, str] | None = None, metadata_update_det
         return 1
     report.add_test("ui_duplicate_symbol_scan", "passed", "No duplicated top-level UI function symbols detected")
     report.add_test("dead_code_report", "passed", "No dead-code report warnings" if not report.warnings else "; ".join(report.warnings))
+    description_issues = validate_model_score_description_source(js_source)
+    if description_issues:
+        report.add_test("model_score_description_source", "failed", "; ".join(description_issues))
+        flush_build_report(report, "build failed during model score description source scan")
+        print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
+        return 1
+    report.add_test("model_score_description_source", "passed", "Model Score compliance descriptions include category-specific what/why/how text")
     flush_build_report(report, "completed static duplicate/dead-code scan")
 
     if 'HTML_GZIP_BASE64 = ""  # Injected by build.py for shipped outputs.\n' not in control_source:
@@ -199,6 +412,13 @@ def build_release(*, metadata: dict[str, str] | None = None, metadata_update_det
         print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
         return 1
     report.add_test("control_code_syntax_placeholder", "passed", "Generated control.py keeps the code syntax payload placeholder")
+
+    if 'AI_STUDIO_EXTENSION_PAYLOAD_GZIP_BASE64 = ""  # Injected by build.py for shipped outputs.\n' not in control_source:
+        report.add_test("control_ai_studio_extension_placeholder", "failed", "Generated control.py is missing the AI Studio extension payload placeholder")
+        flush_build_report(report, "build failed: AI Studio extension placeholder missing")
+        print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
+        return 1
+    report.add_test("control_ai_studio_extension_placeholder", "passed", "Generated control.py keeps the AI Studio extension payload placeholder")
 
     if "/* injected by build.py from web-ui.css */" not in html_source or "// injected by build.py from web-ui.js" not in html_source:
         report.add_test("html_template_placeholders", "failed", "web/base.html is missing CSS/JS build placeholders")
@@ -328,6 +548,41 @@ def build_release(*, metadata: dict[str, str] | None = None, metadata_update_det
             print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
             return 1
 
+        if not smoke_test_selector.skip(report, "runtime_inventory_split_import_smoke"):
+            flush_build_report(report, "running runtime inventory split import smoke test")
+            split_inventory_ok, split_inventory_detail = run_runtime_inventory_split_import_smoke_test(
+                CONTROL_SOURCE_DIR / "runtime_inventory.py",
+                CONTROL_SOURCE_DIR,
+                temp_dir,
+                "runtime-inventory.split-import.py",
+            )
+            if not split_inventory_ok:
+                report.add_test("runtime_inventory_split_import_smoke", "failed", split_inventory_detail or "Runtime inventory split import smoke test failed")
+                flush_build_report(report, "build failed: runtime inventory split import smoke test")
+                print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
+                return 1
+            report.add_test("runtime_inventory_split_import_smoke", "passed", split_inventory_detail or "Runtime inventory split import smoke test passed")
+
+        if not smoke_test_selector.skip(report, "changelog_icon_smoke"):
+            flush_build_report(report, "running changelog icon smoke test")
+            changelog_icon_ok, changelog_icon_detail = run_changelog_change_icon_smoke_test()
+            if not changelog_icon_ok:
+                report.add_test("changelog_icon_smoke", "failed", changelog_icon_detail or "Changelog icon smoke test failed")
+                flush_build_report(report, "build failed: changelog icon smoke test")
+                print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
+                return 1
+            report.add_test("changelog_icon_smoke", "passed", changelog_icon_detail or "Changelog icon smoke test passed")
+
+        if not smoke_test_selector.skip(report, "control_subprocess_timeout_smoke"):
+            flush_build_report(report, "running control subprocess timeout smoke test")
+            subprocess_timeout_ok, subprocess_timeout_detail = run_control_subprocess_timeout_smoke_test()
+            if not subprocess_timeout_ok:
+                report.add_test("control_subprocess_timeout_smoke", "failed", subprocess_timeout_detail or "Control subprocess timeout smoke test failed")
+                flush_build_report(report, "build failed: control subprocess timeout smoke test")
+                print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
+                return 1
+            report.add_test("control_subprocess_timeout_smoke", "passed", subprocess_timeout_detail or "Control subprocess timeout smoke test passed")
+
         flush_build_report(report, "running node syntax check for composed web-ui.js")
         source_js_ok, source_js_detail = validate_js_with_node(js_source, temp_dir, "web-ui.source.check.js")
         if not source_js_ok:
@@ -337,27 +592,29 @@ def build_release(*, metadata: dict[str, str] | None = None, metadata_update_det
             return 1
         report.add_test("node_js_syntax", "passed", "Composed web-ui.js passed node --check")
 
-        flush_build_report(report, "running source UI smoke test")
-        source_smoke_ok, source_smoke_detail = run_ui_smoke_test(bundled_js_source, temp_dir, "web-ui.source.smoke.cjs")
-        if not source_smoke_ok:
-            report.add_test("ui_boot_smoke_source", "failed", source_smoke_detail or "source UI smoke test failed")
-            flush_build_report(report, "build failed: source UI smoke test")
-            print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
-            return 1
-        report.add_test("ui_boot_smoke_source", "passed", "Source UI booted successfully under the mocked DOM smoke test")
+        if not smoke_test_selector.skip(report, "ui_boot_smoke_source"):
+            flush_build_report(report, "running source UI smoke test")
+            source_smoke_ok, source_smoke_detail = run_ui_smoke_test(bundled_js_source, temp_dir, "web-ui.source.smoke.cjs")
+            if not source_smoke_ok:
+                report.add_test("ui_boot_smoke_source", "failed", source_smoke_detail or "source UI smoke test failed")
+                flush_build_report(report, "build failed: source UI smoke test")
+                print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
+                return 1
+            report.add_test("ui_boot_smoke_source", "passed", "Source UI booted successfully under the mocked DOM smoke test")
 
-        flush_build_report(report, "running UI service action smoke test")
-        service_smoke_ok, service_smoke_detail = run_ui_service_actions_smoke_test(
-            bundled_js_source,
-            temp_dir,
-            "web-ui.service-actions.smoke.cjs",
-        )
-        if not service_smoke_ok:
-            report.add_test("ui_service_actions_smoke", "failed", service_smoke_detail or "UI service action smoke test failed")
-            flush_build_report(report, "build failed: UI service action smoke test")
-            print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
-            return 1
-        report.add_test("ui_service_actions_smoke", "passed", service_smoke_detail or "UI service action smoke test passed")
+        if not smoke_test_selector.skip(report, "ui_service_actions_smoke"):
+            flush_build_report(report, "running UI service action smoke test")
+            service_smoke_ok, service_smoke_detail = run_ui_service_actions_smoke_test(
+                bundled_js_source,
+                temp_dir,
+                "web-ui.service-actions.smoke.cjs",
+            )
+            if not service_smoke_ok:
+                report.add_test("ui_service_actions_smoke", "failed", service_smoke_detail or "UI service action smoke test failed")
+                flush_build_report(report, "build failed: UI service action smoke test")
+                print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
+                return 1
+            report.add_test("ui_service_actions_smoke", "passed", service_smoke_detail or "UI service action smoke test passed")
 
         flush_build_report(report, "running clean-css minification")
         try:
@@ -389,32 +646,34 @@ def build_release(*, metadata: dict[str, str] | None = None, metadata_update_det
             return 1
         report.add_test("node_js_shipped_syntax", "passed", "Terser-minified shipped JS passed node --check")
 
-        flush_build_report(report, "running shipped JS smoke test")
-        shipped_smoke_ok, shipped_smoke_detail = run_ui_smoke_test(min_js, temp_dir, "web-ui.shipped.smoke.cjs")
-        if not shipped_smoke_ok:
-            report.add_test("ui_boot_smoke_shipped", "failed", shipped_smoke_detail or "shipped UI smoke test failed")
-            flush_build_report(report, "build failed: shipped JS smoke test")
-            print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
-            return 1
-        report.add_test("ui_boot_smoke_shipped", "passed", "Shipped UI booted successfully under the mocked DOM smoke test")
+        if not smoke_test_selector.skip(report, "ui_boot_smoke_shipped"):
+            flush_build_report(report, "running shipped JS smoke test")
+            shipped_smoke_ok, shipped_smoke_detail = run_ui_smoke_test(min_js, temp_dir, "web-ui.shipped.smoke.cjs")
+            if not shipped_smoke_ok:
+                report.add_test("ui_boot_smoke_shipped", "failed", shipped_smoke_detail or "shipped UI smoke test failed")
+                flush_build_report(report, "build failed: shipped JS smoke test")
+                print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
+                return 1
+            report.add_test("ui_boot_smoke_shipped", "passed", "Shipped UI booted successfully under the mocked DOM smoke test")
 
         ship_raw_html = inject_assets_into_html(html_source, min_css, min_js)
         ship_html = minify_html(ship_raw_html)
         fixture_results = []
-        flush_build_report(report, f"running shipped HTML smoke tests for {len(status_fixtures)} fixtures")
-        for index, (fixture_name, payload) in enumerate(status_fixtures, start=1):
-            ok, detail = run_shipped_html_smoke_test(ship_html, payload, fixture_name, temp_dir, f"web-ui.ship-html-{index}.cjs")
-            fixture_results.append((fixture_name, ok, detail))
-            if not ok:
-                report.add_test("ui_ship_html_smoke", "failed", detail or f"Shipped HTML smoke failed for {fixture_name}")
-                flush_build_report(report, f"build failed: shipped HTML smoke test for {fixture_name}")
-                print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
-                return 1
-        report.add_test(
-            "ui_ship_html_smoke",
-            "passed",
-            ", ".join(name for name, _, _ in fixture_results) if fixture_results else "No fixtures found",
-        )
+        if not smoke_test_selector.skip(report, "ui_ship_html_smoke"):
+            flush_build_report(report, f"running shipped HTML smoke tests for {len(status_fixtures)} fixtures")
+            for index, (fixture_name, payload) in enumerate(status_fixtures, start=1):
+                ok, detail = run_shipped_html_smoke_test(ship_html, payload, fixture_name, temp_dir, f"web-ui.ship-html-{index}.cjs")
+                fixture_results.append((fixture_name, ok, detail))
+                if not ok:
+                    report.add_test("ui_ship_html_smoke", "failed", detail or f"Shipped HTML smoke failed for {fixture_name}")
+                    flush_build_report(report, f"build failed: shipped HTML smoke test for {fixture_name}")
+                    print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
+                    return 1
+            report.add_test(
+                "ui_ship_html_smoke",
+                "passed",
+                ", ".join(name for name, _, _ in fixture_results) if fixture_results else "No fixtures found",
+            )
 
         html_gzip_base64 = compress_html_to_gzip_base64(ship_html)
         report.add_test(
@@ -434,8 +693,21 @@ def build_release(*, metadata: dict[str, str] | None = None, metadata_update_det
             "passed",
             f"Packed vendored gputemps.c and nvml.h into {len(gputemps_vendor_gzip_base64)} base64 chars",
         )
+        try:
+            ai_studio_extension_gzip_base64 = compress_ai_studio_extensions_payload_to_gzip_base64()
+        except Exception as exc:
+            report.add_test("ai_studio_extension_pack", "failed", str(exc))
+            flush_build_report(report, "build failed: AI Studio extension pack")
+            print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
+            return 1
+        report.add_test(
+            "ai_studio_extension_pack",
+            "passed",
+            f"Packed AI Studio ComfyUI preview extension into {len(ai_studio_extension_gzip_base64)} base64 chars",
+        )
         built_control = inject_code_syntax_payload_into_control(control_source, code_syntax_gzip_base64)
         built_control = inject_html_payload_into_control(built_control, html_gzip_base64)
+        built_control = inject_ai_studio_extensions_payload_into_control(built_control, ai_studio_extension_gzip_base64)
         script_source = inject_gputemps_vendor_payload_into_script(script_source, gputemps_vendor_gzip_base64)
         built_script = inject_control_into_script(script_source, built_control)
         built_script = inject_updater_into_script(built_script, updater_source)
@@ -459,132 +731,170 @@ def build_release(*, metadata: dict[str, str] | None = None, metadata_update_det
             print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
             return 1
 
-        flush_build_report(report, "running API contract smoke test")
-        api_contract_ok, api_contract_detail = run_api_contract_smoke_test(temp_control, temp_dir, "control.api-contract.py")
-        if not api_contract_ok:
-            report.add_test("api_contract_smoke", "failed", api_contract_detail or "API contract smoke test failed")
-            flush_build_report(report, "build failed: API contract smoke test")
-            print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
-            return 1
-        report.add_test("api_contract_smoke", "passed", api_contract_detail or "API contract smoke test passed")
+        if not smoke_test_selector.skip(report, "api_contract_smoke"):
+            flush_build_report(report, "running API contract smoke test")
+            api_contract_ok, api_contract_detail = run_api_contract_smoke_test(temp_control, temp_dir, "control.api-contract.py")
+            if not api_contract_ok:
+                report.add_test("api_contract_smoke", "failed", api_contract_detail or "API contract smoke test failed")
+                flush_build_report(report, "build failed: API contract smoke test")
+                print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
+                return 1
+            report.add_test("api_contract_smoke", "passed", api_contract_detail or "API contract smoke test passed")
 
-        flush_build_report(report, "running remote update metadata smoke test")
-        remote_update_smoke_ok, remote_update_smoke_detail = run_remote_update_metadata_smoke_test(
-            temp_control,
-            temp_dir,
-            "control.remote-update-metadata.py",
-        )
-        if not remote_update_smoke_ok:
-            report.add_test("remote_update_metadata_smoke", "failed", remote_update_smoke_detail or "Remote update metadata smoke test failed")
-            flush_build_report(report, "build failed: remote update metadata smoke test")
-            print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
-            return 1
-        report.add_test("remote_update_metadata_smoke", "passed", remote_update_smoke_detail or "Remote update metadata smoke test passed")
+        if not smoke_test_selector.skip(report, "remote_update_metadata_smoke"):
+            flush_build_report(report, "running remote update metadata smoke test")
+            remote_update_smoke_ok, remote_update_smoke_detail = run_remote_update_metadata_smoke_test(
+                temp_control,
+                temp_dir,
+                "control.remote-update-metadata.py",
+            )
+            if not remote_update_smoke_ok:
+                report.add_test("remote_update_metadata_smoke", "failed", remote_update_smoke_detail or "Remote update metadata smoke test failed")
+                flush_build_report(report, "build failed: remote update metadata smoke test")
+                print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
+                return 1
+            report.add_test("remote_update_metadata_smoke", "passed", remote_update_smoke_detail or "Remote update metadata smoke test passed")
 
-        flush_build_report(report, "running model install progress smoke test")
-        model_install_smoke_ok, model_install_smoke_detail = run_model_install_progress_smoke_test(
-            temp_control,
-            temp_dir,
-            "control.model-install-progress.py",
-        )
-        if not model_install_smoke_ok:
-            report.add_test("model_install_progress_smoke", "failed", model_install_smoke_detail or "Model install progress smoke test failed")
-            flush_build_report(report, "build failed: model install progress smoke test")
-            print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
-            return 1
-        report.add_test("model_install_progress_smoke", "passed", model_install_smoke_detail or "Model install progress smoke test passed")
+        if not smoke_test_selector.skip(report, "model_install_progress_smoke"):
+            flush_build_report(report, "running model install progress smoke test")
+            model_install_smoke_ok, model_install_smoke_detail = run_model_install_progress_smoke_test(
+                temp_control,
+                temp_dir,
+                "control.model-install-progress.py",
+            )
+            if not model_install_smoke_ok:
+                report.add_test("model_install_progress_smoke", "failed", model_install_smoke_detail or "Model install progress smoke test failed")
+                flush_build_report(report, "build failed: model install progress smoke test")
+                print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
+                return 1
+            report.add_test("model_install_progress_smoke", "passed", model_install_smoke_detail or "Model install progress smoke test passed")
 
-        flush_build_report(report, "running runtime inventory registry smoke test")
-        inventory_registry_ok, inventory_registry_detail = run_runtime_inventory_registry_smoke_test(
-            temp_control,
-            temp_dir,
-            ROOT,
-            "control.runtime-inventory-registry.py",
-        )
-        if not inventory_registry_ok:
-            report.add_test("runtime_inventory_registry_smoke", "failed", inventory_registry_detail or "Runtime inventory registry smoke test failed")
-            flush_build_report(report, "build failed: runtime inventory registry smoke test")
-            print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
-            return 1
-        report.add_test("runtime_inventory_registry_smoke", "passed", inventory_registry_detail or "Runtime inventory registry smoke test passed")
+        if not smoke_test_selector.skip(report, "runtime_inventory_registry_smoke"):
+            flush_build_report(report, "running runtime inventory registry smoke test")
+            inventory_registry_ok, inventory_registry_detail = run_runtime_inventory_registry_smoke_test(
+                temp_control,
+                temp_dir,
+                ROOT,
+                "control.runtime-inventory-registry.py",
+            )
+            if not inventory_registry_ok:
+                report.add_test("runtime_inventory_registry_smoke", "failed", inventory_registry_detail or "Runtime inventory registry smoke test failed")
+                flush_build_report(report, "build failed: runtime inventory registry smoke test")
+                print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
+                return 1
+            report.add_test("runtime_inventory_registry_smoke", "passed", inventory_registry_detail or "Runtime inventory registry smoke test passed")
 
-        flush_build_report(report, "running chat state race smoke test")
-        chat_race_ok, chat_race_detail = run_chat_state_race_smoke_test(
-            temp_control,
-            temp_dir,
-            "control.chat-state-race.py",
-        )
-        if not chat_race_ok:
-            report.add_test("chat_state_race_smoke", "failed", chat_race_detail or "Chat state race smoke test failed")
-            flush_build_report(report, "build failed: chat state race smoke test")
-            print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
-            return 1
-        report.add_test("chat_state_race_smoke", "passed", chat_race_detail or "Chat state race smoke test passed")
+        if not smoke_test_selector.skip(report, "chat_state_race_smoke"):
+            flush_build_report(report, "running chat state race smoke test")
+            chat_race_ok, chat_race_detail = run_chat_state_race_smoke_test(
+                temp_control,
+                temp_dir,
+                "control.chat-state-race.py",
+            )
+            if not chat_race_ok:
+                report.add_test("chat_state_race_smoke", "failed", chat_race_detail or "Chat state race smoke test failed")
+                flush_build_report(report, "build failed: chat state race smoke test")
+                print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
+                return 1
+            report.add_test("chat_state_race_smoke", "passed", chat_race_detail or "Chat state race smoke test passed")
 
-        flush_build_report(report, "running audit log filter smoke test")
-        audit_filter_ok, audit_filter_detail = run_audit_log_filter_smoke_test(
-            temp_control,
-            temp_dir,
-            "control.audit-log-filter.py",
-        )
-        if not audit_filter_ok:
-            report.add_test("audit_log_filter_smoke", "failed", audit_filter_detail or "Audit log filter smoke test failed")
-            flush_build_report(report, "build failed: audit log filter smoke test")
-            print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
-            return 1
-        report.add_test("audit_log_filter_smoke", "passed", audit_filter_detail or "Audit log filter smoke test passed")
+        if not smoke_test_selector.skip(report, "admin_auth_failure_cache_smoke"):
+            flush_build_report(report, "running admin auth failure cache smoke test")
+            admin_auth_cache_ok, admin_auth_cache_detail = run_admin_auth_failure_cache_smoke_test(
+                temp_control,
+                temp_dir,
+                "control.admin-auth-failure-cache.py",
+            )
+            if not admin_auth_cache_ok:
+                report.add_test("admin_auth_failure_cache_smoke", "failed", admin_auth_cache_detail or "Admin auth failure cache smoke test failed")
+                flush_build_report(report, "build failed: admin auth failure cache smoke test")
+                print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
+                return 1
+            report.add_test("admin_auth_failure_cache_smoke", "passed", admin_auth_cache_detail or "Admin auth failure cache smoke test passed")
 
-        flush_build_report(report, "running log bootstrap tail smoke test")
-        log_tail_ok, log_tail_detail = run_log_bootstrap_tail_smoke_test(
-            temp_control,
-            temp_dir,
-            "control.log-bootstrap-tail.py",
-        )
-        if not log_tail_ok:
-            report.add_test("log_bootstrap_tail_smoke", "failed", log_tail_detail or "Log bootstrap tail smoke test failed")
-            flush_build_report(report, "build failed: log bootstrap tail smoke test")
-            print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
-            return 1
-        report.add_test("log_bootstrap_tail_smoke", "passed", log_tail_detail or "Log bootstrap tail smoke test passed")
+        if not smoke_test_selector.skip(report, "audit_log_filter_smoke"):
+            flush_build_report(report, "running audit log filter smoke test")
+            audit_filter_ok, audit_filter_detail = run_audit_log_filter_smoke_test(
+                temp_control,
+                temp_dir,
+                "control.audit-log-filter.py",
+            )
+            if not audit_filter_ok:
+                report.add_test("audit_log_filter_smoke", "failed", audit_filter_detail or "Audit log filter smoke test failed")
+                flush_build_report(report, "build failed: audit log filter smoke test")
+                print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
+                return 1
+            report.add_test("audit_log_filter_smoke", "passed", audit_filter_detail or "Audit log filter smoke test passed")
 
-        flush_build_report(report, "running log query CLI smoke test")
-        log_query_ok, log_query_detail = run_log_query_cli_smoke_test(
-            temp_control,
-            temp_dir,
-            "control.log-query-cli.py",
-        )
-        if not log_query_ok:
-            report.add_test("log_query_cli_smoke", "failed", log_query_detail or "Log query CLI smoke test failed")
-            flush_build_report(report, "build failed: log query CLI smoke test")
-            print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
-            return 1
-        report.add_test("log_query_cli_smoke", "passed", log_query_detail or "Log query CLI smoke test passed")
+        if not smoke_test_selector.skip(report, "log_bootstrap_tail_smoke"):
+            flush_build_report(report, "running log bootstrap tail smoke test")
+            log_tail_ok, log_tail_detail = run_log_bootstrap_tail_smoke_test(
+                temp_control,
+                temp_dir,
+                "control.log-bootstrap-tail.py",
+            )
+            if not log_tail_ok:
+                report.add_test("log_bootstrap_tail_smoke", "failed", log_tail_detail or "Log bootstrap tail smoke test failed")
+                flush_build_report(report, "build failed: log bootstrap tail smoke test")
+                print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
+                return 1
+            report.add_test("log_bootstrap_tail_smoke", "passed", log_tail_detail or "Log bootstrap tail smoke test passed")
 
-        flush_build_report(report, "running debug transfer expansion smoke test")
-        debug_transfer_ok, debug_transfer_detail = run_debug_transfer_expansion_smoke_test(
-            temp_control,
-            temp_dir,
-            "control.debug-transfer-expansion.py",
-        )
-        if not debug_transfer_ok:
-            report.add_test("debug_transfer_expansion_smoke", "failed", debug_transfer_detail or "Debug transfer expansion smoke test failed")
-            flush_build_report(report, "build failed: debug transfer expansion smoke test")
-            print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
-            return 1
-        report.add_test("debug_transfer_expansion_smoke", "passed", debug_transfer_detail or "Debug transfer expansion smoke test passed")
+        if not smoke_test_selector.skip(report, "log_query_cli_smoke"):
+            flush_build_report(report, "running log query CLI smoke test")
+            log_query_ok, log_query_detail = run_log_query_cli_smoke_test(
+                temp_control,
+                temp_dir,
+                "control.log-query-cli.py",
+            )
+            if not log_query_ok:
+                report.add_test("log_query_cli_smoke", "failed", log_query_detail or "Log query CLI smoke test failed")
+                flush_build_report(report, "build failed: log query CLI smoke test")
+                print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
+                return 1
+            report.add_test("log_query_cli_smoke", "passed", log_query_detail or "Log query CLI smoke test passed")
 
-        flush_build_report(report, "running docker logrotate refresh smoke test")
-        logrotate_ok, logrotate_detail = run_docker_logrotate_refresh_smoke_test(
-            temp_control,
-            temp_dir,
-            "control.docker-logrotate.py",
-        )
-        if not logrotate_ok:
-            report.add_test("docker_logrotate_refresh_smoke", "failed", logrotate_detail or "Docker logrotate refresh smoke test failed")
-            flush_build_report(report, "build failed: docker logrotate refresh smoke test")
-            print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
-            return 1
-        report.add_test("docker_logrotate_refresh_smoke", "passed", logrotate_detail or "Docker logrotate refresh smoke test passed")
+        if not smoke_test_selector.skip(report, "debug_transfer_expansion_smoke"):
+            flush_build_report(report, "running debug transfer expansion smoke test")
+            debug_transfer_ok, debug_transfer_detail = run_debug_transfer_expansion_smoke_test(
+                temp_control,
+                temp_dir,
+                "control.debug-transfer-expansion.py",
+            )
+            if not debug_transfer_ok:
+                report.add_test("debug_transfer_expansion_smoke", "failed", debug_transfer_detail or "Debug transfer expansion smoke test failed")
+                flush_build_report(report, "build failed: debug transfer expansion smoke test")
+                print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
+                return 1
+            report.add_test("debug_transfer_expansion_smoke", "passed", debug_transfer_detail or "Debug transfer expansion smoke test passed")
+
+        if not smoke_test_selector.skip(report, "storage_browser_chunk_smoke"):
+            flush_build_report(report, "running storage browser chunk smoke test")
+            storage_chunk_ok, storage_chunk_detail = run_storage_browser_chunk_smoke_test(
+                temp_control,
+                temp_dir,
+                "control.storage-browser-chunk.py",
+            )
+            if not storage_chunk_ok:
+                report.add_test("storage_browser_chunk_smoke", "failed", storage_chunk_detail or "Storage browser chunk smoke test failed")
+                flush_build_report(report, "build failed: storage browser chunk smoke test")
+                print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
+                return 1
+            report.add_test("storage_browser_chunk_smoke", "passed", storage_chunk_detail or "Storage browser chunk smoke test passed")
+
+        if not smoke_test_selector.skip(report, "docker_logrotate_refresh_smoke"):
+            flush_build_report(report, "running docker logrotate refresh smoke test")
+            logrotate_ok, logrotate_detail = run_docker_logrotate_refresh_smoke_test(
+                temp_control,
+                temp_dir,
+                "control.docker-logrotate.py",
+            )
+            if not logrotate_ok:
+                report.add_test("docker_logrotate_refresh_smoke", "failed", logrotate_detail or "Docker logrotate refresh smoke test failed")
+                flush_build_report(report, "build failed: docker logrotate refresh smoke test")
+                print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
+                return 1
+            report.add_test("docker_logrotate_refresh_smoke", "passed", logrotate_detail or "Docker logrotate refresh smoke test passed")
 
         script_embedded = extract_embedded_control(built_script)
         if script_embedded != built_control.rstrip("\n"):
@@ -637,12 +947,17 @@ def build_release(*, metadata: dict[str, str] | None = None, metadata_update_det
         report.add_test("lf_line_endings", "passed", "Built outputs use LF line endings only")
 
         sync_generated_root_sources(
-            control_source=control_source,
+            control_source=built_control,
             updater_text=updater_source,
             html_text=html_source,
             css_text=css_source,
             js_text=js_source,
             script_text=built_script,
+            bundle_html=bundle_html,
+            min_css=min_css,
+            min_js=min_js,
+            ship_raw_html=ship_raw_html,
+            ship_html=ship_html,
         )
 
         flush_build_report(report, "generating test HTML artifact")
@@ -654,6 +969,36 @@ def build_release(*, metadata: dict[str, str] | None = None, metadata_update_det
             print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
             return 1
         report.add_test("test_html_artifact", "passed", test_html_detail or "test html smoke ok")
+
+        expected_artifacts = [
+            CONTROL_OUTPUT_PATH,
+            UPDATER_OUTPUT_PATH,
+            WEB_HTML_OUTPUT_PATH,
+            WEB_CSS_OUTPUT_PATH,
+            WEB_JS_OUTPUT_PATH,
+            WEB_BUNDLE_HTML_OUTPUT_PATH,
+            WEB_MIN_CSS_OUTPUT_PATH,
+            WEB_MIN_JS_OUTPUT_PATH,
+            WEB_SHIP_RAW_HTML_OUTPUT_PATH,
+            WEB_SHIP_HTML_OUTPUT_PATH,
+            TEST_HTML_PATH,
+        ]
+        missing_artifacts = [
+            path.relative_to(ROOT).as_posix()
+            for path in expected_artifacts
+            if not path.exists() or (path.is_file() and path.stat().st_size <= 0)
+        ]
+        if missing_artifacts:
+            detail = "Missing generated artifact(s): " + ", ".join(missing_artifacts)
+            report.add_test("artifact_folder_outputs", "failed", detail)
+            flush_build_report(report, "build failed: artifact folder outputs")
+            print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
+            return 1
+        report.add_test(
+            "artifact_folder_outputs",
+            "passed",
+            "Generated control, base assets, minified web UI, and test HTML were written under artifacts/",
+        )
 
         backup_release_artifacts(
             report,
@@ -672,9 +1017,49 @@ def build_release(*, metadata: dict[str, str] | None = None, metadata_update_det
             built_script=built_script,
             test_html=test_html,
         )
+        backup_artifacts_dir = ROOT / "backups" / f"backups_{support.BACKUP_TAG}" / ARTIFACTS_DIR.name
+        misplaced_backup_ship_artifacts = [
+            path.name
+            for path in (
+                backup_artifacts_dir.parent / "control.ship.py",
+                backup_artifacts_dir.parent / "web-ui.ship.raw.html",
+                backup_artifacts_dir.parent / "web-ui.ship.html",
+            )
+            if path.exists()
+        ]
+        missing_backup_ship_artifacts = [
+            path.name
+            for path in (
+                backup_artifacts_dir / "control.ship.py",
+                backup_artifacts_dir / "web-ui.ship.raw.html",
+                backup_artifacts_dir / "web-ui.ship.html",
+            )
+            if not path.exists() or path.stat().st_size <= 0
+        ]
+        if misplaced_backup_ship_artifacts or missing_backup_ship_artifacts:
+            detail_parts = []
+            if misplaced_backup_ship_artifacts:
+                detail_parts.append("misplaced at backup root: " + ", ".join(misplaced_backup_ship_artifacts))
+            if missing_backup_ship_artifacts:
+                detail_parts.append("missing from backup artifacts/: " + ", ".join(missing_backup_ship_artifacts))
+            detail = "; ".join(detail_parts)
+            report.add_test("backup_ship_artifact_layout", "failed", detail)
+            flush_build_report(report, "build failed: backup ship artifact layout")
+            print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
+            return 1
+        report.add_test(
+            "backup_ship_artifact_layout",
+            "passed",
+            "Shipped control and web artifacts were retained under the release backup artifacts/ folder",
+        )
 
-        cleanup_root_artifacts(report)
-        report.add_test("root_generated_cleanup", "passed", "Generated root bundle files were removed after the successful build, while web-ui.test.html was retained")
+        cleanup_root_artifacts(report, remove_artifacts=remove_artifacts)
+        cleanup_detail = (
+            "Generated root bundle files were removed after the successful build, and the artifacts folder was removed by --remove-artifacts"
+            if remove_artifacts
+            else "Generated root bundle files were removed after the successful build; release artifacts were retained under artifacts/"
+        )
+        report.add_test("root_generated_cleanup", "passed", cleanup_detail)
         write_text(BUILD_LAST_SUCCESS_PATH, report.to_json() + "\n")
 
     flush_build_report(report, "build completed successfully")
@@ -691,21 +1076,70 @@ def main(argv: list[str] | None = None) -> int:
         "--changes",
         dest="changes",
         action="append",
-        required=True,
-        help="User-facing release note bullet for this new version. Repeat for multiple bullets.",
+        nargs="+",
+        help="User-facing release note bullet for this new version. Repeat for multiple bullets, or pass multiple entries after --changes.",
+    )
+    parser.add_argument(
+        "--smoke-tests",
+        dest="smoke_tests",
+        action="append",
+        default=[],
+        help="Run only the selected smoke test IDs or names, comma-separated. Use --list-smoke-tests to see IDs. Intended for targeted iteration only; omit for full release validation.",
+    )
+    parser.add_argument(
+        "--list-smoke-tests",
+        action="store_true",
+        help="Print numeric smoke test IDs and exit without building.",
     )
     parser.add_argument(
         "--iterative",
         action="store_true",
         help="Keep the current numeric version and advance only the optional letter suffix (for example v0.9.32 -> v0.9.32a). Without this switch, builds advance the numeric patch version (for example v0.9.32 -> v0.9.33).",
     )
-    args = parser.parse_args(argv)
-    metadata, metadata_update_detail = update_metadata_for_build(
-        args.changes,
-        iterative=bool(args.iterative),
+    parser.add_argument(
+        "--version",
+        dest="target_version",
+        default="",
+        help="Build exactly this version instead of applying the default patch bump. Cannot be combined with --iterative.",
     )
-    configure_build_identity(metadata["version"], metadata["script_version"])
-    return build_release(metadata=metadata, metadata_update_detail=metadata_update_detail)
+    parser.add_argument(
+        "--remove-artifacts",
+        action="store_true",
+        help="Delete the generated artifacts/ folder after a successful build. By default the folder is retained for inspection.",
+    )
+    args = parser.parse_args(argv)
+    if args.list_smoke_tests:
+        print(smoke_test_list_text())
+        return 0
+    if not args.changes:
+        parser.error("--change/--changes is required unless --list-smoke-tests is used")
+    try:
+        selected_smoke_tests = parse_smoke_test_selection(args.smoke_tests)
+    except ValueError as exc:
+        parser.error(str(exc))
+    smoke_test_selector = SmokeTestSelector(selected_smoke_tests)
+    original_metadata_text = support.read_text(support.METADATA_FILE)
+    try:
+        change_entries = [entry for group in (args.changes or []) for entry in group]
+        metadata, metadata_update_detail = update_metadata_for_build(
+            change_entries,
+            iterative=bool(args.iterative),
+            target_version=str(args.target_version or "").strip(),
+        )
+        configure_build_identity(metadata["version"], metadata["script_version"])
+        result = build_release(
+            metadata=metadata,
+            metadata_update_detail=metadata_update_detail,
+            remove_artifacts=bool(args.remove_artifacts),
+            smoke_test_selector=smoke_test_selector,
+        )
+    except Exception:
+        support.write_text(support.METADATA_FILE, original_metadata_text)
+        raise
+    if result != 0:
+        support.write_text(support.METADATA_FILE, original_metadata_text)
+        print("metadata.json restored because the build did not complete successfully")
+    return result
 
 
 if __name__ == "__main__":

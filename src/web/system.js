@@ -102,7 +102,12 @@ function applySystemServiceSectionState(section) {
     "aria-label",
     `${collapsed ? "Expand" : "Collapse"} ${elements.title.toLowerCase()}`,
   );
-  elements.toggle.innerHTML = svgIcon(collapsed ? "chevron-right" : "chevron-up");
+  const cue = elements.toggle.querySelector(".service-section-cue");
+  if (cue) {
+    cue.innerHTML = svgIcon(collapsed ? "chevron-down" : "chevron-up");
+  } else {
+    elements.toggle.innerHTML = svgIcon(collapsed ? "chevron-down" : "chevron-up");
+  }
 }
 function toggleSystemServiceSection(section) {
   if (!Object.prototype.hasOwnProperty.call(systemServiceCollapseState, section)) return;

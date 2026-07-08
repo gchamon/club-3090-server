@@ -1,19 +1,98 @@
 // Shared runtime/UI state
 let selectedInstance = "GPU0";
 let logEs = null;
+let logReconnectTimer = null;
 let logCacheRefreshTimer = null;
 let logCacheRefreshNonce = 0;
 let statusPollTimer = null;
+let statusOutageStartedAt = 0;
+let statusDisconnectedActive = false;
 let initialMetricsSeriesRequested = false;
 let selectedUserName = "";
 let selectedOverviewInstanceId = "";
 let selectedLogInstanceId = "";
 let selectedPresetModelId = "";
 let selectedPresetModelHydrated = false;
+let dynamicPresetRenderSignature = "";
+let presetResourceIdentityCacheSignature = "";
+let presetResourceIdentityCacheValue = new Map();
+const RESOURCE_MARKER_BASE_COLORS = [
+  "#e6194b", // red
+  "#2ca02c", // green
+  "#0066ff", // blue
+  "#ffe119", // yellow
+  "#d100d1", // magenta
+  "#00bcd4", // cyan
+  "#ff7f00", // orange
+  "#6a3d9a", // purple
+  "#000000", // black
+  "#ffffff", // white
+  "#808080", // neutral gray
+  "#8b4513", // brown
+  "#7fff00", // lime
+  "#008080", // teal
+  "#800000", // maroon
+  "#000075", // navy
+  "#ff69b4", // pink
+  "#c49a00", // gold
+  "#386641", // forest
+  "#4cc9f0", // sky
+  "#ff5f1f", // vermilion
+  "#9d4edd", // violet
+  "#d4ff00", // chartreuse
+  "#00a86b", // jade
+  "#a63a50", // wine
+  "#f2e8cf", // cream
+  "#36454f", // charcoal
+  "#b15928", // umber
+  "#1f78b4", // steel blue
+  "#fb9a99", // salmon
+  "#bcf60c", // neon green
+  "#fabebe", // rose
+  "#46f0f0", // aqua
+  "#f032e6", // hot magenta
+  "#e6beff", // lavender
+  "#808000", // olive
+  "#ffd8b1", // peach
+  "#aaffc3", // mint
+  "#0d3b66", // deep sea
+  "#f4d35e", // mustard
+  "#ee964b", // copper
+  "#1b998b", // blue green
+  "#2d3047", // ink
+  "#fffd82", // lemon
+  "#57cc99", // seafoam
+  "#22577a", // slate blue
+  "#7209b7", // royal purple
+  "#582f0e", // dark brown
+  "#a4ac86", // sage
+  "#ced4da", // light gray
+  "#495057", // dark gray
+  "#d00000", // crimson
+  "#3f88c5", // azure
+  "#032b43", // midnight
+];
+const RESOURCE_MARKER_MIN_COLOR_DISTANCE = 0.1;
+const pendingResourceColorOverrides = Object.create(null);
 let pendingLogJump = null;
 let adminAuthRefreshBlocked = false;
 let pendingForcedStatusRefreshIncludeSeries = false;
+let pendingForcedStatusRefreshIncludeInventory = false;
+let pendingForcedStatusRefreshIncludeBenchmarkDetails = false;
+let pendingForcedStatusRefreshInventoryDetail = "";
 const SUMMARY_CACHE_KEY = "club3090-preset-summary-v520";
+const RUNTIME_INVENTORY_CACHE_KEY = "club3090-runtime-inventory-v1";
+const STATUS_CACHE_KEY = "club3090-status-v1";
+const STATUS_CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const STATUS_CACHE_SERIES_MAX_AGE_MS = 30 * 1000;
+const STATUS_CACHE_SERIES_LIMIT = 240;
+const STATUS_LIVE_SERIES_LIMIT = 120;
+const STATUS_BOOT_CONTACT_TIMEOUT_MS = 10 * 1000;
+const STATUS_OPEN_PANEL_DISCONNECT_MS = 60 * 1000;
+const PRESET_MODEL_HTML_CACHE_KEY = "club3090-preset-model-html-v1";
+const SELECTED_PRESET_MODEL_CACHE_KEY = "club3090-selected-preset-model-v1";
+const PRESET_FILTER_CACHE_KEY = "club3090-preset-filter-v1";
+let presetFilterState = null;
 const CHAT_STATE_KEY = "club3090-chat-state-v642";
 const LEGACY_CHAT_STATE_KEY = "club3090-chat-state-v520";
 const LEGACY_CHAT_STATE_KEY_V516 = "club3090-chat-state-v516";
@@ -27,7 +106,14 @@ const CHAT_MIN_COMPACTION_THRESHOLD = 25;
 const CHAT_MAX_COMPACTION_THRESHOLD = 95;
 const CHAT_AUTO_COMPACT_THRESHOLD_DEFAULT = CHAT_MAX_COMPACTION_THRESHOLD;
 const CHAT_THINKING_RENDER_INTERVAL_MS = 250;
-const CHAT_STREAM_RENDER_MIN_INTERVAL_MS = 24;
+const CHAT_STREAM_RENDER_MIN_INTERVAL_MS = 12;
+const CHAT_STREAM_VISIBLE_REVEAL_FAST_INTERVAL_MS = 4;
+const CHAT_STREAM_VISIBLE_REVEAL_MIN_CHARS = 8;
+const CHAT_STREAM_VISIBLE_REVEAL_TARGET_CHARS = 24;
+const CHAT_STREAM_VISIBLE_REVEAL_MAX_CHARS = 64;
+const CHAT_STREAM_VISIBLE_REVEAL_BURST_MAX_CHARS = 160;
+const CHAT_STREAM_VISIBLE_REVEAL_FRAME_BUDGET_MS = 10;
+const CHAT_STREAM_VISIBLE_REVEAL_BACKLOG_CHARS = 180;
 const CHAT_STREAM_MARKDOWN_TAIL_SOFT_LIMIT = 1800;
 const CHAT_STREAM_MARKDOWN_TAIL_HARD_LIMIT = 3600;
 const CHAT_STREAM_MARKDOWN_RESCAN_APPEND_THRESHOLD = 48;
@@ -38,6 +124,7 @@ const CHAT_TRANSCRIPT_EXPAND_STEP = 12;
 const STATUS_POLL_FOREGROUND_FAST_MS = 2000;
 const STATUS_POLL_FOREGROUND_SLOW_MS = 5000;
 const STATUS_POLL_BACKGROUND_MS = 15000;
+const UPDATE_SIGNAL_POLL_MS = 250;
 const LOG_CACHE_REFRESH_MS = 15000;
 const CHAT_TRANSCRIPT_NEAR_BOTTOM_PX = 36;
 const CHAT_TRANSCRIPT_DETACH_SCROLL_PX = 18;
@@ -77,6 +164,12 @@ const CHAT_RUNTIME_SNAPSHOT_FIELDS = [
   "max_prompt_tokens_per_second",
   "max_tokens_per_second",
   "speculative",
+  "benchmark_active",
+  "benchmark_mode",
+  "benchmark_step",
+  "benchmark_step_index",
+  "benchmark_step_count",
+  "benchmark_step_progress",
 ];
 let presetSummaryCache = { persistent: {}, transient: {}, restartTargets: [], lastSeenUptime: 0 };
 let chatStateServerReady = false;
@@ -102,6 +195,8 @@ let chatLiveMessageRenderPendingIndex = -1;
 let chatLiveMessageRenderPendingForceFollow = false;
 let chatLiveMessageRenderPendingReason = "stream";
 let chatLiveMessageRenderLastAt = 0;
+const aiStudioLaneCollapseState = window.club3090AiStudioLaneCollapseState || (window.club3090AiStudioLaneCollapseState = Object.create(null));
+const aiStudioLaneResourceOpenState = window.club3090AiStudioLaneResourceOpenState || (window.club3090AiStudioLaneResourceOpenState = Object.create(null));
 let chatLocalRequestActive = false;
 let chatStreamResumePollTimer = null;
 let chatStreamResumePollNonce = 0;
@@ -209,6 +304,20 @@ function cloneChatMessage(message = {}) {
     maxTokensPerSecond:
       row?.maxTokensPerSecond !== undefined
         ? Number(row.maxTokensPerSecond || 0)
+        : undefined,
+    createdAt:
+      row?.createdAt !== undefined ? Number(row.createdAt || 0) : undefined,
+    generationStartedAt:
+      row?.generationStartedAt !== undefined
+        ? Number(row.generationStartedAt || 0)
+        : undefined,
+    generationFinishedAt:
+      row?.generationFinishedAt !== undefined
+        ? Number(row.generationFinishedAt || 0)
+        : undefined,
+    generationDurationSeconds:
+      row?.generationDurationSeconds !== undefined
+        ? Number(row.generationDurationSeconds || 0)
         : undefined,
   };
 }
@@ -361,14 +470,12 @@ function chatConversationSummaryPayload(conversation) {
   };
 }
 function currentChatStatePayload() {
-  const activeId = String(chatState.activeConversationId || "");
   return {
     revision: Math.max(0, Number(chatState.revision || 0) || 0),
     activeConversationId: chatState.activeConversationId,
     conversations: Array.isArray(chatState.conversations)
       ? chatState.conversations.map((conversation) => ({
-          ...(String(conversation?.id || "") === activeId &&
-          conversation?.messagesLoaded !== false
+          ...(conversation?.messagesLoaded !== false
             ? {
                 ...conversation,
                 summary: String(conversation?.summary || ""),
@@ -558,7 +665,20 @@ async function postChatStateToServer(nextJson, controller) {
   if (chatStatePayloadByteLength(nextJson) <= CHAT_STATE_KEEPALIVE_MAX_BYTES) {
     requestOptions.keepalive = true;
   }
-  const response = await fetch("/admin/chat-state", requestOptions);
+  let response = null;
+  try {
+    response = await fetch("/admin/chat-state", requestOptions);
+  } catch (error) {
+    if (error?.name === "AbortError" || controller?.signal?.aborted) throw error;
+    logDebugEvent("chat_state_save_retry", {
+      error: error?.message || String(error || ""),
+      keepalive: !!requestOptions.keepalive,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const retryOptions = { ...requestOptions };
+    delete retryOptions.keepalive;
+    response = await fetch("/admin/chat-state", retryOptions);
+  }
   let payload = null;
   try {
     payload = await response.json();
@@ -846,6 +966,8 @@ function escapeHtml(value) {
     .replaceAll("'", "&#39;");
 }
 function svgIcon(name) {
+  if (name === "close")
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" fill="none"/></svg>';
   if (name === "edit")
     return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4l10-10-4-4L4 16v4zM14 6l4 4" fill="none"/></svg>';
   if (name === "key")
@@ -856,6 +978,8 @@ function svgIcon(name) {
     return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 7H5v4m0-4 4 4m-4-4a8 8 0 1 1-1 9" fill="none"/></svg>';
   if (name === "delete")
     return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M9 7V5h6v2m-7 3v7m4-7v7m4-7v7M7 7l1 12h8l1-12" fill="none"/></svg>';
+  if (name === "recycle")
+    return '<span class="icon-emoji" aria-hidden="true">♻️</span>';
   if (name === "archive")
     return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16v3H4zm2 3h12v9H6zm4 3h4" fill="none"/></svg>';
   if (name === "copy")
@@ -864,14 +988,20 @@ function svgIcon(name) {
     return '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="18" r="2.5" fill="none"/><circle cx="6" cy="6" r="2.5" fill="none"/><path d="M8.5 7.5 20 18M8.5 16.5 13 12l7-6" fill="none"/></svg>';
   if (name === "file")
     return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3h7l5 5v13H7zM14 3v5h5" fill="none"/></svg>';
+  if (name === "image")
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="5" width="16" height="14" rx="2" ry="2" fill="none"/><path d="m7 16 3.5-4 3 3 2-2.2L18 16" fill="none"/><circle cx="15.5" cy="9.5" r="1.4" fill="currentColor" stroke="none"/></svg>';
   if (name === "folder")
     return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h6l2 2h10v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" fill="none"/></svg>';
+  if (name === "album")
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v14H5zM8 3h11a2 2 0 0 1 2 2v11M3 8v11a2 2 0 0 0 2 2h11" fill="none"/><path d="m7.5 16 3-3.4 2.4 2.6 1.8-2 2.8 2.8" fill="none"/><circle cx="14.5" cy="9.5" r="1.2" fill="currentColor" stroke="none"/></svg>';
+  if (name === "detach")
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 5h5v5m0-5-7 7" fill="none" /><path d="M10 7H7a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-3" fill="none" /></svg>';
   if (name === "folder-up")
-    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 8h5.7l2.6 2.8h8.7v7.4h-4.1M3.5 8v9.2c0 .7.6 1.3 1.3 1.3h5.1" fill="none" stroke-linejoin="round"/><path d="M13.2 18.8v-7m0 0-3.1 3.1m3.1-3.1 3.1 3.1" fill="none" stroke-linecap="square" stroke-linejoin="miter"/></svg>';
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h6l2 2h10v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" fill="none"/><path d="M12 16V9m0 0-2.5 2.5M12 9l2.5 2.5" fill="none"/></svg>';
   if (name === "mount")
-    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v10m0 0-4-4m4 4 4-4M5 20h14" fill="none"/></svg>';
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h4.5v4.5H8.2L12 11.3l3.8-3.8h-2.3V3H18l2.8 7.8c.2.6.1 1.2-.3 1.7c-.4.5-1 .7-1.6.7H5.1c-.6 0-1.2-.2-1.6-.7c-.4-.5-.5-1.1-.3-1.7L6 3Z" fill="currentColor" stroke="none"/><path d="M12 5.2v5m0 0-2.4-2.4M12 10.2l2.4-2.4" fill="none" stroke="#0b0f14" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><rect x="2.5" y="15.5" width="19" height="6" rx="2.2" ry="2.2" fill="none"/><circle cx="18.2" cy="18.5" r="1.1" fill="currentColor" stroke="none"/></svg>';
   if (name === "unmount")
-    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 20h14M8 8l8 8M16 8l-8 8" fill="none"/></svg>';
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h4.5v4.5H8.2L12 11.3l3.8-3.8h-2.3V3H18l2.8 7.8c.2.6.1 1.2-.3 1.7c-.4.5-1 .7-1.6.7H5.1c-.6 0-1.2-.2-1.6-.7c-.4-.5-.5-1.1-.3-1.7L6 3Z" fill="currentColor" stroke="none"/><path d="M12 10.2v-5m0 0-2.4 2.4M12 5.2l2.4 2.4" fill="none" stroke="#0b0f14" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><rect x="2.5" y="15.5" width="19" height="6" rx="2.2" ry="2.2" fill="none"/><circle cx="18.2" cy="18.5" r="1.1" fill="currentColor" stroke="none"/></svg>';
   if (name === "upload")
     return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0l-4 4m4-4l4 4M5 20h14" fill="none"/></svg>';
   if (name === "download")
@@ -892,20 +1022,50 @@ function svgIcon(name) {
     return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 17 17 7M7 17h10V7" fill="none"/><circle cx="7" cy="17" r="2" fill="currentColor" stroke="none"/><circle cx="17" cy="7" r="2" fill="currentColor" stroke="none"/><circle cx="17" cy="17" r="2" fill="currentColor" stroke="none"/></svg>';
   if (name === "send")
     return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12 19 5l-3.8 5.4L19 12l-3.8 1.6L19 19 4 12Z" fill="currentColor" stroke="none"/></svg>';
+  if (name === "play")
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.5 18 12 8 18.5Z" fill="currentColor" stroke="none"/></svg>';
+  if (name === "volume")
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 15H3V9h2l5-4v14l-5-4Z" fill="currentColor" stroke="none"/><path d="M14 9.5a4 4 0 0 1 0 5M17 7a8 8 0 0 1 0 10" fill="none"/></svg>';
+  if (name === "music")
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18.5a2.5 2.5 0 1 1-1-2V6l10-2v10.5a2.5 2.5 0 1 1-1-2V8L9 9.6v8.9Z" fill="currentColor" stroke="none"/></svg>';
+  if (name === "megaphone")
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 14h3l9 4V6l-9 4H4v4Zm3 0 2 5h3l-2.2-5" fill="currentColor" stroke="none"/><path d="M18 9.5a4 4 0 0 1 0 5M20 7.5a7 7 0 0 1 0 9" fill="none"/></svg>';
+  if (name === "waveform")
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 13v-2m4 6V7m4 13V4m4 12V8m4 5v-2" fill="none"/></svg>';
+  if (name === "menu")
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M5 12h14M5 17h14" fill="none"/></svg>';
+  if (name === "filter")
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16l-6.2 7.1v5.4l-3.6 1.8v-7.2L4 5Z" fill="none"/></svg>';
+  if (name === "sparkles")
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l1.6 4.4L18 9l-4.4 1.6L12 15l-1.6-4.4L6 9l4.4-1.6L12 3Zm6 10 .9 2.1L21 16l-2.1.9L18 19l-.9-2.1L15 16l2.1-.9L18 13ZM5.5 14l.8 1.7 1.7.8-1.7.8-.8 1.7-.8-1.7-1.7-.8 1.7-.8.8-1.7Z" fill="none"/></svg>';
+  if (name === "database")
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 6c0-1.7 3.1-3 7-3s7 1.3 7 3-3.1 3-7 3-7-1.3-7-3Zm0 0v6c0 1.7 3.1 3 7 3s7-1.3 7-3V6M5 12v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6" fill="none"/></svg>';
   if (name === "stop")
     return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7h10v10H7z" fill="currentColor" stroke="none"/></svg>';
+  if (name === "check")
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7" fill="none"/></svg>';
+  if (name === "refresh")
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 8V4m0 0h-4m4 0-3.1 3.1A7 7 0 1 0 19 15" fill="none"/></svg>';
   if (name === "close")
     return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" fill="none"/></svg>';
   if (name === "plus")
     return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none"/></svg>';
+  if (name === "minus")
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14" fill="none"/></svg>';
   if (name === "chat")
     return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 18V6h14v9H8l-3 3Zm3-7h8m-8 3h5" fill="none"/></svg>';
+  if (name === "terminal")
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 7 4.5 5L5 17M11 17h8" fill="none"/></svg>';
   if (name === "share")
     return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 12.5 15.5 7M8 12.5l7.5 4.5" fill="none"/><circle cx="6" cy="12.5" r="3" fill="currentColor" stroke="none"/><circle cx="18" cy="5.5" r="3" fill="currentColor" stroke="none"/><circle cx="18" cy="18.5" r="3" fill="currentColor" stroke="none"/></svg>';
+  if (name === "minimize")
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14" fill="none"/></svg>';
   if (name === "gear")
     return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8.5a3.5 3.5 0 1 0 0 7a3.5 3.5 0 0 0 0-7Zm8 3.5l-2.1.8a6.9 6.9 0 0 1-.6 1.4l.9 2l-2.1 2.1l-2-.9a6.9 6.9 0 0 1-1.4.6L12 20l-1.1-2.1a6.9 6.9 0 0 1-1.4-.6l-2 .9l-2.1-2.1l.9-2a6.9 6.9 0 0 1-.6-1.4L4 12l2.1-1.1a6.9 6.9 0 0 1 .6-1.4l-.9-2l2.1-2.1l2 .9a6.9 6.9 0 0 1 1.4-.6L12 4l1.1 2.1a6.9 6.9 0 0 1 1.4.6l2-.9l2.1 2.1l-.9 2a6.9 6.9 0 0 1 .6 1.4L20 12Z" fill="none"/></svg>';
   if (name === "view")
     return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 12s3.6-6 9.5-6 9.5 6 9.5 6-3.6 6-9.5 6-9.5-6-9.5-6Z" fill="none"/><circle cx="12" cy="12" r="3.25" fill="none"/></svg>';
+  if (name === "percent")
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 17 17 7" fill="none"/><circle cx="7.5" cy="7.5" r="2.1" fill="none"/><circle cx="16.5" cy="16.5" r="2.1" fill="none"/></svg>';
   if (name === "preview")
     return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 12s3.6-6 9.5-6 9.5 6 9.5 6-3.6 6-9.5 6-9.5-6-9.5-6Z" fill="none"/><circle cx="12" cy="12" r="3.25" fill="none"/></svg>';
   if (name === "hide")
@@ -914,15 +1074,18 @@ function svgIcon(name) {
     return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 15 6-6 6 6" fill="none"/></svg>';
   if (name === "chevron-down")
     return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6" fill="none"/></svg>';
+  if (name === "chevron-left")
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 6-6 6 6 6" fill="none"/></svg>';
   if (name === "chevron-right")
     return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6" fill="none"/></svg>';
   return "";
 }
-function renderIconButton({ title, action, icon, className = "", disabled = false }) {
-  const classes = `iconbtn ${className}`.trim();
+function renderIconButton({ title, action, icon, className = "", disabled = false, attrs = "" }) {
+  const classes = `iconbtn ${className}${disabled ? " iconbtn-disabled" : ""}`.trim();
   const disabledAttr = disabled ? ' disabled aria-disabled="true"' : "";
   const onclickAttr = disabled ? "" : ` onclick="${action}"`;
-  return `<button class="${classes}" title="${escapeHtml(title)}" aria-label="${escapeHtml(title)}"${disabledAttr}${onclickAttr}>${svgIcon(icon)}</button>`;
+  const extraAttrs = attrs ? ` ${attrs}` : "";
+  return `<button type="button" class="${classes}" title="${escapeHtml(title)}" aria-label="${escapeHtml(title)}"${disabledAttr}${extraAttrs}${onclickAttr}>${svgIcon(icon)}</button>`;
 }
 async function copyTextValue(value) {
   const text = String(value || "");
@@ -1117,6 +1280,8 @@ function renderUpdateNotices(status = {}) {
   const compat = status.club3090_compat || {};
   const supported = compat.supported || {};
   const updateActive = selfUpdateActive(status);
+  const benchmarkActive =
+    typeof benchmarkJobActive === "function" ? benchmarkJobActive(status) : false;
   const startedAt = Number(status.control_started_at || 0);
   const remoteKey = currentUpdateBannerRemoteKey(status);
   const hasUpdate = !!remote.update_available && remote.script_version;
@@ -1127,7 +1292,9 @@ function renderUpdateNotices(status = {}) {
       : "";
   const compatButton = updateActive
     ? '<button class="update-notice-link" type="button" disabled aria-disabled="true">Compatible migration unavailable while an update is running.</button>'
-    : '<button class="update-notice-link" onclick="startCompatibleMigration()">Click here to migrate to a compatible version!</button>';
+    : benchmarkActive
+      ? '<button class="update-notice-link" type="button" disabled aria-disabled="true">Stop Model Scores before migrating.</button>'
+      : '<button class="update-notice-link" onclick="startCompatibleMigration()">Click here to migrate to a compatible version!</button>';
   const redBar = compat.local_repo_newer_than_supported
     ? `<div class="update-notice-bar update-notice-bar-red"><span class="update-notice-spacer"></span><div class="update-notice-message">The local Club-3090 commit is newer than supported by this script and may cause unforeseen issues. ${compatButton}</div><span class="update-notice-spacer"></span></div>`
     : "";
@@ -1255,7 +1422,13 @@ function triggerAdminPanelReload(message = "Reloading the admin panel...", delay
   setAuditMsg(message);
   const startedAt = Date.now();
   const navigate = () => {
-    const target = `/admin?_=${Date.now()}`;
+    const query = new URLSearchParams({ _: String(Date.now()) });
+    const savedReturn = readPendingUpdateReturn();
+    const restoreTab = normalizeTabName(updateMonitor.returnTab || savedReturn?.tab || activeTabName || "overview");
+    const restoreScroll = Math.max(0, Number(updateMonitor.returnScrollTop || savedReturn?.scrollTop || 0));
+    if (restoreTab) query.set("restore_tab", restoreTab);
+    if (restoreScroll > 0) query.set("restore_scroll", String(restoreScroll));
+    const target = `/admin?${query.toString()}`;
     window.location.href = target;
   };
   const tryReload = async () => {
@@ -1314,6 +1487,7 @@ function promptStaleUpdateConfirmation(scope, targetCommit = "") {
   });
 }
 function completeUpdateMonitor(payload = {}) {
+  markUpdateTokenCompleted(payload?.token || updateMonitor.token);
   endUpdateMonitor();
   const returnCode = Number(payload?.return_code || 0);
   triggerAdminPanelReload(
@@ -1338,6 +1512,7 @@ function updateLogVisualMode() {
 function endUpdateMonitor() {
   updateMonitor.active = false;
   updateMonitor.completed = true;
+  updateAcknowledgedToken = "";
   setUpdateUiLocked(false);
   if (updateMonitor.statusTimer) {
     clearInterval(updateMonitor.statusTimer);
@@ -1347,22 +1522,65 @@ function endUpdateMonitor() {
 }
 async function pollUpdateMonitorStatus() {
   if (!updateMonitor.active || !updateMonitor.statusUrl) return;
+  const fallbackToAdminStatus = async () => {
+    try {
+      const response = await fetch(`/admin/status?force=1&_=${Date.now()}`, { cache: "no-store" });
+      if (!response.ok) return false;
+      const status = await response.json();
+      if (!status || status.ok === false) return false;
+      const update = currentSelfUpdateState(status);
+      if (update?.active) return false;
+      if (completeUpdateMonitorFromStatus(update)) return true;
+      if (Date.now() - Number(updateMonitor.startedAt || 0) > 8000) {
+        completeUpdateMonitorFromStatus(
+          {
+            ...update,
+            status: update?.status || "complete",
+            token: update?.token || updateMonitor.token,
+            return_code: update?.return_code ?? 0,
+          },
+          { force: true },
+        );
+        return true;
+      }
+    } catch (e) {}
+    return false;
+  };
   try {
     const response = await fetch(updateMonitor.statusUrl, { cache: "no-store" });
-    if (!response.ok) return;
-    const payload = await response.json();
-    if (!payload || payload.ok === false) return;
-    if (!payload.active) {
-      completeUpdateMonitor(payload);
+    if (!response.ok) {
+      await fallbackToAdminStatus();
+      return;
     }
-  } catch (e) {}
+    const payload = await response.json();
+    if (!payload || payload.ok === false) {
+      await fallbackToAdminStatus();
+      return;
+    }
+    const update = payload.self_update && typeof payload.self_update === "object" ? payload.self_update : payload;
+    if (!update.active) {
+      completeUpdateMonitor(update);
+    }
+  } catch (e) {
+    await fallbackToAdminStatus();
+  }
 }
 function beginUpdateMonitor(payload, scope) {
+  if (!updateMonitor.returnLogSource || currentLogSource !== "update") {
+    updateMonitor.returnLogSource = updateFallbackLogSource(currentLogSource);
+  }
   updateMonitor.active = true;
   updateMonitor.completed = false;
+  updateMonitor.startedAt = Date.now();
   updateMonitor.streamUrl = String(payload?.stream_url || "").trim();
   updateMonitor.statusUrl = String(payload?.status_url || "").trim();
   updateMonitor.token = String(payload?.update_token || payload?.token || "").trim();
+  if (!updateMonitor.returnTab) {
+    updateMonitor.returnTab = normalizeTabName(activeTabName || "overview");
+    updateMonitor.returnScrollTop = Math.max(0, Number(currentPageScrollTop() || 0));
+  }
+  rememberPendingUpdateReturn(updateMonitor.returnTab, updateMonitor.returnScrollTop);
+  rememberPendingUpdateToken(updateMonitor.token);
   updateMonitor.reloadScheduled = false;
   if (updateMonitor.statusTimer) clearInterval(updateMonitor.statusTimer);
   updateMonitor.statusTimer = setInterval(() => {
@@ -1377,6 +1595,26 @@ function beginUpdateMonitor(payload, scope) {
     scope === "club3090"
       ? "Club-3090 migration is running through the separate updater service. The orange log stream will stay live while the control plane restarts."
       : "Admin script update is running through the separate updater service. The orange log stream will stay live while the control plane restarts.",
+  );
+  scheduleRenderedUpdateAcknowledgement(updateMonitor.token);
+}
+function beginPendingUpdateUi(scope) {
+  updateMonitor.returnTab = normalizeTabName(activeTabName || "overview");
+  updateMonitor.returnScrollTop = Math.max(0, Number(currentPageScrollTop() || 0));
+  updateMonitor.returnLogSource = updateFallbackLogSource(currentLogSource);
+  rememberPendingUpdateReturn(updateMonitor.returnTab, updateMonitor.returnScrollTop);
+  updateMonitor.completed = false;
+  updateMonitor.startedAt = Date.now();
+  updateMonitor.reloadScheduled = false;
+  currentLogSource = "update";
+  setUpdateUiLocked(true);
+  activateTab("logs", true);
+  connectLogs(true);
+  updateLogVisualMode();
+  setAuditMsg(
+    scope === "club3090"
+      ? "Starting Club-3090 migration. The orange update log will remain selected while the control plane restarts."
+      : "Starting admin script update. The orange update log will remain selected while the control plane restarts.",
   );
 }
 function mirrorAuthToggles(v) {

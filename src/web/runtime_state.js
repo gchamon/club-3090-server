@@ -17,6 +17,97 @@ function writeCachedUiState(data) {
     localStorage.setItem(UI_STATE_KEY, JSON.stringify(data || {}));
   } catch (e) {}
 }
+function readUiStateFromLocationHash() {
+  try {
+    const raw = String(window.location.hash || "").replace(/^#/, "");
+    if (!raw) return {};
+    const params = new URLSearchParams(raw);
+    const tab = params.has("tab") ? normalizeTabName(params.get("tab") || "") : "";
+    const scroll = Number(params.get("scroll") || "");
+    const state = {};
+    if (tab) state.active_tab = tab;
+    if (tab && Number.isFinite(scroll) && scroll > 0) {
+      state.tab_scroll_positions = { [tab]: Math.max(0, scroll) };
+    }
+    return state;
+  } catch (e) {
+    return {};
+  }
+}
+function readUiStateFromLocationSearch() {
+  try {
+    const params = new URLSearchParams(window.location.search || "");
+    const tab = params.has("ui_tab") ? normalizeTabName(params.get("ui_tab") || "") : "";
+    const scroll = Number(params.get("ui_scroll") || "");
+    const state = {};
+    if (tab) state.active_tab = tab;
+    if (tab && Number.isFinite(scroll) && scroll > 0) {
+      state.tab_scroll_positions = { [tab]: Math.max(0, scroll) };
+    }
+    return state;
+  } catch (e) {
+    return {};
+  }
+}
+function readUiStateFromLocationNow() {
+  const locationLike =
+    (typeof window !== "undefined" && window.location) ||
+    (typeof location !== "undefined" ? location : null) ||
+    {};
+  const restoreParams = new URLSearchParams(locationLike.search || "");
+  const rawRestoreTab = String(restoreParams.get("restore_tab") || "").trim();
+  const restoreTab = rawRestoreTab ? normalizeTabName(rawRestoreTab) : "";
+  const restoreScroll = Number(
+    restoreParams.get("restore_scroll") || "",
+  );
+  const hashState = readUiStateFromLocationHash();
+  const searchState = readUiStateFromLocationSearch();
+  const state = { ...searchState, ...hashState };
+  if (restoreTab) {
+    state.active_tab = restoreTab;
+    if (Number.isFinite(restoreScroll) && restoreScroll > 0) {
+      state.tab_scroll_positions = {
+        ...(state.tab_scroll_positions || {}),
+        [restoreTab]: Math.max(0, restoreScroll),
+      };
+    }
+  }
+  return state;
+}
+function applyLocationUiStateOverride() {
+  const state = readUiStateFromLocationNow();
+  const rawTab = String(state.active_tab || "").trim();
+  const tab = rawTab ? normalizeTabName(rawTab) : "";
+  if (tab && tab !== activeTabName) activeTabName = tab;
+  if (state.tab_scroll_positions && typeof state.tab_scroll_positions === "object") {
+    Object.entries(state.tab_scroll_positions).forEach(([name, value]) => {
+      const key = normalizeTabName(name);
+      if (key) tabScrollPositions[key] = Math.max(0, Number(value || 0));
+    });
+  }
+}
+function writeUiStateToLocationHash(data = {}) {
+  try {
+    const tab = normalizeTabName(data.active_tab || activeTabName || "overview");
+    const scroll = Math.max(0, Number((data.tab_scroll_positions || {})[tab] || 0));
+    const params = new URLSearchParams();
+    params.set("tab", tab);
+    if (scroll > 0) params.set("scroll", String(Math.round(scroll)));
+    const nextHash = `#${params.toString()}`;
+    const nextUrl = `${window.location.pathname || ""}${window.location.search || ""}${nextHash}`;
+    if (window.location.hash !== nextHash) window.history.replaceState(null, "", nextUrl);
+  } catch (e) {}
+}
+function writeUiStateToLocationSearch(data = {}) {
+  try {
+    const nextUrl = new URL(window.location.href);
+    nextUrl.searchParams.delete("ui_tab");
+    nextUrl.searchParams.delete("ui_scroll");
+    const nextPath = `${nextUrl.pathname}${nextUrl.search}${nextUrl.hash}`;
+    const currentPath = `${window.location.pathname || ""}${window.location.search || ""}${window.location.hash || ""}`;
+    if (nextPath !== currentPath) window.history.replaceState(null, "", nextPath);
+  } catch (e) {}
+}
 function readJsonCache(key, fallback) {
   try {
     const parsed = JSON.parse(localStorage.getItem(key) || "null");
@@ -80,6 +171,89 @@ function ensureChatSeedConversation() {
   chatState.activeConversationId = firstConversation.id;
   syncChatStateFromActiveConversation();
 }
+function applyChatStatePayload(cached) {
+  if (!cached || typeof cached !== "object") return false;
+  if (Array.isArray(cached.conversations)) {
+    const conversations = cached.conversations
+      .map((conversation) => createChatConversation(conversation))
+      .filter(Boolean);
+    const archivedConversations = Array.isArray(cached.archivedConversations)
+      ? cached.archivedConversations
+          .map((conversation) => createChatConversation(conversation))
+          .filter(Boolean)
+      : [];
+    if (conversations.length) {
+      chatState = {
+        ...chatState,
+        revision: Math.max(0, Number(cached.revision || 0) || 0),
+        activeConversationId: String(
+          cached.activeConversationId || conversations[0].id,
+        ),
+        conversations,
+        archivedConversations,
+        promptTemplates: Array.isArray(cached.promptTemplates)
+          ? cached.promptTemplates
+              .map((template) => ({
+                id: String(template?.id || chatConversationId()),
+                name: String(template?.name || "").trim(),
+                text: String(template?.text || ""),
+              }))
+              .filter((template) => template.name || template.text)
+          : [],
+      };
+    } else if (archivedConversations.length) {
+      chatState = {
+        ...chatState,
+        revision: Math.max(0, Number(cached.revision || 0) || 0),
+        archivedConversations,
+        promptTemplates: Array.isArray(cached.promptTemplates)
+          ? cached.promptTemplates
+              .map((template) => ({
+                id: String(template?.id || chatConversationId()),
+                name: String(template?.name || "").trim(),
+                text: String(template?.text || ""),
+              }))
+              .filter((template) => template.name || template.text)
+          : [],
+      };
+    }
+  } else {
+    const imported = createChatConversation({
+      title: CHAT_UNTITLED_TITLE,
+      presetId: String(cached.presetId || ""),
+      apiPresetName: String(cached.apiPresetName || ""),
+      params: cached.params && typeof cached.params === "object" ? cached.params : {},
+      systemPrompt: String(cached.systemPrompt || ""),
+      smartTitleEnabled: cached.smartTitleEnabled !== false,
+      messages: Array.isArray(cached.messages) ? cached.messages : [],
+      attachments: Array.isArray(cached.attachments) ? cached.attachments : [],
+      autoCompactEnabled: cached.autoCompactEnabled !== false,
+      autoCompactThresholdPct: cached.autoCompactThresholdPct,
+    });
+    chatState = {
+      ...chatState,
+      revision: Math.max(0, Number(cached.revision || 0) || 0),
+      activeConversationId: imported.id,
+      conversations: [imported],
+    };
+  }
+  ensureChatSeedConversation();
+  syncChatStateFromActiveConversation();
+  return true;
+}
+function hydrateChatStateFromLocalCache() {
+  if (chatStateHydrated || chatStateHydratingPromise) return false;
+  const cached = readJsonCache(CHAT_STATE_KEY, null);
+  if (!cached) return false;
+  const applied = applyChatStatePayload(cached);
+  if (applied) {
+    logDebugEvent("chat_local_cache_ready", {
+      activeConversationId: String(chatState.activeConversationId || ""),
+      conversationCount: chatConversations().length,
+    });
+  }
+  return applied;
+}
 async function hydrateChatState() {
   if (chatStateHydrated) return chatState;
   if (chatStateHydratingPromise) return chatStateHydratingPromise;
@@ -89,6 +263,7 @@ async function hydrateChatState() {
       localConversationCount: chatConversations().length,
     });
     let cached = null;
+    hydrateChatStateFromLocalCache();
     try {
       const response = await fetchJsonWithTimeout(
         `/admin/chat-state?titles=1&_=${Date.now()}`,
@@ -99,71 +274,13 @@ async function hydrateChatState() {
       if (response.ok && payload?.ok && payload?.state) cached = payload.state;
     } catch (e) {}
     if (cached && Array.isArray(cached.conversations)) {
-      const conversations = cached.conversations
-        .map((conversation) => createChatConversation(conversation))
-        .filter(Boolean);
-      const archivedConversations = Array.isArray(cached.archivedConversations)
-        ? cached.archivedConversations
-            .map((conversation) => createChatConversation(conversation))
-            .filter(Boolean)
-        : [];
-      if (conversations.length) {
-        chatState = {
-          ...chatState,
-          revision: Math.max(0, Number(cached.revision || 0) || 0),
-          activeConversationId: String(
-            cached.activeConversationId || conversations[0].id,
-          ),
-          conversations,
-          archivedConversations,
-          promptTemplates: Array.isArray(cached.promptTemplates)
-            ? cached.promptTemplates
-                .map((template) => ({
-                  id: String(template?.id || chatConversationId()),
-                  name: String(template?.name || "").trim(),
-                  text: String(template?.text || ""),
-                }))
-                .filter((template) => template.name || template.text)
-            : [],
-        };
-      } else if (archivedConversations.length) {
-        chatState = {
-          ...chatState,
-          revision: Math.max(0, Number(cached.revision || 0) || 0),
-          archivedConversations,
-          promptTemplates: Array.isArray(cached.promptTemplates)
-            ? cached.promptTemplates
-                .map((template) => ({
-                  id: String(template?.id || chatConversationId()),
-                  name: String(template?.name || "").trim(),
-                  text: String(template?.text || ""),
-                }))
-                .filter((template) => template.name || template.text)
-            : [],
-        };
-      }
+      applyChatStatePayload(cached);
     } else if (cached) {
-      const imported = createChatConversation({
-        title: CHAT_UNTITLED_TITLE,
-        presetId: String(cached.presetId || ""),
-        apiPresetName: String(cached.apiPresetName || ""),
-        params: cached.params && typeof cached.params === "object" ? cached.params : {},
-        systemPrompt: String(cached.systemPrompt || ""),
-        smartTitleEnabled: cached.smartTitleEnabled !== false,
-        messages: Array.isArray(cached.messages) ? cached.messages : [],
-        attachments: Array.isArray(cached.attachments) ? cached.attachments : [],
-        autoCompactEnabled: cached.autoCompactEnabled !== false,
-        autoCompactThresholdPct: cached.autoCompactThresholdPct,
-      });
-      chatState = {
-        ...chatState,
-        revision: Math.max(0, Number(cached.revision || 0) || 0),
-        activeConversationId: imported.id,
-        conversations: [imported],
-      };
+      applyChatStatePayload(cached);
     }
     ensureChatSeedConversation();
     syncChatStateFromActiveConversation();
+    syncLocalChatStateCache();
     noteConfirmedServerChatState(currentChatStatePayload());
     chatStateHydrated = true;
     logDebugEvent("chat_hydrate_ready", {
@@ -462,6 +579,8 @@ function normalizeTabName(name) {
 function currentUiState() {
   return {
     active_tab: normalizeTabName(activeTabName),
+    active_metric_pane: typeof activeMetricPaneId === "function" ? activeMetricPaneId(document) : "mMain",
+    tab_scroll_positions: { ...tabScrollPositions, [normalizeTabName(activeTabName)]: currentPageScrollTop() },
     selected_scope: selectedScope || "GLOBAL",
     current_log_source:
       currentLogSource === "audit" ||
@@ -470,6 +589,7 @@ function currentUiState() {
       String(currentLogSource || "").startsWith("service:")
         ? currentLogSource
         : "docker",
+    selected_log_instance_id: String(selectedLogInstanceId || ""),
     show_global_logs: !!showGlobalLogs,
     show_global_logs_by_source: { ...showGlobalLogSources },
   };
@@ -503,19 +623,33 @@ function activeTabButton(name) {
 }
 function syncHeaderChatButtonAlignment() {
   const button = $("chatLaunchBtn");
-  const row = button && typeof button.closest === "function" ? button.closest(".header-row") : null;
-  const logsButton = activeTabButton("logs");
-  if (!button || !row || !logsButton) return;
-  const rowRect = row.getBoundingClientRect();
-  const logsRect = logsButton.getBoundingClientRect();
-  const marginRight = Math.max(0, Math.round(rowRect.right - logsRect.right));
-  button.style.marginRight = `${marginRight}px`;
+  if (!button) return;
+  button.style.marginRight = "0";
 }
 function hydrateUiState(cfg) {
   if (uiStateHydrated) return;
   const cached = readCachedUiState(),
-    state = { ...cached, ...(cfg || {}) };
+    hashState = readUiStateFromLocationHash(),
+    searchState = readUiStateFromLocationSearch(),
+    restoreTab = normalizeTabName(urlParams.get("restore_tab") || ""),
+    restoreScroll = Number(urlParams.get("restore_scroll") || ""),
+    state = { ...(cfg || {}), ...searchState, ...cached, ...hashState };
+  if (state.tab_scroll_positions && typeof state.tab_scroll_positions === "object") {
+    Object.entries(state.tab_scroll_positions).forEach(([name, value]) => {
+      const key = normalizeTabName(name);
+      tabScrollPositions[key] = Math.max(0, Number(value || 0));
+    });
+  }
   activeTabName = normalizeTabName(state.active_tab || activeTabName);
+  if (typeof setActiveMetricPaneInDocument === "function") {
+    setActiveMetricPaneInDocument(document, state.active_metric_pane || "mMain");
+  }
+  if (restoreTab) {
+    activeTabName = restoreTab;
+    if (Number.isFinite(restoreScroll) && restoreScroll > 0) {
+      tabScrollPositions[restoreTab] = Math.max(0, restoreScroll);
+    }
+  }
   currentLogSource =
     state.current_log_source === "audit" ||
     state.current_log_source === "debug" ||
@@ -523,6 +657,7 @@ function hydrateUiState(cfg) {
     String(state.current_log_source || "").startsWith("service:")
       ? String(state.current_log_source)
       : "docker";
+  selectedLogInstanceId = String(state.selected_log_instance_id || selectedLogInstanceId || "");
   showGlobalLogs =
     typeof state.show_global_logs === "boolean"
       ? state.show_global_logs
@@ -544,6 +679,17 @@ function hydrateUiState(cfg) {
   if (selectedScope !== "GLOBAL") selectedInstance = selectedScope;
   lastQueuedUiStateJson = JSON.stringify(currentUiState());
   uiStateHydrated = true;
+  if (typeof history?.replaceState === "function") {
+    try {
+      const nextUrl = new URL(window.location.href);
+      nextUrl.searchParams.delete("restore_tab");
+      nextUrl.searchParams.delete("restore_scroll");
+      nextUrl.searchParams.delete("ui_tab");
+      nextUrl.searchParams.delete("ui_scroll");
+      nextUrl.searchParams.delete("_");
+      history.replaceState({}, document.title, `${nextUrl.pathname}${nextUrl.search}${nextUrl.hash}`);
+    } catch (e) {}
+  }
 }
 function ensureChatHydrationForActiveTab() {
   if (activeTabName !== "chat" || chatStateHydrated || chatStateHydratingPromise) return;
@@ -563,9 +709,11 @@ let powerCoolingBusyState = { active: false, message: "" };
 function syncPowerCoolingBusyState() {
   const panel = findPanelByHeading("system", "Optimizations + Cooling");
   if (!panel) return;
-  panel.classList.toggle("instance-panel-busy", !!powerCoolingBusyState.active);
+  const benchmarkLocked = typeof benchmarkJobActive === "function" && benchmarkJobActive();
+  const locked = !!powerCoolingBusyState.active || benchmarkLocked;
+  panel.classList.toggle("instance-panel-busy", locked);
   [...panel.querySelectorAll("button,input,select,textarea")].forEach((el) => {
-    if (powerCoolingBusyState.active) el.setAttribute("disabled", "disabled");
+    if (locked) el.setAttribute("disabled", "disabled");
     else el.removeAttribute("disabled");
   });
 }

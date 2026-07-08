@@ -41,6 +41,8 @@ printf 'Club-3090 Server Installer %s\n' "${SCRIPT_VERSION}"
 #   bash install-club3090-server.sh --hf-token hf_xxx
 # Enable loopback-only local automation API:
 #   bash install-club3090-server.sh --local-automation
+# Disable proxy-side automatic preset swapping:
+#   bash install-club3090-server.sh --disable-swap
 # Skip optional GDDR6/GDDR6X junction + VRAM temperature helper setup:
 #   bash install-club3090-server.sh --skip-temps
 # Overrides:
@@ -53,8 +55,10 @@ CONTROL_DIR="/opt/club3090-control"
 NETWORK_STATE_FILE="${CONTROL_DIR}/network_state.json"
 TLS_CERT_FILE="${CONTROL_DIR}/tls.crt"
 TLS_KEY_FILE="${CONTROL_DIR}/tls.key"
-TAILSCALE_CERT_FILE="${CONTROL_DIR}/tailscale.crt"
-TAILSCALE_KEY_FILE="${CONTROL_DIR}/tailscale.key"
+PUBLIC_IP_CERT_FILE="${CONTROL_DIR}/public-ip.crt"
+PUBLIC_IP_KEY_FILE="${CONTROL_DIR}/public-ip.key"
+ACME_WEBROOT="${CONTROL_DIR}/acme"
+CERT_REFRESH_SH="${CONTROL_DIR}/refresh-ip-certificate.sh"
 HTTPS_HOST_FILE="${CONTROL_DIR}/https_host"
 CADDYFILE_PATH="${CONTROL_DIR}/Caddyfile"
 MIGRATION_STATE_FILE="${CONTROL_DIR}/migration-state.env"
@@ -66,6 +70,7 @@ ONLINE_TLS_CERT_IP_MODE="disable"
 ONLINE_TLS_TAILSCALE_MODE="disable"
 ONLINE_TLS_TAILSCALE_FUNNEL_MODE="disable"
 LOCAL_AUTOMATION_MODE="disable"
+PROXY_SWAP_MODE="preserve"
 GPU_EXTRA_TEMPS_MODE="enable"
 PORTS_SPEC=""
 HF_TOKEN_INPUT=""
@@ -117,6 +122,10 @@ while [[ "$#" -gt 0 ]]; do
       ;;
     --local-automation)
       LOCAL_AUTOMATION_MODE="enable"
+      shift
+      ;;
+    --disable-swap)
+      PROXY_SWAP_MODE="disable"
       shift
       ;;
     --skip-temps)
@@ -237,6 +246,44 @@ PYENVREAD
   fi
 }
 
+discover_saved_hf_token() {
+  local candidate=""
+  local value=""
+  local candidates=()
+  if [[ -n "${HF_HOME:-}" ]]; then
+    candidates+=("${HF_HOME}/token")
+  fi
+  if [[ -n "${HOME:-}" ]]; then
+    candidates+=("${HOME}/.cache/huggingface/token" "${HOME}/.huggingface/token")
+  fi
+  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    candidates+=("/home/${SUDO_USER}/.cache/huggingface/token" "/home/${SUDO_USER}/.huggingface/token")
+  fi
+  candidates+=("/root/.cache/huggingface/token" "/root/.huggingface/token")
+  for candidate in /home/*/.cache/huggingface/token /home/*/.huggingface/token; do
+    candidates+=("${candidate}")
+  done
+  for candidate in "${candidates[@]}"; do
+    if [[ ! -r "${candidate}" ]]; then
+      continue
+    fi
+    value="$(tr -d '\r\n' < "${candidate}" 2>/dev/null || true)"
+    if [[ "${value}" == hf_* ]]; then
+      printf '%s\n' "${value}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+EXISTING_CONTROL_ADMIN_BIND_PORT=""
+EXISTING_CONTROL_PROXY_BIND_PORT=""
+if [[ "${ACTION}" == "update" || "${ACTION}" == "migrate" ]]; then
+  existing_control_unit="/etc/systemd/system/club3090-control.service"
+  EXISTING_CONTROL_ADMIN_BIND_PORT="$(read_existing_service_env "CLUB3090_ADMIN_BIND_PORT" "${existing_control_unit}" || true)"
+  EXISTING_CONTROL_PROXY_BIND_PORT="$(read_existing_service_env "CLUB3090_PROXY_BIND_PORT" "${existing_control_unit}" || true)"
+fi
+
 if [[ ( "${ACTION}" == "update" || "${ACTION}" == "migrate" ) && -z "${PORTS_SPEC}" ]]; then
   existing_admin_port="$(read_existing_service_port CLUB3090_ADMIN_PORT || true)"
   existing_proxy_port="$(read_existing_service_port CLUB3090_PROXY_PORT || true)"
@@ -287,7 +334,8 @@ fi
 
 choose_loopback_port() {
   local preferred="$1"
-  shift
+  local reusable="$2"
+  shift 2
   local candidate
   local used_ports="$*"
   for candidate in "${preferred}" $((preferred + 1000)) $((preferred + 2000)) $((preferred + 10000)); do
@@ -297,7 +345,9 @@ choose_loopback_port() {
         *)
           if command -v ss >/dev/null 2>&1; then
             if ss -ltnH "( sport = :${candidate} )" 2>/dev/null | grep -q .; then
-              continue
+              if [[ ! "${reusable}" =~ ^[0-9]+$ || "${candidate}" != "${reusable}" ]]; then
+                continue
+              fi
             fi
           fi
           printf '%s\n' "${candidate}"
@@ -333,6 +383,12 @@ HF_TOKEN_VALUE="${HF_TOKEN_INPUT:-${HF_TOKEN:-}}"
 
 if [[ -z "${HF_TOKEN_VALUE}" ]]; then
   existing_saved_hf_token="$(read_repo_env_value "${REPO_ENV_FILE}" "HF_TOKEN" || true)"
+  if [[ -n "${existing_saved_hf_token:-}" ]]; then
+    HF_TOKEN_VALUE="${existing_saved_hf_token}"
+  fi
+fi
+if [[ -z "${HF_TOKEN_VALUE}" ]]; then
+  existing_saved_hf_token="$(discover_saved_hf_token || true)"
   if [[ -n "${existing_saved_hf_token:-}" ]]; then
     HF_TOKEN_VALUE="${existing_saved_hf_token}"
   fi
@@ -398,8 +454,8 @@ CONTROL_UPDATER_BIND_PORT="${CLUB3090_UPDATER_BIND_PORT:-18010}"
 if [[ "${ONLINE_TLS_EFFECTIVE_ENABLED}" == "true" ]]; then
   CONTROL_ADMIN_BIND_HOST="127.0.0.1"
   CONTROL_PROXY_BIND_HOST="127.0.0.1"
-  CONTROL_ADMIN_BIND_PORT="$(choose_loopback_port 18008 "${ADMIN_PORT}" "${PROXY_PORT}" "${LOCAL_API_PORT}")"
-  CONTROL_PROXY_BIND_PORT="$(choose_loopback_port 18009 "${ADMIN_PORT}" "${PROXY_PORT}" "${LOCAL_API_PORT}" "${CONTROL_ADMIN_BIND_PORT}")"
+  CONTROL_ADMIN_BIND_PORT="$(choose_loopback_port 18008 "${EXISTING_CONTROL_ADMIN_BIND_PORT}" "${ADMIN_PORT}" "${PROXY_PORT}" "${LOCAL_API_PORT}")"
+  CONTROL_PROXY_BIND_PORT="$(choose_loopback_port 18009 "${EXISTING_CONTROL_PROXY_BIND_PORT}" "${ADMIN_PORT}" "${PROXY_PORT}" "${LOCAL_API_PORT}" "${CONTROL_ADMIN_BIND_PORT}")"
   if [[ -z "${CONTROL_ADMIN_BIND_PORT:-}" || -z "${CONTROL_PROXY_BIND_PORT:-}" || -z "${CONTROL_UPDATER_BIND_PORT:-}" ]]; then
     echo "ERROR: Could not allocate internal loopback ports for Caddy-backed HTTPS mode." >&2
     exit 1
@@ -500,6 +556,174 @@ log_done() {
 status_line() {
   printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"
 }
+
+EXTERNAL_SELF_UPDATE_MONITOR_ACTIVE=0
+EXTERNAL_SELF_UPDATE_SCOPE=""
+EXTERNAL_SELF_UPDATE_LABEL=""
+EXTERNAL_SELF_UPDATE_TOKEN=""
+EXTERNAL_SELF_UPDATE_STARTED_AT=0
+
+external_self_update_write_state() {
+  local active="$1"
+  local status="$2"
+  local summary="$3"
+  local return_code="${4:-}"
+  if [[ -z "${PYTHON_BIN:-}" || ! -x "${PYTHON_BIN}" ]]; then
+    return 0
+  fi
+  "${SUDO[@]}" mkdir -p "${CONTROL_DIR}" >/dev/null 2>&1 || true
+  "${SUDO[@]}" env \
+    CLUB3090_SELF_UPDATE_STATE_FILE="${SELF_UPDATE_STATE_FILE}" \
+    CLUB3090_SELF_UPDATE_LOG_FILE="${SELF_UPDATE_LOG_FILE}" \
+    CLUB3090_SELF_UPDATE_ACTIVE="${active}" \
+    CLUB3090_SELF_UPDATE_STATUS="${status}" \
+    CLUB3090_SELF_UPDATE_SCOPE="${EXTERNAL_SELF_UPDATE_SCOPE}" \
+    CLUB3090_SELF_UPDATE_LABEL="${EXTERNAL_SELF_UPDATE_LABEL}" \
+    CLUB3090_SELF_UPDATE_SUMMARY="${summary}" \
+    CLUB3090_SELF_UPDATE_TOKEN="${EXTERNAL_SELF_UPDATE_TOKEN}" \
+    CLUB3090_SELF_UPDATE_STARTED_AT="${EXTERNAL_SELF_UPDATE_STARTED_AT}" \
+    CLUB3090_SELF_UPDATE_FINISHED_AT="$(date +%s)" \
+    CLUB3090_SELF_UPDATE_RETURN_CODE="${return_code}" \
+    CLUB3090_SELF_UPDATE_SCRIPT_VERSION="${SCRIPT_VERSION}" \
+    CLUB3090_SELF_UPDATE_TARGET_COMMIT="${REQUESTED_CLUB3090_COMMIT}" \
+    CLUB3090_SELF_UPDATE_COMMAND="$0 --${ACTION}" \
+    "${PYTHON_BIN}" - <<'PYSELFUPDATE'
+import json
+import os
+import tempfile
+import time
+
+state_path = os.environ["CLUB3090_SELF_UPDATE_STATE_FILE"]
+log_file = os.environ.get("CLUB3090_SELF_UPDATE_LOG_FILE", "")
+active = os.environ.get("CLUB3090_SELF_UPDATE_ACTIVE", "false").lower() == "true"
+started_at = int(float(os.environ.get("CLUB3090_SELF_UPDATE_STARTED_AT") or time.time()))
+finished_at = 0 if active else int(float(os.environ.get("CLUB3090_SELF_UPDATE_FINISHED_AT") or time.time()))
+return_code_raw = os.environ.get("CLUB3090_SELF_UPDATE_RETURN_CODE", "")
+try:
+    return_code = None if return_code_raw == "" else int(return_code_raw)
+except Exception:
+    return_code = None
+
+payload = {
+    "active": active,
+    "status": os.environ.get("CLUB3090_SELF_UPDATE_STATUS") or ("running" if active else "idle"),
+    "scope": os.environ.get("CLUB3090_SELF_UPDATE_SCOPE") or "",
+    "label": os.environ.get("CLUB3090_SELF_UPDATE_LABEL") or "",
+    "command": os.environ.get("CLUB3090_SELF_UPDATE_COMMAND") or "",
+    "started_at": started_at,
+    "finished_at": finished_at,
+    "return_code": return_code,
+    "summary": os.environ.get("CLUB3090_SELF_UPDATE_SUMMARY") or "",
+    "token": os.environ.get("CLUB3090_SELF_UPDATE_TOKEN") or "",
+    "log_file": log_file,
+    "script_version": os.environ.get("CLUB3090_SELF_UPDATE_SCRIPT_VERSION") or "",
+    "target_commit": os.environ.get("CLUB3090_SELF_UPDATE_TARGET_COMMIT") or "",
+    "ui_ack_token": "",
+    "ui_ack_at": 0,
+}
+
+os.makedirs(os.path.dirname(state_path), exist_ok=True)
+fd, tmp_path = tempfile.mkstemp(prefix=".self-update-state.", suffix=".json", dir=os.path.dirname(state_path))
+with os.fdopen(fd, "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, ensure_ascii=False, indent=2)
+    handle.write("\n")
+os.replace(tmp_path, state_path)
+PYSELFUPDATE
+}
+
+wait_for_external_self_update_ack() {
+  if [[ -z "${PYTHON_BIN:-}" || ! -x "${PYTHON_BIN}" || -z "${EXTERNAL_SELF_UPDATE_TOKEN:-}" ]]; then
+    return 1
+  fi
+  "${PYTHON_BIN}" - <<'PYSELFUPDATEACK'
+import json
+import os
+import time
+import urllib.error
+import urllib.request
+
+token = os.environ.get("EXTERNAL_SELF_UPDATE_TOKEN", "").strip()
+url = f"http://127.0.0.1:{os.environ.get('CONTROL_BIND_PORT', '18008')}/admin/update-status?token={token}"
+deadline = time.monotonic() + 5.0
+while time.monotonic() < deadline:
+    try:
+        with urllib.request.urlopen(url, timeout=0.8) as response:
+            payload = json.loads(response.read().decode("utf-8", "replace") or "{}")
+        state = payload.get("self_update") or {}
+        ack_token = str(state.get("ui_ack_token") or "").strip()
+        ack_at = int(state.get("ui_ack_at") or 0)
+        started_at = int(state.get("started_at") or 0)
+        if (
+            state.get("active") is True
+            and str(state.get("token") or "").strip() == token
+            and ack_token == token
+            and ack_at >= started_at > 0
+        ):
+            raise SystemExit(0)
+    except urllib.error.HTTPError:
+        pass
+    except Exception:
+        pass
+    time.sleep(0.25)
+raise SystemExit(1)
+PYSELFUPDATEACK
+}
+
+begin_external_self_update_monitor() {
+  if [[ "${ACTION}" != "update" && "${ACTION}" != "migrate" ]]; then
+    return 0
+  fi
+  if [[ "${CLUB3090_RUNNING_FROM_UPDATER:-0}" == "1" || "${EXTERNAL_SELF_UPDATE_MONITOR_ACTIVE}" == "1" ]]; then
+    return 0
+  fi
+  if [[ -z "${PYTHON_BIN:-}" || ! -x "${PYTHON_BIN}" ]]; then
+    return 0
+  fi
+  if [[ "${ACTION}" == "migrate" ]]; then
+    EXTERNAL_SELF_UPDATE_SCOPE="club3090"
+    EXTERNAL_SELF_UPDATE_LABEL="Manual Club-3090 migration"
+  else
+    EXTERNAL_SELF_UPDATE_SCOPE="controller"
+    EXTERNAL_SELF_UPDATE_LABEL="Manual web panel update"
+  fi
+  EXTERNAL_SELF_UPDATE_TOKEN="$("${PYTHON_BIN}" - <<'PYTOKEN'
+import secrets
+print(secrets.token_urlsafe(24))
+PYTOKEN
+)"
+  EXTERNAL_SELF_UPDATE_STARTED_AT="$(date +%s)"
+  "${SUDO[@]}" mkdir -p "${CONTROL_DIR}" >/dev/null 2>&1 || true
+  "${SUDO[@]}" rm -f "${SELF_UPDATE_LOG_FILE}" >/dev/null 2>&1 || true
+  external_self_update_write_state "true" "running" "${EXTERNAL_SELF_UPDATE_LABEL} running" ""
+  EXTERNAL_SELF_UPDATE_MONITOR_ACTIVE=1
+  exec > >("${SUDO[@]}" tee -a "${SELF_UPDATE_LOG_FILE}") 2>&1
+  status_line "[self-update external] ${EXTERNAL_SELF_UPDATE_LABEL} is streaming to ${SELF_UPDATE_LOG_FILE}"
+  status_line "[self-update external] waiting up to 5s for an open web panel to render and acknowledge update mode"
+  if EXTERNAL_SELF_UPDATE_TOKEN="${EXTERNAL_SELF_UPDATE_TOKEN}" CONTROL_BIND_PORT="${CONTROL_BIND_PORT:-18008}" wait_for_external_self_update_ack; then
+    status_line "[self-update external] web panel rendered and acknowledged update mode"
+  else
+    status_line "[self-update external] update-mode acknowledgement timed out; continuing with update"
+  fi
+}
+
+finalize_external_self_update_monitor() {
+  local rc="${1:-0}"
+  if [[ "${EXTERNAL_SELF_UPDATE_MONITOR_ACTIVE}" != "1" ]]; then
+    return 0
+  fi
+  local status summary
+  if [[ "${rc}" -eq 0 ]]; then
+    status="completed"
+    summary="${EXTERNAL_SELF_UPDATE_LABEL} finished successfully"
+  else
+    status="failed"
+    summary="${EXTERNAL_SELF_UPDATE_LABEL} failed with return code ${rc}"
+  fi
+  external_self_update_write_state "false" "${status}" "${summary}" "${rc}" || true
+  EXTERNAL_SELF_UPDATE_MONITOR_ACTIVE=0
+}
+
+begin_external_self_update_monitor
 
 validate_upstream_checkout_layout() {
   local repo_dir="${1:-${CLUB3090_DIR}}"
@@ -672,6 +896,7 @@ migration_state_defaults() {
   MIGRATION_BOOTSTRAP_INVENTORY_DONE=0
   MIGRATION_SETUP_DONE=0
   MIGRATION_POST_SETUP_INVENTORY_DONE=0
+  MIGRATION_CUSTOM_PRESETS_DONE=0
   MIGRATION_UPDATE_DONE=0
   MIGRATION_FINAL_INVENTORY_DONE=0
   MIGRATION_SERVICES_REFRESHED=0
@@ -709,6 +934,7 @@ MIGRATION_ASSETS_MERGED=$(printf '%q' "${MIGRATION_ASSETS_MERGED}")
 MIGRATION_BOOTSTRAP_INVENTORY_DONE=$(printf '%q' "${MIGRATION_BOOTSTRAP_INVENTORY_DONE}")
 MIGRATION_SETUP_DONE=$(printf '%q' "${MIGRATION_SETUP_DONE}")
 MIGRATION_POST_SETUP_INVENTORY_DONE=$(printf '%q' "${MIGRATION_POST_SETUP_INVENTORY_DONE}")
+MIGRATION_CUSTOM_PRESETS_DONE=$(printf '%q' "${MIGRATION_CUSTOM_PRESETS_DONE}")
 MIGRATION_UPDATE_DONE=$(printf '%q' "${MIGRATION_UPDATE_DONE}")
 MIGRATION_FINAL_INVENTORY_DONE=$(printf '%q' "${MIGRATION_FINAL_INVENTORY_DONE}")
 MIGRATION_SERVICES_REFRESHED=$(printf '%q' "${MIGRATION_SERVICES_REFRESHED}")
@@ -752,6 +978,7 @@ persist_hf_token_if_available() {
   fi
   append_control_log_line "hf token: persisting token to ${REPO_ENV_FILE} for setup and later admin download reuse"
   write_repo_env_value "${REPO_ENV_FILE}" "HF_TOKEN" "${HF_TOKEN_VALUE}"
+  "${SUDO[@]}" chmod 600 "${REPO_ENV_FILE}"
 }
 
 detect_upstream_remote_head() {
@@ -789,6 +1016,7 @@ migration_pending_summary() {
   [[ "${MIGRATION_BOOTSTRAP_INVENTORY_DONE}" == "1" ]] || pending+=("inventory-bootstrap")
   [[ "${MIGRATION_SETUP_DONE}" == "1" ]] || pending+=("setup")
   [[ "${MIGRATION_POST_SETUP_INVENTORY_DONE}" == "1" ]] || pending+=("inventory-post-setup")
+  [[ "${MIGRATION_CUSTOM_PRESETS_DONE}" == "1" ]] || pending+=("custom-preset-migration")
   [[ "${MIGRATION_UPDATE_DONE}" == "1" ]] || pending+=("update.sh")
   [[ "${MIGRATION_FINAL_INVENTORY_DONE}" == "1" ]] || pending+=("inventory-final")
   if [[ "${#pending[@]}" -eq 0 ]]; then
@@ -828,6 +1056,7 @@ prepare_migration_state() {
       MIGRATION_BOOTSTRAP_INVENTORY_DONE=0
       MIGRATION_SETUP_DONE=0
       MIGRATION_POST_SETUP_INVENTORY_DONE=0
+      MIGRATION_CUSTOM_PRESETS_DONE=0
       MIGRATION_UPDATE_DONE=0
       MIGRATION_FINAL_INVENTORY_DONE=0
       MIGRATION_SERVICES_REFRESHED=0
@@ -877,6 +1106,7 @@ migration_exit_trap() {
       fi
     fi
   fi
+  finalize_external_self_update_monitor "${rc}" || true
 }
 
 trap 'migration_exit_trap' EXIT
@@ -982,23 +1212,108 @@ count_tree_files() {
   find "${path}" -type f 2>/dev/null | wc -l | awk '{print $1}'
 }
 
-merge_dir_contents_logged() {
+move_migrated_tree_with_symlink_logged() {
   local label="$1"
   local src="$2"
   local dst="$3"
+  local file_count src_real dst_real
   if [[ ! -d "${src}" ]]; then
     append_control_log_line "${label}: source missing, skipping (${src})"
     return 0
   fi
-  local file_count
+  if [[ -L "${src}" ]]; then
+    append_control_log_line "${label}: source is already a symlink, skipping (${src})"
+    return 0
+  fi
+  src_real="$(readlink -f "${src}" 2>/dev/null || true)"
+  dst_real="$(readlink -f "${dst}" 2>/dev/null || true)"
+  if [[ -n "${src_real}" && -n "${dst_real}" && "${src_real}" == "${dst_real}" ]]; then
+    append_control_log_line "${label}: source and target already resolve together (${src})"
+    return 0
+  fi
   file_count="$(count_tree_files "${src}")"
-  migration_update_state "merge_${label}"
-  append_control_log_line "${label}: merging ${file_count} files from ${src} into ${dst}"
-  run_live_command "${label}" "/" "mkdir -p $(shell_quote "${dst}") && cp -a $(shell_quote "${src}")/. $(shell_quote "${dst}")/"
+  migration_update_state "move_${label}"
+  append_control_log_line "${label}: moving/merging ${file_count} files from ${src} into ${dst}, then linking the backup path back to the canonical tree"
+  "${SUDO[@]}" "${PYTHON_BIN}" - "${src}" "${dst}" <<'PYMOVEMIGRATEDTREE'
+import errno
+import os
+import shutil
+import sys
+
+src, dst = sys.argv[1:3]
+
+
+def remove_path(path):
+    if os.path.islink(path) or os.path.isfile(path):
+        os.unlink(path)
+    elif os.path.isdir(path):
+        shutil.rmtree(path)
+
+
+def copy_then_remove(source, target):
+    os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+    if os.path.islink(source):
+        os.symlink(os.readlink(source), target)
+        os.unlink(source)
+    elif os.path.isdir(source):
+        shutil.copytree(source, target, symlinks=True, dirs_exist_ok=True)
+        shutil.rmtree(source)
+    else:
+        shutil.copy2(source, target)
+        os.unlink(source)
+
+
+def move_path(source, target):
+    os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+    try:
+        os.rename(source, target)
+        return
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+    copy_then_remove(source, target)
+
+
+def merge_tree(source, target):
+    os.makedirs(target, exist_ok=True)
+    for name in os.listdir(source):
+        left = os.path.join(source, name)
+        right = os.path.join(target, name)
+        if (
+            os.path.isdir(left)
+            and not os.path.islink(left)
+            and os.path.isdir(right)
+            and not os.path.islink(right)
+        ):
+            merge_tree(left, right)
+            continue
+        if os.path.lexists(right):
+            remove_path(right)
+        move_path(left, right)
+    try:
+        os.rmdir(source)
+    except OSError:
+        shutil.rmtree(source)
+
+
+if not os.path.isdir(src) or os.path.islink(src):
+    raise SystemExit(0)
+if os.path.lexists(dst):
+    if os.path.isdir(dst) and not os.path.islink(dst):
+        merge_tree(src, dst)
+    else:
+        remove_path(dst)
+        move_path(src, dst)
+else:
+    move_path(src, dst)
+if os.path.lexists(src):
+    remove_path(src)
+os.symlink(dst, src)
+PYMOVEMIGRATEDTREE
 }
 
 quarantine_non_git_genesis_dirs() {
-  local quarantine_root="${MIGRATION_BACKUP_DIR:-${CLUB3090_DIR}-migrate-artifacts}/preserved-genesis"
+  local quarantine_root="${CLUB3090_PRESERVED_GENESIS_ROOT:-/opt/ai/preserved-genesis}"
   local genesis_dir
   local rel
   local dest
@@ -1010,19 +1325,9 @@ quarantine_non_git_genesis_dirs() {
     fi
     rel="${genesis_dir#"${CLUB3090_DIR}/"}"
     dest="${quarantine_root}/${rel//\//__}.pre-setup"
-    append_control_log_line "genesis quarantine: moving non-git directory ${genesis_dir} to ${dest}"
+    append_control_log_line "genesis quarantine: moving non-git directory ${genesis_dir} to protected external path ${dest}"
     run_live_command "genesis quarantine" "/" "mkdir -p $(shell_quote "$(dirname "${dest}")") && mv $(shell_quote "${genesis_dir}") $(shell_quote "${dest}")"
   done < <(find "${CLUB3090_DIR}/models" -type d -path '*/vllm/patches/genesis' 2>/dev/null || true)
-}
-
-merge_dir_contents() {
-  local src="$1"
-  local dst="$2"
-  if [[ ! -d "${src}" ]]; then
-    return 0
-  fi
-  "${SUDO[@]}" mkdir -p "${dst}"
-  "${SUDO[@]}" cp -a "${src}/." "${dst}/"
 }
 
 merge_env_files() {
@@ -1076,9 +1381,12 @@ normalize_migrated_model_assets() {
   local source_mmproj=""
   [[ -n "${model_dir_root}" && -d "${model_dir_root}" ]] || return 0
   if [[ -d "${legacy_qwen_root}" ]]; then
-    append_control_log_line "migrate asset normalize: mirroring legacy ${legacy_qwen_root} into ${canonical_qwen_root}"
-    "${SUDO[@]}" mkdir -p "${canonical_qwen_root}"
-    "${SUDO[@]}" cp -a "${legacy_qwen_root}/." "${canonical_qwen_root}/" >/dev/null 2>&1 || true
+    if [[ ! -e "${canonical_qwen_root}" ]]; then
+      append_control_log_line "migrate asset normalize: linking canonical ${canonical_qwen_root} to legacy ${legacy_qwen_root}"
+      "${SUDO[@]}" ln -s "$(basename "${legacy_qwen_root}")" "${canonical_qwen_root}" >/dev/null 2>&1 || true
+    else
+      append_control_log_line "migrate asset normalize: canonical ${canonical_qwen_root} already exists; legacy alias ${legacy_qwen_root} left in place without copying"
+    fi
   fi
   if [[ -d "${canonical_qwen_root}" && ! -f "${root_mmproj}" ]]; then
     while IFS= read -r source_mmproj; do
@@ -1093,6 +1401,51 @@ normalize_migrated_model_assets() {
   fi
 }
 
+migrate_instance_runtime_caches() {
+  local backup_control_dir="$1"
+  local runtime_root="${CLUB3090_DIR}/models-cache/.runtime/instances"
+  local legacy_root="${CONTROL_DIR}/instances"
+  local source_root=""
+  [[ -n "${backup_control_dir}" ]] || return 0
+  "${SUDO[@]}" mkdir -p "${runtime_root}" "${legacy_root}" >/dev/null 2>&1 || true
+  for source_root in "${backup_control_dir}/instances" "${legacy_root}"; do
+    [[ -d "${source_root}" ]] || continue
+    while IFS= read -r cache_dir; do
+      [[ -n "${cache_dir}" && -d "${cache_dir}" ]] || continue
+      local instance_id dest legacy
+      instance_id="$(basename "$(dirname "${cache_dir}")")"
+      [[ -n "${instance_id}" ]] || continue
+      dest="${runtime_root}/${instance_id}"
+      legacy="${legacy_root}/${instance_id}/cache"
+      append_control_log_line "migrate instance cache: ${cache_dir} -> ${dest}"
+      "${SUDO[@]}" mkdir -p "${dest}" "$(dirname "${legacy}")" >/dev/null 2>&1 || true
+      if [[ "$(readlink -f "${cache_dir}" 2>/dev/null || true)" != "$(readlink -f "${dest}" 2>/dev/null || true)" ]]; then
+        move_migrated_tree_with_symlink_logged "migrate instance cache ${instance_id}" "${cache_dir}" "${dest}"
+      fi
+      if [[ "${cache_dir}" == "${legacy}" && ! -L "${legacy}" ]]; then
+        "${SUDO[@]}" rm -rf "${legacy}" >/dev/null 2>&1 || true
+        "${SUDO[@]}" ln -s "${dest}" "${legacy}" >/dev/null 2>&1 || "${SUDO[@]}" mkdir -p "${legacy}" >/dev/null 2>&1 || true
+      fi
+    done < <(find "${source_root}" -mindepth 2 -maxdepth 2 -type d -name cache 2>/dev/null || true)
+  done
+}
+
+deduplicate_known_model_cache_aliases() {
+  local cache_root="${CLUB3090_DIR}/models-cache"
+  local canonical="${cache_root}/gemma-4-26B-A4B-it-assistant"
+  local alias="${cache_root}/gemma-4-26b-a4b-it-assistant"
+  [[ -d "${canonical}" && -d "${alias}" && ! -L "${alias}" ]] || return 0
+  [[ -f "${canonical}/model.safetensors" && -f "${alias}/model.safetensors" ]] || return 0
+  cmp -s "${canonical}/model.safetensors" "${alias}/model.safetensors" || return 0
+  if [[ -f "${canonical}/config.json" || -f "${alias}/config.json" ]]; then
+    [[ -f "${canonical}/config.json" && -f "${alias}/config.json" ]] || return 0
+    cmp -s "${canonical}/config.json" "${alias}/config.json" || return 0
+  fi
+  append_control_log_line "migrate model cache dedupe: replacing duplicate ${alias} with symlink to ${canonical}"
+  "${SUDO[@]}" rm -rf -- "${alias}"
+  "${SUDO[@]}" ln -s "$(basename "${canonical}")" "${alias}"
+}
+
 rebuild_runtime_inventory_cli() {
   local phase_flag="${1:-}"
   local phase_step="${2:-inventory_rebuild}"
@@ -1105,6 +1458,46 @@ rebuild_runtime_inventory_cli() {
   if [[ -n "${phase_flag}" ]]; then
     migration_mark_flag_done "${phase_flag}" "${phase_step}_complete"
   fi
+}
+
+cleanup_benchmark_global_results_cli() {
+  local phase_step="${1:-benchmark_global_results_cleanup}"
+  if [[ "${ACTION}" == "migrate" ]]; then
+    migration_update_state "${phase_step}"
+  fi
+  append_control_log_line "benchmark global result cleanup starting (${phase_step})"
+  run_live_command "benchmark global result cleanup" "/" "env CLUB3090_DIR=$(shell_quote "${CLUB3090_DIR}") $(shell_quote "${PYTHON_BIN}") $(shell_quote "${CONTROL_PY}") --cleanup-benchmark-global-results"
+  append_control_log_line "benchmark global result cleanup finished (${phase_step})"
+}
+
+rebuild_benchmark_inventory_cli() {
+  local phase_step="${1:-benchmark_inventory_rebuild}"
+  if [[ "${ACTION}" == "migrate" ]]; then
+    migration_update_state "${phase_step}"
+  fi
+  append_control_log_line "benchmark inventory rebuild starting (${phase_step})"
+  run_live_command "benchmark inventory rebuild" "/" "env CLUB3090_DIR=$(shell_quote "${CLUB3090_DIR}") $(shell_quote "${PYTHON_BIN}") $(shell_quote "${CONTROL_PY}") --rebuild-benchmark-inventory"
+  append_control_log_line "benchmark inventory rebuild finished (${phase_step})"
+}
+
+migrate_custom_presets_cli() {
+  if [[ "${ACTION}" != "migrate" ]]; then
+    return 0
+  fi
+  if [[ "${MIGRATION_CUSTOM_PRESETS_DONE}" == "1" ]]; then
+    append_control_log_line "migrate custom preset recovery already complete; skipping"
+    return 0
+  fi
+  if [[ -z "${MIGRATION_BACKUP_DIR}" || ! -d "${MIGRATION_BACKUP_DIR}" ]]; then
+    append_control_log_line "migrate custom preset recovery skipped: backup dir missing (${MIGRATION_BACKUP_DIR:-unset})"
+    migration_mark_flag_done "MIGRATION_CUSTOM_PRESETS_DONE" "custom_preset_migration_skipped"
+    return 0
+  fi
+  migration_update_state "custom_preset_migration"
+  append_control_log_line "migrate custom preset recovery starting from ${MIGRATION_BACKUP_DIR}"
+  run_live_command "custom preset migration" "/" "env CLUB3090_DIR=$(shell_quote "${CLUB3090_DIR}") $(shell_quote "${PYTHON_BIN}") $(shell_quote "${CONTROL_PY}") --migrate-custom-presets $(shell_quote "${MIGRATION_BACKUP_DIR}")"
+  append_control_log_line "migrate custom preset recovery finished"
+  migration_mark_flag_done "MIGRATION_CUSTOM_PRESETS_DONE" "custom_preset_migration_complete"
 }
 
 collect_required_setup_commands() {
@@ -1170,6 +1563,7 @@ run_required_setup_commands() {
     return 0
   fi
   local cmd
+  local run_cmd
   local idx=0
   local total="${#commands[@]}"
   for cmd in "${commands[@]}"; do
@@ -1179,7 +1573,12 @@ run_required_setup_commands() {
       migration_update_state "setup_command_${idx}_of_${total}"
     fi
     append_control_log_line "${action_label} setup command: ${cmd}"
-    run_live_command "model setup ${idx}/${total}" "${CLUB3090_DIR}" "${cmd}"
+    run_cmd="${cmd}"
+    if [[ "${ACTION}" == "migrate" && "${cmd}" == *"scripts/setup.sh"* && "${cmd}" != *"PREFLIGHT_DISK_GB="* ]]; then
+      run_cmd="PREFLIGHT_DISK_GB=${MIGRATION_PREFLIGHT_DISK_GB:-1} ${cmd}"
+      append_control_log_line "migrate setup command using PREFLIGHT_DISK_GB=${MIGRATION_PREFLIGHT_DISK_GB:-1} for preserved model-cache verification"
+    fi
+    run_live_command "model setup ${idx}/${total}" "${CLUB3090_DIR}" "${run_cmd}"
   done
   if [[ "${ACTION}" == "migrate" ]]; then
     migration_mark_flag_done "MIGRATION_SETUP_DONE" "setup_complete"
@@ -1257,7 +1656,12 @@ migrate_repo_checkout() {
 
   if [[ "${MIGRATION_ASSETS_MERGED}" != "1" ]]; then
     migration_update_state "asset_merge_start"
-    merge_dir_contents_logged "migrate models-cache merge" "${backup_dir}/models-cache" "${CLUB3090_DIR}/models-cache"
+    move_migrated_tree_with_symlink_logged "migrate models-cache move" "${backup_dir}/models-cache" "${CLUB3090_DIR}/models-cache"
+    move_migrated_tree_with_symlink_logged "migrate AI Studio assets move" "${backup_dir}/ai-studio-models" "${CLUB3090_DIR}/ai-studio-models"
+    move_migrated_tree_with_symlink_logged "migrate upstream results move" "${backup_dir}/results" "${CLUB3090_DIR}/results"
+    move_migrated_tree_with_symlink_logged "migrate LMCache KV move" "${backup_dir}/lmcache-kv" "${CLUB3090_DIR}/lmcache-kv"
+    migrate_instance_runtime_caches "${CONTROL_DIR}"
+    deduplicate_known_model_cache_aliases
     if [[ -f "${backup_dir}/.env" ]]; then
       append_control_log_line "migrate env merge: merging ${backup_dir}/.env into ${CLUB3090_DIR}/.env"
       merge_env_files "${CLUB3090_DIR}/.env" "${backup_dir}/.env" "${backup_dir}" "${CLUB3090_DIR}"
@@ -1292,7 +1696,7 @@ migrate_repo_checkout() {
     append_control_log_line "migrate model-dir resolution: backup_raw=${backup_model_dir_raw:-<default>} backup_resolved=${backup_model_dir_resolved:-<unresolved>} new_raw=${new_model_dir_raw:-<default>} new_resolved=${new_model_dir_resolved:-<unresolved>}"
     if [[ -n "${backup_model_dir_resolved:-}" && -d "${backup_model_dir_resolved}" && -n "${new_model_dir_resolved:-}" ]]; then
       if [[ "${backup_model_dir_resolved}" != "${new_model_dir_resolved}" ]]; then
-        merge_dir_contents_logged "migrate effective model dir merge" "${backup_model_dir_resolved}" "${new_model_dir_resolved}"
+        move_migrated_tree_with_symlink_logged "migrate effective model dir move" "${backup_model_dir_resolved}" "${new_model_dir_resolved}"
       else
         append_control_log_line "migrate effective model dir merge skipped: source and target resolve to the same path (${new_model_dir_resolved})"
       fi
@@ -1307,13 +1711,13 @@ migrate_repo_checkout() {
       fi
       local rel
       rel="${cache_dir#"${backup_dir}/"}"
-      merge_dir_contents_logged "migrate cache merge ${rel}" "${cache_dir}" "${CLUB3090_DIR}/${rel}"
+      move_migrated_tree_with_symlink_logged "migrate cache move ${rel}" "${cache_dir}" "${CLUB3090_DIR}/${rel}"
     done < <(find "${backup_dir}/models" -type d -path '*/cache' 2>/dev/null || true)
     normalize_migrated_model_assets "${CLUB3090_DIR}/models-cache"
     if [[ -n "${new_model_dir_resolved:-}" && "${new_model_dir_resolved}" != "${CLUB3090_DIR}/models-cache" ]]; then
       normalize_migrated_model_assets "${new_model_dir_resolved}"
     fi
-    append_control_log_line "migrate asset merge summary: repo-local models-cache preserved, effective MODEL_DIR mirrored, compose cache directories copied, .env merged if present"
+    append_control_log_line "migrate asset merge summary: repo-local models-cache, AI Studio assets, upstream results, and LMCache KV preserved; effective MODEL_DIR mirrored, compose cache directories copied, .env merged if present"
     migration_mark_flag_done "MIGRATION_ASSETS_MERGED" "asset_merge_complete"
   else
     append_control_log_line "migrate asset merge step already complete"
@@ -1436,6 +1840,26 @@ ensure_command_or_install_with_timeout() {
     return 1
   fi
   command -v "${cmd}" >/dev/null 2>&1
+}
+
+ensure_python_yaml_available() {
+  if "${PYTHON_BIN}" -c 'import yaml' >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "Installing PyYAML for upstream Club-3090 profile, registry, and estate tooling..."
+  case "${OS_FAMILY}" in
+    arch)
+      install_packages python-yaml >/dev/null 2>&1 || true
+      ;;
+    debian)
+      install_packages python3-yaml >/dev/null 2>&1 || true
+      ;;
+  esac
+  if ! "${PYTHON_BIN}" -c 'import yaml' >/dev/null 2>&1; then
+    echo "ERROR: PyYAML is required by the current upstream Club-3090 profile registry tooling." >&2
+    echo "Install python-yaml/python3-yaml or make PyYAML importable by ${PYTHON_BIN} and rerun this installer." >&2
+    exit 1
+  fi
 }
 
 ensure_pamtester_available() {
@@ -1921,7 +2345,7 @@ ensure_letsencrypt_ip_certificate() {
       --preferred-profile shortlived \
       --standalone \
       --ip-address "${ip_value}" \
-      --deploy-hook "systemctl reload club3090-caddy.service >/dev/null 2>&1 || true" || {
+      --deploy-hook "if systemctl is-active --quiet club3090-caddy.service; then systemctl reload club3090-caddy.service >/dev/null 2>&1 || systemctl restart club3090-caddy.service >/dev/null 2>&1 || true; fi" || {
       echo "WARNING: Let's Encrypt IP certificate issuance timed out or failed. Caddy will still serve HTTPS on the direct IP using its local certificate authority." >&2
       return 1
     }
@@ -1932,32 +2356,15 @@ ensure_letsencrypt_ip_certificate() {
       --preferred-profile shortlived \
       --standalone \
       --ip-address "${ip_value}" \
-      --deploy-hook "systemctl reload club3090-caddy.service >/dev/null 2>&1 || true"; then
+      --deploy-hook "if systemctl is-active --quiet club3090-caddy.service; then systemctl reload club3090-caddy.service >/dev/null 2>&1 || systemctl restart club3090-caddy.service >/dev/null 2>&1 || true; fi"; then
     echo "WARNING: Let's Encrypt IP certificate issuance failed. Caddy will still serve HTTPS on the direct IP using its local certificate authority." >&2
     return 1
   fi
   [[ -r "${fullchain}" && -r "${privkey}" ]]
 }
 
-ensure_tailscale_certificate() {
-  local host_value="$1"
-  [[ -n "${host_value}" && "${host_value}" == *.ts.net ]] || return 1
-  command -v tailscale >/dev/null 2>&1 || return 1
-  "${SUDO[@]}" mkdir -p "${CONTROL_DIR}"
-  if "${SUDO[@]}" tailscale cert --cert-file "${TAILSCALE_CERT_FILE}" --key-file "${TAILSCALE_KEY_FILE}" "${host_value}" >/dev/null 2>&1; then
-    "${SUDO[@]}" chmod 600 "${TAILSCALE_KEY_FILE}" >/dev/null 2>&1 || true
-    "${SUDO[@]}" test -r "${TAILSCALE_CERT_FILE}" -a -r "${TAILSCALE_KEY_FILE}"
-    return $?
-  fi
-  echo "WARNING: Failed to materialize Tailscale certificate for ${host_value}. Ensure Tailscale HTTPS certificates are enabled in the tailnet admin settings." >&2
-  return 1
-}
-
 ensure_https_certificate() {
-  local local_ip public_ip san_list san_file
-  if [[ -r "${TLS_CERT_FILE}" && -r "${TLS_KEY_FILE}" ]]; then
-    return 0
-  fi
+  local local_ip public_ip tailscale_ip san_list san_file existing_sans=""
   ensure_command_or_install openssl "Installing OpenSSL for HTTPS certificate generation..." openssl >/dev/null 2>&1 || true
   require_command_after_install openssl "HTTPS mode needs OpenSSL to generate a certificate."
   local_ip="$(detect_primary_local_ip)"
@@ -1965,12 +2372,27 @@ ensure_https_certificate() {
   if command -v curl >/dev/null 2>&1; then
     public_ip="$(curl -fsSL --max-time 5 https://api.ipify.org 2>/dev/null || true)"
   fi
+  tailscale_ip=""
+  if command -v tailscale >/dev/null 2>&1; then
+    tailscale_ip="$(tailscale ip -4 2>/dev/null | head -n 1 || true)"
+  fi
+  if [[ -r "${TLS_CERT_FILE}" && -r "${TLS_KEY_FILE}" ]]; then
+    existing_sans="$("${SUDO[@]}" openssl x509 -in "${TLS_CERT_FILE}" -noout -ext subjectAltName 2>/dev/null || true)"
+    if { [[ -z "${local_ip}" ]] || grep -Fq "IP Address:${local_ip}" <<<"${existing_sans}"; } \
+      && { [[ -z "${public_ip}" ]] || grep -Fq "IP Address:${public_ip}" <<<"${existing_sans}"; } \
+      && { [[ -z "${tailscale_ip}" ]] || grep -Fq "IP Address:${tailscale_ip}" <<<"${existing_sans}"; }; then
+      return 0
+    fi
+  fi
   san_list="DNS:localhost,DNS:$(hostname)"
   if [[ -n "${local_ip}" ]]; then
     san_list+=",IP:${local_ip}"
   fi
   if [[ -n "${public_ip}" ]]; then
     san_list+=",IP:${public_ip}"
+  fi
+  if [[ -n "${tailscale_ip}" ]]; then
+    san_list+=",IP:${tailscale_ip}"
   fi
   san_file="$(mktemp)"
   cat > "${san_file}" <<EOF
@@ -1995,6 +2417,21 @@ EOF
   }
   rm -f "${san_file}"
   "${SUDO[@]}" chmod 600 "${TLS_KEY_FILE}" || true
+}
+
+prepare_public_ip_certificate_links() {
+  local public_ip="$1"
+  local live_dir="" cert_source="${TLS_CERT_FILE}" key_source="${TLS_KEY_FILE}"
+  if is_ipv4_address "${public_ip}"; then
+    live_dir="$(certbot_live_dir_for_host "${public_ip}")"
+    if "${SUDO[@]}" test -r "${live_dir}/fullchain.pem" -a -r "${live_dir}/privkey.pem"; then
+      cert_source="${live_dir}/fullchain.pem"
+      key_source="${live_dir}/privkey.pem"
+    fi
+  fi
+  "${SUDO[@]}" rm -f "${PUBLIC_IP_CERT_FILE}" "${PUBLIC_IP_KEY_FILE}" >/dev/null 2>&1 || true
+  "${SUDO[@]}" ln -s "${cert_source}" "${PUBLIC_IP_CERT_FILE}"
+  "${SUDO[@]}" ln -s "${key_source}" "${PUBLIC_IP_KEY_FILE}"
 }
 
 detect_primary_local_ip() {
@@ -2040,27 +2477,55 @@ run_tailscale_serve_command() {
 close_runtime_exposure() {
   local cleanup_deadline
   cleanup_deadline="$(( $(network_now_seconds) + 15 ))"
-  local runtime_port
-  for runtime_port in $(seq 8010 8020) $(seq 8200 8299); do
-    if network_deadline_expired "${cleanup_deadline}"; then
-      echo "WARNING: Runtime port exposure cleanup exceeded 15 seconds; continuing installer." >&2
-      break
+  local runtime_port runtime_spec runtime_start runtime_end rule_number
+  local firewall_ports="" ufw_status="" ufw_rules=""
+  if command -v ufw >/dev/null 2>&1; then
+    if command -v timeout >/dev/null 2>&1; then
+      ufw_status="$(timeout --kill-after=2s 5s "${SUDO[@]}" ufw status numbered 2>/dev/null || true)"
+    else
+      ufw_status="$("${SUDO[@]}" ufw status numbered 2>/dev/null || true)"
     fi
-    if command -v ufw >/dev/null 2>&1; then
-      run_network_cmd 3 "${SUDO[@]}" ufw delete allow "${runtime_port}"/tcp || true
-    elif command -v firewall-cmd >/dev/null 2>&1 && run_network_cmd 3 "${SUDO[@]}" firewall-cmd --state; then
-      run_network_cmd 3 "${SUDO[@]}" firewall-cmd --permanent --remove-port="${runtime_port}"/tcp || true
-    elif command -v iptables >/dev/null 2>&1; then
+    ufw_rules="$(printf '%s\n' "${ufw_status}" | sed -nE 's/^\[[[:space:]]*([0-9]+)\][[:space:]]+([0-9]+)(:([0-9]+))?\/tcp.*/\1 \2 \4/p' | sort -rn -k1,1)"
+    while read -r rule_number runtime_start runtime_end; do
+      [[ -n "${rule_number}" ]] || continue
+      runtime_end="${runtime_end:-${runtime_start}}"
+      if (( (runtime_start >= 8010 && runtime_end <= 8020) || (runtime_start >= 8200 && runtime_end <= 8299) )); then
+        run_network_cmd 3 "${SUDO[@]}" ufw --force delete "${rule_number}" || true
+      fi
+    done <<< "${ufw_rules}"
+  elif command -v firewall-cmd >/dev/null 2>&1 && run_network_cmd 3 "${SUDO[@]}" firewall-cmd --state; then
+    if command -v timeout >/dev/null 2>&1; then
+      firewall_ports="$(timeout --kill-after=2s 5s "${SUDO[@]}" firewall-cmd --permanent --list-ports 2>/dev/null || true)"
+    else
+      firewall_ports="$("${SUDO[@]}" firewall-cmd --permanent --list-ports 2>/dev/null || true)"
+    fi
+    for runtime_spec in ${firewall_ports}; do
+      [[ "${runtime_spec}" == */tcp ]] || continue
+      runtime_port="${runtime_spec%/tcp}"
+      runtime_start="${runtime_port%%-*}"
+      runtime_end="${runtime_port##*-}"
+      [[ "${runtime_start}" =~ ^[0-9]+$ && "${runtime_end}" =~ ^[0-9]+$ ]] || continue
+      if (( (runtime_start >= 8010 && runtime_end <= 8020) || (runtime_start >= 8200 && runtime_end <= 8299) )); then
+        run_network_cmd 3 "${SUDO[@]}" firewall-cmd --permanent --remove-port="${runtime_spec}" || true
+      fi
+    done
+    run_network_cmd 5 "${SUDO[@]}" firewall-cmd --reload || true
+  elif command -v iptables >/dev/null 2>&1; then
+    for runtime_port in $(seq 8010 8020) $(seq 8200 8299); do
+      if network_deadline_expired "${cleanup_deadline}"; then
+        echo "WARNING: Runtime port exposure cleanup exceeded 15 seconds; continuing installer." >&2
+        break
+      fi
       while run_network_cmd 2 "${SUDO[@]}" iptables -C INPUT -p tcp --dport "${runtime_port}" -j ACCEPT; do
         run_network_cmd 2 "${SUDO[@]}" iptables -D INPUT -p tcp --dport "${runtime_port}" -j ACCEPT || break
       done
-    fi
-    if [[ "${TAILSCALE_HTTPS_EFFECTIVE_ENABLED:-false}" != "true" ]] && command -v upnpc >/dev/null 2>&1; then
+    done
+  fi
+  if [[ "${TAILSCALE_HTTPS_EFFECTIVE_ENABLED:-false}" != "true" ]] && command -v upnpc >/dev/null 2>&1; then
+    for runtime_port in $(seq 8010 8020) $(seq 8200 8299); do
+      network_deadline_expired "${cleanup_deadline}" && break
       run_network_cmd 3 upnpc -d "${runtime_port}" tcp || true
-    fi
-  done
-  if command -v firewall-cmd >/dev/null 2>&1 && run_network_cmd 3 "${SUDO[@]}" firewall-cmd --state; then
-    run_network_cmd 5 "${SUDO[@]}" firewall-cmd --reload || true
+    done
   fi
 }
 
@@ -2215,6 +2680,7 @@ if [[ -z "${PYTHON_BIN}" ]]; then
   echo "ERROR: python3 is required but was not found after dependency installation." >&2
   exit 1
 fi
+ensure_python_yaml_available
 
 log_done "Dependency preparation complete"
 
@@ -2229,26 +2695,74 @@ persist_hf_token_if_available
 "${SUDO[@]}" mkdir -p "${CONTROL_DIR}"
 ensure_gputemps_helper_available
 
+benchmark_worker_active_for_update() {
+  if systemctl is-active --quiet club3090-benchmarks.service 2>/dev/null; then
+    return 0
+  fi
+  if pgrep -f 'control\.py --benchmark-worker' >/dev/null 2>&1; then
+    return 0
+  fi
+  local state_file="${CONTROL_DIR}/benchmarks/state.json"
+  if [[ -f "${state_file}" ]] && python3 - "${state_file}" <<'PY' >/dev/null 2>&1; then
+import json
+import sys
+
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+job = data.get("job") if isinstance(data, dict) else {}
+active = bool(job.get("active") or data.get("active"))
+status = str(job.get("status") or data.get("status") or "").strip().lower()
+raise SystemExit(0 if active and status in {"running", "queued", "cooldown", "launching"} else 1)
+PY
+    return 0
+  fi
+  return 1
+}
+
+BENCHMARK_WORKER_ACTIVE=false
+if benchmark_worker_active_for_update; then
+  BENCHMARK_WORKER_ACTIVE=true
+  append_control_log_line "update: benchmark worker active; preserving benchmark-owned power, fan, and runtime services"
+fi
+
 # Disable older manual GPU power-limit services from earlier setup; v2.6 manages this dynamically.
-"${SUDO[@]}" systemctl disable --now nvidia-tweaks.service 2>/dev/null || true
-"${SUDO[@]}" systemctl disable --now set-gpu-power.service 2>/dev/null || true
+if [[ "${BENCHMARK_WORKER_ACTIVE}" == "true" ]]; then
+  append_control_log_line "update: skipped legacy GPU power service shutdown while benchmark worker is active"
+else
+  "${SUDO[@]}" systemctl disable --now nvidia-tweaks.service 2>/dev/null || true
+  "${SUDO[@]}" systemctl disable --now set-gpu-power.service 2>/dev/null || true
+fi
 
 # On update, stop the previous console follower first so a noisy old version
 # does not keep spamming the active TTY while files are being replaced.
 if [[ "${ACTION}" == "update" || "${ACTION}" == "migrate" ]]; then
-  log_step "Stopping currently managed club-3090 services before ${ACTION}"
+  if [[ "${BENCHMARK_WORKER_ACTIVE}" == "true" ]]; then
+    log_step "Stopping control-plane services before ${ACTION} while preserving active benchmark services"
+  else
+    log_step "Stopping currently managed club-3090 services before ${ACTION}"
+  fi
   # Stop the control plane before replacing files so a broken/stale Python process
   # cannot keep serving old code while the update is being installed.
   # Keep Caddy and the separate updater service alive so the web UI can continue
   # streaming self-update progress in real time during control-plane restarts.
   "${SUDO[@]}" systemctl stop club3090-console-log.service 2>/dev/null || true
   "${SUDO[@]}" systemctl stop club3090-control.service 2>/dev/null || true
-  "${SUDO[@]}" systemctl stop club3090-headless-x.service 2>/dev/null || true
-  "${SUDO[@]}" systemctl stop club3090-headless-x-v213.service 2>/dev/null || true
+  if [[ "${BENCHMARK_WORKER_ACTIVE}" == "true" ]]; then
+    append_control_log_line "update: preserved headless X fan-control services while benchmark worker is active"
+  else
+    "${SUDO[@]}" systemctl stop club3090-headless-x.service 2>/dev/null || true
+    "${SUDO[@]}" systemctl stop club3090-headless-x-v213.service 2>/dev/null || true
+  fi
   if [[ "${ACTION}" == "migrate" ]]; then
-    "${SUDO[@]}" systemctl stop club3090-vllm.service 2>/dev/null || true
-    if [[ -f "${CLUB3090_DIR}/scripts/switch.sh" ]]; then
-      (cd "${CLUB3090_DIR}" && "${SUDO[@]}" bash scripts/switch.sh --down) >/dev/null 2>&1 || true
+    if [[ "${BENCHMARK_WORKER_ACTIVE}" == "true" ]]; then
+      append_control_log_line "migrate: benchmark worker active; preserving upstream runtime containers and skipping switch.sh --down"
+    else
+      "${SUDO[@]}" systemctl stop club3090-vllm.service 2>/dev/null || true
+      if [[ -f "${CLUB3090_DIR}/scripts/switch.sh" ]]; then
+        (cd "${CLUB3090_DIR}" && "${SUDO[@]}" bash scripts/switch.sh --down) >/dev/null 2>&1 || true
+      fi
     fi
   fi
   log_done "Old services stopped"
@@ -2485,7 +2999,7 @@ if [[ ! -f "${CONTROL_DIR}/last_good_mode" ]]; then
 fi
 
 log_step "Refreshing persisted server configuration"
-"${SUDO[@]}" "${PYTHON_BIN}" - "${CONTROL_DIR}" "${ONLINE_EFFECTIVE_ENABLED}" "${LOCAL_AUTOMATION_EFFECTIVE_ENABLED}" "${ONLINE_TLS_EFFECTIVE_ENABLED}" "${LOCAL_API_PORT}" "${TLS_CERT_FILE}" "${TLS_KEY_FILE}" <<'PYSERVERCFG'
+"${SUDO[@]}" "${PYTHON_BIN}" - "${CONTROL_DIR}" "${ONLINE_EFFECTIVE_ENABLED}" "${LOCAL_AUTOMATION_EFFECTIVE_ENABLED}" "${ONLINE_TLS_EFFECTIVE_ENABLED}" "${LOCAL_API_PORT}" "${TLS_CERT_FILE}" "${TLS_KEY_FILE}" "${PROXY_SWAP_MODE}" <<'PYSERVERCFG'
 import json, os, sys
 control_dir = sys.argv[1]
 online_mode = sys.argv[2]
@@ -2494,9 +3008,11 @@ https_mode = sys.argv[4]
 local_api_port = int(sys.argv[5])
 https_cert_file = sys.argv[6]
 https_key_file = sys.argv[7]
+proxy_swap_mode = sys.argv[8]
 path = os.path.join(control_dir, "server_config.json")
 current = {
     "allow_proxy_without_api_key": True,
+    "proxy_swap_enabled": True,
     "online_enabled": False,
     "upnp_enabled": False,
     "https_enabled": False,
@@ -2527,6 +3043,8 @@ if local_automation_mode == "true":
     current["local_api_port"] = local_api_port
 else:
     current["local_api_enabled"] = False
+if proxy_swap_mode == "disable":
+    current["proxy_swap_enabled"] = False
 current["admin_path"] = "/admin"
 tmp = path + ".tmp"
 with open(tmp, "w", encoding="utf-8") as f:
@@ -2579,6 +3097,7 @@ if [[ "${ACTION}" == "migrate" ]]; then
   else
     append_control_log_line "migrate post-setup inventory already complete; skipping"
   fi
+  migrate_custom_presets_cli
   if [[ "${MIGRATION_UPDATE_DONE}" != "1" ]]; then
     append_control_log_line "migrate update.sh step superseded by direct setup replay on the freshly cloned upstream checkout"
     migration_mark_flag_done "MIGRATION_UPDATE_DONE" "update_step_superseded"
@@ -2590,6 +3109,8 @@ if [[ "${ACTION}" == "migrate" ]]; then
   else
     append_control_log_line "migrate final inventory already complete; skipping"
   fi
+  cleanup_benchmark_global_results_cli "benchmark_global_results_cleanup_final"
+  rebuild_benchmark_inventory_cli "benchmark_inventory_final"
   log_done "Migration setup commands completed"
 else
   rebuild_runtime_inventory_cli
@@ -2604,6 +3125,8 @@ else
     rebuild_runtime_inventory_cli "" "inventory_post_install_update"
     log_done "Install repo update completed"
   fi
+  cleanup_benchmark_global_results_cli "benchmark_global_results_cleanup"
+  rebuild_benchmark_inventory_cli "benchmark_inventory_final"
 fi
 
 write_control_units() {
@@ -2647,6 +3170,40 @@ Environment=CLUB3090_WOL_BROADCAST=255.255.255.255
 ExecStart=${CONTROL_PY}
 Restart=always
 RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+  "${SUDO[@]}" tee /etc/systemd/system/club3090-benchmarks.service >/dev/null <<UNIT
+[Unit]
+Description=club-3090 model scores benchmark worker
+After=network-online.target docker.service club3090-control.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+Environment=CLUB3090_DIR=${CLUB3090_DIR}
+Environment=DEFAULT_MODE=${DEFAULT_MODE}
+Environment=CLUB3090_SCRIPT_VERSION=${SCRIPT_VERSION}
+Environment=CLUB3090_ADMIN_PORT=${ADMIN_PORT}
+Environment=CLUB3090_PROXY_PORT=${PROXY_PORT}
+Environment=CLUB3090_LOCAL_API_PORT=${LOCAL_API_PORT}
+Environment=CLUB3090_ADMIN_BIND_HOST=${CONTROL_ADMIN_BIND_HOST}
+Environment=CLUB3090_PROXY_BIND_HOST=${CONTROL_PROXY_BIND_HOST}
+Environment=CLUB3090_ADMIN_BIND_PORT=${CONTROL_ADMIN_BIND_PORT}
+Environment=CLUB3090_PROXY_BIND_PORT=${CONTROL_PROXY_BIND_PORT}
+Environment=CLUB3090_CONTROL_DIR=${CONTROL_DIR}
+Environment=CLUB3090_GPU_ACTIVE_POWER_LIMIT_W=280
+Environment=CLUB3090_GPU_IDLE_POWER_LIMIT_W=120
+Environment=CLUB3090_CPU_ACTIVE_GOVERNOR=performance
+Environment=CLUB3090_CPU_IDLE_GOVERNOR=powersave
+Environment=CLUB3090_FAN_MAX_SPEED=100
+Environment=CLUB3090_FAN_MIN_SAFE_SPEED=35
+ExecStart=${CONTROL_PY} --benchmark-worker
+Restart=no
 StandardOutput=journal
 StandardError=journal
 
@@ -2728,7 +3285,8 @@ UNIT
 }
 
 write_caddy_config() {
-  local https_host="" certbot_live_dir="" certbot_fullchain="" certbot_privkey="" tls_line="" emit_host_routes="false" caddy_host_address=""
+  local https_host="" certbot_live_dir="" certbot_fullchain="" certbot_privkey="" tls_line="" emit_host_routes="false" emit_fallback_routes="true"
+  local caddy_host_address="" host_bind_line="" public_ip="" local_ip="" tailscale_ip="" emit_public_ip_routes="false" emit_tailscale_ip_routes="false"
   https_host="$(read_https_public_host || true)"
   if [[ "${ONLINE_TLS_TAILSCALE_MODE:-disable}" == "enable" && "${https_host}" != *.ts.net ]]; then
     https_host="$(detect_tailscale_https_host 2>/dev/null || true)"
@@ -2745,14 +3303,23 @@ write_caddy_config() {
       emit_host_routes="true"
     fi
   elif [[ -n "${https_host}" && "${https_host}" == *.ts.net ]]; then
-    if ! "${SUDO[@]}" test -r "${TAILSCALE_CERT_FILE}" -a -r "${TAILSCALE_KEY_FILE}"; then
-      ensure_tailscale_certificate "${https_host}" || true
+    # Caddy obtains and renews ts.net certificates directly from tailscaled.
+    # The service runs as root so it can access the local Tailscale API.
+    tls_line=$'    tls {\n        get_certificate tailscale\n    }'
+    emit_host_routes="true"
+    # A same-port wildcard route with a manually loaded certificate preempts
+    # Caddy's Tailscale certificate manager during SNI selection.
+    emit_fallback_routes="false"
+    local_ip="$(detect_primary_local_ip || true)"
+    public_ip="$(detect_public_ipv4 || true)"
+    tailscale_ip="$(tailscale ip -4 2>/dev/null | head -n 1 || true)"
+    if is_ipv4_address "${tailscale_ip}"; then
+      host_bind_line="    bind ${tailscale_ip}"
+      emit_tailscale_ip_routes="true"
     fi
-    if "${SUDO[@]}" test -r "${TAILSCALE_CERT_FILE}" -a -r "${TAILSCALE_KEY_FILE}"; then
-      tls_line="    tls ${TAILSCALE_CERT_FILE} ${TAILSCALE_KEY_FILE}"
-      emit_host_routes="true"
-    else
-      echo "WARNING: Tailscale certificate files are unavailable for ${https_host}; Caddy ts.net port routes will not be browser-trusted." >&2
+    if is_ipv4_address "${public_ip}" && is_ipv4_address "${local_ip}" && is_ipv4_address "${tailscale_ip}"; then
+      prepare_public_ip_certificate_links "${public_ip}"
+      emit_public_ip_routes="true"
     fi
   fi
   if [[ "${https_host}" == *.ts.net ]]; then
@@ -2762,15 +3329,21 @@ write_caddy_config() {
   fi
   "${SUDO[@]}" tee "${CADDYFILE_PATH}" >/dev/null <<CADDY
 {
-    admin off
+    admin 127.0.0.1:2019
+    auto_https disable_redirects
+$(if [[ "${emit_public_ip_routes}" == "true" ]]; then printf '    default_sni %s\n' "${public_ip}"; fi)
 }
 
 $(if [[ "${emit_host_routes}" == "true" ]]; then cat <<EOF
 ${caddy_host_address}:${ADMIN_PORT} {
+${host_bind_line}
 ${tls_line}
-    @club3090_updater path /admin/update-stream /admin/update-status
+    @club3090_updater path /admin/update-stream /admin/update-status /admin/update-ack
     handle @club3090_updater {
         reverse_proxy 127.0.0.1:${CONTROL_UPDATER_BIND_PORT}
+    }
+    handle_path /comfyui/* {
+        reverse_proxy 127.0.0.1:8188
     }
     handle {
         reverse_proxy 127.0.0.1:${CONTROL_ADMIN_BIND_PORT}
@@ -2778,17 +3351,82 @@ ${tls_line}
 }
 
 ${caddy_host_address}:${PROXY_PORT} {
+${host_bind_line}
 ${tls_line}
     reverse_proxy 127.0.0.1:${CONTROL_PROXY_BIND_PORT}
 }
 EOF
 fi)
 
-https://:${ADMIN_PORT} {
+$(if [[ "${emit_tailscale_ip_routes}" == "true" ]]; then cat <<EOF
+https://${tailscale_ip}:${ADMIN_PORT} {
+    bind ${tailscale_ip}
     tls ${TLS_CERT_FILE} ${TLS_KEY_FILE}
-    @club3090_updater path /admin/update-stream /admin/update-status
+    @club3090_updater path /admin/update-stream /admin/update-status /admin/update-ack
     handle @club3090_updater {
         reverse_proxy 127.0.0.1:${CONTROL_UPDATER_BIND_PORT}
+    }
+    handle_path /comfyui/* {
+        reverse_proxy 127.0.0.1:8188
+    }
+    handle {
+        reverse_proxy 127.0.0.1:${CONTROL_ADMIN_BIND_PORT}
+    }
+}
+
+https://${tailscale_ip}:${PROXY_PORT} {
+    bind ${tailscale_ip}
+    tls ${TLS_CERT_FILE} ${TLS_KEY_FILE}
+    reverse_proxy 127.0.0.1:${CONTROL_PROXY_BIND_PORT}
+}
+EOF
+fi)
+
+$(if [[ "${emit_public_ip_routes}" == "true" ]]; then cat <<EOF
+https://${public_ip}:${ADMIN_PORT} {
+    bind ${local_ip}
+    tls ${PUBLIC_IP_CERT_FILE} ${PUBLIC_IP_KEY_FILE}
+    @club3090_updater path /admin/update-stream /admin/update-status /admin/update-ack
+    handle @club3090_updater {
+        reverse_proxy 127.0.0.1:${CONTROL_UPDATER_BIND_PORT}
+    }
+    handle_path /comfyui/* {
+        reverse_proxy 127.0.0.1:8188
+    }
+    handle {
+        reverse_proxy 127.0.0.1:${CONTROL_ADMIN_BIND_PORT}
+    }
+}
+
+https://${public_ip}:${PROXY_PORT} {
+    bind ${local_ip}
+    tls ${PUBLIC_IP_CERT_FILE} ${PUBLIC_IP_KEY_FILE}
+    reverse_proxy 127.0.0.1:${CONTROL_PROXY_BIND_PORT}
+}
+
+http:// {
+    bind ${local_ip}
+    @club3090_acme path /.well-known/acme-challenge/*
+    handle @club3090_acme {
+        root * ${ACME_WEBROOT}
+        file_server
+    }
+    handle {
+        redir https://{host}:${ADMIN_PORT}{uri} permanent
+    }
+}
+EOF
+fi)
+
+$(if [[ "${emit_fallback_routes}" == "true" ]]; then cat <<EOF
+https://:${ADMIN_PORT} {
+    tls ${TLS_CERT_FILE} ${TLS_KEY_FILE}
+    @club3090_updater path /admin/update-stream /admin/update-status /admin/update-ack
+    handle @club3090_updater {
+        reverse_proxy 127.0.0.1:${CONTROL_UPDATER_BIND_PORT}
+    }
+    handle_path /comfyui/* {
+        reverse_proxy 127.0.0.1:8188
     }
     handle {
         reverse_proxy 127.0.0.1:${CONTROL_ADMIN_BIND_PORT}
@@ -2799,7 +3437,159 @@ https://:${PROXY_PORT} {
     tls ${TLS_CERT_FILE} ${TLS_KEY_FILE}
     reverse_proxy 127.0.0.1:${CONTROL_PROXY_BIND_PORT}
 }
+EOF
+fi)
 CADDY
+}
+
+write_certificate_refresh_script() {
+  "${SUDO[@]}" mkdir -p "${ACME_WEBROOT}"
+  "${SUDO[@]}" tee "${CERT_REFRESH_SH}" >/dev/null <<'CERTSH'
+#!/usr/bin/env bash
+set -u
+
+CONTROL_DIR="${CLUB3090_CONTROL_DIR:-/opt/club3090-control}"
+ACME_WEBROOT="${CONTROL_DIR}/acme"
+FALLBACK_CERT="${CONTROL_DIR}/tls.crt"
+FALLBACK_KEY="${CONTROL_DIR}/tls.key"
+PUBLIC_CERT="${CONTROL_DIR}/public-ip.crt"
+PUBLIC_KEY="${CONTROL_DIR}/public-ip.key"
+LOG_FILE="${CONTROL_DIR}/control.log"
+TIMEOUT_SECONDS="${CLUB3090_CERTBOT_ISSUE_TIMEOUT_SECONDS:-180}"
+
+log_line() {
+  printf '%s certificate refresh: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "${LOG_FILE}" 2>/dev/null || true
+}
+
+open_temporary_http_mapping() {
+  local local_ip mapping_output
+  local_ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i == "src") {print $(i+1); exit}}')"
+  if [[ -n "${local_ip}" ]] && command -v upnpc >/dev/null 2>&1; then
+    if timeout --foreground --kill-after=2s 12s upnpc -e "club3090-acme" -a "${local_ip}" 80 80 tcp 600 >/dev/null 2>&1; then
+      log_line "temporary UPnP TCP/80 lease opened for ACME validation"
+      return 0
+    fi
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    log_line "temporary TCP/80 mapping unavailable because neither UPnP nor Python NAT-PMP support is usable"
+    return 1
+  fi
+  mapping_output="$(python3 - <<'PY' 2>/dev/null
+import socket
+import struct
+
+gateway = ""
+with open("/proc/net/route", "r", encoding="ascii", errors="replace") as handle:
+    next(handle, None)
+    for line in handle:
+        fields = line.split()
+        if len(fields) >= 3 and fields[1] == "00000000":
+            gateway = socket.inet_ntoa(struct.pack("<I", int(fields[2], 16)))
+            break
+if not gateway:
+    raise SystemExit(1)
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.settimeout(3)
+public_ip = ""
+for attempt in range(3):
+    try:
+        sock.sendto(b"\x00\x00", (gateway, 5351))
+        response, _ = sock.recvfrom(2048)
+        if len(response) >= 12:
+            version, opcode, result, _epoch = struct.unpack("!BBHI", response[:8])
+            if version == 0 and opcode == 128 and result == 0:
+                public_ip = socket.inet_ntoa(response[8:12])
+                break
+    except OSError:
+        if attempt == 2:
+            raise SystemExit(1)
+
+request = struct.pack("!BBHHHI", 0, 2, 0, 80, 80, 600)
+for attempt in range(3):
+    try:
+        sock.sendto(request, (gateway, 5351))
+        response, _ = sock.recvfrom(2048)
+        if len(response) >= 16:
+            version, opcode, result, _epoch, private_port, public_port, lifetime = struct.unpack(
+                "!BBHIHHI", response[:16]
+            )
+            if (
+                version == 0
+                and opcode == 130
+                and result == 0
+                and private_port == 80
+                and public_port == 80
+                and lifetime > 0
+            ):
+                print(f"temporary NAT-PMP TCP/80 lease opened via {gateway} (router WAN {public_ip or 'unknown'})")
+                raise SystemExit(0)
+    except OSError:
+        if attempt == 2:
+            raise SystemExit(1)
+raise SystemExit(1)
+PY
+)" || true
+  if [[ -n "${mapping_output}" ]]; then
+    log_line "${mapping_output}"
+    return 0
+  fi
+  log_line "router did not grant a temporary TCP/80 lease; ensure public TCP/80 is forwarded to this server for ACME validation"
+  return 1
+}
+
+public_ip="$(curl -fsSL --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+if [[ ! "${public_ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+  log_line "public IPv4 detection failed; keeping self-signed fallback"
+  exit 0
+fi
+if ! command -v certbot >/dev/null 2>&1; then
+  log_line "Certbot is unavailable; keeping self-signed fallback for ${public_ip}"
+  exit 0
+fi
+if ! timeout --foreground --kill-after=2s 15s certbot --help all 2>/dev/null | grep -q -- '--ip-address'; then
+  log_line "Certbot lacks IP certificate support; keeping self-signed fallback for ${public_ip}"
+  exit 0
+fi
+
+mkdir -p "${ACME_WEBROOT}"
+live_dir="/etc/letsencrypt/live/${public_ip}"
+open_temporary_http_mapping || true
+certbot_args=(
+  certonly
+  --non-interactive
+  --agree-tos
+  --register-unsafely-without-email
+  --preferred-profile shortlived
+  --webroot
+  --webroot-path "${ACME_WEBROOT}"
+  --ip-address "${public_ip}"
+)
+if [[ -r "${live_dir}/fullchain.pem" && -r "${live_dir}/privkey.pem" ]]; then
+  certbot_args+=(--keep-until-expiring)
+fi
+
+if timeout --foreground --kill-after=15s "${TIMEOUT_SECONDS}s" certbot "${certbot_args[@]}" >> "${LOG_FILE}" 2>&1 \
+  && [[ -r "${live_dir}/fullchain.pem" && -r "${live_dir}/privkey.pem" ]]; then
+  rm -f "${PUBLIC_CERT}" "${PUBLIC_KEY}"
+  ln -s "${live_dir}/fullchain.pem" "${PUBLIC_CERT}"
+  ln -s "${live_dir}/privkey.pem" "${PUBLIC_KEY}"
+  systemctl reload club3090-caddy.service >/dev/null 2>&1 \
+    || systemctl restart club3090-caddy.service >/dev/null 2>&1 \
+    || true
+  log_line "browser-trusted public IP certificate is active for ${public_ip}"
+else
+  if [[ ! -e "${PUBLIC_CERT}" && -r "${FALLBACK_CERT}" ]]; then
+    ln -s "${FALLBACK_CERT}" "${PUBLIC_CERT}" 2>/dev/null || true
+  fi
+  if [[ ! -e "${PUBLIC_KEY}" && -r "${FALLBACK_KEY}" ]]; then
+    ln -s "${FALLBACK_KEY}" "${PUBLIC_KEY}" 2>/dev/null || true
+  fi
+  log_line "Let's Encrypt issuance or renewal failed for ${public_ip}; keeping self-signed fallback. Ensure public TCP/80 reaches this server for ACME validation"
+fi
+exit 0
+CERTSH
+  "${SUDO[@]}" chmod 755 "${CERT_REFRESH_SH}"
 }
 
 write_caddy_unit() {
@@ -2811,8 +3601,11 @@ Wants=club3090-control.service network-online.target
 
 [Service]
 Type=simple
+Environment=HOME=/root
+Environment=XDG_DATA_HOME=${CONTROL_DIR}/caddy-data
+Environment=XDG_CONFIG_HOME=${CONTROL_DIR}/caddy-config
 ExecStart=$(command -v caddy) run --config ${CADDYFILE_PATH} --adapter caddyfile
-ExecReload=$(command -v caddy) reload --config ${CADDYFILE_PATH} --adapter caddyfile
+ExecReload=$(command -v caddy) reload --config ${CADDYFILE_PATH} --adapter caddyfile --force
 Restart=always
 RestartSec=3
 StandardOutput=journal
@@ -2821,16 +3614,58 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 UNIT
+
+  "${SUDO[@]}" tee /etc/systemd/system/club3090-cert-refresh.service >/dev/null <<UNIT
+[Unit]
+Description=club-3090 public IP certificate refresh
+After=network-online.target club3090-caddy.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=CLUB3090_CONTROL_DIR=${CONTROL_DIR}
+ExecStart=${CERT_REFRESH_SH}
+TimeoutStartSec=240
+UNIT
+
+  "${SUDO[@]}" tee /etc/systemd/system/club3090-cert-refresh.timer >/dev/null <<'UNIT'
+[Unit]
+Description=Daily club-3090 public IP certificate refresh
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1d
+Persistent=true
+RandomizedDelaySec=15min
+Unit=club3090-cert-refresh.service
+
+[Install]
+WantedBy=timers.target
+UNIT
+}
+
+cleanup_generic_caddy_unit_conflict() {
+  if "${SUDO[@]}" systemctl list-unit-files caddy.service >/dev/null 2>&1; then
+    "${SUDO[@]}" systemctl disable --now caddy.service >/dev/null 2>&1 || true
+    "${SUDO[@]}" systemctl reset-failed caddy.service >/dev/null 2>&1 || true
+  fi
 }
 
 configure_https_frontend() {
   local https_host=""
   if [[ "${ONLINE_TLS_EFFECTIVE_ENABLED}" != "true" ]]; then
     "${SUDO[@]}" systemctl disable --now club3090-caddy.service 2>/dev/null || true
-    "${SUDO[@]}" rm -f /etc/systemd/system/club3090-caddy.service "${CADDYFILE_PATH}" >/dev/null 2>&1 || true
+    "${SUDO[@]}" systemctl disable --now club3090-cert-refresh.timer club3090-cert-refresh.service 2>/dev/null || true
+    "${SUDO[@]}" rm -f \
+      /etc/systemd/system/club3090-caddy.service \
+      /etc/systemd/system/club3090-cert-refresh.service \
+      /etc/systemd/system/club3090-cert-refresh.timer \
+      "${CADDYFILE_PATH}" \
+      "${CERT_REFRESH_SH}" >/dev/null 2>&1 || true
     write_https_public_host ""
     return 0
   fi
+  write_certificate_refresh_script
   https_host="$(resolve_https_public_host || true)"
   write_https_public_host "${https_host}"
   ensure_https_certificate
@@ -2845,7 +3680,9 @@ configure_https_frontend() {
   elif is_ipv4_address "${https_host}"; then
     :
   elif [[ "${https_host}" == *.ts.net ]]; then
-    ensure_tailscale_certificate "${https_host}" || true
+    # Remove certificates produced by older installers. Caddy's native
+    # Tailscale manager renews the certificate automatically.
+    "${SUDO[@]}" rm -f "${CONTROL_DIR}/tailscale.crt" "${CONTROL_DIR}/tailscale.key" >/dev/null 2>&1 || true
   else
     :
   fi
@@ -2859,6 +3696,7 @@ configure_https_frontend() {
     exit 1
   fi
   write_caddy_unit
+  cleanup_generic_caddy_unit_conflict
 }
 
 write_vllm_unit() {
@@ -2899,12 +3737,15 @@ enable_managed_units() {
   "${SUDO[@]}" systemctl enable club3090-vllm.service
   "${SUDO[@]}" systemctl disable club3090-headless-x.service 2>/dev/null || true
   "${SUDO[@]}" systemctl enable club3090-control.service
+  "${SUDO[@]}" systemctl enable club3090-benchmarks.service
   "${SUDO[@]}" systemctl enable club3090-updater.service
   "${SUDO[@]}" systemctl enable club3090-console-log.service
   if [[ "${ONLINE_TLS_EFFECTIVE_ENABLED}" == "true" ]]; then
     "${SUDO[@]}" systemctl enable club3090-caddy.service
+    "${SUDO[@]}" systemctl enable club3090-cert-refresh.timer
   else
     "${SUDO[@]}" systemctl disable club3090-caddy.service 2>/dev/null || true
+    "${SUDO[@]}" systemctl disable club3090-cert-refresh.timer club3090-cert-refresh.service 2>/dev/null || true
   fi
 }
 
@@ -2976,7 +3817,18 @@ start_control_plane_services_if_booted() {
   start_unit_nonblocking club3090-updater.service
   start_unit_nonblocking club3090-control.service
   if [[ "${ONLINE_TLS_EFFECTIVE_ENABLED}" == "true" ]]; then
-    start_unit_nonblocking club3090-caddy.service
+    cleanup_generic_caddy_unit_conflict
+    local control_wait_seconds="${CONTROL_HTTP_READY_TIMEOUT_SECONDS:-60}"
+    if ! wait_for_control_http "${CONTROL_ADMIN_BIND_PORT}" "${control_wait_seconds}"; then
+      echo "WARNING: Control listener 127.0.0.1:${CONTROL_ADMIN_BIND_PORT} was not ready after ${control_wait_seconds} seconds; starting Caddy anyway." >&2
+    fi
+    if "${SUDO[@]}" systemctl is-active --quiet club3090-caddy.service; then
+      "${SUDO[@]}" systemctl restart club3090-caddy.service >/dev/null 2>&1 || true
+    else
+      start_unit_nonblocking club3090-caddy.service
+    fi
+    start_unit_nonblocking club3090-cert-refresh.timer
+    start_unit_nonblocking club3090-cert-refresh.service
   fi
   configure_tailscale_serve_if_requested
   configure_tailscale_funnel_if_requested
@@ -2995,14 +3847,18 @@ start_unit_nonblocking() {
   "${SUDO[@]}" systemctl start "${unit}" >/dev/null 2>&1 || true
 }
 
-reload_caddy_if_active() {
-  if [[ "${ONLINE_TLS_EFFECTIVE_ENABLED}" != "true" ]]; then
-    return 0
-  fi
-  if "${SUDO[@]}" systemctl is-active --quiet club3090-caddy.service; then
-    "${SUDO[@]}" systemctl reload club3090-caddy.service >/dev/null 2>&1 || \
-      "${SUDO[@]}" systemctl restart club3090-caddy.service >/dev/null 2>&1 || true
-  fi
+wait_for_control_http() {
+  local port="$1"
+  local timeout_seconds="${2:-15}"
+  local deadline
+  deadline="$(( $(network_now_seconds) + timeout_seconds ))"
+  while ! network_deadline_expired "${deadline}"; do
+    if curl --silent --show-error --max-time 1 --output /dev/null "http://127.0.0.1:${port}/admin" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
 }
 
 refresh_updater_service_if_safe() {
@@ -3025,7 +3881,6 @@ if [[ "${ACTION}" == "install" ]]; then
   log_step "Enabling managed club-3090 services"
   enable_managed_units
   refresh_updater_service_if_safe
-  reload_caddy_if_active
   log_step "Starting control-plane services when server boot mode is active"
   start_control_plane_services_if_booted
   log_done "Install actions completed"
@@ -3049,7 +3904,6 @@ elif [[ "${ACTION}" == "update" ]]; then
   log_step "Re-enabling managed club-3090 services"
   enable_managed_units
   refresh_updater_service_if_safe
-  reload_caddy_if_active
   log_step "Starting control-plane services if the server boot flag is active"
   start_control_plane_services_if_booted
   log_done "Update actions completed"
@@ -3069,7 +3923,6 @@ else
   log_step "Re-enabling managed club-3090 services"
   enable_managed_units
   refresh_updater_service_if_safe
-  reload_caddy_if_active
   log_step "Starting control-plane services if the server boot flag is active"
   start_control_plane_services_if_booted
   migration_mark_flag_done "MIGRATION_SERVICES_REFRESHED" "services_refreshed_after_migrate"
@@ -3113,6 +3966,7 @@ echo "Auto mode: ${AUTO_DEFAULT_MODE}"
 echo "Default:   ${DEFAULT_MODE}"
 echo "Admin port:${ADMIN_PORT}"
 echo "Proxy port:${PROXY_PORT}"
+echo "Proxy swap:$([[ "${PROXY_SWAP_MODE}" == "disable" ]] && echo disabled || echo enabled)"
 echo "Local API: ${LOCAL_API_PORT} ($([[ "${LOCAL_AUTOMATION_EFFECTIVE_ENABLED}" == "true" ]] && echo enabled || echo disabled))"
 echo "Instances: ${CONTROL_DIR}/instances.json"
 echo "Server cfg: ${CONTROL_DIR}/server_config.json"
@@ -3127,7 +3981,8 @@ if [[ "${ONLINE_TLS_EFFECTIVE_ENABLED}" == "true" && -z "${resolved_https_host:-
 elif [[ "${ONLINE_TLS_EFFECTIVE_ENABLED}" == "true" && "${ONLINE_TLS_TAILSCALE_MODE:-disable}" == "enable" && "${ONLINE_TLS_TAILSCALE_FUNNEL_MODE:-disable}" != "enable" ]]; then
   echo "Tailscale Serve admin: https://${DISPLAY_HOST}/admin"
   echo "Tailscale Serve proxy: https://${DISPLAY_HOST}:8443/v1/chat/completions"
-  echo "HTTPS note: direct :${ADMIN_PORT}/:${PROXY_PORT} IP access remains on the self-signed Caddy path; the browser-trusted ts.net path is served by Tailscale itself."
+  echo "HTTPS note: Caddy serves browser-trusted ts.net certificates on :${ADMIN_PORT}/:${PROXY_PORT}; the public-IP route upgrades from its self-signed fallback when the managed Let's Encrypt refresh succeeds."
+  echo "Public-IP certificate renewal: the managed refresher tries temporary UPnP and NAT-PMP TCP/80 leases. If the router cannot grant one, forward public TCP/80 to this server for ACME validation."
 fi
 if [[ "${ONLINE_TLS_TAILSCALE_FUNNEL_MODE:-disable}" == "enable" && -n "${resolved_https_host:-}" ]]; then
   echo "Tailscale Funnel public admin: https://${DISPLAY_HOST}/admin"

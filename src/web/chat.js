@@ -1031,10 +1031,13 @@ function scheduleChatTranscriptHeightSync() {
   window.requestAnimationFrame(() => syncChatTranscriptHeight());
 }
 window.addEventListener("resize", scheduleChatTranscriptHeightSync);
+function chatBenchmarkLocked() {
+  return typeof benchmarkJobActive === "function" && benchmarkJobActive();
+}
 function handleChatInputChange() {
   handleChatInputResize();
   const hasSelectableRuntime = activeChatPresets().length > 0 || chatSelectedRuntimeIsUnavailable();
-  const chatControlsDisabled = chatState.busy || chatHydrationPending() || !chatStateHydrated;
+  const chatControlsDisabled = chatState.busy || chatHydrationPending() || !chatStateHydrated || chatBenchmarkLocked();
   const hasDraft =
     !!String($("chatInput")?.value || "").trim() ||
     !!(chatState.attachments || []).length;
@@ -1056,7 +1059,7 @@ function ensureChatInputBindings() {
 function renderChatPresetSelector() {
   const select = $("chatPresetSelect");
   if (!select) return;
-  const chatControlsDisabled = chatState.busy || chatHydrationPending() || !chatStateHydrated;
+  const chatControlsDisabled = chatState.busy || chatHydrationPending() || !chatStateHydrated || chatBenchmarkLocked();
   const rows = activeChatPresets();
   const conversation = activeChatConversation();
   const savedPresetKey = String(chatState.presetId || conversation?.presetId || "").trim();
@@ -1085,7 +1088,9 @@ function renderChatPresetSelector() {
   const html = `${staleOption}${rows
     .map((runtime) => {
       const key = chatPresetKey(runtime);
-      const label = `${variantDisplayLabel({ upstream_tag: runtime.selector || runtime.mode })} | ${runtime.id || runtime.instance_id}`;
+      const displayName = String(runtime.chat_label || "").trim()
+        || variantDisplayLabel({ upstream_tag: runtime.selector || runtime.mode });
+      const label = `${displayName} | ${runtime.id || runtime.instance_id}`;
       return `<option value="${escapeHtml(key)}" ${key === chatState.presetId ? "selected" : ""}>${escapeHtml(label)}</option>`;
     })
     .join("")}`;
@@ -1101,7 +1106,7 @@ function chatApiPresetOptions() {
 function renderChatApiPresetSelector() {
   const select = $("chatApiPresetSelect");
   if (!select) return;
-  const chatControlsDisabled = chatState.busy || chatHydrationPending() || !chatStateHydrated;
+  const chatControlsDisabled = chatState.busy || chatHydrationPending() || !chatStateHydrated || chatBenchmarkLocked();
   const presets = chatApiPresetOptions();
   const valid = new Set(presets.map((preset) => String(preset?.name || "")));
   if (chatState.apiPresetName && !valid.has(chatState.apiPresetName)) {
@@ -1120,11 +1125,38 @@ function renderChatApiPresetSelector() {
 function chatRuntimeSupportsVision(runtime) {
   return !!runtime && !!String(runtime.vision || "").trim();
 }
+function chatRuntimeSupportsMedia(runtime, kind = "image") {
+  if (kind === "text") return true;
+  const row = runtime || {};
+  const haystack = [
+    row.vision,
+    row.modality,
+    row.selector,
+    row.mode,
+    row.model,
+    row.model_id,
+    row.served_model_name,
+    row.label,
+  ]
+    .map((value) => String(value || "").toLowerCase())
+    .join(" ");
+  if (kind === "image") {
+    return chatRuntimeSupportsVision(row) || /\b(vision|vl|omni|gemma|multimodal)\b/.test(haystack);
+  }
+  if (kind === "audio" || kind === "video") {
+    return (
+      /\b(omni|audio|video|speech|voice|gemma|multimodal)\b/.test(haystack) ||
+      (chatRuntimeSupportsVision(row) && /\b(gemma|omni)\b/.test(haystack))
+    );
+  }
+  return false;
+}
 function chatAttachmentId() {
   return `chat-att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 function chatAttachmentKindClass(attachment) {
-  return attachment?.kind === "image" ? "chat-attachment-image" : "chat-attachment-text";
+  const kind = String(attachment?.kind || "text").toLowerCase();
+  return ["image", "audio", "video"].includes(kind) ? `chat-attachment-${kind}` : "chat-attachment-text";
 }
 function chatAttachmentTextPreview(text) {
   const normalized = String(text || "").replace(/\r/g, "").trim();
@@ -1137,6 +1169,16 @@ function renderChatAttachmentPreview(attachment, options = {}) {
   const name = escapeHtml(attachment?.name || "attachment");
   if (attachment?.kind === "image") {
     return `<div class="chat-attachment-preview ${compact ? "compact" : ""} ${chatAttachmentKindClass(attachment)}"><div class="chat-attachment-preview-thumb"><img src="${attachment.url}" alt="${name}" /></div>${compact ? `<div class="chat-attachment-preview-copy"><span class="chat-attachment-name">${name}</span></div>` : ""}</div>`;
+  }
+  if (attachment?.kind === "audio") {
+    return `<div class="chat-attachment-preview ${compact ? "compact" : ""} ${chatAttachmentKindClass(attachment)}"><div class="chat-attachment-preview-thumb audio-thumb"><span>${svgIcon("waveform")}</span></div><div class="chat-attachment-preview-copy"><span class="chat-attachment-name">${name}</span>${compact ? "" : `<audio controls preload="metadata" src="${escapeHtml(attachment.url || "")}"></audio>`}</div></div>`;
+  }
+  if (attachment?.kind === "video") {
+    const thumbnail = attachment.thumbnail_url || attachment.thumbnailUrl || "";
+    const thumb = thumbnail
+      ? `<img src="${escapeHtml(thumbnail)}" alt="${name}" />`
+      : `<video src="${escapeHtml(attachment.url || "")}" preload="metadata" muted playsinline></video>`;
+    return `<div class="chat-attachment-preview ${compact ? "compact" : ""} ${chatAttachmentKindClass(attachment)}"><div class="chat-attachment-preview-thumb video-thumb">${thumb}<span class="chat-video-play-mark">${svgIcon("play")}</span></div><div class="chat-attachment-preview-copy"><span class="chat-attachment-name">${name}</span>${compact ? "" : `<video controls preload="metadata" src="${escapeHtml(attachment.url || "")}"></video>`}</div></div>`;
   }
   const preview = escapeHtml(chatAttachmentTextPreview(attachment?.text || "")) || "Empty text attachment";
   return `<div class="chat-attachment-preview ${compact ? "compact" : ""} ${chatAttachmentKindClass(attachment)}"><div class="chat-attachment-preview-thumb text-thumb"><span>TXT</span></div><div class="chat-attachment-preview-copy"><span class="chat-attachment-name">${name}</span><span class="chat-attachment-preview-text">${preview}</span></div></div>`;
@@ -1369,6 +1411,70 @@ function richEmbedForUrl(url, altText = "") {
   if (youtubeUrl)
     return `<div class="chat-rich-embed"><iframe class="chat-markdown-media" src="${escapeHtml(youtubeUrl)}" title="${escapeHtml(altText || "embedded media")}" loading="lazy" allowfullscreen></iframe></div>`;
   return "";
+}
+function openChatLocalMedia(rootPath, relativePath) {
+  if (typeof openStorageBrowserFileReadOnly === "function") {
+    openStorageBrowserFileReadOnly(String(rootPath || "/"), String(relativePath || ""));
+  }
+}
+function markChatGeneratedMediaBroken(media) {
+  const host = media?.closest?.(".chat-generated-media");
+  if (!host) return;
+  host.classList.add("chat-generated-media-broken");
+  host.querySelector(".chat-local-media-open")?.remove();
+}
+function renderChatGeneratedMedia(output = {}) {
+  if (Array.isArray(output)) {
+    return output.map((item) => renderChatGeneratedMedia(item)).join("");
+  }
+  const url = String(output?.url || "");
+  const rootPath = String(output?.root_path || "/");
+  const relativePath = String(output?.relative_path || "");
+  const name = String(output?.name || relativePath.split("/").pop() || "generated media");
+  const open = `openChatLocalMedia(${JSON.stringify(rootPath)},${JSON.stringify(relativePath)})`;
+  const canOpen = !!relativePath && !!url;
+  const popoutIcon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 5h5v5m0-5-7 7" fill="none" /><path d="M10 7H7a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-3" fill="none" /></svg>';
+  let media = "";
+  if (output?.kind === "image")
+    media = `<img class="chat-markdown-image chat-local-media" src="${escapeHtml(url)}" alt="${escapeHtml(name)}" loading="lazy" onerror="markChatGeneratedMediaBroken(this)" />`;
+  else if (output?.kind === "video")
+    media = `<video class="chat-markdown-media chat-local-media" controls preload="metadata" src="${escapeHtml(url)}" onerror="markChatGeneratedMediaBroken(this)"></video>`;
+  else
+    media = `<audio class="chat-markdown-media chat-local-media" controls preload="metadata" src="${escapeHtml(url)}" onerror="markChatGeneratedMediaBroken(this)"></audio>`;
+  const openButton = canOpen
+    ? `<button type="button" class="chat-local-media-open" title="Open in File Editor" aria-label="Open generated media in File Editor" onclick='${escapeHtml(open)}'>${popoutIcon}</button>`
+    : "";
+  return `<div class="chat-rich-embed chat-generated-media">${media}${openButton}</div>`;
+}
+function renderStudioPlanResults(results = []) {
+  if (!Array.isArray(results) || !results.length) return "";
+  const textResult = results.find((result) => result?.kind === "text" && Array.isArray(result?.items));
+  const items = textResult?.items || [];
+  const batchResults = results.filter((result) => result?.kind === "media" && result?.batch);
+  const standalone = results
+    .filter((result) => result?.kind === "media" && !result?.batch)
+    .flatMap((result) => result?.outputs || []);
+  const rows = items.map((item, itemIndex) => {
+    const media = batchResults.flatMap((result) =>
+      (result.outputs || [])
+        .filter((entry, index) => index === itemIndex || entry?.item === item)
+        .map((entry) => entry?.output)
+        .filter(Boolean),
+    );
+    const image = media.find((output) => output?.kind === "image");
+    const audio = media.find((output) => output?.kind === "audio");
+    const heading = [item?.name, item?.dates].filter(Boolean).join(" · ");
+    const copy = String(item?.text || item?.paragraph || item?.description || "").trim();
+    return `<section class="chat-studio-result-row">${
+      image ? `<div class="chat-studio-result-portrait">${renderChatGeneratedMedia(image)}</div>` : ""
+    }<div class="chat-studio-result-copy">${heading ? `<h4>${escapeHtml(heading)}</h4>` : ""}${
+      copy ? `<div class="chat-message-markdown">${cachedMarkdownToHtml(copy)}</div>` : ""
+    }${audio ? `<div class="chat-studio-result-audio">${renderChatGeneratedMedia(audio)}</div>` : ""}</div></section>`;
+  }).join("");
+  const tail = standalone.length
+    ? `<div class="chat-studio-result-tail">${standalone.map((entry) => renderChatGeneratedMedia(entry?.output || entry)).join("")}</div>`
+    : "";
+  return rows || tail ? `<div class="chat-studio-plan-results">${rows}${tail}</div>` : "";
 }
 function applyBalancedUnderscoreFormatting(text) {
   return String(text || "")
@@ -4456,7 +4562,7 @@ function chatTranscriptSignature() {
     CHAT_TRANSCRIPT_INITIAL_TURNS,
     Number(chatTranscriptVisibleTurns || 0) || CHAT_TRANSCRIPT_INITIAL_TURNS,
   );
-  const parts = [conversationId, String(visibleTurns), String(chatMarkdownRenderEpoch)];
+  const parts = [conversationId, String(visibleTurns), String(chatMarkdownRenderEpoch), String(chatEditingMessageIndex)];
   (chatState.messages || []).forEach((message, index) => {
     const attachments = chatMessageAttachments(message);
     parts.push(
@@ -4474,19 +4580,179 @@ function chatTranscriptSignature() {
         message?.inputTokensEstimate ?? "",
         message?.inputTokensApprox ? 1 : 0,
         message?.outputTokens ?? "",
+        message?.ttftSeconds ?? "",
         message?.tokensPerSecond ?? "",
       ].join(":"),
     );
   });
   return parts.join("|");
 }
-function renderChatMessageMeta(message = {}) {
+let chatEditingMessageIndex = -1;
+function renderChatInlineMessageEditor(message = {}, messageIndex = -1) {
+  return `<div class="chat-message-inline-editor"><textarea id="chatMessageEditTextarea-${Number(messageIndex)}" class="chat-message-edit-textarea" spellcheck="true" onkeydown="handleChatInlineEditKeydown(event, ${Number(messageIndex)})">${escapeHtml(String(message?.text || ""))}</textarea><div class="chat-message-edit-actions"><button type="button" class="btn green" onclick="saveChatMessageInlineEdit(${Number(messageIndex)})">Save</button><button type="button" class="btn blue" onclick="cancelChatMessageInlineEdit()">Cancel</button></div><div class="chat-settings-note">Editing plaintext here will re-render Markdown after saving.</div></div>`;
+}
+function focusChatInlineEditor(messageIndex) {
+  requestAnimationFrame(() => {
+    const textarea = $(`chatMessageEditTextarea-${Number(messageIndex)}`);
+    if (!textarea) return;
+    textarea.focus();
+    textarea.selectionStart = textarea.selectionEnd = String(textarea.value || "").length;
+  });
+}
+async function editChatMessage(messageIndex) {
+  if (chatState.busy) {
+    openClubAlertModal("Stop the active generation before editing a message.");
+    return;
+  }
+  const index = Number(messageIndex);
+  const message = (chatState.messages || [])[index];
+  if (!message) return;
+  chatEditingMessageIndex = chatEditingMessageIndex === index ? -1 : index;
+  chatTranscriptLastSignature = "";
+  renderChatTranscript(false, { reason: "edit-start" });
+  if (chatEditingMessageIndex === index) focusChatInlineEditor(index);
+}
+function cancelChatMessageInlineEdit() {
+  chatEditingMessageIndex = -1;
+  chatTranscriptLastSignature = "";
+  renderChatTranscript(false, { reason: "edit-cancel" });
+}
+function handleChatInlineEditKeydown(event, messageIndex) {
+  if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+    event.preventDefault();
+    saveChatMessageInlineEdit(messageIndex);
+  } else if (event.key === "Escape") {
+    event.preventDefault();
+    cancelChatMessageInlineEdit();
+  }
+}
+function saveChatMessageInlineEdit(messageIndex) {
+  const index = Number(messageIndex);
+  const message = (chatState.messages || [])[index];
+  const textarea = $(`chatMessageEditTextarea-${index}`);
+  if (!message || !textarea) {
+    cancelChatMessageInlineEdit();
+    return;
+  }
+  const nextText = String(textarea.value || "");
+  chatEditingMessageIndex = -1;
+  if (nextText === String(message.text || "")) {
+    chatTranscriptLastSignature = "";
+    renderChatTranscript(false, { reason: "edit-cancel" });
+    return;
+  }
+  message.text = nextText;
+  delete message.streamingVisibleText;
+  delete message.streamingVisibleReasoningText;
+  delete message.streamingVisibleActive;
+  chatTranscriptLastSignature = "";
+  persistChatConversationState();
+  renderChatTranscript(false, { reason: "edit" });
+}
+async function deleteChatMessage(messageIndex) {
+  if (chatState.busy) {
+    openClubAlertModal("Stop the active generation before deleting a message.");
+    return;
+  }
+  const index = Number(messageIndex);
+  const message = (chatState.messages || [])[index];
+  if (!message) return;
+  const label = message.role === "user" ? "user" : "assistant";
+  if (!(await openClubConfirmModal(`Delete this ${label} message from the conversation?`))) return;
+  chatState.messages.splice(index, 1);
+  if (chatEditingMessageIndex === index) chatEditingMessageIndex = -1;
+  else if (chatEditingMessageIndex > index) chatEditingMessageIndex -= 1;
+  chatTranscriptLastSignature = "";
+  persistChatConversationState();
+  renderChatTranscript(false, { reason: "delete" });
+}
+function applyAssistantGenerationMetrics(message = {}, metrics = {}) {
+  if (!message || message.role !== "assistant" || !metrics || typeof metrics !== "object") return message;
+  const metricSource =
+    metrics.generation_metrics && typeof metrics.generation_metrics === "object"
+      ? metrics.generation_metrics
+      : metrics;
+  const usage =
+    metricSource.usage && typeof metricSource.usage === "object"
+      ? metricSource.usage
+      : metricSource;
+  const outputTokens = Number(
+    usage.output_tokens ??
+      usage.completion_tokens ??
+      metricSource.output_tokens ??
+      metricSource.completion_tokens,
+  );
+  const ttftSeconds = Number(metricSource.ttft_s ?? metricSource.ttftSeconds);
+  const tokensPerSecond = Number(metricSource.generation_tps ?? metricSource.tokensPerSecond);
+  if (Number.isFinite(outputTokens) && outputTokens >= 0) message.outputTokens = outputTokens;
+  if (Number.isFinite(ttftSeconds) && ttftSeconds >= 0) message.ttftSeconds = ttftSeconds;
+  if (Number.isFinite(tokensPerSecond) && tokensPerSecond > 0) {
+    message.tokensPerSecond = tokensPerSecond;
+    message.maxTokensPerSecond = Math.max(Number(message.maxTokensPerSecond || 0), tokensPerSecond);
+  }
+  return message;
+}
+function chatMessageTimestampIso(message = {}) {
+  const value = Number(message?.createdAt || message?.timestamp || 0);
+  if (!Number.isFinite(value) || value <= 0) return "";
+  try {
+    return new Date(value).toISOString();
+  } catch (error) {
+    return "";
+  }
+}
+function chatMessageGenerationDurationSeconds(message = {}) {
+  const explicit = Number(message?.generationDurationSeconds);
+  if (Number.isFinite(explicit) && explicit >= 0) return explicit;
+  const started = Number(message?.generationStartedAt || 0);
+  const finished = Number(message?.generationFinishedAt || 0);
+  if (Number.isFinite(started) && started > 0 && Number.isFinite(finished) && finished >= started) {
+    return (finished - started) / 1000;
+  }
+  return null;
+}
+function markAssistantGenerationFinished(message = {}) {
+  if (!message || message.role !== "assistant") return message;
+  const finishedAt = Date.now();
+  message.generationFinishedAt = finishedAt;
+  const startedAt = Number(message.generationStartedAt || message.createdAt || 0);
+  if (Number.isFinite(startedAt) && startedAt > 0 && finishedAt >= startedAt) {
+    message.generationDurationSeconds = (finishedAt - startedAt) / 1000;
+  }
+  return message;
+}
+async function flushChatConversationStateNow() {
+  syncActiveConversationFromChatState();
+  persistChatConversationState();
+  try {
+    await flushServerChatStateSave(currentChatStatePayload());
+  } catch (error) {
+    logDebugEvent("chat_state_final_flush_error", {
+      error: error?.message || String(error || ""),
+      activeConversationId: String(chatState.activeConversationId || ""),
+    });
+  }
+}
+function commitStudioPlanProgress(assistantIndex, options = {}) {
+  syncActiveConversationFromChatState();
+  if (options?.render) {
+    renderChatTranscript(true, { reason: options.reason || "studio-progress" });
+  } else {
+    updateLiveChatMessageDom(assistantIndex, true);
+  }
+  persistChatConversationState();
+}
+function renderChatMessageMeta(message = {}, messageIndex = -1) {
   const bits = [];
+  const timestamp = chatMessageTimestampIso(message);
+  if (timestamp) bits.push(timestamp);
   if (message.role === "user") {
     const inputTokens = message.inputTokens ?? message.inputTokensEstimate;
     if (inputTokens !== null && inputTokens !== undefined)
       bits.push(`input: ${formatGroupedInt(inputTokens)} tokens`);
   } else if (message.role === "assistant") {
+    const durationSeconds = chatMessageGenerationDurationSeconds(message);
+    if (durationSeconds !== null) bits.push(`${formatElapsedSeconds(durationSeconds)} generation`);
     if (message.outputTokens !== null && message.outputTokens !== undefined)
       bits.push(`output: ${formatGroupedInt(message.outputTokens)} tokens`);
     if (message.ttftSeconds !== null && message.ttftSeconds !== undefined)
@@ -4495,9 +4761,32 @@ function renderChatMessageMeta(message = {}) {
       bits.push(`tk/s: ${formatNumber(message.tokensPerSecond, 2)}`);
     }
   }
-  return bits.length
-    ? `<div class="chat-message-meta">${escapeHtml(bits.join(" · "))}</div>`
+  const actions =
+    Number.isInteger(Number(messageIndex)) && Number(messageIndex) >= 0
+      ? `<span class="chat-message-actions"><button type="button" class="chat-message-action" title="Edit message" aria-label="Edit message" onclick="editChatMessage(${Number(messageIndex)})">${svgIcon("edit")}</button><button type="button" class="chat-message-action danger" title="Delete message" aria-label="Delete message" onclick="deleteChatMessage(${Number(messageIndex)})">${svgIcon("delete")}</button></span>`
+      : "";
+  return bits.length || actions
+    ? `<div class="chat-message-meta"><span class="chat-message-metrics">${escapeHtml(bits.join(" · "))}</span>${actions}</div>`
     : "";
+}
+function syncChatMessageMetaDom(bodyHost, message, messageIndex) {
+  if (!bodyHost) return;
+  const nextHtml = renderChatMessageMeta(message, messageIndex);
+  const current = bodyHost.querySelector(".chat-message-meta");
+  if (!nextHtml) {
+    if (current) current.remove();
+    return;
+  }
+  if (current && current.outerHTML === nextHtml) return;
+  const template = document.createElement("template");
+  template.innerHTML = nextHtml;
+  const nextNode = template.content.firstElementChild;
+  if (!nextNode) return;
+  if (current) {
+    current.replaceWith(nextNode);
+  } else {
+    bodyHost.appendChild(nextNode);
+  }
 }
 function renderChatMessageTitle(message = {}) {
   if (message.role === "assistant") return `${message.modelLabel || "Model"}:`;
@@ -4519,13 +4808,14 @@ function renderChatThinkingCardHtml(message = {}, messageIndex = -1) {
       ? Date.now() - Number(message.thinkingStartedAt || Date.now())
       : message.thinkingDurationMs,
   );
+  const thinkingLabel = String(message?.reasoningLabel || "").trim() || (thinkingActive ? "Thinking" : "Thought");
   const thinkingTitle = thinkingDuration
-    ? `${thinkingActive ? "Thinking" : "Thought"} for ${thinkingDuration}`
+    ? `${thinkingLabel} for ${thinkingDuration}`
     : thinkingView.reasoningText
-      ? `${thinkingActive ? "Thinking" : "Thought"} for <1 second`
+      ? `${thinkingLabel} for <1 second`
       : thinkingActive
         ? "Thinking"
-        : "Thought";
+        : thinkingLabel;
   const thinkingSubtitle = thinkingActive
     ? "Reasoning is streaming live."
     : thinkingExpanded
@@ -4576,7 +4866,21 @@ function renderChatMessageMarkdownHtml(
   }
   return `<div class="chat-message-markdown${streaming ? " chat-live-preview" : ""}"><div class="chat-message-markdown-stable">${stableHtml}</div><div class="chat-message-markdown-live">${liveHtml}</div>${hiddenInlinePreview}</div>`;
 }
+function renderStudioProgressMessageHtml(message = {}, contentText = "", options = {}) {
+  const lines = String(contentText || "").split(/\n+/);
+  const headline = String(lines[0] || "").trim();
+  const subline = String(lines[1] || "").trim();
+  if (!/^Generating Assets \d+\/\d+ · \d+% Done$/i.test(headline) || !/^Now:/i.test(subline)) {
+    return "";
+  }
+  const rest = lines.slice(2).join("\n").trim();
+  const restHtml = rest ? renderChatMessageMarkdownHtml(message, rest, options) : "";
+  return `<div class="chat-studio-progress"><div class="chat-studio-progress-head">${escapeHtml(headline)}</div><div class="chat-studio-progress-sub">${escapeHtml(subline)}</div>${restHtml}</div>`;
+}
 function renderChatMessageBodyContent(message = {}, messageIndex = -1) {
+  if (Number(messageIndex) === Number(chatEditingMessageIndex)) {
+    return renderChatInlineMessageEditor(message, messageIndex);
+  }
   const thinkingView =
     message.role === "assistant"
       ? chatMessageThinkingView(message)
@@ -4605,15 +4909,28 @@ function renderChatMessageBodyContent(message = {}, messageIndex = -1) {
         )
         .join("")}</div>`
     : "";
-  const meta = renderChatMessageMeta(message);
-  const markdownBody = renderChatMessageMarkdownHtml(
+  const meta = renderChatMessageMeta(message, messageIndex);
+  const progressBody = renderStudioProgressMessageHtml(
     message,
     thinkingView.contentText || "",
     {
       streaming: message.role === "assistant" && !!chatState.busy,
     },
   );
-  return `${thinkingCard}${markdownBody}${files}${images}${meta}`;
+  const markdownBody = progressBody || renderChatMessageMarkdownHtml(
+    message,
+    thinkingView.contentText || "",
+    {
+      streaming: message.role === "assistant" && !!chatState.busy,
+    },
+  );
+  const planResults = message?.studioPlanResults ? renderStudioPlanResults(message.studioPlanResults) : "";
+  const generatedMedia = planResults
+    ? ""
+    : message?.generatedMedia
+      ? renderChatGeneratedMedia(message.generatedMedia)
+      : "";
+  return `${thinkingCard}${markdownBody}${planResults}${generatedMedia}${files}${images}${meta}`;
 }
 function syncLiveChatThinkingDom(bodyHost, message, messageIndex, markdownHost) {
   if (!bodyHost || !markdownHost) return;
@@ -4726,6 +5043,15 @@ function updateLiveChatMessageDom(messageIndex, forceFollow = false) {
         delete stableHost.dataset.stableSourceLength;
       }
       if (liveHost.innerHTML !== state.liveHtml) liveHost.innerHTML = state.liveHtml;
+      if (
+        chatState.busy &&
+        message.role === "assistant" &&
+        thinkingView.contentText &&
+        !String(stableHost.textContent || "").trim() &&
+        !String(liveHost.textContent || "").trim()
+      ) {
+        liveHost.textContent = thinkingView.contentText;
+      }
       const shouldHighlightStable =
         chatHtmlNeedsCodeSyntaxHighlight(state?.stableHtml || "") ||
         chatHtmlNeedsCodeSyntaxHighlight(state?.appendedStableHtml || "") ||
@@ -4734,6 +5060,7 @@ function updateLiveChatMessageDom(messageIndex, forceFollow = false) {
         scheduleCodeSyntaxHighlight(stableHost);
       }
     }
+    syncChatMessageMetaDom(bodyHost, message, messageIndex);
     chatTranscriptRenderLastAt = Date.now();
     chatLiveMessageRenderLastAt = chatTranscriptRenderLastAt;
     chatTranscriptLastSignature = "";
@@ -5000,6 +5327,90 @@ function toggleChatStatsCollapsed() {
   persistChatConversationState();
   renderChatUi();
 }
+function renderChatStudioLaneSelector() {
+  const select = $("chatStudioLane");
+  if (!select) return;
+  const previous = String(select.value || "");
+  const rows = typeof aiStudioResourceRows === "function" ? aiStudioResourceRows() : [];
+  const liveReady = lastStatus?.ai_studio?.model_ready;
+  if (liveReady && typeof liveReady === "object") {
+    try {
+      localStorage.setItem("club3090_chat_studio_models", JSON.stringify(liveReady));
+    } catch (error) {}
+  }
+  let cachedReady = {};
+  try {
+    cachedReady = JSON.parse(localStorage.getItem("club3090_chat_studio_models") || "{}");
+  } catch (error) {}
+  const backendReady = liveReady && typeof liveReady === "object" ? liveReady : cachedReady;
+  let cachedStudioActive = true;
+  try {
+    const stored = localStorage.getItem("club3090_chat_studio_active");
+    if (stored !== null) cachedStudioActive = stored === "1";
+  } catch (error) {}
+  const studioReadyForPlanning = lastStatus && Object.prototype.hasOwnProperty.call(lastStatus, "ai_studio")
+    ? !!(lastStatus?.ai_studio?.ready || lastStatus?.ai_studio?.active)
+    : !!(window.__club3090ChatStudioActive ?? cachedStudioActive);
+  const backendPlanReady = lastStatus && Object.prototype.hasOwnProperty.call(lastStatus, "ai_studio")
+    ? !!(lastStatus?.ai_studio?.backend_plan_ready || lastStatus?.ai_studio?.production?.ready || lastStatus?.ai_studio?.model_ready?.production)
+    : false;
+  const hasAny = (tokens) => rows.some((entry) => {
+    const text = `${entry?.label || ""} ${entry?.path || ""} ${entry?.models?.join?.(" ") || ""}`.toLowerCase();
+    return tokens.some((token) => text.includes(token));
+  });
+  const hasAll = (groups) => groups.every((tokens) => hasAny(tokens));
+  const laneReady = (lane, groups) =>
+    Object.prototype.hasOwnProperty.call(backendReady, lane)
+      ? !!backendReady[lane]
+      : hasAll(groups);
+  const lanes = [
+    ["ideogram", "Image · Ideogram-4", laneReady("ideogram", [["ideogram4_fp8_scaled"], ["ideogram4_unconditional"], ["qwen3vl_8b_fp8_scaled"], ["flux2-vae"]])],
+    ["hidream", "Image · HiDream-O1", laneReady("hidream", [["hidream-o1-image-dev-2604-fp8", "hidream-o1-image-dev-2604", "hidream_o1"]])],
+    ["chroma", "Image · Chroma", laneReady("chroma", [["chroma1-hd"], ["t5xxl_fp16"], ["vae/flux/ae.safetensors", "flux/ae.safetensors"]])],
+    ["zimage", "Image · Z-Image", laneReady("zimage", [["z-image-turbo-fp8"], ["qwen_3_4b_fp8_mixed"], ["vae/ae.safetensors", "ae.safetensors"]])],
+    ["krea", "Image · Krea 2", laneReady("krea", [["krea2_turbo_fp8_scaled"], ["qwen3vl_4b_fp8_scaled"], ["qwen_image_vae"]])],
+    ["music", "Music · ACE-Step", laneReady("music", [["ace_step_v1_3.5b", "ace-step-1.5"]])],
+    ["sfx", "Sound · Stable Audio", laneReady("sfx", [["stable-audio-open-1.0.safetensors"], ["t5-base.safetensors"]])],
+    ["ltx", "Video · LTX-2.3", laneReady("ltx", [
+      ["ltx-2.3-22b-distilled-1.1-q8_0"],
+      ["ltx-2.3-22b-distilled_audio_vae"],
+      ["ltx-2.3-22b-distilled_video_vae"],
+      ["ltx-2.3-22b-distilled_embeddings_connectors"],
+      ["gemma_3_12b_it_fp8_scaled"],
+    ])],
+    ["sulphur", "Video · Sulphur", laneReady("sulphur", [
+      ["sulphur_dev-q8_0"],
+      ["ltx-2.3-22b-dev_audio_vae"],
+      ["ltx-2.3-22b-dev_video_vae"],
+      ["ltx-2.3-22b-dev_embeddings_connectors"],
+      ["ltx-2.3-22b-distilled-lora-384-1.1"],
+      ["gemma_3_12b_it_fp8_scaled"],
+    ])],
+    ["10eros", "Video · 10Eros", laneReady("10eros", [
+      ["10eros_v1-q8_0", "10eros_v1"],
+      ["ltx-2.3-22b-dev_audio_vae"],
+      ["ltx-2.3-22b-dev_video_vae"],
+      ["ltx-2.3-22b-dev_embeddings_connectors"],
+      ["ltx-2.3-22b-distilled-lora-384-1.1"],
+      ["gemma_3_12b_it_fp8_scaled"],
+    ])],
+    ["wan", "Video · Wan2.2", laneReady("wan", [
+      ["wan2.2-rapid-mega-aio-nsfw-v10-q8_0", "wan2.2-rapid-mega"],
+      ["umt5_xxl_fp8_e4m3fn_scaled"],
+      ["wan_2.1_vae"],
+    ])],
+    ["voice", "Speech · Step-Audio-EditX", laneReady("voice", [["step-audio-editx"], ["step-audio-tokenizer"]])],
+    ["kokoro", "Speech · Kokoro Voiceover", laneReady("kokoro", [["kokoro-v1.0.onnx"], ["voices-v1.0.bin"]])],
+  ];
+  const anyReadyLane = lanes.some(([, , ready]) => !!ready) || studioReadyForPlanning;
+  const html = `<option value="">Chat response</option><option value="plan" ${anyReadyLane ? "" : "disabled"}>Plan Mode${anyReadyLane ? "" : " (Missing Model)"}</option><option value="plan-backend" ${backendPlanReady ? "" : "disabled"}>Plan Mode (Backend)</option><option value="interactive" ${anyReadyLane ? "" : "disabled"}>Interactive Mode${anyReadyLane ? "" : " (Missing Model)"}</option>${lanes.map(([value, label, ready]) =>
+    `<option value="${value}" ${ready ? "" : "disabled"}>${escapeHtml(label)}${ready ? "" : " (Missing Model)"}</option>`
+  ).join("")}`;
+  if (select.innerHTML !== html) select.innerHTML = html;
+  if (["plan", "interactive"].includes(previous) && anyReadyLane) select.value = previous;
+  else if (previous === "plan-backend" && backendPlanReady) select.value = previous;
+  else if (previous && lanes.some(([value, , ready]) => value === previous && ready)) select.value = previous;
+}
 function renderChatUi(options = {}) {
   const preserveTranscript = !!options.preserveTranscript;
   const toggle = $("chatSettingsToggle");
@@ -5013,6 +5424,7 @@ function renderChatUi(options = {}) {
   renderConversationSelector();
   renderChatPresetSelector();
   renderChatApiPresetSelector();
+  renderChatStudioLaneSelector();
   renderChatAttachments();
   if ($("chatAutoscroll")) {
     $("chatAutoscroll").checked = chatTranscriptAutoscrollEnabled();
@@ -5021,7 +5433,25 @@ function renderChatUi(options = {}) {
   renderChatRuntimeStats();
   handleChatInputResize();
   const runtime = activeChatRuntime();
-  const chatControlsDisabled = chatState.busy || chatHydrationPending() || !chatStateHydrated;
+  const chatControlsDisabled = chatState.busy || chatHydrationPending() || !chatStateHydrated || chatBenchmarkLocked();
+  const studioStatus = lastStatus?.ai_studio || {};
+  const hasStudioStatus = !!(lastStatus && Object.prototype.hasOwnProperty.call(lastStatus, "ai_studio"));
+  if (hasStudioStatus) {
+    window.__club3090ChatStudioActive = !!(studioStatus.ready || studioStatus.active);
+    try {
+      localStorage.setItem("club3090_chat_studio_active", window.__club3090ChatStudioActive ? "1" : "0");
+    } catch (error) {}
+  }
+  let cachedStudioActive = true;
+  try {
+    const stored = localStorage.getItem("club3090_chat_studio_active");
+    if (stored !== null) cachedStudioActive = stored === "1";
+  } catch (error) {}
+  const studioReady = hasStudioStatus
+    ? !!(studioStatus.ready || studioStatus.active)
+    : !!(window.__club3090ChatStudioActive ?? cachedStudioActive);
+  if ($("chatStudioRow")) $("chatStudioRow").classList.toggle("hidden", !studioReady);
+  if (!studioReady && $("chatStudioLane")) $("chatStudioLane").value = "";
   if ($("chatStatsCard"))
     $("chatStatsCard").classList.toggle("collapsed", !!chatState.statsCollapsed);
   if ($("chatStatsToggleBtn")) {
@@ -5033,11 +5463,15 @@ function renderChatUi(options = {}) {
     const hasDraft =
       !!String($("chatInput")?.value || "").trim() ||
       !!(chatState.attachments || []).length;
+    const studioLaneSelected = !!String($("chatStudioLane")?.value || "");
     $("chatSendBtn").disabled =
-      chatControlsDisabled || !(activeChatPresets().length > 0 || chatSelectedRuntimeIsUnavailable()) || (!chatState.busy && !hasDraft);
+      chatControlsDisabled ||
+      !(studioLaneSelected || activeChatPresets().length > 0 || chatSelectedRuntimeIsUnavailable()) ||
+      (!chatState.busy && !hasDraft);
     $("chatSendBtn").classList.toggle("is-stop", !!chatState.busy);
     $("chatSendBtn").innerHTML = svgIcon(chatState.busy ? "stop" : "send");
   }
+  if ($("chatStudioLane")) $("chatStudioLane").disabled = chatControlsDisabled || !studioReady;
   if ($("chatAttachBtn")) $("chatAttachBtn").disabled = chatControlsDisabled;
   if ($("chatMicBtn")) {
     $("chatMicBtn").disabled = chatControlsDisabled;
@@ -5084,21 +5518,60 @@ function readFileAsDataUrl(file) {
     reader.readAsDataURL(file);
   });
 }
-async function uploadChatImageAttachment(file, source = "file") {
+function captureVideoAttachmentThumbnail(file) {
+  return new Promise((resolve) => {
+    if (!file || !String(file.type || "").toLowerCase().startsWith("video/")) return resolve("");
+    const video = document.createElement("video");
+    const url = URL.createObjectURL(file);
+    let settled = false;
+    const finish = (value = "") => {
+      if (settled) return;
+      settled = true;
+      URL.revokeObjectURL(url);
+      resolve(value);
+    };
+    video.preload = "metadata";
+    video.muted = true;
+    video.playsInline = true;
+    video.addEventListener("loadeddata", () => {
+      try {
+        const canvas = document.createElement("canvas");
+        const width = Math.max(1, Math.min(480, Number(video.videoWidth || 320)));
+        const height = Math.max(1, Math.round(width * (Number(video.videoHeight || 180) / Math.max(1, Number(video.videoWidth || 320)))));
+        canvas.width = width;
+        canvas.height = height;
+        canvas.getContext("2d")?.drawImage(video, 0, 0, width, height);
+        finish(canvas.toDataURL("image/jpeg", 0.72));
+      } catch (error) {
+        finish("");
+      }
+    }, { once: true });
+    video.addEventListener("error", () => finish(""), { once: true });
+    setTimeout(() => finish(""), 4500);
+    video.src = url;
+    try {
+      video.currentTime = 0.1;
+    } catch (error) {}
+  });
+}
+async function uploadChatMediaAttachment(file, kind, source = "file") {
+  const cleanKind = String(kind || "").toLowerCase();
+  const thumbnailUrl = cleanKind === "video" ? await captureVideoAttachmentThumbnail(file) : "";
   const response = await fetch("/admin/chat-attachments", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      kind: "image",
-      name: file?.name || "image",
-      mime: file?.type || "image/*",
+      kind: cleanKind,
+      name: file?.name || cleanKind || "media",
+      mime: file?.type || `${cleanKind}/*`,
       source,
+      thumbnail_url: thumbnailUrl,
       data_url: await readFileAsDataUrl(file),
     }),
   });
   const payload = await response.json();
   if (!response.ok || !payload?.ok || !payload?.attachment) {
-    throw new Error(payload?.error || `Failed to upload ${file?.name || "image"}.`);
+    throw new Error(payload?.error || `Failed to upload ${file?.name || cleanKind || "media"}.`);
   }
   return cloneChatAttachment(payload.attachment);
 }
@@ -5106,8 +5579,17 @@ async function buildChatAttachmentsFromFiles(files, source = "file") {
   const additions = [];
   for (const file of files || []) {
     if (!file) continue;
-    if (String(file.type || "").toLowerCase().startsWith("image/")) {
-      additions.push(await uploadChatImageAttachment(file, source));
+    const fileType = String(file.type || "").toLowerCase();
+    if (fileType.startsWith("image/")) {
+      additions.push(await uploadChatMediaAttachment(file, "image", source));
+      continue;
+    }
+    if (fileType.startsWith("audio/")) {
+      additions.push(await uploadChatMediaAttachment(file, "audio", source));
+      continue;
+    }
+    if (fileType.startsWith("video/")) {
+      additions.push(await uploadChatMediaAttachment(file, "video", source));
       continue;
     }
     if (isTextAttachmentFile(file)) {
@@ -5121,7 +5603,7 @@ async function buildChatAttachmentsFromFiles(files, source = "file") {
       });
       continue;
     }
-    throw new Error(`Unsupported attachment type: ${file.name || "file"}. Attach text files or images only.`);
+    throw new Error(`Unsupported attachment type: ${file.name || "file"}. Attach text, image, audio, or video files only.`);
   }
   return additions;
 }
@@ -5235,7 +5717,13 @@ function toggleChatDictation() {
   }
 }
 function chatAttachmentTextBlock(attachment) {
-  return `Attached file: ${attachment?.name || "attachment"}\n\n${attachment?.text || ""}`;
+  const name = attachment?.name || "attachment";
+  const kind = String(attachment?.kind || "text").toLowerCase();
+  if (kind === "audio" || kind === "video") {
+    const mime = attachment?.mime ? ` · ${attachment.mime}` : "";
+    return `${kind === "audio" ? "Audio" : "Video"} attachment: ${name}${mime}`;
+  }
+  return `Attached file: ${name}\n\n${attachment?.text || ""}`;
 }
 function activeChatRequestParams() {
   const preset = chatApiPresetOptions().find(
@@ -5269,10 +5757,17 @@ function splitThinkingBlocks(text) {
   };
 }
 function chatMessageThinkingView(message) {
-  const titleStripped = extractChatTitleMarker(message?.text || "");
-  const sourceText = titleStripped.title ? titleStripped.text : String(message?.text || "");
+  const visibleText =
+    message?.streamingVisibleActive && typeof message?.streamingVisibleText === "string"
+      ? message.streamingVisibleText
+      : undefined;
+  const titleStripped = extractChatTitleMarker(visibleText ?? message?.text ?? "");
+  const sourceText = titleStripped.title ? titleStripped.text : String(visibleText ?? message?.text ?? "");
   const inline = splitThinkingBlocks(sourceText);
-  const direct = chatMessageReasoningText(message).trim();
+  const direct =
+    message?.streamingVisibleActive && typeof message?.streamingVisibleReasoningText === "string"
+      ? String(message.streamingVisibleReasoningText || "").trim()
+      : chatMessageReasoningText(message).trim();
   const parts = [];
   if (direct) parts.push(direct);
   if (inline.reasoningText && !parts.includes(inline.reasoningText))
@@ -5370,6 +5865,12 @@ function buildChatRequestMessages(messages = chatState.messages || []) {
       attachments.forEach((attachment) => {
         if (attachment?.kind === "image" && attachment?.url) {
           content.push({ type: "image_url", image_url: { url: attachment.url } });
+        } else if (attachment?.kind === "audio" && attachment?.url) {
+          content.push({ type: "audio_url", audio_url: { url: attachment.url } });
+          content.push({ type: "text", text: chatAttachmentTextBlock(attachment) });
+        } else if (attachment?.kind === "video" && attachment?.url) {
+          content.push({ type: "video_url", video_url: { url: attachment.url } });
+          content.push({ type: "text", text: chatAttachmentTextBlock(attachment) });
         } else if (attachment?.kind === "text" && attachment?.text) {
           content.push({ type: "text", text: chatAttachmentTextBlock(attachment) });
         }
@@ -5432,7 +5933,17 @@ function stopChatGeneration() {
   if (!activeConversation?.generationActive || !activeConversationId) return;
   setChatMsg("Stopping generation...");
   requestServerStopForConversation(activeConversationId)
-    .then(() => {
+    .then((payload) => {
+      const status = String(payload?.stream?.status || "").toLowerCase();
+      if (["done", "error", "aborted", "cancelled", "stopped"].includes(status)) {
+        activeConversation.generationActive = false;
+        chatState.busy = false;
+        stopChatStreamResumePolling();
+        persistChatConversationState();
+        setChatMsg("");
+        renderChatUi();
+        return;
+      }
       scheduleChatStreamResumePolling(120);
     })
     .catch((error) => {
@@ -5605,8 +6116,1475 @@ function scheduleConversationRuntimeMetricRefresh(attempts = 2, delayMs = 250) {
   };
   run();
 }
+let activeImageStudioJobId = "";
+function formatInteractiveStudioPlanText(plan = {}) {
+  const action = String(plan.action || "").toLowerCase();
+  const rationale = String(plan.rationale || "").trim();
+  if (action !== "generate") return String(plan.prompt || "Tell me what you'd like to create.");
+  const steps = Array.isArray(plan.steps) && plan.steps.length
+    ? plan.steps
+    : [{ label: plan.label, lane: plan.lane, prompt: plan.prompt }];
+  const body = steps.map((step, index) => {
+    const label = String(step?.label || step?.lane || "AI Studio");
+    const purpose = String(step?.purpose || "").trim();
+    const prompt = String(step?.prompt || "").trim();
+    const batch = step?.batch && typeof step.batch === "object"
+      ? Object.entries(step.batch)
+          .filter(([, value]) => value !== null && value !== undefined && String(value).trim())
+          .map(([key, value]) => `${key.replaceAll("_", " ")}: ${value}`)
+          .join(", ")
+      : "";
+    const dependencies = Array.isArray(step?.depends_on) && step.depends_on.length
+      ? `\n   Depends on: ${step.depends_on.join(", ")}`
+      : "";
+    return `${index + 1}. ${label}${purpose ? ` — ${purpose}` : ""}${batch ? `\n   Batch: ${batch}` : ""}${dependencies}${prompt ? `\n   Prompt: ${prompt}` : ""}`;
+  }).join("\n");
+  return `Plan${rationale ? ` — ${rationale}` : ""}\n${body}`;
+}
+function planExecutionUnitTotal(steps = []) {
+  return Math.max(1, steps.reduce((total, step) => {
+    const batchCount = Math.max(1, Number(step?.batch?.count || 0) || 1);
+    return total + (step?.batch ? batchCount : 1);
+  }, 0));
+}
+function planExecutionCompletedUnits(steps = [], stepResults = [], stepIndex = 0, itemIndex = 0) {
+  let completed = 0;
+  for (let index = 0; index < stepIndex; index += 1) {
+    const step = steps[index] || {};
+    if (step?.batch) {
+      const outputs = Array.isArray(stepResults[index]?.outputs) ? stepResults[index].outputs.length : 0;
+      const batchCount = Math.max(1, Number(step?.batch?.count || 0) || 1);
+      completed += outputs > 0 ? outputs : batchCount;
+    } else {
+      completed += 1;
+    }
+  }
+  return completed + Math.max(0, itemIndex);
+}
+function planExecutionPhaseWeight(status = "") {
+  const normalized = String(status || "").trim().toLowerCase();
+  if (normalized === "success") return 1;
+  if (normalized === "running") return 0.55;
+  if (normalized === "uploading") return 0.25;
+  if (normalized === "preparing") return 0.15;
+  if (normalized === "submitting") return 0.08;
+  if (normalized === "queued") return 0.02;
+  return 0.05;
+}
+function planExecutionProgressText(plan = {}, steps = [], stepResults = [], stepIndex = 0, itemIndex = 0, batchItems = [], generation = {}) {
+  const step = steps[stepIndex] || {};
+  const stepLabel = String(step?.label || step?.lane || "AI Studio");
+  const totalSteps = Math.max(1, steps.length);
+  const totalUnits = planExecutionUnitTotal(steps);
+  const completedUnits = planExecutionCompletedUnits(steps, stepResults, stepIndex, itemIndex);
+  const stepTotal = step?.batch ? Math.max(1, batchItems.length || Number(step?.batch?.count || 0) || 1) : 1;
+  const phaseWeight = planExecutionPhaseWeight(generation?.status);
+  const currentUnits = step?.batch
+    ? Math.max(phaseWeight, Math.min(stepTotal, Math.max(1, itemIndex + phaseWeight)))
+    : Math.max(phaseWeight, 0.05);
+  const percent = Math.max(0, Math.min(100, Math.round(((completedUnits + currentUnits) / totalUnits) * 100)));
+  const currentProgress = step?.batch ? `${itemIndex + 1}/${stepTotal}` : "1/1";
+  const nextStep = steps[stepIndex + 1] || null;
+  const nextLabel = nextStep
+    ? String(nextStep?.label || nextStep?.lane || "AI Studio")
+    : "Complete";
+  return [
+    `Generating Assets ${stepIndex + 1}/${totalSteps} · ${percent}% Done`,
+    `Now: ${stepLabel} ${currentProgress} · Next: ${nextLabel}`,
+  ].join("\n");
+}
+function planExecutionProgressHeadline(text = "") {
+  return String(text || "").split(/\n/, 1)[0] || "";
+}
+function latestPendingStudioPlan() {
+  return [...(chatState.messages || [])].reverse().find((message) =>
+    message?.role === "assistant" &&
+    message?.studioLane === "plan" &&
+    message?.interactivePlan &&
+    String(message.interactivePlan.action || "").toLowerCase() === "generate" &&
+    !message.generatedMedia
+  )?.interactivePlan || null;
+}
+function chatTextConfirmsPlan(text) {
+  const normalized = String(text || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized || normalized.length > 220) return false;
+  if (/\b(?:cancel|stop|wait|hold|change|revise|revision|instead|not|don t|dont|do not|no)\b/.test(normalized)) return false;
+  return /\b(?:confirm|confirmed|approve|approved|execute|run|proceed|go ahead|looks good|do it|yes|ok|okay)\b/.test(normalized);
+}
+function latestResumableStudioExecution(plan = {}) {
+  const signature = JSON.stringify(plan?.steps || []);
+  return [...(chatState.messages || [])].reverse().find((message) =>
+    message?.role === "assistant" &&
+    ["plan-execution", "interactive-execution"].includes(String(message?.studioLane || "")) &&
+    Array.isArray(message?.studioPlanResults) &&
+    JSON.stringify(message?.interactivePlan?.steps || []) === signature
+  ) || null;
+}
+function parsePlanBatchItems(text) {
+  let source = String(text || "").trim();
+  source = source
+    .replace(/^\uFEFF/, "")
+    .replace(/^`{2,}\s*(?:json|javascript|js)?\s*/i, "")
+    .replace(/\s*`{2,}\s*$/i, "")
+    .trim();
+  const fenced = source.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced) source = fenced[1].trim();
+  const start = source.indexOf("[");
+  const end = source.lastIndexOf("]");
+  if (start >= 0 && end > start) source = source.slice(start, end + 1);
+  const parsed = JSON.parse(source);
+  if (!Array.isArray(parsed)) throw new Error("The text step did not return the JSON array required by its batch plan.");
+  return parsed.filter((item) => item && typeof item === "object");
+}
+function planBatchScalar(value) {
+  if (Array.isArray(value)) return value.map((row) => planBatchScalar(row)).filter(Boolean).join("; ");
+  if (value && typeof value === "object") {
+    for (const key of ["text", "summary", "description", "body", "copy", "copy_block", "paragraph", "positioning", "script", "value"]) {
+      const nested = planBatchScalar(value[key]);
+      if (nested) return nested;
+    }
+    return Object.entries(value)
+      .map(([key, row]) => `${key}: ${planBatchScalar(row)}`.trim())
+      .filter((row) => !/:$/.test(row))
+      .join("; ");
+  }
+  return String(value ?? "").trim();
+}
+function firstPlanBatchValue(item = {}, keys = []) {
+  for (const key of keys) {
+    const value = planBatchScalar(item?.[key]);
+    if (value) return value;
+  }
+  return "";
+}
+function planPromptWantsNarrationCopy(...parts) {
+  const text = parts.map((part) => String(part || "")).join(" ").toLowerCase();
+  return (
+    /\b(?:read|narrat\w*|voiceover|speak|speech|tts|audio)\b[\s\S]{0,120}\b(?:paragraph|text|body|copy|description|summary|profile|script)\b/.test(text) ||
+    /\b(?:paragraph|text|body|copy|description|summary|profile|script)\b[\s\S]{0,120}\b(?:read|narrat\w*|voiceover|speak|speech|tts|audio)\b/.test(text)
+  );
+}
+function normalizePlanBatchItem(item = {}, sourcePrompt = "", originalRequest = "") {
+  const normalized = { ...(item && typeof item === "object" ? item : {}) };
+  normalized.name = firstPlanBatchValue(normalized, ["name", "title", "subject", "label", "person", "character", "topic"]) || normalized.name || "";
+  normalized.dates = firstPlanBatchValue(normalized, ["dates", "date", "dates_served", "served", "term", "years", "period", "era"]) || normalized.dates || "";
+  normalized.text = firstPlanBatchValue(normalized, ["text", "paragraph", "body", "copy", "copy_block", "description", "summary", "profile", "positioning", "tagline", "accomplishments", "bio", "script", "narration"]) || normalized.text || "";
+  const explicitSpeechText = firstPlanBatchValue(normalized, ["speech_text", "narration_text", "narration_script", "voiceover_text", "voiceover_script", "tts_text", "audio_text", "script"]);
+  const looseSpeechText = firstPlanBatchValue(normalized, ["speech", "narration", "voiceover"]);
+  normalized.speech_text = explicitSpeechText || looseSpeechText || normalized.speech_text || "";
+  normalized.image_prompt = firstPlanBatchValue(normalized, ["image_prompt", "visual_prompt", "image", "illustration_prompt", "art_prompt", "prompt"]) || normalized.image_prompt || "";
+  if (!explicitSpeechText && planPromptWantsNarrationCopy(sourcePrompt, originalRequest) && normalized.text) {
+    normalized.speech_text = normalized.text;
+  } else if (!normalized.speech_text && normalized.text) {
+    normalized.speech_text = normalized.text;
+  }
+  if (!normalized.image_prompt) {
+    const identity = [normalized.name, normalized.dates].filter(Boolean).join(" ");
+    normalized.image_prompt = [
+      identity ? `Create a faithful image for ${identity}.` : "Create a faithful image for this source item.",
+      normalized.text ? `Use this item context: ${normalized.text}` : "",
+      "Make the composition specific, visually clear, and distinct from neighboring batch items.",
+    ].filter(Boolean).join(" ");
+  }
+  return normalized;
+}
+function normalizePlanBatchItems(items = [], sourcePrompt = "", originalRequest = "") {
+  return (Array.isArray(items) ? items : [])
+    .filter((item) => item && typeof item === "object")
+    .map((item) => normalizePlanBatchItem(item, sourcePrompt, originalRequest));
+}
+function planSourceExecutionPrompt(prompt, expectedBatchCount = 0) {
+  const expected = Number(expectedBatchCount || 0);
+  return [
+    String(prompt || "").trim(),
+    "Output only one complete strict JSON array. Do not wrap it in Markdown fences, commentary, headings, or prose.",
+    "Use valid JSON strings with double quotes for every key and string value. Do not include trailing commas.",
+    "If the request names or implies multiple subjects, entries, scenes, sections, products, people, places, or assets, create one separate object for each one. Never combine multiple requested items inside one wrapper object.",
+    "Preserve requested ordinal ranges, counts, order, duplicates, editions, and exact membership. For first/last/next/every/all requests, do not skip intermediate entries or substitute better-known adjacent items.",
+    "The source prompt's required field names are authoritative. If it asks for fields such as text, image_prompt, or speech_text, use those exact keys and do not substitute synonyms such as accomplishments, paragraph, narration, image, or speech.",
+    "When speech_text is requested for reading/narrating/speaking paragraph, text, body, copy, profile, summary, or script content, speech_text must match that generated copy exactly enough for the audio to read it. Do not replace it with famous quotes, oaths, excerpts, slogans, or unrelated speeches.",
+    "Honor exact word-count constraints for generated script fields; for example, a 20-word voiceover script must contain exactly 20 spoken words.",
+    "For factual or real-world subjects, use conservative widely established facts. Do not invent events, dates, roles, names, achievements, causal links, attributions, or quotations; if uncertain, use broader accurate wording instead of a specific claim.",
+    "For fictional products, brands, worlds, facilities, or scenarios, stay inside the user's stated premise. Do not add unrelated elements, audiences, claims, technologies, names, locations, objectives, story details, or worldbuilding that the user did not request.",
+    "When image_prompt is requested, make each image_prompt a self-contained prompt with distinct pose, viewpoint, setting/scenery, crop, lighting, action, composition, and contextual details appropriate to that object.",
+    expected > 0 ? `The array must contain exactly ${expected} objects/items.` : "",
+    expected > 1 ? `No object may contain a nested list that represents the ${expected} requested objects/items; split those into top-level array objects instead.` : "",
+    expected >= 20
+      ? "Keep every generated field compact enough to fit the full array in one response: text fields should be concise short paragraphs, speech_text should mirror text, and image_prompt should be one detailed but compact sentence."
+      : "",
+  ].filter(Boolean).join("\n\n");
+}
+function expandPlanBatchPrompt(template, item = {}) {
+  return String(template || "").replace(/\{\{([a-zA-Z0-9_]+)\}\}/g, (_match, key) =>
+    String(item?.[key] ?? ""),
+  );
+}
+function planBatchExpectedCountForSource(steps = [], sourceStepNumber = 0, prompt = "") {
+  const dependentCounts = (Array.isArray(steps) ? steps : [])
+    .filter((step) => Number(step?.batch?.source_step || 0) === Number(sourceStepNumber || 0))
+    .map((step) => Number(step?.batch?.count || 0))
+    .filter((count) => Number.isFinite(count) && count > 0);
+  const promptText = String(prompt || "");
+  const topLevelMatches = Array.from(promptText.matchAll(
+    /\b(?:output|return|array\s+must\s+contain)\s+exactly\s+(\d{1,4})\s+(?:top[-\s]+level\s+)?(?:objects?|object\(s\)(?:\/item\(s\))?|items?|item\(s\))(?=$|\s|[.,;:])/gi,
+  ));
+  if (topLevelMatches.length) {
+    return Number(topLevelMatches[topLevelMatches.length - 1][1] || 0);
+  }
+  if (dependentCounts.length) return Math.max(...dependentCounts);
+  const promptMatches = Array.from(promptText.matchAll(
+    /\bexactly\s+(\d{1,4})\s+(?:objects?|object\(s\)(?:\/item\(s\))?|items?|item\(s\)|entries|records?|artifacts?|rows?|clips?|images?|audios?)(?=$|\s|[.,;:])/gi,
+  ));
+  const promptCount = promptMatches.length ? Number(promptMatches[promptMatches.length - 1][1] || 0) : 0;
+  return Math.max(promptCount, 0);
+}
+function planIdeogramRequestsSingleRender(...parts) {
+  const text = parts.map((part) => String(part || "")).join(" ").toLowerCase();
+  return /\b(?:single|one)\s+(?:final\s+)?(?:image|render|picture|photo|photograph|poster|logo|illustration)\b/.test(text) ||
+    /\b(?:exactly\s+)?(?:one|single|1)\s+(?:(?:[a-z0-9-]+)\s+){0,6}(?:image|render|picture|photo|photograph|poster|logo|illustration)\b/.test(text) ||
+    /\b(?:no|not|without)\s+(?:a\s+)?(?:grid|contact\s+sheet|candidate\s+sheet|2x2|two[-\s]+by[-\s]+two|four[-\s]+panel)\b/.test(text) ||
+    /\b(?:high[-\s]+resolution|high[-\s]+quality|hi[-\s]*res|full[-\s]+resolution)\b/.test(text) ||
+    /\b(?:1080p|1440p|2160p|4k|8k|uhd|qhd|hd)\b/.test(text) ||
+    /\b\d{3,5}\s*[x×]\s*\d{3,5}\b/.test(text);
+}
+function planBatchSubjectName(item = {}, fallback = "") {
+  for (const key of ["name", "title", "subject", "label", "person", "character", "topic"]) {
+    const value = String(item?.[key] ?? "").trim();
+    if (value) return value;
+  }
+  return String(fallback || "").trim();
+}
+function planBatchSubjectContext(item = {}) {
+  return ["dates", "date", "term", "served", "era", "period", "role", "location", "style"]
+    .map((key) => String(item?.[key] ?? "").trim())
+    .filter(Boolean)
+    .slice(0, 4)
+    .join(" · ");
+}
+function planBatchItemsForStepDescriptor(step = {}, sourceItems = []) {
+  const items = Array.isArray(sourceItems) ? sourceItems.filter((item) => item && typeof item === "object") : [];
+  if (!items.length) return [];
+  const descriptor = String(step?.batch?.items || "").trim();
+  let selected = items;
+  const nameMatch = descriptor.match(/\bname\s*=\s*["']?([a-z0-9][a-z0-9 _-]{0,80})["']?/i);
+  if (nameMatch) {
+    const target = String(nameMatch[1] || "")
+      .replace(/[^a-z0-9 _-].*$/i, "")
+      .trim()
+      .toLowerCase();
+    if (target) {
+      const normalizedTarget = target.replace(/[_-]+/g, " ");
+      const matched = items.filter((item) => {
+        const name = planBatchSubjectName(item || {}, "")
+          .toLowerCase()
+          .replace(/[_-]+/g, " ");
+        return name === normalizedTarget || name.includes(normalizedTarget);
+      });
+      if (matched.length) selected = matched;
+    }
+  }
+  const count = Number(step?.batch?.count || 0);
+  if (Number.isFinite(count) && count > 0 && selected.length > count) {
+    selected = selected.slice(0, count);
+  }
+  return selected;
+}
+function planKokoroVoiceForItem(item = {}, index = 0, contextText = "") {
+  const text = [
+    planBatchSubjectName(item || {}, ""),
+    planBatchScalar(item?.gender),
+    planBatchScalar(item?.voice),
+    planBatchScalar(item?.voice_hint),
+    planBatchScalar(item?.role),
+    planBatchScalar(item?.title),
+    planBatchScalar(item?.text),
+    planBatchScalar(item?.speech_text),
+    contextText,
+  ].join(" ").toLowerCase();
+  const femaleVoices = ["af_heart", "af_bella", "af_nicole"];
+  const maleVoices = ["am_adam", "am_michael", "bm_george", "am_echo"];
+  if (/\b(?:she|her|hers|woman|female|girl|mother|queen|actress|soprano|alto)\b/.test(text)) {
+    return femaleVoices[index % femaleVoices.length];
+  }
+  if (/\b(?:he|him|his|man|male|boy|father|king|president|actor|baritone|tenor|bass)\b/.test(text)) {
+    return maleVoices[index % maleVoices.length];
+  }
+  if (/\bmale voices?\b|\bmen's voices?\b|\bmasculine voices?\b/.test(text)) {
+    return maleVoices[index % maleVoices.length];
+  }
+  return femaleVoices[index % femaleVoices.length];
+}
+function planLanePromptNeedsEnhancement(lane) {
+  return ["ideogram", "hidream", "chroma", "zimage", "krea", "ltx", "sulphur", "10eros", "wan", "music", "sfx"].includes(
+    String(lane || "").trim().toLowerCase(),
+  );
+}
+function planLaneSpeaksPrompt(lane) {
+  return ["kokoro", "voice"].includes(String(lane || "").trim().toLowerCase());
+}
+function planWordTokens(text) {
+  return String(text || "").match(/[A-Za-z0-9]+(?:['-][A-Za-z0-9]+)*/g) || [];
+}
+function planWordKey(word) {
+  return String(word || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+function planTrimRepeatedLeadTail(text) {
+  const words = planWordTokens(text);
+  const maxRepeat = Math.min(4, Math.floor(words.length / 2));
+  for (let count = maxRepeat; count >= 1; count -= 1) {
+    const head = words.slice(0, count).map(planWordKey).join(" ");
+    const tail = words.slice(words.length - count).map(planWordKey).join(" ");
+    if (head && head === tail) {
+      return `${words.slice(0, words.length - count).join(" ")}.`;
+    }
+  }
+  return String(text || "").trim();
+}
+function planExactWordCountRequirements(...parts) {
+  const text = parts.map((part) => String(part || "")).join(" ");
+  const requirements = [];
+  const seen = new Set();
+  const addRequirement = (count, label = "") => {
+    const expected = Number(count || 0);
+    if (!Number.isFinite(expected) || expected <= 0) return;
+    const normalizedLabel = String(label || "script").toLowerCase().replace(/\s+/g, "_");
+    const keys = /(?:voiceover|narration|speech|tts|audio|script)/.test(normalizedLabel)
+      ? ["voiceover_script", "narration_script", "narration_text", "speech_text", "voiceover_text", "tts_text", "audio_text", "script"]
+      : ["text"];
+    const signature = `${expected}:${keys.join(",")}`;
+    if (seen.has(signature)) return;
+    seen.add(signature);
+    requirements.push({ count: expected, keys, label: label || "script" });
+  };
+  const leadingPatterns = [
+    /\b(?:exactly\s+)?(\d{1,3})[-\s]+word\s+(voiceover[_\s]+script|voiceover[_\s]+text|narration[_\s]+script|narration[_\s]+text|speech[_\s]+script|speech[_\s]+text|tts[_\s]+script|tts[_\s]+text|audio[_\s]+script|audio[_\s]+text|script)\b/gi,
+    /\b(?:exactly\s+)?(\d{1,3})\s+words?\s+(?:long\s+)?(?:for\s+)?(voiceover[_\s]+script|voiceover[_\s]+text|narration[_\s]+script|narration[_\s]+text|speech_text|speech\s+text|tts\s+text|audio\s+text|script)\b/gi,
+  ];
+  const trailingPatterns = [
+    /\b(voiceover[_\s]+script|voiceover[_\s]+text|narration[_\s]+script|narration[_\s]+text|speech_text|speech\s+text|tts\s+text|audio\s+text|script)\b[^.\n;]{0,80}?\b(?:exactly\s+)?(\d{1,3})\s+words?\b/gi,
+  ];
+  for (const pattern of leadingPatterns) {
+    for (const match of text.matchAll(pattern)) addRequirement(match[1], match[2]);
+  }
+  for (const pattern of trailingPatterns) {
+    for (const match of text.matchAll(pattern)) addRequirement(match[2], match[1]);
+  }
+  return requirements.slice(0, 6);
+}
+function planBatchWordCountError(items = [], sourcePrompt = "", originalRequest = "") {
+  const requirements = planExactWordCountRequirements(sourcePrompt, originalRequest);
+  if (!requirements.length) return "";
+  const rows = Array.isArray(items) ? items : [];
+  for (let itemIndex = 0; itemIndex < rows.length; itemIndex += 1) {
+    const item = rows[itemIndex] || {};
+    for (const requirement of requirements) {
+      const value = firstPlanBatchValue(item, requirement.keys);
+      if (!value) continue;
+      const actual = planWordTokens(value).length;
+      if (actual !== requirement.count) {
+        return `Item ${itemIndex + 1} ${requirement.label || "script"} has ${actual}/${requirement.count} words.`;
+      }
+    }
+  }
+  return "";
+}
+function planRepairTextToWordCount(value, expectedCount = 0, item = {}, originalRequest = "") {
+  const expected = Number(expectedCount || 0);
+  if (!Number.isFinite(expected) || expected <= 0) return String(value || "").trim();
+  const baseWords = planWordTokens(planTrimRepeatedLeadTail(value));
+  if (baseWords.length >= expected) return `${baseWords.slice(0, expected).join(" ")}.`;
+  const used = new Set(baseWords.map(planWordKey).filter(Boolean));
+  const pool = planWordTokens([
+    planBatchScalar(item?.image_prompt),
+    planBatchScalar(item?.visual_prompt),
+    planBatchScalar(item?.scene_name),
+    planBatchScalar(item?.name),
+    planBatchScalar(item?.title),
+    planBatchScalar(item?.location),
+    planBatchScalar(item?.setting),
+    planBatchScalar(item?.tagline),
+    planBatchScalar(item?.positioning),
+    planBatchScalar(item?.summary),
+    planBatchScalar(item?.description),
+    originalRequest,
+  ].filter(Boolean).join(" ")).filter((word) => {
+    const key = planWordKey(word);
+    if (!key || used.has(key)) return false;
+    used.add(key);
+    return true;
+  });
+  const repaired = [...baseWords];
+  for (const word of pool) {
+    if (repaired.length >= expected) break;
+    repaired.push(word);
+  }
+  const fallback = ["clear", "compact", "future", "growth", "designed", "for", "daily", "use"];
+  for (let index = 0; repaired.length < expected; index += 1) {
+    repaired.push(fallback[index % fallback.length]);
+  }
+  return `${repaired.slice(0, expected).join(" ")}.`;
+}
+function repairPlanBatchWordCounts(items = [], sourcePrompt = "", originalRequest = "") {
+  const requirements = planExactWordCountRequirements(sourcePrompt, originalRequest);
+  if (!requirements.length) return { items, repaired: false, notes: [] };
+  const rows = (Array.isArray(items) ? items : []).map((item) => ({ ...(item || {}) }));
+  const notes = [];
+  for (let itemIndex = 0; itemIndex < rows.length; itemIndex += 1) {
+    const item = rows[itemIndex] || {};
+    for (const requirement of requirements) {
+      const value = firstPlanBatchValue(item, requirement.keys);
+      if (!value) continue;
+      const actual = planWordTokens(value).length;
+      if (actual === requirement.count) continue;
+      const repaired = planRepairTextToWordCount(value, requirement.count, item, originalRequest);
+      const updatedKeys = requirement.keys.filter((key) => Object.prototype.hasOwnProperty.call(item, key));
+      if (!updatedKeys.length) updatedKeys.push("speech_text");
+      if (requirement.keys.includes("voiceover_script") && !updatedKeys.includes("voiceover_script")) {
+        updatedKeys.push("voiceover_script");
+      }
+      if (requirement.keys.includes("speech_text") && !updatedKeys.includes("speech_text")) {
+        updatedKeys.push("speech_text");
+      }
+      for (const key of updatedKeys) item[key] = repaired;
+      notes.push(`Item ${itemIndex + 1} ${requirement.label || "script"} repaired from ${actual} to ${requirement.count} words.`);
+    }
+    rows[itemIndex] = item;
+  }
+  return { items: rows, repaired: notes.length > 0, notes };
+}
+function planExactSecondsFromText(...parts) {
+  const text = parts.map((part) => String(part || "")).join(" ");
+  const exact = text.match(/\b(?:exactly\s*)?(\d{1,4})\s*(?:second|seconds|sec|secs|s)\b/i);
+  return exact ? Number(exact[1] || 0) : 0;
+}
+function clipPlanPromptText(text, maxChars = 900) {
+  const value = String(text || "").replace(/\s+/g, " ").trim();
+  if (!value || value.length <= maxChars) return value;
+  return `${value.slice(0, Math.max(0, maxChars - 1)).trim()}...`;
+}
+function planVideoVisualBriefText(...parts) {
+  return parts
+    .map((part) => String(part || ""))
+    .filter(Boolean)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .replace(/\b(?:Original request|Source content|Plan anchors|Concrete subject and scene content to render|Generator task|Visual contract|Production detail|Text policy|Timeline)\s*:\s*/gi, " ")
+    .replace(/\b(?:strict\s+)?JSON\b/gi, " ")
+    .replace(/\b(?:array|object|objects|field|fields|keys|top-level|metadata|schema|record|records)\b/gi, " ")
+    .replace(/\b(?:scene_name|narration_text|image_prompt|speech_text|generatedMedia)\b/gi, " ")
+    .replace(/\b(?:caption|captions|subtitle|subtitles|title card|readable words|visible text|lettering|typography)\b/gi, " ")
+    .replace(/[{}\[\]"`]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+function planVideoTimelinePrompt(base, seconds = 0, originalRequest = "") {
+  const requestText = [base, originalRequest].map((part) => String(part || "")).filter(Boolean).join(" ");
+  const lowered = requestText.toLowerCase();
+  const hasHistoryShape = /\b(history|historical|timeline|evolution|origin|legacy|through the years)\b/.test(lowered)
+    || /\bfrom\s+(?:the\s+)?(?:\d{3,4}s?|\w+\s+era|ancient|past|present|today)\s+to\s+(?:today|present|the\s+\w+\s+era|\d{3,4}s?)\b/.test(lowered);
+  const hasLaunchShape = /\b(brand\s+(?:launch|story|campaign|film|video|spot)|launch|product\s+(?:launch|demo|commercial|spot|showcase|film|video)|commercial|advertisement|campaign|promo|showcase|kit)\b/.test(lowered);
+  const hasDocumentaryShape = /\b(documentary|micro[- ]documentary|scene[- ]by[- ]scene|episode|reportage|educational)\b/.test(lowered);
+  const asksForSequence = /\b(?:timeline|sequence|storyboard|montage|multi[-\s]?shot|(?:\d+|two|three|four|five|several|multiple|many)\s+(?:shots?|scenes?|segments?|beats?)|shots|scenes|segments|beats|chapters?|cut(?:s|ting)?|transition(?:s)?)\b/.test(lowered);
+  const asksForSingleScene = /\b(?:(?:single|one)[-\s]+(?:shot|scene|take)|one continuous|continuous shot|unbroken|minimal|simple|plain|locked[-\s]?off|static|no cuts?|without cuts?|no transitions?|without transitions?)\b/.test(lowered);
+  if ((asksForSingleScene && !asksForSequence) || (!hasHistoryShape && !hasLaunchShape && !hasDocumentaryShape && !asksForSequence)) {
+    return "Continuity: follow the prompt explicitly as one continuous requested scene; do not add unrequested objects, characters, readable text, effects, cuts, transitions, or story beats.";
+  }
+  const subjectHint = hasHistoryShape
+    ? "Move chronologically from the earliest requested period to the latest, using era-appropriate locations, clothing, tools, architecture, and symbolic objects."
+    : hasLaunchShape
+      ? "Build a coherent product or brand story with hero object shots, human-scale usage context, material details, and a clean final reveal."
+      : hasDocumentaryShape
+        ? "Treat the request as a documentary sequence with observational details, environmental context, and purposeful scene transitions."
+        : "Keep every shot anchored to the same requested subject, place, style, and action instead of drifting into unrelated stock footage.";
+  if (!seconds) {
+    return [
+      subjectHint,
+      "Shot sequence: establish the setting, introduce the subject, show the requested action or transformation, add one close contextual detail, then resolve on a clear final image.",
+    ].join(" ");
+  }
+  const beatCount = Math.max(1, Math.min(seconds <= 12 ? seconds : Math.ceil(seconds / 2), 12));
+  const labels = [
+    "wide establishing shot with exact setting and era/style cues",
+    "clear reveal of the main subject and its relationship to the request",
+    "medium shot of the primary action, process, or transformation",
+    "close detail shot of meaningful objects, materials, symbols, or environment",
+    "second angle that adds context without changing topic",
+    "motion beat with camera movement following the subject or action",
+    "human or environmental reaction that clarifies scale and mood",
+    "visual contrast beat that shows change, stakes, or progression",
+    "polished hero shot with strong composition and clean lighting",
+    "contextual insert that reinforces the requested facts or theme without text",
+    "build toward resolution with coherent movement and stable continuity",
+    "final resolved shot that clearly satisfies the request",
+  ];
+  const beats = [];
+  for (let index = 0; index < beatCount; index += 1) {
+    const start = Math.round((seconds * index) / beatCount);
+    const end = Math.round((seconds * (index + 1)) / beatCount);
+    beats.push(`${start}-${end}s: ${labels[index] || labels[labels.length - 1]}.`);
+  }
+  return [subjectHint, `Timeline: ${beats.join(" ")}`].join("\n");
+}
+function enhancePlanMediaPrompt({ lane, prompt, item, itemIndex = 0, batchTotal = 0, step, contextText = "", originalRequest = "" } = {}) {
+  const normalizedLane = String(lane || "").trim().toLowerCase();
+  const base = String(prompt || "").trim();
+  if (!planLanePromptNeedsEnhancement(normalizedLane)) return base;
+  const subject = planBatchSubjectName(item || {}, batchTotal ? `Item ${itemIndex + 1}` : "");
+  const subjectContext = planBatchSubjectContext(item || {});
+  const sourceText = clipPlanPromptText(planBatchScalar(item?.text), 900);
+  const purpose = String(step?.purpose || "").trim();
+  if (["ltx", "sulphur", "10eros", "wan"].includes(normalizedLane)) {
+    const seconds = planExactSecondsFromText(base, purpose, originalRequest);
+    const visualContext = clipPlanPromptText(
+      planVideoVisualBriefText(sourceText, contextText, originalRequest),
+      seconds ? 1300 : 1800,
+    );
+    return [
+      `Cinematic visual brief: ${visualContext || planVideoVisualBriefText(base) || base}.`,
+      `Render ${seconds ? `exactly ${seconds} seconds of ` : ""}image-only moving footage as one coherent scene unless the prompt explicitly asks for a sequence.`,
+      `Creative task: ${planVideoVisualBriefText(base) || base}.`,
+      subject ? `Primary subject: ${subject}${subjectContext ? ` (${subjectContext})` : ""}.` : "",
+      "Follow the prompt explicitly without adding other elements; preserve requested inclusions, omissions, duration, subject attributes, camera style, and setting.",
+      "Image-only camera footage: stable subject identity, intentional camera motion, grounded lighting, clear foreground/background, no graphic design layer, no UI layer, and no split-screen or contact-sheet layout.",
+      "Avoid generated on-screen text unless the request explicitly needs readable writing: do not add readable overlays, logos, watermarks, credits, lower thirds, signs, labels, or random writing-like marks.",
+      "Show prompt-relevant visible details first: setting, era/style, lighting, materials, foreground/background elements, lens feel, shot scale, motion path, subject action, and final resolved image.",
+      planVideoTimelinePrompt(base, seconds, originalRequest),
+    ].filter(Boolean).join("\n\n");
+  }
+  if (["ideogram", "hidream", "chroma", "zimage", "krea"].includes(normalizedLane)) {
+    const contextAnchor = clipPlanPromptText(contextText, 700);
+    return [
+      base,
+      subject ? `Subject anchor: ${subject}${subjectContext ? ` (${subjectContext})` : ""}.` : "",
+      sourceText ? `Source context: ${sourceText}` : "",
+      contextAnchor ? `Plan anchors: ${contextAnchor}` : "",
+      batchTotal > 1
+        ? `Batch variation requirement: this is item ${itemIndex + 1} of ${batchTotal}; make it materially different from the others through at least three simultaneous changes across pose/object arrangement, camera angle, crop, setting/scenery, lighting, action/mood, foreground/background depth, color emphasis, contextual props, and composition while preserving the requested style and identity.`
+        : "Composition requirement: make the image specific, polished, and visually inspectable with a clear focal subject, intentional framing, and grounded contextual details.",
+    ].filter(Boolean).join("\n\n");
+  }
+  if (normalizedLane === "music") {
+    const contextAnchor = clipPlanPromptText(contextText, 650);
+    return [
+      base,
+      contextAnchor ? `Plan anchors: ${contextAnchor}` : "",
+      "Arrange as a complete production cue with clear genre, tempo feel, instrumentation, intro/development/ending, mix texture, and emotional arc. Avoid vocals unless explicitly requested.",
+    ].filter(Boolean).join("\n\n");
+  }
+  if (normalizedLane === "sfx") {
+    const contextAnchor = clipPlanPromptText(contextText, 650);
+    return [
+      base,
+      contextAnchor ? `Plan anchors: ${contextAnchor}` : "",
+      "Design as a layered sound cue with foreground action, background ambience, spatial distance, dynamics, timing, texture, and a clean beginning and ending.",
+    ].filter(Boolean).join("\n\n");
+  }
+  return base;
+}
+function appendStudioExecutorNote(assistantMessage, title, details = {}) {
+  if (!assistantMessage) return;
+  assistantMessage.reasoningLabel = "Executor notes";
+  assistantMessage.thinkingExpanded = false;
+  assistantMessage.thinkingLive = false;
+  assistantMessage.thinkingDone = true;
+  const lines = [`### ${title}`];
+  for (const [key, value] of Object.entries(details || {})) {
+    const text = typeof value === "string" ? value.trim() : JSON.stringify(value, null, 2);
+    if (!text) continue;
+    lines.push(`**${key}:**\n${text}`);
+  }
+  const block = lines.join("\n\n");
+  assistantMessage.reasoningText = [String(assistantMessage.reasoningText || "").trim(), block]
+    .filter(Boolean)
+    .join("\n\n");
+}
+function imageStudioOutputNames(output) {
+  const rows = Array.isArray(output)
+    ? output
+    : output && typeof output === "object"
+      ? [output]
+      : [];
+  return rows
+    .map((item) => String(item?.name || item?.filename || item?.relative_path || item?.url || "").trim())
+    .filter(Boolean);
+}
+function backendPlanCompletionText(generation = {}) {
+  const detail = String(generation?.detail || "Backend Plan Mode production complete.").trim();
+  const names = imageStudioOutputNames(generation?.output || null);
+  const outputLine = names.length
+    ? `Output: ${names.slice(0, 3).join(", ")}${names.length > 3 ? ` and ${names.length - 3} more` : ""}.`
+    : "";
+  return [detail, outputLine].filter(Boolean).join("\n\n");
+}
+function studioConversationTitleFromPlan(plan = {}, fallbackText = "") {
+  const title = sanitizeConversationTitle(plan?.title || "");
+  if (!title || isWeakAutoConversationTitle(title)) return "";
+  const titleWords = new Set(
+    title
+      .toLowerCase()
+      .split(/[^a-z0-9]+/i)
+      .filter((word) => word.length >= 4),
+  );
+  if (!titleWords.size) return "";
+  const promptWords = new Set(
+    String(fallbackText || "")
+      .toLowerCase()
+      .split(/[^a-z0-9]+/i)
+      .filter((word) => word.length >= 4),
+  );
+  for (const word of titleWords) {
+    if (promptWords.has(word)) return title;
+  }
+  return "";
+}
+function shouldAutoNameStudioConversation() {
+  if (!(chatState.messages || []).length) return true;
+  const conversation = activeChatConversation();
+  return Boolean(
+    conversation?.autoNamed &&
+      isWeakAutoConversationTitle(chatConversationTitle(conversation)),
+  );
+}
+async function sendImageStudioMessage(lane, text, attachments = []) {
+  if (!text) return setChatMsg("Enter a generation prompt.");
+  const backendPlanMode = lane === "plan-backend";
+  const input = $("chatInput");
+  const shouldAutoNameConversation = shouldAutoNameStudioConversation();
+  const messageCreatedAt = Date.now();
+  const userMessage = {
+    role: "user",
+    text,
+    attachments,
+    inputTokensEstimate: estimateTextTokenCount(text),
+    inputTokensApprox: true,
+    createdAt: messageCreatedAt,
+  };
+  const assistantMessage = {
+    role: "assistant",
+    text: backendPlanMode ? "Starting backend Plan Mode..." : "Preparing AI Studio generation...",
+    modelLabel: $("chatStudioLane")?.selectedOptions?.[0]?.textContent || "AI Studio",
+    studioLane: lane,
+    studioPrompt: text,
+    createdAt: messageCreatedAt,
+    generationStartedAt: messageCreatedAt,
+  };
+  chatState.messages = [...(chatState.messages || []), userMessage, assistantMessage];
+  chatState.busy = true;
+  if (input) input.value = "";
+  persistChatConversationState();
+  if (shouldAutoNameConversation) {
+    applyConversationTitle(chatState.activeConversationId, "", text, attachments);
+  }
+  renderChatUi();
+  renderChatTranscript(true, { reason: "user" });
+  const assistantIndex = chatState.messages.length - 1;
+  try {
+    const priorPrompt = [...(chatState.messages || [])]
+      .slice(0, Math.max(0, assistantIndex - 1))
+      .reverse()
+      .find(
+        (message) =>
+          message?.role === "assistant" &&
+          message?.studioLane === lane &&
+          message?.studioPrompt &&
+          message?.generatedMedia,
+      )?.studioPrompt || "";
+    const generationPrompt = backendPlanMode ? text : enhancePlanMediaPrompt({
+      lane,
+      prompt: text,
+      originalRequest: text,
+    });
+    appendStudioExecutorNote(assistantMessage, backendPlanMode ? "Backend Plan Mode submission" : "Direct generation submission", {
+      Lane: lane,
+      "Original prompt": text,
+      "Enhanced prompt sent": generationPrompt,
+      Attachments: attachments.length
+        ? attachments.map((row) => `${row.kind || "file"}:${row.name || "attachment"}`).join(", ")
+        : "none",
+    });
+    updateLiveChatMessageDom(assistantIndex, true);
+    persistChatConversationState();
+    const response = await fetch(backendPlanMode ? "/admin/ai-studio/backend-plan" : "/admin/ai-studio/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: backendPlanMode
+        ? JSON.stringify({ prompt: text, attachments })
+        : JSON.stringify({ lane, prompt: generationPrompt, prior_prompt: priorPrompt, attachments }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || !payload?.ok) throw new Error(payload?.error || "AI Studio generation failed to start.");
+    activeImageStudioJobId = String(payload?.generation?.id || "");
+    while (activeImageStudioJobId) {
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      const statusResponse = await fetch(
+        `/admin/ai-studio/generation?job_id=${encodeURIComponent(activeImageStudioJobId)}&_=${Date.now()}`,
+        { cache: "no-store" },
+      );
+      const statusPayload = await statusResponse.json().catch(() => ({}));
+      if (!statusResponse.ok || !statusPayload?.ok)
+        throw new Error(statusPayload?.error || "AI Studio status check failed.");
+      const generation = statusPayload.generation || {};
+      assistantMessage.text = String(generation.detail || "Generating...");
+      if (generation.status === "success") {
+        assistantMessage.text = backendPlanMode ? backendPlanCompletionText(generation) : "";
+        assistantMessage.studioPrompt = priorPrompt
+          ? `${priorPrompt}\n\nRequested refinement: ${text}`
+          : text;
+        assistantMessage.generatedMedia = generation.output || null;
+        appendStudioExecutorNote(assistantMessage, backendPlanMode ? "Backend Plan Mode output" : "Direct generation output", {
+          Lane: lane,
+          Output: JSON.stringify(generation.output || null, null, 2),
+        });
+        activeImageStudioJobId = "";
+        break;
+      }
+      if (generation.status === "failed")
+        throw new Error(generation.error || generation.detail || "AI Studio generation failed.");
+      if (generation.status === "cancelled") {
+        assistantMessage.text = "Generation cancelled.";
+        activeImageStudioJobId = "";
+        break;
+      }
+      updateLiveChatMessageDom(assistantIndex, true);
+      setChatMsg(generation.detail || "AI Studio is generating...");
+    }
+    persistChatConversationState();
+    renderChatTranscript(true, { reason: "complete" });
+    setChatMsg(assistantMessage.generatedMedia ? (backendPlanMode ? "Backend Plan Mode complete." : "AI Studio generation complete.") : assistantMessage.text);
+  } catch (error) {
+    assistantMessage.text = `AI Studio error: ${String(error?.message || error)}`;
+    activeImageStudioJobId = "";
+    persistChatConversationState();
+    renderChatTranscript(true, { reason: "error" });
+    setChatMsg(assistantMessage.text, "error");
+  } finally {
+    markAssistantGenerationFinished(assistantMessage);
+    chatState.busy = false;
+    await flushChatConversationStateNow();
+    renderChatUi();
+  }
+}
+async function executePlannedStudioMessage(confirmText, plan, attachments = [], execution = {}) {
+  const steps = Array.isArray(plan?.steps) && plan.steps.length
+    ? plan.steps
+    : [{ lane: plan?.lane, label: plan?.label, prompt: plan?.prompt }];
+  if (!steps.length) return setChatMsg("No executable Plan Mode plan is available.", "error");
+  if (execution.assistantMessage && !Array.isArray(execution.assistantMessage.generatedMedia)) {
+    execution.assistantMessage.generatedMedia = [];
+  }
+  const input = $("chatInput");
+  const messageCreatedAt = Date.now();
+  const userMessage = {
+    role: "user",
+    text: confirmText || "Confirm plan",
+    attachments,
+    inputTokensEstimate: estimateTextTokenCount(confirmText || "Confirm plan"),
+    inputTokensApprox: true,
+    createdAt: messageCreatedAt,
+  };
+  const resumable = execution.assistantMessage ? null : latestResumableStudioExecution(plan);
+  const resumedResults = Array.isArray(resumable?.studioPlanResults)
+    ? structuredClone(resumable.studioPlanResults)
+    : [];
+  const resumedMedia = Array.isArray(resumable?.generatedMedia)
+    ? structuredClone(resumable.generatedMedia)
+    : [];
+  const assistantMessage = execution.assistantMessage || {
+    role: "assistant",
+    text: "Acknowledged, executing plan mode...",
+    modelLabel: "Plan Mode",
+    studioLane: "plan-execution",
+    studioPrompt: steps.map((step) => step?.prompt || "").join("\n\n"),
+    interactivePlan: plan,
+    generatedMedia: resumedMedia,
+    studioPlanResults: resumedResults,
+    createdAt: messageCreatedAt,
+    generationStartedAt: messageCreatedAt,
+  };
+  if (!execution.assistantMessage) {
+    chatState.messages = [...(chatState.messages || []), userMessage, assistantMessage];
+  }
+  chatState.busy = true;
+  if (input) input.value = "";
+  persistChatConversationState();
+  renderChatUi();
+  renderChatTranscript(true, { reason: "user" });
+  const assistantIndex = execution.assistantIndex ?? (chatState.messages.length - 1);
+  const stepResults = resumedResults;
+  const originalRequestText = String(plan?.original_request || plan?.request || plan?.prompt || assistantMessage.studioPrompt || "").trim();
+  const planStepExpectedUnits = (step, index) => {
+    if (!step?.batch) return 1;
+    const sourceStep = Math.max(0, Number(step?.batch?.source_step || 0) - 1);
+    const sourceItems = Array.isArray(stepResults[sourceStep]?.items) ? stepResults[sourceStep].items : [];
+    const selectedItems = planBatchItemsForStepDescriptor(step, sourceItems);
+    const batchCount = Number(step?.batch?.count || 0) || 0;
+    return Math.max(1, selectedItems.length || batchCount || 1);
+  };
+  const planStepIsComplete = (step, index) => {
+    const result = stepResults[index];
+    if (!result) return false;
+    if (String(step?.lane || "").trim().toLowerCase() === "text") {
+      const text = String(result.text || "").trim();
+      if (!text || result.kind !== "text") return false;
+      if (step?.batch) {
+        const items = Array.isArray(result.items) ? result.items : [];
+        return items.length >= planStepExpectedUnits(step, index);
+      }
+      return true;
+    }
+    if (result.kind !== "media") return false;
+    const outputs = Array.isArray(result.outputs) ? result.outputs : [];
+    return outputs.length >= planStepExpectedUnits(step, index);
+  };
+  const planStepContextText = (stepIndex, options = {}) => {
+    const compact = !!options.compact;
+    const maxResultChars = Math.max(400, Number(options.maxResultChars || (compact ? 1800 : 4000)));
+    const maxItemChars = Math.max(120, Number(options.maxItemChars || 260));
+    const contextParts = [];
+    const originalRequest = String(plan?.original_request || "").trim();
+    if (originalRequest) contextParts.push(`Original request:\n${originalRequest}`);
+    const priorStepSummaries = stepResults
+      .slice(0, Math.max(0, stepIndex))
+      .map((result, priorIndex) => {
+        const priorStep = steps[priorIndex] || {};
+        const priorHeading = `Step ${priorIndex + 1} (${String(priorStep?.label || priorStep?.lane || "step")})`;
+        const priorPrompt = String(priorStep?.prompt || "").trim();
+        if (!result) return "";
+        if (result.kind === "text" && result.text) {
+          if (compact && Array.isArray(result.items) && result.items.length) {
+            const compactItems = result.items.slice(0, 12).map((item, itemIndex) => {
+              const name = planBatchSubjectName(item || {}, `Item ${itemIndex + 1}`);
+              const dates = planBatchSubjectContext(item || {});
+              const copy = planBatchScalar(item?.text || item?.speech_text || item?.summary || item?.description).slice(0, maxItemChars);
+              const visual = planBatchScalar(item?.image_prompt || item?.visual_prompt || item?.prompt).slice(0, maxItemChars);
+              return [
+                name,
+                dates ? `(${dates})` : "",
+                copy ? `- narration/content: ${copy}` : "",
+                visual ? `visual: ${visual}` : "",
+              ].filter(Boolean).join(" ");
+            });
+            return `${priorHeading} source items:\n${compactItems.join("\n")}`;
+          }
+          return `${priorHeading} prompt:\n${priorPrompt}\nResult:\n${String(result.text || "").trim().slice(0, maxResultChars)}`;
+        }
+        const outputs = Array.isArray(result.outputs) ? result.outputs : [];
+        if (!outputs.length) return "";
+        const labels = outputs
+          .map(({ item, output } = {}) =>
+            planBatchSubjectName(item || {}, "") ||
+            String(output?.name || output?.filename || output?.path || "").trim(),
+          )
+          .filter(Boolean)
+          .slice(0, 16);
+        const outputText = labels.length ? `\nOutputs: ${labels.join(", ")}` : "";
+        return compact
+          ? `${priorHeading}${outputText}`
+          : `${priorHeading} prompt:\n${priorPrompt}${outputText}`;
+      })
+      .filter(Boolean);
+    if (priorStepSummaries.length) {
+      contextParts.push(`Completed earlier steps:\n${priorStepSummaries.join("\n")}`);
+    }
+    return contextParts.join("\n\n").trim();
+  };
+  const planStepAttachmentKinds = (lane) => {
+    const normalizedLane = String(lane || "").trim().toLowerCase();
+    if (normalizedLane === "voice") return new Set(["audio"]);
+    if (["ltx", "sulphur", "10eros", "wan"].includes(normalizedLane)) return new Set(["image"]);
+    return new Set();
+  };
+  const blobToDataUrl = (blob) => new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(reader.error || new Error("Failed to read generated media."));
+    reader.readAsDataURL(blob);
+  });
+  const planStepAttachmentFromOutput = async (output, lane) => {
+    const allowedKinds = planStepAttachmentKinds(lane);
+    if (!allowedKinds.size) return null;
+    const kind = String(output?.kind || "").trim().toLowerCase();
+    if (!allowedKinds.has(kind)) return null;
+    const url = String(output?.url || "").trim();
+    if (!url) return null;
+    try {
+      if (/^data:/i.test(url)) {
+        return {
+          kind,
+          name: String(output?.name || "").trim() || `${kind}-attachment`,
+          url,
+        };
+      }
+      const response = await fetch(url, { cache: "no-store" });
+      if (!response.ok) return null;
+      const blob = await response.blob();
+      const dataUrl = await blobToDataUrl(blob);
+      if (!/^data:/i.test(dataUrl)) return null;
+      return {
+        kind,
+        name: String(output?.name || "").trim() || `${kind}-attachment`,
+        url: dataUrl,
+      };
+    } catch (error) {
+      return null;
+    }
+  };
+  const planStepAttachments = async (step, stepIndex, itemIndex, batchItems = []) => {
+    const allowedKinds = planStepAttachmentKinds(step?.lane);
+    if (!allowedKinds.size) return [];
+    const collected = [];
+    const seen = new Set();
+    const addAttachment = (attachment) => {
+      const row = attachment && typeof attachment === "object" ? attachment : null;
+      if (!row) return;
+      const kind = String(row.kind || "").trim().toLowerCase();
+      const url = String(row.url || "").trim();
+      if (!kind || !url || !allowedKinds.has(kind)) return;
+      const key = `${kind}\u0000${url}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      collected.push({
+        ...row,
+        kind,
+        url,
+      });
+    };
+    const dependencyIndexes = Array.isArray(step?.depends_on) ? step.depends_on : [];
+    for (const dependencyIndex of dependencyIndexes) {
+      const dependencyResult = stepResults[Math.max(0, Number(dependencyIndex || 0) - 1)] || null;
+      const dependencyOutputs = Array.isArray(dependencyResult?.outputs) ? dependencyResult.outputs : [];
+      if (!dependencyOutputs.length) continue;
+      let selectedOutputs = [];
+      if (step?.batch && batchItems.length) {
+        const matching = dependencyOutputs.find((entry, depIndex) =>
+          depIndex === itemIndex || entry?.item === batchItems[itemIndex],
+        );
+        if (matching?.output) selectedOutputs = [matching.output];
+      }
+      if (!selectedOutputs.length) {
+        const usableDependencyOutputs = dependencyOutputs
+          .map((entry) => entry?.output)
+          .filter((output) =>
+            output &&
+            allowedKinds.has(String(output?.kind || "").trim().toLowerCase())
+          );
+        if (usableDependencyOutputs.length === 1) {
+          selectedOutputs = [usableDependencyOutputs[0]];
+        }
+      }
+      for (const output of selectedOutputs) {
+        const attachment = await planStepAttachmentFromOutput(output, step?.lane);
+        if (attachment) addAttachment(attachment);
+      }
+    }
+    for (const attachment of attachments) {
+      addAttachment(attachment);
+    }
+    return collected;
+  };
+  try {
+    for (let stepIndex = 0; stepIndex < steps.length; stepIndex += 1) {
+      const step = steps[stepIndex] || {};
+      const lane = String(step.lane || "").trim().toLowerCase();
+      const plannedPrompt = String(step.prompt || "").trim();
+      if (!lane || !plannedPrompt) throw new Error(`Plan step ${stepIndex + 1} is incomplete.`);
+      assistantMessage.text = planExecutionProgressText(plan, steps, stepResults, stepIndex, 0, [], { status: "submitting" });
+      commitStudioPlanProgress(assistantIndex);
+      if (lane === "text") {
+        if (stepResults[stepIndex]?.kind === "text" && stepResults[stepIndex]?.text) {
+          assistantMessage.studioPlanResults = stepResults;
+          commitStudioPlanProgress(assistantIndex, { render: true });
+          continue;
+        }
+        const isDirectorRuntime = (row) =>
+          String(row?.id || row?.instance_id || "").toUpperCase() === "STUDIO_DIRECTOR" ||
+          String(row?.selector || row?.mode || "") === "ai-studio/director";
+        const selectedRuntime = activeChatRuntime();
+        const nonDirectorRuntime = activeChatPresets().find((row) => !isDirectorRuntime(row)) || null;
+        const directorRuntime = activeChatPresets().find((row) => isDirectorRuntime(row)) || null;
+        const runtime =
+          selectedRuntime && !isDirectorRuntime(selectedRuntime)
+            ? selectedRuntime
+            : nonDirectorRuntime || selectedRuntime || directorRuntime || null;
+        const requestBody = {
+          conversation_id: String(chatState.activeConversationId || ""),
+          instance_id: runtime?.id || runtime?.instance_id || "STUDIO_DIRECTOR",
+          mode: runtime?.selector || runtime?.mode || "ai-studio/director",
+          model: runtime?.served_model_name || runtime?.model_id || "qwen3.5-4b-uncensored",
+          messages: [{ role: "user", content: plannedPrompt }],
+          params: {
+            ...chatState.params,
+            max_tokens: Math.max(12000, Number(chatState.params?.max_tokens || 0)),
+          },
+          api_preset: chatState.apiPresetName || "",
+        };
+        let textResult = "";
+        let items = [];
+        let sourceRepairNote = "";
+        const feedsBatch = steps.some((candidate) => Number(candidate?.batch?.source_step || 0) === stepIndex + 1);
+        const expectedBatchCount = feedsBatch
+          ? planBatchExpectedCountForSource(steps, stepIndex + 1, plannedPrompt)
+          : 0;
+        requestBody.messages = [{
+          role: "user",
+          content: feedsBatch
+            ? planSourceExecutionPrompt(plannedPrompt, expectedBatchCount)
+            : plannedPrompt,
+        }];
+        requestBody.params.max_tokens = Math.max(
+          expectedBatchCount >= 20 ? 20000 : 12000,
+          Number(chatState.params?.max_tokens || 0),
+        );
+        for (let textAttempt = 0; textAttempt < 3; textAttempt += 1) {
+          const textResponse = await fetch("/admin/chat", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(requestBody),
+          });
+          const textPayload = await textResponse.json().catch(() => ({}));
+          if (!textResponse.ok || !textPayload?.ok)
+            throw new Error(textPayload?.error || `Plan text step ${stepIndex + 1} failed.`);
+          textResult = String(
+            textPayload?.response?.choices?.[0]?.message?.content ||
+            textPayload?.response?.choices?.[0]?.text ||
+            "",
+          ).trim();
+          applyAssistantGenerationMetrics(assistantMessage, textPayload);
+          if (!textResult) throw new Error(`Plan text step ${stepIndex + 1} returned no content.`);
+          let parseError = null;
+          let validationError = "";
+          try {
+            items = feedsBatch ? parsePlanBatchItems(textResult) : [];
+            if (feedsBatch) items = normalizePlanBatchItems(items, plannedPrompt, originalRequestText);
+          } catch (error) {
+            items = [];
+            parseError = error;
+          }
+          if (!parseError && feedsBatch) {
+            validationError = planBatchWordCountError(items, plannedPrompt, originalRequestText);
+          }
+          if (parseError && textAttempt < 2) {
+            assistantMessage.text = `${planExecutionProgressText(plan, steps, stepResults, stepIndex, 0, [], { status: "preparing" })}\nThe source returned unparsable batch JSON. Retrying the structured text step before media generation...`;
+            commitStudioPlanProgress(assistantIndex);
+            requestBody.messages = [{
+              role: "user",
+              content: `${planSourceExecutionPrompt(plannedPrompt, expectedBatchCount)}\n\nCORRECTION: The previous response could not be parsed as one complete strict JSON array (${String(parseError?.message || parseError)}). Return the complete array again, with no Markdown fences, no leading language tag, no prose, and no truncation.`,
+            }];
+            continue;
+          }
+          if (parseError) throw parseError;
+          if (validationError && textAttempt < 2) {
+            assistantMessage.text = `${planExecutionProgressText(plan, steps, stepResults, stepIndex, 0, [], { status: "preparing" })}\nThe source missed an exact script word-count constraint. Retrying the structured text step before media generation...`;
+            commitStudioPlanProgress(assistantIndex);
+            requestBody.messages = [{
+              role: "user",
+              content: `${planSourceExecutionPrompt(plannedPrompt, expectedBatchCount)}\n\nCORRECTION: The previous response violated an exact word-count constraint (${validationError}). Rewrite the affected generated script fields so they contain exactly the requested number of spoken words while preserving the requested objects, order, field names, image prompts, and factual constraints. Output only the corrected strict JSON array.`,
+            }];
+            continue;
+          }
+          if (validationError) {
+            const repairResult = repairPlanBatchWordCounts(items, plannedPrompt, originalRequestText);
+            if (repairResult.repaired) {
+              items = repairResult.items;
+              textResult = JSON.stringify(items);
+              sourceRepairNote = repairResult.notes.join("\n");
+              validationError = planBatchWordCountError(items, plannedPrompt, originalRequestText);
+            }
+          }
+          if (validationError) throw new Error(`Plan text step ${stepIndex + 1} returned invalid source content: ${validationError}`);
+          if (!expectedBatchCount || items.length === expectedBatchCount || textAttempt > 0) break;
+          assistantMessage.text = `${planExecutionProgressText(plan, steps, stepResults, stepIndex, 0, [], { status: "preparing" })}\nThe source returned ${items.length}/${expectedBatchCount} batch items. Retrying the structured text step before media generation...`;
+          commitStudioPlanProgress(assistantIndex);
+          requestBody.messages = [{
+            role: "user",
+            content: `${planSourceExecutionPrompt(plannedPrompt, expectedBatchCount)}\n\nCORRECTION: The previous response contained ${items.length}/${expectedBatchCount} objects. Return exactly ${expectedBatchCount} objects that satisfy the original request. Preserve required duplicates, separate terms, separate editions, ordered entries, and distinct identities whenever the request implies them. Do not merge, omit, summarize, or add unrelated entries. Output only the corrected strict JSON array.`,
+          }];
+        }
+        if (feedsBatch && !items.length) throw new Error(`Plan text step ${stepIndex + 1} returned no batch items.`);
+        if (expectedBatchCount && items.length !== expectedBatchCount) {
+          throw new Error(`Plan text step ${stepIndex + 1} returned ${items.length}/${expectedBatchCount} batch items after retry.`);
+        }
+        stepResults[stepIndex] = { kind: "text", text: textResult, items };
+        assistantMessage.studioPlanResults = stepResults;
+        appendStudioExecutorNote(assistantMessage, `Step ${stepIndex + 1} source output`, {
+          Lane: "text",
+          Prompt: requestBody.messages?.[0]?.content || plannedPrompt,
+          Repair: sourceRepairNote,
+          Output: textResult,
+        });
+        assistantMessage.text = `${planExecutionProgressText(plan, steps, stepResults, stepIndex, 0, [], { status: "success" })}\n${textResult}`;
+        commitStudioPlanProgress(assistantIndex, { render: true });
+        continue;
+      }
+      const sourceStep = Math.max(0, Number(step?.batch?.source_step || 0) - 1);
+      const sourceBatchItems = Array.isArray(stepResults[sourceStep]?.items) ? stepResults[sourceStep].items : [];
+      const batchItems = step?.batch ? planBatchItemsForStepDescriptor(step, sourceBatchItems) : [null];
+      if (step?.batch && !batchItems.length) throw new Error(`Plan step ${stepIndex + 1} has no batch items from step ${sourceStep + 1}.`);
+      const outputs = Array.isArray(stepResults[stepIndex]?.outputs)
+        ? stepResults[stepIndex].outputs
+        : [];
+      if (outputs.length >= batchItems.length) {
+        assistantMessage.studioPlanResults = stepResults;
+        commitStudioPlanProgress(assistantIndex, { render: true });
+        continue;
+      }
+      for (let itemIndex = outputs.length; itemIndex < batchItems.length;) {
+        const useIdeogramCandidateSheet =
+          lane === "ideogram" &&
+          step?.batch &&
+          batchItems.length >= 10;
+        const workItems = [batchItems[itemIndex]];
+        const item = workItems[0];
+        let resolvedPrompt = expandPlanBatchPrompt(plannedPrompt, item || {});
+        if (lane === "ideogram" && step?.batch) {
+          const identity = planBatchSubjectName(item || {}, `Subject ${itemIndex + 1}`);
+          const context = planBatchSubjectContext(item || {});
+          const direction = expandPlanBatchPrompt(plannedPrompt, item || {});
+          resolvedPrompt = [
+            `Create the requested image for "${identity}"${context ? ` (${context})` : ""}.`,
+            "Make this item visually and semantically distinct from every other item in the same batch; change at least three major axes at once, such as pose, viewpoint, crop, setting/scenery, lighting, action, foreground/background depth, color emphasis, contextual props, or composition, while preserving the requested style.",
+            "If this item names a real public or historical subject, use recognizable public-reference likenesses and distinctive attributes instead of a generic substitute.",
+            "Use a neutral educational/editorial framing where relevant, with no advocacy or unsafe content unless explicitly requested and allowed.",
+            direction,
+          ].join(" ");
+        }
+        resolvedPrompt = resolvedPrompt.replace(
+          /\[Insert text from Step (\d+) here\]/gi,
+          (_match, value) => String(stepResults[Math.max(0, Number(value) - 1)]?.text || ""),
+        );
+        const isVideoLane = ["ltx", "sulphur", "10eros", "wan"].includes(lane);
+        const isEnhancedMediaLane = planLanePromptNeedsEnhancement(lane);
+        const contextText = planStepContextText(stepIndex, {
+          compact: isEnhancedMediaLane,
+          maxResultChars: isVideoLane ? 1200 : isEnhancedMediaLane ? 900 : 4000,
+          maxItemChars: isVideoLane ? 180 : isEnhancedMediaLane ? 160 : 320,
+        });
+        if (contextText && !planLaneSpeaksPrompt(lane) && !isEnhancedMediaLane && (stepIndex > 0 || (Array.isArray(step?.depends_on) && step.depends_on.length))) {
+          resolvedPrompt = [
+            resolvedPrompt,
+            "Use the completed plan context exactly and keep the same named subjects, dates, visible labels, ordering, and requested duration.",
+            contextText,
+          ].join("\n\n");
+        }
+        const batchProgress = step?.batch ? ` item ${itemIndex + 1}/${batchItems.length}` : "";
+        const expandedPrompt = resolvedPrompt;
+        resolvedPrompt = enhancePlanMediaPrompt({
+          lane,
+          prompt: resolvedPrompt,
+          item: item || {},
+          itemIndex,
+          batchTotal: batchItems.length,
+          step,
+          contextText,
+          originalRequest: originalRequestText,
+        });
+        const generationOptions =
+          useIdeogramCandidateSheet
+            ? {
+                width: 1024,
+                height: 1024,
+                steps: 8,
+                candidate_identity: planBatchSubjectName(item || "", ""),
+              }
+            : step?.batch &&
+              batchItems.length >= 10 &&
+            ["ideogram", "chroma", "zimage", "krea"].includes(lane)
+            ? { width: 512, height: 512, steps: 6 }
+            : {};
+        if (
+          lane === "ideogram" &&
+          !useIdeogramCandidateSheet &&
+          planIdeogramRequestsSingleRender(resolvedPrompt, plannedPrompt, originalRequestText)
+        ) {
+          generationOptions.candidate_grid = false;
+          generationOptions.single_image = true;
+        }
+        if (lane === "kokoro" && step?.batch) {
+          generationOptions.voice = planKokoroVoiceForItem(item || {}, itemIndex, originalRequestText);
+        }
+        const stepAttachments = await planStepAttachments(step, stepIndex, itemIndex, batchItems);
+        appendStudioExecutorNote(assistantMessage, `Step ${stepIndex + 1}${batchProgress || ""} submission`, {
+          Lane: lane,
+          "Plan prompt": plannedPrompt,
+          "Expanded prompt": expandedPrompt,
+          "Enhanced prompt sent": resolvedPrompt,
+          Options: JSON.stringify(generationOptions, null, 2),
+          Attachments: stepAttachments.length
+            ? stepAttachments.map((row) => `${row.kind || "file"}:${row.name || "attachment"}`).join(", ")
+            : "none",
+        });
+        commitStudioPlanProgress(assistantIndex, { render: true });
+        const response = await fetch("/admin/ai-studio/generate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            lane,
+            prompt: resolvedPrompt,
+            options: generationOptions,
+            attachments: stepAttachments,
+          }),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok || !payload?.ok) throw new Error(payload?.error || `Plan step ${stepIndex + 1}${batchProgress} failed to start.`);
+        activeImageStudioJobId = String(payload?.generation?.id || "");
+        assistantMessage.text = planExecutionProgressText(plan, steps, stepResults, stepIndex, itemIndex, batchItems, { status: "running" });
+        commitStudioPlanProgress(assistantIndex);
+        while (activeImageStudioJobId) {
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+          const statusResponse = await fetch(
+            `/admin/ai-studio/generation?job_id=${encodeURIComponent(activeImageStudioJobId)}&_=${Date.now()}`,
+            { cache: "no-store" },
+          );
+          const statusPayload = await statusResponse.json().catch(() => ({}));
+          if (!statusResponse.ok || !statusPayload?.ok)
+            throw new Error(statusPayload?.error || "AI Studio status check failed.");
+          const generation = statusPayload.generation || {};
+          const progressText = planExecutionProgressText(plan, steps, stepResults, stepIndex, itemIndex, batchItems, generation);
+          assistantMessage.text = progressText;
+          if (generation.status === "success") {
+            if (generation.output) {
+              const generatedOutputs = Array.isArray(generation.output?.items)
+                ? generation.output.items
+                : [generation.output];
+              if (useIdeogramCandidateSheet && generatedOutputs.length !== 1) {
+                throw new Error(
+                  `Ideogram candidate sheet returned ${generatedOutputs.length}/1 selected image.`,
+                );
+              }
+              generatedOutputs.forEach((output, offset) => {
+                assistantMessage.generatedMedia.push(output);
+                outputs.push({ item: workItems[offset] || item, output });
+              });
+              appendStudioExecutorNote(assistantMessage, `Step ${stepIndex + 1}${batchProgress || ""} output`, {
+                Lane: lane,
+                Output: JSON.stringify(generatedOutputs, null, 2),
+              });
+              stepResults[stepIndex] = { kind: "media", batch: !!step?.batch, outputs };
+              assistantMessage.studioPlanResults = stepResults;
+              commitStudioPlanProgress(assistantIndex, { render: true });
+            }
+            activeImageStudioJobId = "";
+            break;
+          }
+          if (generation.status === "failed")
+            throw new Error(generation.error || generation.detail || `Plan step ${stepIndex + 1}${batchProgress} failed.`);
+          if (generation.status === "cancelled") {
+            assistantMessage.text = "Plan execution cancelled.";
+            commitStudioPlanProgress(assistantIndex);
+            activeImageStudioJobId = "";
+            break;
+          }
+          commitStudioPlanProgress(assistantIndex);
+          const progressHeadline = planExecutionProgressHeadline(progressText);
+          setChatMsg(generation.detail ? `${progressHeadline} · ${generation.detail}` : progressHeadline, "warning");
+        }
+        if (/cancelled/i.test(assistantMessage.text)) break;
+        itemIndex += 1;
+      }
+      stepResults[stepIndex] = { kind: "media", batch: !!step?.batch, outputs };
+      assistantMessage.studioPlanResults = stepResults;
+      commitStudioPlanProgress(assistantIndex, { render: true });
+      if (/cancelled/i.test(assistantMessage.text)) break;
+    }
+    const incompleteStepIndex = steps.findIndex((step, index) => !planStepIsComplete(step, index));
+    if (incompleteStepIndex >= 0) {
+      const missingStep = steps[incompleteStepIndex] || {};
+      throw new Error(
+        `Plan execution stopped before step ${incompleteStepIndex + 1} (${String(missingStep.label || missingStep.lane || "step")}) completed.`,
+      );
+    }
+    const planCancelled = /cancelled/i.test(assistantMessage.text);
+    if (!planCancelled) assistantMessage.text = "Approved plan executed.";
+    await flushChatConversationStateNow();
+    renderChatTranscript(true, { reason: "complete" });
+    setChatMsg(
+      planCancelled
+        ? "Plan execution cancelled."
+        : assistantMessage.generatedMedia.length
+          ? "Approved plan executed."
+          : assistantMessage.text,
+    );
+  } catch (error) {
+    assistantMessage.text = `Plan execution error: ${String(error?.message || error)}`;
+    activeImageStudioJobId = "";
+    await flushChatConversationStateNow();
+    renderChatTranscript(true, { reason: "error" });
+    setChatMsg(assistantMessage.text, "error");
+  } finally {
+    markAssistantGenerationFinished(assistantMessage);
+    await flushChatConversationStateNow();
+    chatState.busy = false;
+    renderChatUi();
+  }
+}
+async function sendPlanStudioMessage(text, attachments = []) {
+  if (!text) return setChatMsg("Enter a prompt for Plan Mode.");
+  const input = $("chatInput");
+  const shouldAutoNameConversation = shouldAutoNameStudioConversation();
+  const messageCreatedAt = Date.now();
+  const userMessage = {
+    role: "user",
+    text,
+    attachments,
+    inputTokensEstimate: estimateTextTokenCount(text),
+    inputTokensApprox: true,
+    createdAt: messageCreatedAt,
+  };
+  const assistantMessage = {
+    role: "assistant",
+    text: "Planning AI Studio route...",
+    modelLabel: "Plan Mode",
+    studioLane: "plan",
+    studioPrompt: text,
+    createdAt: messageCreatedAt,
+    generationStartedAt: messageCreatedAt,
+  };
+  chatState.messages = [...(chatState.messages || []), userMessage, assistantMessage];
+  chatState.busy = true;
+  if (input) input.value = "";
+  persistChatConversationState();
+  renderChatUi();
+  renderChatTranscript(true, { reason: "user" });
+  const assistantIndex = chatState.messages.length - 1;
+  try {
+    const previousPlan = [...(chatState.messages || [])]
+      .slice(0, Math.max(0, assistantIndex - 1))
+      .reverse()
+      .find((message) => message?.role === "assistant" && message?.studioLane === "plan" && message?.interactivePlan)
+      ?.interactivePlan || null;
+    const planResponse = await fetch("/admin/ai-studio/plan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt: text, attachments, previous_plan: previousPlan }),
+    });
+    const planPayload = await planResponse.json().catch(() => ({}));
+    if (!planResponse.ok || !planPayload?.ok) throw new Error(planPayload?.error || "Interactive planner failed.");
+    const plan = planPayload.plan || {};
+    assistantMessage.interactivePlan = plan;
+    applyAssistantGenerationMetrics(assistantMessage, plan.generation_metrics || {});
+    assistantMessage.text = formatInteractiveStudioPlanText(plan);
+    if (shouldAutoNameConversation) {
+      applyConversationTitle(
+        chatState.activeConversationId,
+        studioConversationTitleFromPlan(plan, text),
+        text,
+        attachments,
+      );
+    }
+    updateLiveChatMessageDom(assistantIndex, true);
+    persistChatConversationState();
+    chatState.busy = false;
+    persistChatConversationState();
+    renderChatTranscript(true, { reason: "complete" });
+    setChatMsg(String(plan.action || "").toLowerCase() === "generate" ? "Plan ready. Reply with changes or confirmation to execute in a follow-up." : "Plan Mode returned a chat response.");
+    return;
+  } catch (error) {
+    assistantMessage.text = `Plan Mode error: ${String(error?.message || error)}`;
+    activeImageStudioJobId = "";
+    if (shouldAutoNameConversation) {
+      applyConversationTitle(chatState.activeConversationId, "", text, attachments);
+    }
+    persistChatConversationState();
+    renderChatTranscript(true, { reason: "error" });
+    setChatMsg(assistantMessage.text, "error");
+  } finally {
+    markAssistantGenerationFinished(assistantMessage);
+    persistChatConversationState();
+    chatState.busy = false;
+    renderChatUi();
+  }
+}
+async function sendInteractiveStudioMessage(text, attachments = []) {
+  if (!text) return setChatMsg("Enter a prompt for Interactive Mode.");
+  const input = $("chatInput");
+  const shouldAutoNameConversation = shouldAutoNameStudioConversation();
+  const messageCreatedAt = Date.now();
+  const userMessage = {
+    role: "user",
+    text,
+    attachments,
+    inputTokensEstimate: estimateTextTokenCount(text),
+    inputTokensApprox: true,
+    createdAt: messageCreatedAt,
+  };
+  const assistantMessage = {
+    role: "assistant",
+    text: "Planning Interactive Mode route...",
+    modelLabel: "Interactive Mode",
+    studioLane: "interactive",
+    studioPrompt: text,
+    createdAt: messageCreatedAt,
+    generationStartedAt: messageCreatedAt,
+  };
+  chatState.messages = [...(chatState.messages || []), userMessage, assistantMessage];
+  chatState.busy = true;
+  if (input) input.value = "";
+  persistChatConversationState();
+  renderChatUi();
+  renderChatTranscript(true, { reason: "user" });
+  const assistantIndex = chatState.messages.length - 1;
+  try {
+    const planResponse = await fetch("/admin/ai-studio/plan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt: text, attachments }),
+    });
+    const planPayload = await planResponse.json().catch(() => ({}));
+    if (!planResponse.ok || !planPayload?.ok) throw new Error(planPayload?.error || "Interactive planner failed.");
+    const plan = planPayload.plan || {};
+    assistantMessage.interactivePlan = plan;
+    applyAssistantGenerationMetrics(assistantMessage, plan.generation_metrics || {});
+    assistantMessage.text = formatInteractiveStudioPlanText(plan);
+    if (shouldAutoNameConversation) {
+      applyConversationTitle(
+        chatState.activeConversationId,
+        studioConversationTitleFromPlan(plan, text),
+        text,
+        attachments,
+      );
+    }
+    updateLiveChatMessageDom(assistantIndex, true);
+    persistChatConversationState();
+    if (String(plan.action || "").toLowerCase() !== "generate") {
+      setChatMsg("Interactive Mode returned a chat response.");
+      return;
+    }
+    assistantMessage.studioLane = "interactive-execution";
+    assistantMessage.modelLabel = "Interactive Mode";
+    await executePlannedStudioMessage("", plan, attachments, { assistantMessage, assistantIndex });
+    return;
+  } catch (error) {
+    assistantMessage.text = `Interactive Mode error: ${String(error?.message || error)}`;
+    activeImageStudioJobId = "";
+    if (shouldAutoNameConversation) {
+      applyConversationTitle(chatState.activeConversationId, "", text, attachments);
+    }
+    persistChatConversationState();
+    renderChatTranscript(true, { reason: "error" });
+    setChatMsg(assistantMessage.text, "error");
+  } finally {
+    markAssistantGenerationFinished(assistantMessage);
+    persistChatConversationState();
+    chatState.busy = false;
+    renderChatUi();
+  }
+}
 async function sendChatMessage() {
   if (chatState.busy) {
+    if (activeImageStudioJobId) {
+      fetch("/admin/ai-studio/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ job_id: activeImageStudioJobId }),
+      }).catch(() => {});
+      setChatMsg("Cancelling AI Studio generation...");
+      return;
+    }
     stopChatGeneration();
     return;
   }
@@ -5619,10 +7597,52 @@ async function sendChatMessage() {
       return;
     }
   }
+  if (chatBenchmarkLocked()) {
+    return setChatMsg("Model Scores benchmarking is running. Cancel the benchmark before sending chat messages.", "error");
+  }
   const runtime = activeChatRuntime();
   const input = $("chatInput");
   const text = String(input?.value || "").trim();
   const pendingAttachments = [...(chatState.attachments || [])];
+  const studioLane = String($("chatStudioLane")?.value || "");
+  if (studioLane) {
+    if (studioLane === "plan") {
+      if (!text) return setChatMsg("Enter a prompt for Plan Mode.");
+      chatState.attachments = [];
+      if (chatTextConfirmsPlan(text)) {
+        const plan = latestPendingStudioPlan();
+        if (plan) return executePlannedStudioMessage(text, plan, pendingAttachments);
+      }
+      return sendPlanStudioMessage(text, pendingAttachments);
+    }
+    if (studioLane === "interactive") {
+      if (!text) return setChatMsg("Enter a prompt for Interactive Mode.");
+      chatState.attachments = [];
+      return sendInteractiveStudioMessage(text, pendingAttachments);
+    }
+    if (studioLane === "plan-backend") {
+      if (!text) return setChatMsg("Enter a prompt for backend Plan Mode.");
+      if (pendingAttachments.length) return setChatMsg("Backend Plan Mode does not use attachments yet.", "error");
+      chatState.attachments = [];
+      return sendImageStudioMessage(studioLane, text, []);
+    }
+    const allowedKind = ["ltx", "sulphur", "10eros", "wan"].includes(studioLane)
+      ? "image"
+      : studioLane === "voice"
+        ? "audio"
+        : "";
+    if (pendingAttachments.length && (!allowedKind || pendingAttachments.some((row) => String(row?.kind || "") !== allowedKind))) {
+      return setChatMsg(
+        allowedKind
+          ? `${$("chatStudioLane")?.selectedOptions?.[0]?.textContent || "This Studio lane"} accepts only one ${allowedKind} attachment.`
+          : "This Studio lane does not use attachments.",
+        "error",
+      );
+    }
+    if (!text) return setChatMsg("Enter a generation prompt.");
+    chatState.attachments = [];
+    return sendImageStudioMessage(studioLane, text, pendingAttachments.slice(0, 1));
+  }
   if (!runtime) {
     if (chatSelectedRuntimeIsUnavailable()) {
       promptUnavailableChatRuntimeSelection();
@@ -5631,9 +7651,15 @@ async function sendChatMessage() {
     return setChatMsg("Start a preset before using local chat.");
   }
   if (!text && !pendingAttachments.length) return;
-  if (!chatRuntimeSupportsVision(runtime) && pendingAttachments.some((attachment) => attachment?.kind === "image")) {
-    return setChatMsg("The selected container does not advertise vision support, so image attachments are disabled for this request.");
+  const unsupportedMedia = pendingAttachments.filter((attachment) => {
+    const kind = String(attachment?.kind || "text").toLowerCase();
+    return ["image", "audio", "video"].includes(kind) && !chatRuntimeSupportsMedia(runtime, kind);
+  });
+  if (unsupportedMedia.length) {
+    const kinds = Array.from(new Set(unsupportedMedia.map((attachment) => String(attachment?.kind || "media")))).join(", ");
+    return setChatMsg(`The selected container does not advertise ${kinds} support, so those attachments are disabled for this request.`);
   }
+  const messageCreatedAt = Date.now();
   const userMessage = {
     role: "user",
     text,
@@ -5644,6 +7670,7 @@ async function sendChatMessage() {
       attachments: pendingAttachments,
     }),
     inputTokensApprox: true,
+    createdAt: messageCreatedAt,
   };
   try {
     await maybeCompactChatConversation(runtime, userMessage);
@@ -5660,6 +7687,8 @@ async function sendChatMessage() {
     thinkingDone: false,
     thinkingExpanded: true,
     modelLabel: runtime.served_model_name || runtime.model_id || runtime.mode || "Model",
+    createdAt: messageCreatedAt,
+    generationStartedAt: messageCreatedAt,
   };
   const shouldAutoNameConversation = (chatState.messages || []).length === 0;
   const shouldGenerateSmartTitle = shouldAutoNameConversation && chatSmartTitlesEnabled();
@@ -5686,6 +7715,117 @@ async function sendChatMessage() {
   lockChatTranscriptStreamingHeight();
   setChatMsg("Generating message...");
   const assistantIndex = chatState.messages.length - 1;
+  let firstVisibleStreamRenderDone = false;
+  let visibleTextQueue = "";
+  let visibleReasoningQueue = "";
+  let visibleRevealScheduled = false;
+  let visibleRevealDrainResolver = null;
+  const assistantLiveMessage = () => chatState.messages[assistantIndex] || null;
+  const visibleRevealQueueLength = () =>
+    String(visibleTextQueue || "").length + String(visibleReasoningQueue || "").length;
+  const visibleRevealChunkSize = () => {
+    const queued = visibleRevealQueueLength();
+    if (queued > 5200) return CHAT_STREAM_VISIBLE_REVEAL_BURST_MAX_CHARS;
+    if (queued > 2400) return Math.min(128, CHAT_STREAM_VISIBLE_REVEAL_BURST_MAX_CHARS);
+    if (queued > 900) return Math.min(96, CHAT_STREAM_VISIBLE_REVEAL_BURST_MAX_CHARS);
+    if (queued > 240) return Math.min(64, CHAT_STREAM_VISIBLE_REVEAL_BURST_MAX_CHARS);
+    return CHAT_STREAM_VISIBLE_REVEAL_TARGET_CHARS;
+  };
+  const resolveVisibleRevealDrain = () => {
+    if (visibleRevealDrainResolver && !visibleRevealQueueLength()) {
+      const resolve = visibleRevealDrainResolver;
+      visibleRevealDrainResolver = null;
+      resolve();
+    }
+  };
+  const revealQueuedChatText = () => {
+    visibleRevealScheduled = false;
+    const startedAt = Date.now();
+    let rendered = false;
+    const assistant = assistantLiveMessage();
+    if (!assistant || !assistant.streamingVisibleActive) {
+      visibleTextQueue = "";
+      visibleReasoningQueue = "";
+      resolveVisibleRevealDrain();
+      return;
+    }
+    do {
+      let budget = Math.max(
+        CHAT_STREAM_VISIBLE_REVEAL_MIN_CHARS,
+        Math.min(CHAT_STREAM_VISIBLE_REVEAL_BURST_MAX_CHARS, visibleRevealChunkSize()),
+      );
+      if (visibleReasoningQueue) {
+        const chunk = visibleReasoningQueue.slice(0, budget);
+        visibleReasoningQueue = visibleReasoningQueue.slice(chunk.length);
+        assistant.streamingVisibleReasoningText =
+          String(assistant.streamingVisibleReasoningText || "") + chunk;
+        budget -= chunk.length;
+      }
+      if (budget > 0 && visibleTextQueue) {
+        const chunk = visibleTextQueue.slice(0, budget);
+        visibleTextQueue = visibleTextQueue.slice(chunk.length);
+        assistant.streamingVisibleText = String(assistant.streamingVisibleText || "") + chunk;
+      }
+      rendered = true;
+    } while (
+      visibleRevealQueueLength() > CHAT_STREAM_VISIBLE_REVEAL_BACKLOG_CHARS &&
+      Date.now() - startedAt < CHAT_STREAM_VISIBLE_REVEAL_FRAME_BUDGET_MS
+    );
+    if (rendered) {
+      if (!firstVisibleStreamRenderDone) {
+        firstVisibleStreamRenderDone = updateLiveChatMessageDom(assistantIndex, false);
+      } else {
+        updateLiveChatMessageDom(assistantIndex, false);
+      }
+    }
+    if (visibleRevealQueueLength()) {
+      scheduleVisibleReveal();
+    } else {
+      resolveVisibleRevealDrain();
+    }
+  };
+  const scheduleVisibleReveal = () => {
+    if (visibleRevealScheduled) return;
+    visibleRevealScheduled = true;
+    if (typeof window.requestAnimationFrame === "function") {
+      window.requestAnimationFrame(() => revealQueuedChatText());
+      return;
+    }
+    setTimeout(revealQueuedChatText, CHAT_STREAM_VISIBLE_REVEAL_FAST_INTERVAL_MS);
+  };
+  const enqueueVisibleStreamChunk = async (addedText = "", kind = "text") => {
+    const assistant = assistantLiveMessage();
+    if (!assistant) return;
+    assistant.streamingVisibleActive = true;
+    if (typeof assistant.streamingVisibleText !== "string") assistant.streamingVisibleText = "";
+    if (typeof assistant.streamingVisibleReasoningText !== "string") {
+      assistant.streamingVisibleReasoningText = "";
+    }
+    if (kind === "reasoning") visibleReasoningQueue += String(addedText || "");
+    else visibleTextQueue += String(addedText || "");
+    scheduleVisibleReveal();
+    if (visibleRevealQueueLength() > 3600) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  };
+  const drainVisibleStreamQueue = async () => {
+    if (!visibleRevealQueueLength()) return;
+    await new Promise((resolve) => {
+      visibleRevealDrainResolver = resolve;
+      scheduleVisibleReveal();
+    });
+  };
+  const finishVisibleStream = async () => {
+    await drainVisibleStreamQueue();
+    const assistant = assistantLiveMessage();
+    if (!assistant) return;
+    assistant.streamingVisibleText = assistant.text || "";
+    assistant.streamingVisibleReasoningText = assistant.reasoningText || "";
+    updateLiveChatMessageDom(assistantIndex, false);
+    delete assistant.streamingVisibleActive;
+    delete assistant.streamingVisibleText;
+    delete assistant.streamingVisibleReasoningText;
+  };
   try {
     const requestMessages = buildChatRequestMessages(requestHistory);
     logDebugEvent("chat_request_prepare", {
@@ -5741,21 +7881,23 @@ async function sendChatMessage() {
           if (chatMessageThinkingActive(chatState.messages[assistantIndex])) {
             finalizeChatThinkingState(chatState.messages[assistantIndex]);
           }
-          chatState.messages[assistantIndex].text += String(event.payload?.text || "");
+          const textDelta = String(event.payload?.text || "");
+          chatState.messages[assistantIndex].text += textDelta;
           persistStreamingChatState();
-          scheduleLiveChatMessageDomUpdate(assistantIndex, false, "stream");
+          await enqueueVisibleStreamChunk(textDelta, "text");
         } else if (event.eventName === "reasoning") {
           const assistant = chatState.messages[assistantIndex];
           if (!assistant.thinkingStartedAt) assistant.thinkingStartedAt = Date.now();
           assistant.thinkingLive = true;
           assistant.thinkingDone = false;
           assistant.thinkingExpanded = true;
-          assistant.reasoningText += String(event.payload?.text || "");
+          const reasoningDelta = String(event.payload?.text || "");
+          assistant.reasoningText += reasoningDelta;
           assistant.thinkingDurationMs = clampChatThinkingDurationMs(
             Date.now() - Number(assistant.thinkingStartedAt || Date.now()),
           );
           persistStreamingChatState();
-          scheduleLiveChatMessageDomUpdate(assistantIndex, false, "stream");
+          await enqueueVisibleStreamChunk(reasoningDelta, "reasoning");
         } else if (event.eventName === "tool") {
           if (chatMessageThinkingActive(chatState.messages[assistantIndex])) {
             finalizeChatThinkingState(chatState.messages[assistantIndex]);
@@ -5797,21 +7939,23 @@ async function sendChatMessage() {
         if (chatMessageThinkingActive(chatState.messages[assistantIndex])) {
           finalizeChatThinkingState(chatState.messages[assistantIndex]);
         }
-        chatState.messages[assistantIndex].text += String(event.payload?.text || "");
+        const textDelta = String(event.payload?.text || "");
+        chatState.messages[assistantIndex].text += textDelta;
         persistStreamingChatState();
-        scheduleLiveChatMessageDomUpdate(assistantIndex, false, "stream");
+        await enqueueVisibleStreamChunk(textDelta, "text");
       } else if (event?.eventName === "reasoning") {
         const assistant = chatState.messages[assistantIndex];
         if (!assistant.thinkingStartedAt) assistant.thinkingStartedAt = Date.now();
         assistant.thinkingLive = true;
         assistant.thinkingDone = false;
         assistant.thinkingExpanded = true;
-        assistant.reasoningText += String(event.payload?.text || "");
+        const reasoningDelta = String(event.payload?.text || "");
+        assistant.reasoningText += reasoningDelta;
         assistant.thinkingDurationMs = clampChatThinkingDurationMs(
           Date.now() - Number(assistant.thinkingStartedAt || Date.now()),
         );
         persistStreamingChatState();
-        scheduleLiveChatMessageDomUpdate(assistantIndex, false, "stream");
+        await enqueueVisibleStreamChunk(reasoningDelta, "reasoning");
       } else if (event?.eventName === "tool") {
         if (chatMessageThinkingActive(chatState.messages[assistantIndex])) {
           finalizeChatThinkingState(chatState.messages[assistantIndex]);
@@ -5850,6 +7994,7 @@ async function sendChatMessage() {
     ) {
       finalizeChatThinkingState(chatState.messages[assistantIndex]);
     }
+    await finishVisibleStream();
     renderChatTranscript(false, { reason: "stream" });
     if (shouldGenerateSmartTitle) {
       const extractedTitle = extractChatTitleMarker(chatState.messages[assistantIndex].text);
@@ -5907,6 +8052,7 @@ async function sendChatMessage() {
     if (aborted) scheduleConversationRuntimeMetricRefresh(3, 300);
     stopChatStreamResumePolling();
   } finally {
+    markAssistantGenerationFinished(chatState.messages[assistantIndex]);
     if (chatStreamingPersistTimer) {
       clearTimeout(chatStreamingPersistTimer);
       chatStreamingPersistTimer = null;
@@ -5926,6 +8072,16 @@ async function sendChatMessage() {
       scheduleCodeSyntaxHighlight(transcriptHost);
     }
   }
+}
+if (
+  typeof window !== "undefined" &&
+  window.location?.protocol === "file:" &&
+  /web-ui\.test\.html$/i.test(String(window.location?.pathname || ""))
+) {
+  window.__club3090SetChatMessagesForSmoke = function setChatMessagesForSmoke(messages) {
+    chatState.messages = Array.isArray(messages) ? messages : [];
+    chatTranscriptLastSignature = "";
+  };
 }
 ensureDynamicPresetLayout();
 ensurePresetActionModal();

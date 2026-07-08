@@ -57,16 +57,27 @@ saveAuthSettings = async function () {
   }
 };
 function syncInstanceUtilityButtons(target) {
-  const utilityButtons = [$("instanceBenchmarkBtn"), $("instanceReportBtn"), $("instanceRebenchBtn")];
+  const runScriptButton = $("instanceRunScriptBtn");
+  const imageStudioButton = $("instanceSetupImageStudioBtn");
   const separator = $("instanceUtilitySeparator");
-  const visible = !scopeIsGlobal() && !!target;
-  const enabled = visible && !!target?.running;
+  const visible = scopeIsGlobal() || !!target;
   if (separator) separator.classList.toggle("hidden", !visible);
-  utilityButtons.forEach((button) => {
-    if (!button) return;
-    button.classList.toggle("hidden", !visible);
-    setInstanceScopeDisabled(button, !enabled);
-  });
+  if (runScriptButton) {
+    runScriptButton.classList.toggle("hidden", !visible);
+    setInstanceScopeDisabled(runScriptButton, false);
+  }
+  if (imageStudioButton) {
+    imageStudioButton.classList.toggle("hidden", !visible);
+    const installed = aiStudioServiceInstalled();
+    const busy = aiStudioSetupBusy();
+    imageStudioButton.classList.toggle("red", installed);
+    imageStudioButton.setAttribute("onclick", installed ? "removeImageStudio()" : "startImageStudioSetup()");
+    imageStudioButton.innerHTML = `${imageStudioActionIconSvg()}<span>${escapeHtml(
+      busy ? (installed ? "Removing AI Studio" : "Setup Running") : (installed ? "Remove AI Studio" : "Setup AI Studio"),
+    )}</span>`;
+    setInstanceScopeDisabled(imageStudioButton, false);
+    imageStudioButton.disabled = !!busy;
+  }
 }
 renderInstances = function (instances) {
   ensureV414Layout();
@@ -123,9 +134,11 @@ renderInstances = function (instances) {
   const startBtn = actionButtons[0] || null;
   const restartBtn = actionButtons[1] || null;
   const stopBtn = actionButtons[2] || null;
+  const controlButtons = [startBtn, restartBtn, stopBtn, btn].filter(Boolean);
   const anyRunning = scopeItems().some((item) => !!item.running);
   const targetRunning = !!(target && target.running);
   const allEnabled = scopeItems().length > 0 && scopeItems().every((item) => !!item.enabled);
+  const scoreLock = typeof benchmarkJobActive === "function" && benchmarkJobActive();
   if (scopeIsGlobal()) {
     setHtmlIfChanged(
       summary,
@@ -137,7 +150,7 @@ renderInstances = function (instances) {
         ? "Disable Boot Autostart"
         : "Enable Boot Autostart";
     }
-    actionButtons.forEach((x) => setInstanceScopeDisabled(x, false));
+    controlButtons.forEach((x) => setInstanceScopeDisabled(x, scoreLock));
   } else if (target) {
     setHtmlIfChanged(summary, `${scopeLabel(target)} · ${target.assignment_text} · port ${target.port} · ${target.running ? "running" : "stopped"} · proxy <code>${target.proxy_prefix}/</code> · ${target.enabled ? "autostart enabled" : "autostart disabled"}`);
     if (btn) {
@@ -146,14 +159,14 @@ renderInstances = function (instances) {
         ? "Disable Boot Autostart"
         : "Enable Boot Autostart";
     }
-    actionButtons.forEach((x) => setInstanceScopeDisabled(x, false));
+    controlButtons.forEach((x) => setInstanceScopeDisabled(x, scoreLock));
   } else {
     summary.textContent = "No GPU instances configured";
     if (btn) {
       setInstanceScopeDisabled(btn, true);
       btn.textContent = "Boot autostart unavailable";
     }
-    actionButtons.forEach((x) => setInstanceScopeDisabled(x, true));
+    controlButtons.forEach((x) => setInstanceScopeDisabled(x, true));
   }
   if (scopeIsGlobal()) {
     if (startBtn) startBtn.textContent = anyRunning ? "Stop" : "Start";
@@ -194,13 +207,27 @@ renderPresetScopeTabs = function () {
 };
 updateScopedCards = function () {
   const target = currentScopeInstance(false);
+  const scoreLock = typeof benchmarkJobActive === "function" && benchmarkJobActive();
+  const profileNote = scoreLock
+    ? "Power profiles cannot be managed during a Model Scores benchmark."
+    : `${scopeIsGlobal() ? "Global" : scopeLabel(target)} scope: applying a power profile resets the recorded GPU peak values and starts a fresh measurement session.`;
+  const powerNote = scoreLock
+    ? "Optimizations and cooling cannot be managed during a Model Scores benchmark."
+    : `${scopeIsGlobal() ? "Global" : scopeLabel(target)} scope: optimization and cooling actions use the selected runtime context while keeping host-level power state in sync.`;
   if ($("profileScopeNote"))
-    $("profileScopeNote").innerHTML = `${scopeIsGlobal() ? "Global" : scopeLabel(target)} scope: applying a power profile resets the recorded GPU peak values and starts a fresh measurement session.`;
+    $("profileScopeNote").innerHTML = profileNote;
   if ($("powerScopeNote"))
-    $("powerScopeNote").innerHTML = `${scopeIsGlobal() ? "Global" : scopeLabel(target)} scope: optimization and cooling actions use the selected runtime context while keeping host-level power state in sync.`;
+    $("powerScopeNote").innerHTML = powerNote;
+  [...(document.querySelectorAll("#profileActionRow .btn, #optToggle, #fanToggle") || [])].forEach((button) =>
+    setInstanceScopeDisabled(button, scoreLock),
+  );
   renderLogSourcePanel();
 };
 powerAction = async function (a) {
+  if (typeof benchmarkJobActive === "function" && benchmarkJobActive()) {
+    alert("Model Scores benchmarking is running. Cancel the benchmark before changing runtime state.");
+    return;
+  }
   const cur = scopeIsGlobal() ? { id: "GLOBAL", enabled: scopeItems().length > 0 && scopeItems().every((item) => !!item.enabled) } : currentScopeInstance(false);
   const needsTarget = [
     "stop_container",
@@ -228,6 +255,10 @@ instanceAction = async function (a) {
   await powerAction(a);
 };
 toggleInstanceEnabled = async function () {
+  if (typeof benchmarkJobActive === "function" && benchmarkJobActive()) {
+    alert("Model Scores benchmarking is running. Cancel the benchmark before changing boot autostart.");
+    return;
+  }
   const cur = scopeIsGlobal() ? { id: "GLOBAL", enabled: scopeItems().length > 0 && scopeItems().every((item) => !!item.enabled) } : currentScopeInstance(false);
   if (!cur) {
     alert("Select a GPU or Pair scope first.");
@@ -390,6 +421,10 @@ async function deleteCurrentPairGroup() {
   }
 }
 switchMode = async function (m) {
+  if (typeof benchmarkJobActive === "function" && benchmarkJobActive()) {
+    alert("Model Scores benchmarking is running. Cancel the benchmark before launching presets.");
+    return;
+  }
   const cur = currentScopeInstance(true);
   if (!cur || cur.kind === "dual") {
     alert("Select a single GPU tab to apply a single-GPU preset.");
@@ -409,6 +444,10 @@ switchMode = async function (m) {
     }
 };
 async function switchDualMode(m) {
+  if (typeof benchmarkJobActive === "function" && benchmarkJobActive()) {
+    alert("Model Scores benchmarking is running. Cancel the benchmark before launching presets.");
+    return;
+  }
   const cur = currentScopeInstance(false);
   if (!cur || cur.kind !== "dual") {
     alert("Choose a dual pair tab before applying a dual preset.");
@@ -427,17 +466,23 @@ async function switchDualMode(m) {
 }
 function profileDescription(p) {
   const d = {
-    eco: "Eco profile: lower GPU power limits, lower idle clocks, powersave CPU governor, faster idle/container stop timers.",
+    eco: "Eco profile: 240W active GPU cap, lower idle clocks, powersave CPU governor, faster idle/container stop timers.",
     balanced:
-      "Balanced profile: normal server profile with 280W active GPU cap, idle downclocking after 10 minutes, and container stop after 1 hour.",
-    default:
-      "Default profile: keeps the 280W safety GPU cap but removes idle clock locking, uses schedutil CPU while active, and keeps standard idle timers.",
+      "Balanced profile: default server profile with 280W active GPU cap, idle downclocking after 10 minutes, and container stop after 1 hour.",
+    "benchmark-ready":
+      "Benchmark Ready profile: caps active GPU power at 220W, disables idle downclocking, keeps fans available for the benchmark lock, and uses longer idle timers for validation runs.",
+    fast:
+      "Fast profile: 300W active GPU cap for the first speed benchmark pass, no idle clock locking, schedutil CPU while active, and standard idle timers.",
     turbo:
-      "Turbo profile: higher GPU power allowance, performance CPU governor, relaxed idle timers, and minimal downclocking. Use when performance matters more than power.",
+      "Turbo profile: 350W active GPU allowance, performance CPU governor, relaxed idle timers, and minimal downclocking. Use when performance matters more than power.",
   };
   return d[p] || "Apply profile?";
 }
 profile = async function (p) {
+  if (typeof benchmarkJobActive === "function" && benchmarkJobActive()) {
+    alert("Model Scores benchmarking is running. Cancel the benchmark before changing power profiles.");
+    return;
+  }
   const cur = currentScopeInstance(false);
   const instanceId = scopeIsGlobal() ? cur?.id || "GLOBAL" : cur?.id || null;
   const scopeText = scopeIsGlobal() ? "Global" : scopeLabel(cur);
