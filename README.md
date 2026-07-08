@@ -37,36 +37,40 @@ This repository is the server-management layer. It integrates with the upstream 
 
 ## Screenshots
 Video coming soon.
-<img width="1920" height="1080" alt="Image" src="https://github.com/user-attachments/assets/9729b743-b8d1-4853-919c-06ff82a990d9" width="10%" />
-<img width="1920" height="1080" alt="Image" src="https://github.com/user-attachments/assets/9061ee18-411c-483e-9f2a-d526bf731f9b" width="10%" />
-<img width="1920" height="1080" alt="Image" src="https://github.com/user-attachments/assets/b26a77f8-4cd3-4f42-b22a-7fe47ed0c5ce" width="10%" />
-<img width="1920" height="1080" alt="Image" src="https://github.com/user-attachments/assets/e0b111a6-1c99-4bb1-9ad8-903ba9cfb88e" width="10%" />
-<img width="1920" height="1080" alt="Image" src="https://github.com/user-attachments/assets/dd9aae5b-ff91-4055-aefd-0e6db86db1ee" width="10%" />
-<img width="1920" height="1080" alt="Image" src="https://github.com/user-attachments/assets/3006781f-4b7a-4031-9ca7-67af1e500c0c" width="10%" />
-<img width="1920" height="1080" alt="Image" src="https://github.com/user-attachments/assets/5d274b9a-69c5-4aae-9d6c-09f732e1ae41" width="10%" />
-<img width="1920" height="1080" alt="Image" src="https://github.com/user-attachments/assets/18510221-c6d7-4dec-a9e2-fc2630abc468" width="10%" />
-<img width="1920" height="1080" alt="Image" src="https://github.com/user-attachments/assets/56ff11e1-2ee4-4de1-8917-c34c63e0067e" width="10%" />
-<img width="1920" height="1080" alt="Image" src="https://github.com/user-attachments/assets/8bad3819-bdad-44ba-ac4a-a4e0c8fbffca" width="10%" />
-<img width="1920" height="1080" alt="Image" src="https://github.com/user-attachments/assets/f64015f9-7db6-4edc-b3f9-d182f38b918a" width="10%" />
-<img width="1920" height="1080" alt="Image" src="https://github.com/user-attachments/assets/d655fb6e-2f0f-4a0d-bfba-18995fcc89a1" width="10%" />
-<img width="1920" height="1080" alt="Image" src="https://github.com/user-attachments/assets/bd2f302b-20b4-40bc-aaf5-f2143b27f8fb" width="10%" />
-<img width="1920" height="1080" alt="Image" src="https://github.com/user-attachments/assets/b3d809d3-1b8f-4172-9681-6a5c20fcafa4" width="10%" />
-<img width="1920" height="1080" alt="Image" src="https://github.com/user-attachments/assets/cef96cfb-5916-49b8-9b9d-6d8dd8cfc7f8" width="10%" />
-<img width="1920" height="1080" alt="Image" src="https://github.com/user-attachments/assets/cc9456aa-5ee9-413e-990d-cbb7dba768eb" width="10%" />
-<img width="1920" height="1080" alt="Image" src="https://github.com/user-attachments/assets/7d831285-41dd-4ac8-92fd-82e7b5f5c083" width="10%" />
-<img width="1920" height="1080" alt="Image" src="https://github.com/user-attachments/assets/3d7cf0a9-0f45-47d9-ab89-0969025d948c" width="10%" />
-<img width="1920" height="1080" alt="Image" src="https://github.com/user-attachments/assets/cfff0d88-deea-400f-9af6-1cec186bc52c" width="10%" />
-<img width="1920" height="1080" alt="Image" src="https://github.com/user-attachments/assets/1364fe36-bb0e-48e9-b43e-a80fb07a2adc" width="10%" />
-<img width="1920" height="1080" alt="Image" src="https://github.com/user-attachments/assets/a6813df4-a7a5-4b5f-9bea-f5a511f02cb3" width="10%" />
-<img width="1920" height="1080" alt="Image" src="https://github.com/user-attachments/assets/f279cf16-1b0b-4e2c-b810-58ac05350c1e" width="10%" />
-<img width="1920" height="1080" alt="Image" src="https://github.com/user-attachments/assets/b30f42a0-f003-41a5-8996-97d11e8b7023" width="10%" />
-<img width="1920" height="1080" alt="Image" src="https://github.com/user-attachments/assets/57b70cf9-6390-40db-9190-fe0b3a388abe" width="10%" />
-<img width="1920" height="1080" alt="Image" src="https://github.com/user-attachments/assets/169acf80-0a52-4229-a660-17fcee4ed184" width="10%" />
-<img width="1920" height="1080" alt="Image" src="https://github.com/user-attachments/assets/a9e5ebe9-6a09-4080-8746-4c9fde9baf49" width="10%" />
-<img width="1920" height="1080" alt="Image" src="https://github.com/user-attachments/assets/8f5e66fd-aef7-4b56-96f3-cefc8166ac82" width="10%" />
-<img width="1920" height="1080" alt="Image" src="https://github.com/user-attachments/assets/1bb7ad70-d83a-4e1f-ba2f-a41f4e5d1758" width="10%" />
-<img width="1920" height="1080" alt="Image" src="https://github.com/user-attachments/assets/d2cfa8c9-fc2a-4a76-b8af-a905e53192de" width="10%" />
-<img width="1920" height="1080" alt="Image" src="https://github.com/user-attachments/assets/eea7a3f4-d521-471f-9b36-a5e085233395" width="10%" />
+Click any thumbnail to open the full-size screenshot.
+
+<p align="center">
+  <a href="./screenshots/1.%20Main%20Window.png"><img src="./screenshots/1.%20Main%20Window.png" alt="1. Main Window" width="260" /></a>
+  <a href="./screenshots/2.%20System%20Tab.png"><img src="./screenshots/2.%20System%20Tab.png" alt="2. System Tab" width="260" /></a>
+  <a href="./screenshots/3.%20System%20Tab%20pt%202.png"><img src="./screenshots/3.%20System%20Tab%20pt%202.png" alt="3. System Tab pt 2" width="260" /></a>
+  <a href="./screenshots/4.%20Presets.png"><img src="./screenshots/4.%20Presets.png" alt="4. Presets" width="260" /></a>
+  <a href="./screenshots/5.%20Presets%20pt%202.png"><img src="./screenshots/5.%20Presets%20pt%202.png" alt="5. Presets pt 2" width="260" /></a>
+  <a href="./screenshots/6.%20Users.png"><img src="./screenshots/6.%20Users.png" alt="6. Users" width="260" /></a>
+  <a href="./screenshots/7.%20Metrics.png"><img src="./screenshots/7.%20Metrics.png" alt="7. Metrics" width="260" /></a>
+  <a href="./screenshots/8.%20Metrics%20pt%202%20.png"><img src="./screenshots/8.%20Metrics%20pt%202%20.png" alt="8. Metrics pt 2" width="260" /></a>
+  <a href="./screenshots/9.%20Metrics%20pt%203.png"><img src="./screenshots/9.%20Metrics%20pt%203.png" alt="9. Metrics pt 3" width="260" /></a>
+  <a href="./screenshots/10.%20Metrics%20pt%204.png"><img src="./screenshots/10.%20Metrics%20pt%204.png" alt="10. Metrics pt 4" width="260" /></a>
+  <a href="./screenshots/11.%20Metrics%20pt%205.png"><img src="./screenshots/11.%20Metrics%20pt%205.png" alt="11. Metrics pt 5" width="260" /></a>
+  <a href="./screenshots/12.%20Logs.png"><img src="./screenshots/12.%20Logs.png" alt="12. Logs" width="260" /></a>
+  <a href="./screenshots/13.%20Run%20Script.png"><img src="./screenshots/13.%20Run%20Script.png" alt="13. Run Script" width="260" /></a>
+  <a href="./screenshots/14.%20Chat%20UI.png"><img src="./screenshots/14.%20Chat%20UI.png" alt="14. Chat UI" width="260" /></a>
+  <a href="./screenshots/15.%20Chat%20UI%20pt%202.png"><img src="./screenshots/15.%20Chat%20UI%20pt%202.png" alt="15. Chat UI pt 2" width="260" /></a>
+  <a href="./screenshots/16.%20API%20Presets.png"><img src="./screenshots/16.%20API%20Presets.png" alt="16. API Presets" width="260" /></a>
+  <a href="./screenshots/17.%20Benchmarks.png"><img src="./screenshots/17.%20Benchmarks.png" alt="17. Benchmarks" width="260" /></a>
+  <a href="./screenshots/18.%20Detailed%20Benchmark%20Scores.png"><img src="./screenshots/18.%20Detailed%20Benchmark%20Scores.png" alt="18. Detailed Benchmark Scores" width="260" /></a>
+  <a href="./screenshots/19.%20Model%20Manager.png"><img src="./screenshots/19.%20Model%20Manager.png" alt="19. Model Manager" width="260" /></a>
+  <a href="./screenshots/20.%20Custom%20Models.png"><img src="./screenshots/20.%20Custom%20Models.png" alt="20. Custom Models" width="260" /></a>
+  <a href="./screenshots/21.%20Preset%20Launch%20Settings.png"><img src="./screenshots/21.%20Preset%20Launch%20Settings.png" alt="21. Preset Launch Settings" width="260" /></a>
+  <a href="./screenshots/22.%20Duplicate%20Presets.png"><img src="./screenshots/22.%20Duplicate%20Presets.png" alt="22. Duplicate Presets" width="260" /></a>
+  <a href="./screenshots/23.%20Setup%20Assistant.png"><img src="./screenshots/23.%20Setup%20Assistant.png" alt="23. Setup Assistant" width="260" /></a>
+  <a href="./screenshots/24.%20AI%20Studio.png"><img src="./screenshots/24.%20AI%20Studio.png" alt="24. AI Studio" width="260" /></a>
+  <a href="./screenshots/25.%20AI%20Studio%20Gallery.png"><img src="./screenshots/25.%20AI%20Studio%20Gallery.png" alt="25. AI Studio Gallery" width="260" /></a>
+  <a href="./screenshots/26.%20Preset%20Filter.png"><img src="./screenshots/26.%20Preset%20Filter.png" alt="26. Preset Filter" width="260" /></a>
+  <a href="./screenshots/27.%20Dynamic%20Documentation.png"><img src="./screenshots/27.%20Dynamic%20Documentation.png" alt="27. Dynamic Documentation" width="260" /></a>
+  <a href="./screenshots/28.%20File%20Navigator.png"><img src="./screenshots/28.%20File%20Navigator.png" alt="28. File Navigator" width="260" /></a>
+  <a href="./screenshots/29.%20File%20Editor.png"><img src="./screenshots/29.%20File%20Editor.png" alt="29. File Editor" width="260" /></a>
+  <a href="./screenshots/30.%20Hex%20Editor.png"><img src="./screenshots/30.%20Hex%20Editor.png" alt="30. Hex Editor" width="260" /></a>
+</p>
 
 
 ## Quick Start Guide
