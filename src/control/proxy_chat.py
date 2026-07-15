@@ -41,6 +41,20 @@ def parse_preset_path(path):
             return candidate, cap
         return None, None
 
+    def split_runtime_candidate(tokens):
+        rows = list(tokens or [])
+        for end in range(min(len(rows), 5), 0, -1):
+            cap = None
+            candidate = "/".join(rows[:end])
+            for prefix, value in LENGTH_PREFIXES.items():
+                if candidate.startswith(prefix):
+                    candidate = candidate[len(prefix):]
+                    cap = value
+                    break
+            if resolve_variant_spec(candidate):
+                return canonical_mode_selector(candidate), cap, end
+        return None, None, 0
+
     def upstream_from_rest(rest):
         # If a client appended /v1/... to a preset base URL, remove that nested v1.
         if rest and rest[0] == "v1":
@@ -57,12 +71,18 @@ def parse_preset_path(path):
 
     # Normal current style: /v1/<preset>/...
     if parts[0] == "v1" and len(parts) >= 2:
+        candidate, cap, used = split_runtime_candidate(parts[1:])
+        if candidate:
+            return upstream_from_rest(parts[1 + used:]) + suffix, candidate, cap
         candidate, cap = split_candidate(parts[1])
         if candidate:
             return upstream_from_rest(parts[2:]) + suffix, candidate, cap
         return path, None, None
 
     # Compatibility style: /<preset>/... so clients can safely append /v1/...
+    candidate, cap, used = split_runtime_candidate(parts)
+    if candidate:
+        return upstream_from_rest(parts[used:]) + suffix, candidate, cap
     candidate, cap = split_candidate(parts[0])
     if candidate:
         return upstream_from_rest(parts[1:]) + suffix, candidate, cap
@@ -208,9 +228,12 @@ def ensure_runtime_thinking_defaults(payload, spec=None, preset_name=""):
     current_map = dict(current) if isinstance(current, dict) else {}
     if "enable_thinking" in current_map:
         return payload
-    enable_thinking = True if preset_requests_enable_thinking(preset_name) else runtime_reasoning_enabled(spec)
+    if preset_requests_enable_thinking(preset_name):
+        enable_thinking = True
+    else:
+        enable_thinking = runtime_reasoning_enabled(spec)
     if enable_thinking is None:
-        enable_thinking = False
+        return payload
     updated = dict(payload)
     updated["chat_template_kwargs"] = {**current_map, "enable_thinking": bool(enable_thinking)}
     return updated
@@ -241,6 +264,269 @@ def apply_preset(body, preset_name, max_token_cap, spec=None):
             data["max_tokens"] = max_token_cap
     return json.dumps(data, separators=(",", ":")).encode("utf-8")
 
+def proxy_completion_path(upstream_path):
+    path = str(upstream_path or "").split("?", 1)[0]
+    return path.startswith("/v1/chat/completions") or path.startswith("/v1/completions")
+
+
+def proxy_swap_feature_enabled():
+    try:
+        return bool(read_server_config().get("proxy_swap_enabled", True))
+    except Exception:
+        return True
+
+
+def proxy_json_payload(body):
+    try:
+        data = json.loads(body or b"{}")
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _proxy_model_key(text):
+    return re.sub(r"\s+", "", str(text or "").replace("\\", "/").strip().lower())
+
+
+def _proxy_variant_selector(row):
+    data = row if isinstance(row, dict) else {}
+    return str(
+        data.get("selector")
+        or data.get("upstream_tag")
+        or data.get("registry_key")
+        or data.get("variant_id")
+        or ""
+    ).strip()
+
+
+def _proxy_variant_aliases(row):
+    data = row if isinstance(row, dict) else {}
+    aliases = set()
+    for key in (
+        "selector",
+        "upstream_tag",
+        "registry_key",
+        "variant_id",
+        "model_id",
+        "profile_model_id",
+        "model_display_name",
+        "served_model_name",
+        "model_path",
+        "host_model_dir",
+    ):
+        value = str(data.get(key) or "").strip()
+        if not value:
+            continue
+        aliases.add(_proxy_model_key(value))
+        tail = value.replace("\\", "/").strip("/").split("/")[-1]
+        if tail:
+            aliases.add(_proxy_model_key(tail))
+    return aliases
+
+
+def _proxy_payload_text_size(value, budget=400000):
+    if budget <= 0:
+        return 0
+    if isinstance(value, str):
+        return min(len(value), budget)
+    if isinstance(value, list):
+        total = 0
+        for item in value:
+            total += _proxy_payload_text_size(item, budget - total)
+            if total >= budget:
+                break
+        return total
+    if isinstance(value, dict):
+        total = 0
+        for item in value.values():
+            total += _proxy_payload_text_size(item, budget - total)
+            if total >= budget:
+                break
+        return total
+    return 0
+
+
+def proxy_payload_context_need(payload):
+    data = payload if isinstance(payload, dict) else {}
+    explicit = 0
+    for key in ("max_model_len", "max_context", "max_context_tokens", "context_length", "truncate_prompt_tokens"):
+        try:
+            explicit = max(explicit, int(float(data.get(key) or 0)))
+        except Exception:
+            pass
+    output_cap = 0
+    for key in ("max_completion_tokens", "max_tokens"):
+        try:
+            output_cap = max(output_cap, int(float(data.get(key) or 0)))
+        except Exception:
+            pass
+    prompt_size = 0
+    for key in ("messages", "prompt", "input"):
+        if key in data:
+            prompt_size += _proxy_payload_text_size(data.get(key))
+    estimated = int(prompt_size / 4) + output_cap
+    return max(explicit, estimated)
+
+
+def _proxy_variant_tps_score(selector):
+    try:
+        rows = preset_tps_stats_snapshot()
+        row = rows.get(canonical_mode_selector(selector)) or rows.get(str(selector or "").strip()) or {}
+        return float(row.get("avg_tps") or row.get("max_tps") or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _proxy_choose_variant(candidates, payload=None):
+    rows = [dict(row) for row in (candidates or []) if isinstance(row, dict)]
+    if not rows:
+        return ""
+    need = proxy_payload_context_need(payload or {})
+
+    def score(row):
+        selector = _proxy_variant_selector(row)
+        max_len = 0
+        try:
+            max_len = int(row.get("max_model_len") or row.get("max_ctx") or 0)
+        except Exception:
+            max_len = 0
+        install_ready = str(row.get("install_state") or "").strip().lower() == "ready"
+        scope = str(row.get("scope_kind") or "").strip().lower()
+        scope_bias = {"multi": 4.0, "global_only": 4.0, "dual": 3.0, "single": 2.0}.get(scope, 1.0)
+        context_score = 0.0
+        if need > 0:
+            if max_len >= need:
+                context_score = 5000.0 - min(max_len - need, 500000) / 1000.0
+            else:
+                context_score = -5000.0 - min(need - max_len, 500000) / 1000.0
+        return (
+            100000.0 if install_ready else 0.0,
+            context_score,
+            _proxy_variant_tps_score(selector),
+            scope_bias,
+            -float(max_len or 0),
+            selector,
+        )
+
+    chosen = sorted(rows, key=score, reverse=True)[0]
+    return _proxy_variant_selector(chosen)
+
+
+def proxy_selector_for_model_name(model_name, payload=None):
+    name = str(model_name or "").strip()
+    if not name:
+        return ""
+    direct = resolve_variant_spec(name)
+    if direct:
+        return _proxy_variant_selector(direct)
+    normalized = _proxy_model_key(name)
+    try:
+        inventory = load_runtime_inventory(rebuild_if_missing=False)
+        if not isinstance(inventory, dict) or not inventory.get("variants"):
+            inventory = load_runtime_inventory()
+    except Exception:
+        inventory = {}
+    matches = []
+    for row in (inventory.get("variants") or []) if isinstance(inventory, dict) else []:
+        if normalized in _proxy_variant_aliases(row):
+            matches.append(row)
+    return _proxy_choose_variant(matches, payload=payload)
+
+
+def proxy_requested_selector(body, preset_name=""):
+    payload = proxy_json_payload(body)
+    model_name = str(payload.get("model") or "").strip()
+    selector = proxy_selector_for_model_name(model_name, payload=payload)
+    if selector:
+        return selector
+    return proxy_selector_for_model_name(preset_name, payload=payload)
+
+
+def proxy_running_target_for_selector(selector, instance_id=None):
+    selected = canonical_mode_selector(selector)
+    spec = resolve_variant_spec(selected)
+    if not spec:
+        return None, None
+    target_id = str(instance_id or "").strip().upper()
+    if target_id and target_id != "GLOBAL":
+        instance = get_instance(target_id)
+        if instance and canonical_mode_selector(instance.get("mode")) == selected and instance_running(instance):
+            return dict(instance), spec
+        return None, spec
+    global_port = mode_default_port(selected, PROXY_PORT)
+    global_container = str((spec or {}).get("container_name") or "").strip()
+    running_names = vllm_container_names(all_containers=False)
+    if global_container and global_container in running_names and port_open(global_port, timeout=0.08):
+        return {
+            "id": "GLOBAL",
+            "kind": "global",
+            "mode": selected,
+            "container": global_container,
+            "port": global_port,
+            "running": True,
+            "gpu_indices": mode_gpu_indices(selected, gpu_count=detect_gpu_count_runtime()),
+        }, spec
+    try:
+        rows = running_runtime_rows(instances_snapshot())
+    except Exception:
+        rows = []
+    for row in rows:
+        if canonical_mode_selector(row.get("mode")) == selected:
+            return dict(row), spec
+    return None, spec
+
+
+def proxy_global_target_for_selector(selector):
+    selected = canonical_mode_selector(selector)
+    spec = resolve_variant_spec(selected) or {}
+    return {
+        "id": "GLOBAL",
+        "kind": "global",
+        "mode": selected,
+        "container": str(spec.get("container_name") or current_container() or ""),
+        "port": mode_default_port(selected, PROXY_PORT),
+        "running": True,
+        "gpu_indices": mode_gpu_indices(selected, gpu_count=detect_gpu_count_runtime()),
+    }
+
+
+def ensure_proxy_swap_target(selector, instance_id=None):
+    selected = canonical_mode_selector(selector)
+    target, spec = proxy_running_target_for_selector(selected, instance_id=instance_id)
+    if target:
+        return target, spec
+    if not spec:
+        raise ValueError(f"Unknown model or preset requested through proxy: {selector}")
+    target_id = str(instance_id or "").strip().upper()
+    if target_id and target_id != "GLOBAL":
+        instance = get_instance(target_id)
+        if not instance:
+            raise ValueError(f"Unknown proxy instance: {target_id}")
+        updated = update_instance(target_id, mode=selected, enabled=True)
+        stop_overlapping_instances(updated.get("gpu_indices") or [updated.get("gpu_index", 0)], exclude_ids=[target_id])
+        start_instance(target_id)
+        refreshed = get_instance(target_id) or updated
+        return dict(refreshed), spec
+    run_switch(selected)
+    return proxy_global_target_for_selector(selected), spec
+
+
+def proxy_rewrite_body_model_for_selector(body, selector):
+    if not body:
+        return body
+    spec = resolve_variant_spec(selector) or {}
+    served = str(spec.get("served_model_name") or spec.get("model_id") or "").strip()
+    if not served:
+        return body
+    data = proxy_json_payload(body)
+    if not data:
+        return body
+    if data.get("model") == served:
+        return body
+    updated = dict(data)
+    updated["model"] = served
+    return json.dumps(updated, separators=(",", ":")).encode("utf-8")
+
 def parse_instance_path(path):
     parsed = urlsplit(path)
     parts = [p for p in parsed.path.split("/") if p]
@@ -258,7 +544,127 @@ def runtime_supports_vision(spec):
     return text not in {"", "none", "no", "false", "blocked", "disabled", "n/a"}
 
 
+def runtime_supports_multimodal_audio_video(spec):
+    row = spec if isinstance(spec, dict) else {}
+    haystack = " ".join(
+        str(row.get(key) or "").lower()
+        for key in (
+            "name",
+            "selector",
+            "mode",
+            "model",
+            "model_id",
+            "served_model_name",
+            "description",
+            "modality",
+            "tags",
+        )
+    )
+    return bool(re.search(r"\b(omni|audio|video|speech|voice|gemma|multimodal)\b", haystack))
+
+
+STUDIO_DIRECTOR_CHAT_TARGET_ID = "STUDIO_DIRECTOR"
+STUDIO_DIRECTOR_CHAT_MODE = "ai-studio/director"
+STUDIO_DIRECTOR_CHAT_PORT = 8090
+
+
+def studio_director_chat_target_requested(instance_id="", mode=""):
+    target_id = str(instance_id or "").strip().upper().replace("-", "_")
+    selector_raw = str(mode or "").strip().lower().replace("_", "-")
+    selector = canonical_mode_selector(mode) if mode else ""
+    return (
+        target_id in {STUDIO_DIRECTOR_CHAT_TARGET_ID, "AI_STUDIO_DIRECTOR"}
+        or selector in {STUDIO_DIRECTOR_CHAT_MODE, "studio-director"}
+        or selector_raw in {"ai-studio/director", "studio-director"}
+    )
+
+
+def studio_director_chat_runtime_available():
+    return port_open(STUDIO_DIRECTOR_CHAT_PORT, timeout=0.12)
+
+
+def ensure_studio_director_chat_runtime(reason="chat-fallback"):
+    if studio_director_chat_runtime_available():
+        return True
+    ensure_runtime = globals().get("_image_studio_ensure_director_runtime")
+    if not callable(ensure_runtime):
+        return False
+    try:
+        ensure_runtime(reason=reason)
+    except Exception as exc:
+        logger = globals().get("log_control")
+        if callable(logger):
+            logger(f"AI Studio Director chat fallback could not start runtime: {exc}")
+    return studio_director_chat_runtime_available()
+
+
+def studio_director_chat_gpu_indices():
+    try:
+        env_output = subprocess.check_output(
+            ["docker", "inspect", "-f", "{{range .Config.Env}}{{println .}}{{end}}", "studio-director"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+        if not any(line.strip() == "CUDA_VISIBLE_DEVICES=0" for line in env_output.splitlines()):
+            return []
+        cmd_output = subprocess.check_output(
+            ["docker", "inspect", "-f", "{{json .Config.Cmd}}", "studio-director"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).strip()
+        cmd = json.loads(cmd_output or "[]")
+        if isinstance(cmd, list) and "-ngl" in cmd:
+            index = cmd.index("-ngl")
+            if index + 1 < len(cmd) and str(cmd[index + 1]).strip() in {"0", "0.0"}:
+                return []
+        request_output = subprocess.check_output(
+            ["docker", "inspect", "-f", "{{json .HostConfig.DeviceRequests}}", "studio-director"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).strip()
+        requests = json.loads(request_output or "null") or []
+    except Exception:
+        return []
+    indices = set()
+    for request in requests if isinstance(requests, list) else []:
+        row = request if isinstance(request, dict) else {}
+        device_ids = row.get("DeviceIDs") or []
+        for value in device_ids:
+            text = str(value or "").strip()
+            if text.isdigit():
+                indices.add(int(text))
+        if not device_ids and int(row.get("Count") or 0) != 0:
+            indices.update(range(max(0, int(detect_gpu_count_runtime() or 0))))
+    return sorted(indices)
+
+
+def studio_director_chat_target():
+    if not ensure_studio_director_chat_runtime("chat-fallback"):
+        raise RuntimeError("AI Studio Director is not running.")
+    return {
+        "id": STUDIO_DIRECTOR_CHAT_TARGET_ID,
+        "kind": "ai-studio",
+        "mode": STUDIO_DIRECTOR_CHAT_MODE,
+        "selector": STUDIO_DIRECTOR_CHAT_MODE,
+        "container": "studio-director",
+        "port": STUDIO_DIRECTOR_CHAT_PORT,
+        "running": True,
+        "gpu_indices": studio_director_chat_gpu_indices(),
+    }, {
+        "engine": "llama.cpp",
+        "model_id": "qwen3.5-4b-uncensored",
+        "served_model_name": "qwen3.5-4b-uncensored",
+        "vision": "none",
+        "modality": "text",
+    }
+
+
 def resolve_admin_chat_target(instance_id="", mode=""):
+    if studio_director_chat_target_requested(instance_id=instance_id, mode=mode):
+        return studio_director_chat_target()
     target_id = str(instance_id or "").strip().upper()
     selector = canonical_mode_selector(mode) if mode else ""
     if target_id and target_id != "GLOBAL":
@@ -329,10 +735,21 @@ def resolve_admin_chat_target(instance_id="", mode=""):
     raise RuntimeError("No active runtime is available for chat.")
 
 
-def normalize_admin_chat_messages(messages, allow_images=False):
+def target_uses_vllm_autostart(target):
+    return str((target or {}).get("id") or "").strip().upper() != STUDIO_DIRECTOR_CHAT_TARGET_ID
+
+
+def normalize_admin_chat_messages(messages, allow_media=False):
     normalized = []
     if not isinstance(messages, list):
         raise ValueError("messages must be a list")
+
+    def attachment_url_from_part(part, key):
+        value = part.get(key)
+        if isinstance(value, dict):
+            return str(value.get("url") or "").strip()
+        return str(value or "").strip()
+
     for item in messages:
         if not isinstance(item, dict):
             continue
@@ -350,14 +767,18 @@ def normalize_admin_chat_messages(messages, allow_images=False):
                     text = str(part.get("text") or "")
                     if text:
                         parts.append({"type": "text", "text": text})
-                elif allow_images and part_type == "image_url":
-                    image_url = part.get("image_url")
-                    if isinstance(image_url, dict):
-                        url = str(image_url.get("url") or "").strip()
-                    else:
-                        url = str(image_url or "").strip()
+                elif allow_media and part_type == "image_url":
+                    url = attachment_url_from_part(part, "image_url")
                     if url:
                         parts.append({"type": "image_url", "image_url": {"url": chat_attachment_data_url(url)}})
+                elif allow_media and part_type == "audio_url":
+                    url = attachment_url_from_part(part, "audio_url")
+                    if url:
+                        parts.append({"type": "audio_url", "audio_url": {"url": chat_attachment_data_url(url)}})
+                elif allow_media and part_type == "video_url":
+                    url = attachment_url_from_part(part, "video_url")
+                    if url:
+                        parts.append({"type": "video_url", "video_url": {"url": chat_attachment_data_url(url)}})
             reasoning_text = extract_reasoning_text(item)
             if parts or (role == "assistant" and reasoning_text):
                 row = {"role": role, "content": parts if parts else ""}
@@ -426,8 +847,9 @@ def apply_admin_chat_params(payload, params):
     return payload
 
 def build_admin_chat_payload(data, spec, stream=False):
+    allow_media = runtime_supports_vision(spec) or runtime_supports_multimodal_audio_video(spec)
     payload = {
-        "messages": normalize_admin_chat_messages(data.get("messages") or [], allow_images=runtime_supports_vision(spec)),
+        "messages": normalize_admin_chat_messages(data.get("messages") or [], allow_media=allow_media),
         "stream": bool(stream),
     }
     model_name = str(data.get("model") or spec.get("served_model_name") or spec.get("model_id") or "").strip()
@@ -876,7 +1298,8 @@ def stream_admin_chat_request(handler, data):
             metrics["last_path"] = "/admin/chat-stream"
             target_request_metrics.setdefault(target_key, default_target_request_metrics())
         metrics_started = True
-        ensure_vllm_running_for_request(target.get("id") if target else None)
+        if target_uses_vllm_autostart(target):
+            ensure_vllm_running_for_request(target.get("id") if target else None)
 
         handler.close_connection = False
         handler.send_response(200)
@@ -1237,12 +1660,14 @@ def stream_admin_chat_request(handler, data):
 
 
 def run_admin_chat_request(data):
+    started_at = time.monotonic()
     data = data if isinstance(data, dict) else {}
     target, spec = resolve_admin_chat_target(
         instance_id=data.get("instance_id") or "",
         mode=data.get("mode") or "",
     )
-    ensure_vllm_running_for_request(target.get("id") if target else None)
+    if target_uses_vllm_autostart(target):
+        ensure_vllm_running_for_request(target.get("id") if target else None)
     port = int(target.get("port") or active_port() or 0)
     if port <= 0:
         raise RuntimeError("The selected runtime does not expose a valid port.")
@@ -1285,6 +1710,8 @@ def run_admin_chat_request(data):
             })
         payload["messages"] = payload_messages
     usage = extract_response_usage(json.dumps(parsed, separators=(",", ":")).encode("utf-8"))
+    elapsed = max(0.001, time.monotonic() - started_at)
+    output_tokens = int(usage.get("output_tokens") or 0)
     return {
         "ok": True,
         "instance_id": str(target.get("id") or ""),
@@ -1295,6 +1722,8 @@ def run_admin_chat_request(data):
         "tools_enabled": len(tools),
         "response": parsed,
         "usage": usage,
+        "latency_s": round(elapsed, 3),
+        "generation_tps": round(output_tokens / elapsed, 2) if output_tokens > 0 else None,
     }
 
 

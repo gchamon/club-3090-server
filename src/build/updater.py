@@ -5,7 +5,6 @@ import json
 import os
 import secrets
 import shlex
-import socket
 import subprocess
 import threading
 import time
@@ -52,6 +51,8 @@ state = {
     "token": "",
     "log_file": UPDATE_LOG_FILE,
     "script_version": SCRIPT_VERSION,
+    "ui_ack_token": "",
+    "ui_ack_at": 0,
 }
 
 
@@ -84,7 +85,20 @@ def redact_state(snapshot):
     return clean
 
 
+def sync_state_from_disk():
+    try:
+        with open(UPDATE_STATE_FILE, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return
+    if not isinstance(payload, dict):
+        return
+    with state_lock:
+        state.update(payload)
+
+
 def snapshot_state():
+    sync_state_from_disk()
     with state_lock:
         return redact_state(dict(state))
 
@@ -386,6 +400,8 @@ def start_update(scope_name, target_commit=""):
         log_file=UPDATE_LOG_FILE,
         script_version=SCRIPT_VERSION,
         target_commit=target_commit,
+        ui_ack_token="",
+        ui_ack_at=0,
     )
     append_update_log(f"[self-update service] queued {label}")
     append_update_log(f"[self-update service] scope={normalized} source={source}")
@@ -503,6 +519,28 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlsplit(self.path)
+        if parsed.path == "/admin/update-ack":
+            try:
+                payload = self.read_json()
+                supplied = str(payload.get("token") or "").strip()
+                snapshot = snapshot_state()
+                expected = str(snapshot.get("token") or "").strip()
+                if (
+                    not supplied
+                    or not expected
+                    or not secrets.compare_digest(supplied, expected)
+                    or not snapshot.get("active")
+                ):
+                    self.send_json({"ok": False, "error": "invalid update token"}, 403)
+                    return
+                acknowledged = set_state(
+                    ui_ack_token=expected,
+                    ui_ack_at=int(time.time()),
+                )
+                self.send_json({"ok": True, "ui_ack_at": acknowledged.get("ui_ack_at")})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, 500)
+            return
         if parsed.path != "/start":
             self.send_json({"ok": False, "error": "not found"}, 404)
             return

@@ -121,6 +121,63 @@ def _parse_speculative_metric_line(line):
     return spec
 
 
+def benchmark_job_active_from_state_file():
+    try:
+        state = read_json_file(os.path.join(CONTROL_DIR, "benchmarks", "state.json"), {})
+    except Exception:
+        return False
+    if not isinstance(state, dict):
+        return False
+    status = str(state.get("status") or "").strip().lower()
+    if bool(state.get("active")) or status == "running":
+        return True
+    for row in state.get("queue") or []:
+        if isinstance(row, dict) and str(row.get("status") or "").strip().lower() == "running":
+            return True
+    return False
+
+
+def benchmark_power_status_overlay_from_state_file():
+    try:
+        state = read_json_file(os.path.join(CONTROL_DIR, "benchmarks", "state.json"), {})
+    except Exception:
+        return {}
+    if not isinstance(state, dict):
+        return {}
+    status = str(state.get("status") or "").strip().lower()
+    rows = [row for row in (state.get("queue") or []) if isinstance(row, dict)]
+    running = [row for row in rows if str(row.get("status") or "").strip().lower() == "running"]
+    if not (bool(state.get("active")) or status == "running" or running):
+        return {}
+    row = running[0] if running else {}
+    step_id = str(row.get("step_id") or "").strip().lower()
+    label = str(row.get("step_label") or "").strip()
+    label_lower = label.lower()
+    profile = "benchmark-ready"
+    gpu_state = "benchmark-ready"
+    if step_id == "bench" or "throughput" in label_lower:
+        if "turbo" in label_lower:
+            profile = "turbo"
+            gpu_state = "benchmark-turbo"
+        elif "fast" in label_lower:
+            profile = "fast"
+            gpu_state = "benchmark-fast"
+        else:
+            gpu_state = "benchmark-throughput"
+    elif "safe" in label_lower:
+        profile = "benchmark-safe"
+        gpu_state = "benchmark-safe"
+    display = str(row.get("display_name") or row.get("selector") or "").strip()
+    return {
+        "profile": profile,
+        "gpu": gpu_state,
+        "cpu": "benchmark",
+        "container": f"benchmarking {display}" if display else "benchmarking",
+        "last_action": "benchmark_active",
+        "benchmark_step_label": label,
+    }
+
+
 def estimate_request_prefill_seconds(prompt_tokens, output_tokens, ttft_s, latency_s, generation_tps):
     prompt_count = _positive_float(prompt_tokens)
     if prompt_count is None:
@@ -167,13 +224,16 @@ def derive_request_prompt_tps(prompt_tokens, output_tokens, ttft_s, latency_s, g
     return round(peak, 2) if peak is not None else None
 
 
-def estimate_generation_tps_from_stream(output_tokens, first_token_at, last_token_at):
+def estimate_generation_tps_from_stream(output_tokens, first_token_at, last_token_at, min_elapsed_s=0.25):
     tokens = _positive_float(output_tokens)
     first_seen = _positive_float(first_token_at)
     last_seen = _positive_float(last_token_at)
     if tokens is None or first_seen is None or last_seen is None or last_seen <= first_seen:
         return None
-    return round(tokens / max(last_seen - first_seen, 0.001), 2)
+    elapsed = last_seen - first_seen
+    if elapsed < max(0.0, float(min_elapsed_s or 0.0)):
+        return None
+    return round(tokens / elapsed, 2)
 
 
 def authoritative_output_tokens_from_usage(usage):
@@ -188,13 +248,15 @@ def resolve_best_generation_tps(log_candidate, authoritative_tokens, fallback_to
         authoritative_tokens,
         first_token_at,
         last_token_at,
+        min_elapsed_s=0.05,
     )
     heuristic_estimate = None
-    if authoritative_estimate is None and _positive_float(log_candidate) is None:
+    if authoritative_estimate is None:
         heuristic_estimate = estimate_generation_tps_from_stream(
             fallback_tokens,
             first_token_at,
             last_token_at,
+            min_elapsed_s=0.25,
         )
     peak = _peak_metric_value(
         log_candidate,
@@ -280,11 +342,167 @@ def update_system_metric_peaks(point, *, persist=True):
         return next_peaks
 
 
+METRICS_HISTORY_POINT_KEYS = (
+    "t",
+    "gpu_util",
+    "mem_pct",
+    "mem_used_gib",
+    "mem_total_gib",
+    "temp_c",
+    "power_w",
+    "ram_pct",
+    "ram_used_gib",
+    "ram_total_gib",
+    "cpu_pct",
+    "disk_pct",
+    "system_util_pct",
+    "net_rx_mbps",
+    "net_tx_mbps",
+    "net_rx_kbps",
+    "net_tx_kbps",
+    "active_requests",
+    "latency_s",
+    "ttft_s",
+    "tps",
+)
+
+METRICS_HISTORY_GPU_KEYS = (
+    "index",
+    "util",
+    "mem_pct",
+    "temp",
+    "temp_junction",
+    "temp_junction_c",
+    "temp_vram",
+    "temp_vram_c",
+    "power",
+    "fan",
+    "failed",
+    "frozen",
+    "failure_mode",
+)
+
+
+def sanitize_metrics_history_point(point):
+    data = point if isinstance(point, dict) else {}
+    try:
+        ts = int(float(data.get("t") or 0))
+    except Exception:
+        ts = 0
+    if ts <= 0:
+        return None
+    clean = {"t": ts}
+    for key in METRICS_HISTORY_POINT_KEYS:
+        if key == "t":
+            continue
+        value = data.get(key)
+        upper_bound = SYSTEM_METRIC_PEAK_CHART_LIMITS.get(key)
+        if isinstance(value, bool):
+            clean[key] = int(value)
+        elif isinstance(value, (int, float)):
+            numeric = float(value)
+            if upper_bound is not None and numeric > float(upper_bound):
+                continue
+            clean[key] = round(numeric, 3)
+        elif isinstance(value, str) and value.strip():
+            numeric = safe_float(value)
+            if upper_bound is not None and numeric > float(upper_bound):
+                continue
+            clean[key] = round(float(numeric), 3)
+    gpu_rows = []
+    for gpu in data.get("gpus") or []:
+        if not isinstance(gpu, dict):
+            continue
+        gpu_row = {}
+        for key in METRICS_HISTORY_GPU_KEYS:
+            value = gpu.get(key)
+            if isinstance(value, bool):
+                gpu_row[key] = bool(value)
+            elif isinstance(value, (int, float)):
+                gpu_row[key] = round(float(value), 3)
+            elif isinstance(value, str):
+                gpu_row[key] = value[:200]
+        if gpu_row.get("index") is not None:
+            gpu_rows.append(gpu_row)
+    clean["gpus"] = gpu_rows
+    return clean
+
+
+def prune_metrics_history_points(points):
+    cutoff = int(time.time() - METRICS_HISTORY_RETENTION_SECONDS)
+    seen = {}
+    for point in points or []:
+        clean = sanitize_metrics_history_point(point)
+        if not clean or int(clean.get("t") or 0) < cutoff:
+            continue
+        seen[int(clean["t"])] = clean
+    ordered = [seen[key] for key in sorted(seen.keys())]
+    return ordered[-int(METRICS_HISTORY_MAX_POINTS):]
+
+
+def ensure_metrics_history_loaded():
+    with metrics_history_lock:
+        if metrics_history_cache.get("loaded"):
+            return
+        raw = read_json_file(METRICS_HISTORY_FILE, {})
+        raw_points = raw.get("series") if isinstance(raw, dict) else []
+        points = prune_metrics_history_points(raw_points if isinstance(raw_points, list) else [])
+        metrics_history_cache["loaded"] = True
+        metrics_history_cache["write_time"] = time.time()
+    with metrics_lock:
+        if not series_points:
+            for point in points:
+                series_points.append(point)
+    if points:
+        log_control(f"Loaded {len(points)} persisted metric history points")
+
+
+def persist_metrics_history_if_due(force=False):
+    now = time.time()
+    with metrics_lock:
+        points = prune_metrics_history_points(list(series_points))
+    with metrics_history_lock:
+        if not force and now - safe_float(metrics_history_cache.get("write_time")) < METRICS_HISTORY_PERSIST_INTERVAL_SECONDS:
+            return False
+        payload = {
+            "schema_version": 1,
+            "updated_at": int(now),
+            "retention_seconds": int(METRICS_HISTORY_RETENTION_SECONDS),
+            "series": points,
+        }
+        write_json_atomic_if_changed(METRICS_HISTORY_FILE, payload, separators=(",", ":"))
+        metrics_history_cache["loaded"] = True
+        metrics_history_cache["write_time"] = now
+        return True
+
+
+def normalize_status_series_limit(value, default=METRICS_HISTORY_STATUS_MAX_POINTS):
+    try:
+        limit = int(float(str(value).strip()))
+    except Exception:
+        limit = int(default or METRICS_HISTORY_STATUS_MAX_POINTS)
+    return max(1, min(int(METRICS_HISTORY_STATUS_MAX_POINTS), limit))
+
+
+def metric_series_status_snapshot_unlocked(max_points=None):
+    limit = normalize_status_series_limit(max_points)
+    total = len(series_points)
+    if total <= limit:
+        return list(series_points)
+    step = max(1, int(math.ceil(total / max(1, limit))))
+    sampled = [point for index, point in enumerate(series_points) if index % step == 0]
+    if series_points:
+        sampled.append(series_points[-1])
+    return sampled[-limit:]
+
+
 def clear_recorded_metrics_history():
-    global latest_metrics_collected_at, system_metric_peaks_cache
+    global latest_gpu_rows, latest_system_snapshot, latest_metrics_collected_at, system_metric_peaks_cache
     with metrics_lock:
         series_points.clear()
         gpu_session_peaks.clear()
+        latest_gpu_rows = []
+        latest_system_snapshot = {}
         latest_metrics_collected_at = 0.0
     with system_metric_peaks_lock:
         system_metric_peaks_cache = {"charts": {}, "gpus": {}}
@@ -294,6 +512,19 @@ def clear_recorded_metrics_history():
             indent=2,
             sort_keys=True,
         )
+    with metrics_history_lock:
+        write_json_atomic_if_changed(
+            METRICS_HISTORY_FILE,
+            {
+                "schema_version": 1,
+                "updated_at": int(time.time()),
+                "retention_seconds": int(METRICS_HISTORY_RETENTION_SECONDS),
+                "series": [],
+            },
+            separators=(",", ":"),
+        )
+        metrics_history_cache["loaded"] = True
+        metrics_history_cache["write_time"] = time.time()
     log_audit("admin_metrics_history_cleared")
     return {
         "ok": True,
@@ -663,17 +894,190 @@ def gpu_extra_temperature_rows(max_age=2.0):
         gpu_extra_temps_cache.update({"ts": now, "rows": {}, "error": str(e)[-500:]})
         return {}
 
+GPU_LAST_SEEN_ROW_KEYS = (
+    "index",
+    "name",
+    "vendor",
+    "temp_c",
+    "temp_peak_c",
+    "temp_junction_c",
+    "temp_junction_peak_c",
+    "temp_vram_c",
+    "temp_vram_peak_c",
+    "temp_aux_source",
+    "util_pct",
+    "mem_used_mib",
+    "mem_total_mib",
+    "mem_free_mib",
+    "mem_pct",
+    "power_w",
+    "power_peak_w",
+    "power_limit_w",
+    "fan_pct",
+    "core_clock_mhz",
+    "core_clock_peak_mhz",
+    "mem_clock_mhz",
+    "mem_clock_peak_mhz",
+    "compute_cap",
+)
+
+
+def gpu_last_seen_key(value):
+    return re.sub(r"[^0-9]+", "", str(value or "").strip())
+
+
+def sanitize_gpu_last_seen_snapshot(payload):
+    data = payload if isinstance(payload, dict) else {}
+    gpus = data.get("gpus") if isinstance(data.get("gpus"), dict) else {}
+    clean = {"schema_version": 1, "updated_at": safe_float(data.get("updated_at")), "gpus": {}}
+    for key, row in gpus.items():
+        gpu_key = gpu_last_seen_key(key)
+        source = row if isinstance(row, dict) else {}
+        gpu_key = gpu_key or gpu_last_seen_key(source.get("index"))
+        if not gpu_key:
+            continue
+        clean_row = {}
+        for row_key in GPU_LAST_SEEN_ROW_KEYS:
+            value = source.get(row_key)
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                clean_row[row_key] = value
+        clean_row["index"] = clean_row.get("index") if str(clean_row.get("index") or "").strip() else gpu_key
+        clean_row["last_seen_at"] = safe_float(source.get("last_seen_at") or data.get("updated_at"))
+        if source.get("last_seen_iso"):
+            clean_row["last_seen_iso"] = str(source.get("last_seen_iso"))[:80]
+        clean["gpus"][gpu_key] = clean_row
+    return clean
+
+
+def _read_gpu_last_seen_unlocked():
+    cached = gpu_last_seen_cache.get("value") if isinstance(gpu_last_seen_cache, dict) else None
+    if isinstance(cached, dict):
+        return sanitize_gpu_last_seen_snapshot(cached)
+    raw = read_json_file(GPU_LAST_SEEN_FILE, {})
+    clean = sanitize_gpu_last_seen_snapshot(raw)
+    gpu_last_seen_cache["value"] = clean
+    gpu_last_seen_cache["time"] = time.time()
+    return clean
+
+
+def gpu_last_seen_snapshot():
+    with gpu_last_seen_lock:
+        return _read_gpu_last_seen_unlocked()
+
+
+def persist_gpu_last_seen_rows(rows):
+    healthy = [
+        row
+        for row in (rows or [])
+        if isinstance(row, dict)
+        and not row.get("error")
+        and not row.get("failed")
+        and gpu_last_seen_key(row.get("index"))
+    ]
+    if not healthy:
+        return gpu_last_seen_snapshot()
+    now = time.time()
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+    with gpu_last_seen_lock:
+        snapshot = _read_gpu_last_seen_unlocked()
+        next_rows = dict(snapshot.get("gpus") or {})
+        for row in healthy:
+            gpu_key = gpu_last_seen_key(row.get("index"))
+            clean_row = {
+                key: row.get(key)
+                for key in GPU_LAST_SEEN_ROW_KEYS
+                if isinstance(row.get(key), (str, int, float, bool)) or row.get(key) is None
+            }
+            clean_row["index"] = str(row.get("index") or gpu_key)
+            clean_row["last_seen_at"] = now
+            clean_row["last_seen_iso"] = now_iso
+            next_rows[gpu_key] = clean_row
+        next_snapshot = sanitize_gpu_last_seen_snapshot({"schema_version": 1, "updated_at": now, "gpus": next_rows})
+        gpu_last_seen_cache["value"] = next_snapshot
+        gpu_last_seen_cache["time"] = now
+        if now - safe_float(gpu_last_seen_cache.get("write_time")) >= 10:
+            write_json_atomic_if_changed(GPU_LAST_SEEN_FILE, next_snapshot, indent=2, sort_keys=True)
+            gpu_last_seen_cache["write_time"] = now
+        return next_snapshot
+
+
+def gpu_failure_mode_from_errors(errors):
+    text = " | ".join(str(item or "").strip() for item in (errors or []) if str(item or "").strip())
+    lower = text.lower()
+    if "unable to determine the device handle" in lower:
+        return "Device handle unavailable"
+    if "unknown error" in lower:
+        return "NVIDIA driver unknown error"
+    if "query failed" in lower:
+        return "NVIDIA telemetry unavailable"
+    return "Missing from NVIDIA telemetry"
+
+
+def failed_gpu_row_from_last_seen(index_key, last_row, peak_row, errors):
+    now = time.time()
+    row = dict(last_row or {})
+    row["index"] = str(row.get("index") or index_key)
+    row["name"] = str(row.get("name") or f"GPU {index_key}")
+    row["failed"] = True
+    row["frozen"] = True
+    row["status"] = "Failure"
+    row["failure_mode"] = gpu_failure_mode_from_errors(errors)
+    row["failure_detail"] = " | ".join(str(item or "").strip() for item in (errors or []) if str(item or "").strip())[-2000:]
+    last_seen_at = safe_float(row.get("last_seen_at"))
+    row["stale_seconds"] = round(max(0.0, now - last_seen_at), 1) if last_seen_at else None
+    peak = peak_row if isinstance(peak_row, dict) else {}
+    peak_map = {
+        "temp_peak_c": "temp",
+        "temp_junction_peak_c": "temp_junction",
+        "temp_vram_peak_c": "temp_vram",
+        "power_peak_w": "power",
+        "fan_pct": "fan",
+    }
+    for target_key, peak_key in peak_map.items():
+        if row.get(target_key) in (None, "", "N/A") and peak.get(peak_key) is not None:
+            row[target_key] = peak.get(peak_key)
+    if row.get("temp_c") in (None, "", "N/A") and peak.get("temp") is not None:
+        row["temp_c"] = peak.get("temp")
+    if row.get("temp_junction_c") in (None, "", "N/A") and peak.get("temp_junction") is not None:
+        row["temp_junction_c"] = peak.get("temp_junction")
+    if row.get("temp_vram_c") in (None, "", "N/A") and peak.get("temp_vram") is not None:
+        row["temp_vram_c"] = peak.get("temp_vram")
+    if row.get("power_w") in (None, "", "N/A") and peak.get("power") is not None:
+        row["power_w"] = peak.get("power")
+    return row
+
+
+def merge_failed_gpu_rows(rows, errors=None):
+    rows = [dict(row) for row in (rows or []) if isinstance(row, dict)]
+    current_keys = {gpu_last_seen_key(row.get("index")) for row in rows if gpu_last_seen_key(row.get("index"))}
+    snapshot = gpu_last_seen_snapshot()
+    peaks = system_metric_peaks_snapshot()
+    last_rows = snapshot.get("gpus") if isinstance(snapshot.get("gpus"), dict) else {}
+    peak_rows = peaks.get("gpus") if isinstance(peaks.get("gpus"), dict) else {}
+    for key in sorted(set(last_rows.keys()) | set(peak_rows.keys()), key=lambda item: int(item) if str(item).isdigit() else 9999):
+        if key in current_keys:
+            continue
+        rows.append(failed_gpu_row_from_last_seen(key, last_rows.get(key), peak_rows.get(key), errors or []))
+    rows.sort(key=lambda row: int(gpu_last_seen_key(row.get("index")) or "9999") if gpu_last_seen_key(row.get("index") or "") else 9999)
+    return rows
+
+
 def gpu_stats():
     if not shutil.which("nvidia-smi"):
         return []
     vendor_map = gpu_vendors_by_index()
     extra_temps = gpu_extra_temperature_rows()
+    try:
+        persisted_peak_rows = (system_metric_peaks_snapshot().get("gpus") or {})
+    except Exception:
+        persisted_peak_rows = {}
     field_sets = [
         "index,name,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw,power.limit,fan.speed,clocks.current.graphics,clocks.current.memory,compute_cap",
         "index,name,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw,power.limit,fan.speed,clocks.current.graphics,clocks.current.memory",
     ]
     out = ""
     last_error = None
+    query_errors = []
     for fields in field_sets:
         try:
             out = subprocess.check_output(
@@ -686,9 +1090,16 @@ def gpu_stats():
         except Exception as e:
             last_error = e
     if not out:
-        return [{"error": str(last_error or "nvidia-smi query failed")}]
+        merged = merge_failed_gpu_rows([], [str(last_error or "nvidia-smi query failed")])
+        return merged or [{"error": str(last_error or "nvidia-smi query failed")}]
     rows = []
     for line in out.splitlines():
+        line_text = str(line or "").strip()
+        if not line_text:
+            continue
+        if "unable to determine" in line_text.lower() or "unknown error" in line_text.lower():
+            query_errors.append(line_text)
+            continue
         parts = [x.strip() for x in line.split(",")]
         try:
             compute_cap = ""
@@ -713,6 +1124,17 @@ def gpu_stats():
             peak_key = str(idx)
             with metrics_lock:
                 peak_row = gpu_session_peaks.setdefault(peak_key, {})
+                persisted_peak = persisted_peak_rows.get(peak_key) if isinstance(persisted_peak_rows, dict) else {}
+                if isinstance(persisted_peak, dict):
+                    for persisted_key, session_key in (
+                        ("temp", "temp_c"),
+                        ("temp_junction", "temp_junction_c"),
+                        ("temp_vram", "temp_vram_c"),
+                        ("power", "power_w"),
+                    ):
+                        persisted_value = _positive_float(persisted_peak.get(persisted_key))
+                        if persisted_value is not None:
+                            peak_row[session_key] = round(max(persisted_value, safe_float(peak_row.get(session_key))), 2)
                 if temp_now is not None:
                     peak_row["temp_c"] = round(max(temp_now, safe_float(peak_row.get("temp_c"))), 2)
                 if junction_now is not None:
@@ -763,7 +1185,8 @@ def gpu_stats():
             rows.append(row)
         except Exception as e:
             rows.append({"error": f"parse gpu stat failed: {e}"})
-    return rows
+    persist_gpu_last_seen_rows(rows)
+    return merge_failed_gpu_rows(rows, query_errors)
 
 def safe_float(value):
     try:
@@ -1351,23 +1774,41 @@ def estimate_tokens_from_stream_bytes(raw):
 def build_series_point():
     global latest_gpu_rows, latest_system_snapshot, latest_metrics_collected_at
     gpus = gpu_stats(); sysinfo = system_stats(gpu_rows=gpus)
-    util=[]; mem=[]; temps=[]; watts=[]; gpu_points=[]
+    util=[]; mem=[]; mem_used=[]; mem_total=[]; temps=[]; watts=[]; gpu_points=[]
     for g in gpus:
         if "error" in g: continue
-        util_v=safe_float(g.get("util_pct")); mem_v=safe_float(g.get("mem_pct")); temp_v=safe_float(g.get("temp_c")); watt_v=safe_float(g.get("power_w")); fan_v=safe_float(g.get("fan_pct"))
+        util_v=safe_float(g.get("util_pct")); mem_v=safe_float(g.get("mem_pct")); mem_used_v=safe_float(g.get("mem_used_mib")); mem_total_v=safe_float(g.get("mem_total_mib")); temp_v=safe_float(g.get("temp_c")); watt_v=safe_float(g.get("power_w")); fan_v=safe_float(g.get("fan_pct"))
         junction_v=safe_float(g.get("temp_junction_c")); vram_temp_v=safe_float(g.get("temp_vram_c"))
-        util.append(util_v); mem.append(mem_v); temps.append(temp_v); watts.append(watt_v)
-        gpu_points.append({"index":g.get("index"),"util":util_v,"mem_pct":mem_v,"temp":temp_v,"temp_junction":junction_v,"temp_junction_c":junction_v,"temp_vram":vram_temp_v,"temp_vram_c":vram_temp_v,"power":watt_v,"fan":fan_v})
-    ram_pct=safe_float((sysinfo.get('memory') or {}).get('used_pct')); cpu_pct=safe_float((sysinfo.get('cpu') or {}).get('total_pct'))
+        failed_gpu = bool(g.get("failed") or g.get("frozen"))
+        if not failed_gpu:
+            util.append(util_v); mem.append(mem_v); mem_used.append(mem_used_v); mem_total.append(mem_total_v); temps.append(temp_v); watts.append(watt_v)
+        gpu_points.append({"index":g.get("index"),"util":util_v,"mem_pct":mem_v,"mem_used_gib":round(mem_used_v/1024.0,3) if mem_used_v > 0 else 0,"mem_total_gib":round(mem_total_v/1024.0,3) if mem_total_v > 0 else 0,"temp":temp_v,"temp_junction":junction_v,"temp_junction_c":junction_v,"temp_vram":vram_temp_v,"temp_vram_c":vram_temp_v,"power":watt_v,"fan":fan_v,"failed":failed_gpu,"frozen":bool(g.get("frozen")),"failure_mode":str(g.get("failure_mode") or "")})
+    memory_row = sysinfo.get('memory') or {}
+    ram_pct=safe_float(memory_row.get('used_pct')); cpu_pct=safe_float((sysinfo.get('cpu') or {}).get('total_pct'))
+    ram_used_gib=round(safe_float(memory_row.get('used_mib'))/1024.0, 3) if safe_float(memory_row.get('used_mib')) > 0 else 0
+    ram_total_gib=round(safe_float(memory_row.get('total_mib'))/1024.0, 3) if safe_float(memory_row.get('total_mib')) > 0 else 0
     disks=sysinfo.get('disks') or []; disk_pct=max([safe_float(d.get('used_pct')) for d in disks if isinstance(d,dict)] or [0])
     net=sysinfo.get('network') or {}; rx_mbps=safe_float(net.get('rx_mbps')); tx_mbps=safe_float(net.get('tx_mbps'))
+    try:
+        studio_active = bool(globals().get("image_studio_activity_active", lambda **kwargs: False)(max_age=2.0))
+    except Exception:
+        studio_active = False
     with metrics_lock:
-        point={"t":int(time.time()),"gpu_util":round(sum(util)/len(util),1) if util else 0,"mem_pct":round(sum(mem)/len(mem),1) if mem else 0,"temp_c":round(max(temps),1) if temps else 0,"power_w":round(sum(watts),1) if watts else 0,"ram_pct":round(ram_pct,1),"cpu_pct":round(cpu_pct,1),"disk_pct":round(disk_pct,1),"system_util_pct":round((cpu_pct+ram_pct+(sum(util)/len(util) if util else 0))/3,1),"net_rx_mbps":round(rx_mbps,2),"net_tx_mbps":round(tx_mbps,2),"net_rx_kbps":round(rx_mbps*1000,1),"net_tx_kbps":round(tx_mbps*1000,1),"gpus":gpu_points,"active_requests":metrics.get("active_requests",0),"latency_s":metrics.get("last_latency_s") or 0,"ttft_s":metrics.get("last_ttft_s") or 0,"tps":metrics.get("last_tokens_per_second") or 0}
+        benchmark_active = bool(metrics.get("benchmark_active")) or benchmark_job_active_from_state_file() or any(bool((row or {}).get("benchmark_active")) for row in (target_request_metrics or {}).values() if isinstance(row, dict))
+        last_path = str(metrics.get("last_path") or "")
+        benchmark_metric_sample = benchmark_active or last_path.startswith("benchmark:")
+        vram_used_gib=round(sum(mem_used)/1024.0,3) if mem_used else 0
+        vram_total_gib=round(sum(mem_total)/1024.0,3) if mem_total else 0
+        point={"t":int(time.time()),"gpu_util":round(sum(util)/len(util),1) if util else 0,"mem_pct":round(sum(mem)/len(mem),1) if mem else 0,"mem_used_gib":vram_used_gib,"mem_total_gib":vram_total_gib,"temp_c":round(max(temps),1) if temps else 0,"power_w":round(sum(watts),1) if watts else 0,"ram_pct":round(ram_pct,1),"ram_used_gib":ram_used_gib,"ram_total_gib":ram_total_gib,"cpu_pct":round(cpu_pct,1),"disk_pct":round(disk_pct,1),"system_util_pct":round((cpu_pct+ram_pct+(sum(util)/len(util) if util else 0))/3,1),"net_rx_mbps":round(rx_mbps,2),"net_tx_mbps":round(tx_mbps,2),"net_rx_kbps":round(rx_mbps*1000,1),"net_tx_kbps":round(tx_mbps*1000,1),"gpus":gpu_points,"active_requests":max(int(metrics.get("active_requests",0) or 0), 1 if benchmark_active or studio_active else 0),"latency_s":0 if benchmark_metric_sample else metrics.get("last_latency_s") or 0,"ttft_s":0 if benchmark_metric_sample else metrics.get("last_ttft_s") or 0,"tps":0 if benchmark_metric_sample else metrics.get("last_tokens_per_second") or 0}
         series_points.append(point)
+        cutoff = int(time.time() - METRICS_HISTORY_RETENTION_SECONDS)
+        while series_points and int(safe_float((series_points[0] or {}).get("t"))) < cutoff:
+            series_points.popleft()
         latest_gpu_rows = gpus
         latest_system_snapshot = sysinfo
         latest_metrics_collected_at = time.time()
     update_system_metric_peaks(point)
+    persist_metrics_history_if_due()
     return point
 
 def metrics_collector():
@@ -1448,8 +1889,8 @@ def build_instance_runtime_metrics_entry(instance, target_metrics_snapshot=None)
         "ctx_size_tokens": runtime_meta.get("ctx_size_tokens"),
         "speculative_method": runtime_meta.get("speculative_method"),
         "prompt_tps": prompt_tps,
-        "generation_tps": log_metrics.get("generation_tps"),
-        "running_requests": log_metrics.get("running_requests"),
+        "generation_tps": generation_tps,
+        "running_requests": first_defined(log_metrics.get("running_requests"), 1 if request_metrics.get("benchmark_active") else None),
         "waiting_requests": first_defined(log_metrics.get("waiting_requests"), log_metrics.get("pending_requests")),
         "pending_requests": log_metrics.get("pending_requests"),
         "swapped_requests": log_metrics.get("swapped_requests"),
@@ -1470,6 +1911,12 @@ def build_instance_runtime_metrics_entry(instance, target_metrics_snapshot=None)
         "last_preset": request_metrics.get("last_preset"),
         "last_path": request_metrics.get("last_path"),
         "last_request_at": request_metrics.get("last_request_at"),
+        "benchmark_active": bool(request_metrics.get("benchmark_active")),
+        "benchmark_mode": request_metrics.get("benchmark_mode") or "",
+        "benchmark_step": request_metrics.get("benchmark_step") or "",
+        "benchmark_step_index": request_metrics.get("benchmark_step_index") or 0,
+        "benchmark_step_count": request_metrics.get("benchmark_step_count") or 0,
+        "benchmark_step_progress": request_metrics.get("benchmark_step_progress") or 0.0,
     }
 
 
@@ -1538,8 +1985,8 @@ def build_global_runtime_metrics_entry(mode, port, container, metrics_snapshot, 
         "ctx_size_tokens": spec.get("ctx_size_tokens"),
         "speculative_method": spec.get("speculative_method"),
         "prompt_tps": prompt_tps,
-        "generation_tps": log_metrics.get("generation_tps"),
-        "running_requests": log_metrics.get("running_requests"),
+        "generation_tps": generation_tps,
+        "running_requests": first_defined(log_metrics.get("running_requests"), 1 if metrics_snapshot.get("benchmark_active") else None),
         "waiting_requests": first_defined(log_metrics.get("waiting_requests"), log_metrics.get("pending_requests")),
         "pending_requests": log_metrics.get("pending_requests"),
         "swapped_requests": log_metrics.get("swapped_requests"),
@@ -1560,18 +2007,24 @@ def build_global_runtime_metrics_entry(mode, port, container, metrics_snapshot, 
         "last_preset": metrics_snapshot.get("last_preset"),
         "last_path": metrics_snapshot.get("last_path"),
         "last_request_at": metrics_snapshot.get("last_request_at"),
+        "benchmark_active": bool(metrics_snapshot.get("benchmark_active")),
+        "benchmark_mode": metrics_snapshot.get("benchmark_mode") or "",
+        "benchmark_step": metrics_snapshot.get("benchmark_step") or "",
+        "benchmark_step_index": metrics_snapshot.get("benchmark_step_index") or 0,
+        "benchmark_step_count": metrics_snapshot.get("benchmark_step_count") or 0,
+        "benchmark_step_progress": metrics_snapshot.get("benchmark_step_progress") or 0.0,
     }
 
 
-def build_status_snapshot(force_remote_metadata=False):
+def build_status_snapshot(refresh_remote_metadata=False):
     with metrics_lock:
         m = dict(metrics)
         recent = list(recent_requests)
-        series = list(series_points)
-    runtime_inventory = enrich_runtime_inventory_cache_sizes(load_runtime_inventory())
+        series = metric_series_status_snapshot_unlocked()
+    runtime_inventory = load_runtime_inventory()
     local_installer_metadata = read_local_installer_metadata()
     self_update_state = read_self_update_state()
-    remote_update_metadata = fetch_remote_script_metadata(force=force_remote_metadata)
+    remote_update_metadata = cached_remote_script_metadata(refresh=refresh_remote_metadata)
     upstream_services = discover_upstream_services(force=False, max_age=30.0)
     current_mode = active_mode()
     ap = active_port()
@@ -1612,6 +2065,12 @@ def build_status_snapshot(force_remote_metadata=False):
     failed_mode = str(read_switch_failure().get("mode") or "")
     active_modes = [mode for mode in runtime_mode_list(runtime_rows, "") if mode and mode != failed_mode]
     containers = runtime_container_list(runtime_rows, "")
+    studio_runtime = image_studio_runtime_snapshot()
+    with metrics_lock:
+        m = dict(metrics)
+    studio_queue_depth = int(studio_runtime.get("queue_running") or 0) + int(studio_runtime.get("queue_pending") or 0)
+    if studio_queue_depth:
+        m["active_requests"] = max(int(m.get("active_requests") or 0), studio_queue_depth)
     reported_active_mode = ""
     if current_mode in active_modes:
         reported_active_mode = current_mode
@@ -1625,8 +2084,21 @@ def build_status_snapshot(force_remote_metadata=False):
                 reported_active_port = int(matching_row.get("port") or 0)
         if reported_active_port <= 0 and len(runtime_rows) == 1:
             reported_active_port = int(runtime_rows[0].get("port") or 0)
+    elif studio_runtime.get("active"):
+        reported_active_mode = str(studio_runtime.get("mode") or "ai-studio")
+        active_modes = [reported_active_mode]
+        reported_active_port = int(studio_runtime.get("port") or 8188)
+        containers = list(studio_runtime.get("running_containers") or [])
     gpus_snapshot, system_snapshot, _ = get_latest_runtime_snapshot()
-    supported_club_version = remote_update_metadata.get("club_3090_version") if isinstance(remote_update_metadata.get("club_3090_version"), dict) else {}
+    supported_club_version = (
+        dict(SCRIPT_CLUB3090_COMPAT)
+        if isinstance(SCRIPT_CLUB3090_COMPAT, dict) and SCRIPT_CLUB3090_COMPAT
+        else (
+            remote_update_metadata.get("club_3090_version")
+            if isinstance(remote_update_metadata.get("club_3090_version"), dict)
+            else {}
+        )
+    )
     supported_commit = str(supported_club_version.get("commit") or "").strip()
     repo_head = str(runtime_inventory.get("repo_head") or "").strip()
     repo_describe = str(runtime_inventory.get("repo_describe") or "").strip()
@@ -1640,18 +2112,23 @@ def build_status_snapshot(force_remote_metadata=False):
         for item in (supported_club_version.get("compatible_release_patterns") or supported_club_version.get("compatible_releases") or [])
         if str(item or "").strip()
     ]
-    repo_marked_compatible = bool(
-        (repo_head and supported_commit and repo_head == supported_commit)
-        or any(repo_head.startswith(prefix) for prefix in compatible_commit_prefixes if repo_head)
-        or any(fnmatch.fnmatch(repo_describe, pattern) for pattern in compatible_release_patterns if repo_describe)
-    )
     supported_commit_is_ancestor = bool(supported_commit and repo_head and git_is_ancestor(CLUB3090_DIR, supported_commit, repo_head))
     local_commit_is_ancestor = bool(supported_commit and repo_head and git_is_ancestor(CLUB3090_DIR, repo_head, supported_commit))
+    repo_commit_marked_compatible = bool(
+        (repo_head and supported_commit and repo_head == supported_commit)
+        or any(repo_head.startswith(prefix) for prefix in compatible_commit_prefixes if repo_head)
+    )
+    repo_release_marked_compatible = bool(
+        any(fnmatch.fnmatch(repo_describe, pattern) for pattern in compatible_release_patterns if repo_describe)
+    )
+    repo_marked_compatible = bool(repo_commit_marked_compatible or repo_release_marked_compatible)
     club3090_compat = {
         "supported": supported_club_version,
         "local_repo_head": repo_head,
         "local_repo_describe": repo_describe,
         "local_repo_marked_compatible": repo_marked_compatible,
+        "local_repo_commit_marked_compatible": repo_commit_marked_compatible,
+        "local_repo_release_marked_compatible": repo_release_marked_compatible,
         "local_repo_newer_than_supported": bool(not repo_marked_compatible and repo_head and supported_commit and repo_head != supported_commit and supported_commit_is_ancestor),
         "local_repo_older_than_supported": bool(not repo_marked_compatible and repo_head and supported_commit and repo_head != supported_commit and local_commit_is_ancestor),
     }
@@ -1661,6 +2138,7 @@ def build_status_snapshot(force_remote_metadata=False):
         "active_port": reported_active_port,
         "container": (containers[0] if containers else ""),
         "containers": containers,
+        "ai_studio": studio_runtime,
         "club3090_dir": CLUB3090_DIR,
         "script_version": SCRIPT_VERSION,
         "control_started_at": int(startup_time),
@@ -1683,6 +2161,7 @@ def build_status_snapshot(force_remote_metadata=False):
         "series": series,
         "system_metric_peaks": system_metric_peaks_snapshot(),
         "ui_config": read_ui_config(),
+        "resource_colors": resource_color_config(),
         "preset_tps_stats": preset_tps_stats_snapshot(),
         "presets": preset_catalog(),
         "gpu_count": gpu_count,
@@ -1695,7 +2174,8 @@ def build_status_snapshot(force_remote_metadata=False):
         "model_install_job": model_install_job_snapshot(),
         "model_install_jobs": model_install_jobs_snapshot(),
         "custom_model_job": custom_model_job_snapshot(),
-        "admin_task_job": admin_task_job_snapshot(),
+        "script_job": script_job_snapshot(),
+        "benchmarks": benchmarks_status_snapshot(include_scores=True),
         "single_gpu_modes": list(SINGLE_GPU_MODES),
         "dual_gpu_modes": list(DUAL_GPU_MODES),
         "running_dual_mode": (dual_rows[0]["mode"] if dual_rows else None),
@@ -1714,13 +2194,47 @@ def build_status_snapshot(force_remote_metadata=False):
     }
 
 
-def refresh_status_snapshot(force_remote_metadata=False):
-    global status_snapshot_cache, status_snapshot_updated_at
-    snapshot = build_status_snapshot(force_remote_metadata=force_remote_metadata)
-    with status_snapshot_lock:
-        status_snapshot_cache = snapshot
-        status_snapshot_updated_at = time.time()
-    return snapshot
+def refresh_status_snapshot(refresh_remote_metadata=False):
+    global status_snapshot_cache, status_snapshot_updated_at, status_snapshot_refresh_started_at
+    with status_snapshot_refresh_lock:
+        status_snapshot_refresh_started_at = time.time()
+        try:
+            snapshot = build_status_snapshot(refresh_remote_metadata=refresh_remote_metadata)
+            with status_snapshot_lock:
+                status_snapshot_cache = snapshot
+                status_snapshot_updated_at = time.time()
+            return snapshot
+        finally:
+            status_snapshot_refresh_started_at = 0.0
+
+
+def start_status_snapshot_refresh(refresh_remote_metadata=False):
+    if not status_snapshot_refresh_lock.acquire(blocking=False):
+        return False
+    globals()["status_snapshot_refresh_started_at"] = time.time()
+
+    def worker():
+        global status_snapshot_cache, status_snapshot_updated_at, status_snapshot_refresh_started_at
+        try:
+            snapshot = build_status_snapshot(refresh_remote_metadata=refresh_remote_metadata)
+            with status_snapshot_lock:
+                status_snapshot_cache = snapshot
+                status_snapshot_updated_at = time.time()
+        except Exception as exc:
+            log_control(f"background status snapshot refresh error: {exc}")
+        finally:
+            status_snapshot_refresh_started_at = 0.0
+            try:
+                status_snapshot_refresh_lock.release()
+            except Exception:
+                pass
+
+    threading.Thread(
+        target=worker,
+        name="status-snapshot-refresh",
+        daemon=True,
+    ).start()
+    return True
 
 
 def build_status_error_snapshot(error, previous=None):
@@ -1734,11 +2248,12 @@ def build_status_error_snapshot(error, previous=None):
         "active_port": int(previous.get("active_port") or 0),
         "container": str(previous.get("container") or ""),
         "containers": list(previous.get("containers") or []),
+        "ai_studio": dict(previous.get("ai_studio") or {}),
         "club3090_dir": CLUB3090_DIR,
         "script_version": SCRIPT_VERSION,
         "control_started_at": int(previous.get("control_started_at") or startup_time),
         "local_installer_metadata": previous.get("local_installer_metadata") if isinstance(previous.get("local_installer_metadata"), dict) else read_local_installer_metadata(),
-        "remote_update": previous.get("remote_update") if isinstance(previous.get("remote_update"), dict) else fetch_remote_script_metadata(force=False),
+        "remote_update": previous.get("remote_update") if isinstance(previous.get("remote_update"), dict) else cached_remote_script_metadata(refresh=False),
         "club3090_compat": previous.get("club3090_compat") if isinstance(previous.get("club3090_compat"), dict) else {},
         "uptime_seconds": int(time.time() - startup_time),
         "machine_uptime_seconds": int(previous.get("machine_uptime_seconds") or machine_uptime_seconds()),
@@ -1766,7 +2281,8 @@ def build_status_error_snapshot(error, previous=None):
         "model_install_job": previous.get("model_install_job") if isinstance(previous.get("model_install_job"), dict) else model_install_job_snapshot(),
         "model_install_jobs": list(previous.get("model_install_jobs") or model_install_jobs_snapshot()),
         "custom_model_job": previous.get("custom_model_job") if isinstance(previous.get("custom_model_job"), dict) else custom_model_job_snapshot(),
-        "admin_task_job": previous.get("admin_task_job") if isinstance(previous.get("admin_task_job"), dict) else admin_task_job_snapshot(),
+        "script_job": previous.get("script_job") if isinstance(previous.get("script_job"), dict) else script_job_snapshot(),
+        "benchmarks": ensure_benchmark_scores_for_status(previous.get("benchmarks")) if isinstance(previous.get("benchmarks"), dict) else benchmarks_status_snapshot(include_scores=True),
         "single_gpu_modes": list(previous.get("single_gpu_modes") or SINGLE_GPU_MODES),
         "dual_gpu_modes": list(previous.get("dual_gpu_modes") or DUAL_GPU_MODES),
         "running_dual_mode": previous.get("running_dual_mode"),
@@ -1788,13 +2304,135 @@ def build_status_error_snapshot(error, previous=None):
     return snapshot
 
 
-def get_status_snapshot(force=False):
+def build_status_lightweight_snapshot(previous=None, reason="", series_limit=None):
+    global status_lightweight_cache, status_lightweight_updated_at
+    series_limit = normalize_status_series_limit(series_limit)
+    previous = dict(previous) if isinstance(previous, dict) else {}
+    snapshot = dict(previous)
+    acquired = False
+    try:
+        acquired = metrics_lock.acquire(timeout=1.0)
+    except TypeError:
+        acquired = metrics_lock.acquire(False)
+    if acquired:
+        try:
+            snapshot["metrics"] = dict(metrics)
+            snapshot["recent_requests"] = list(recent_requests)
+            snapshot["series"] = metric_series_status_snapshot_unlocked(max_points=series_limit)
+            snapshot["gpus"] = list(latest_gpu_rows or snapshot.get("gpus") or [])
+            snapshot["system"] = dict(latest_system_snapshot or snapshot.get("system") or {})
+            status_lightweight_cache = dict(snapshot)
+            status_lightweight_updated_at = time.time()
+        finally:
+            try:
+                metrics_lock.release()
+            except Exception:
+                pass
+    snapshot.setdefault("active_mode", str(previous.get("active_mode") or ""))
+    snapshot.setdefault("active_modes", list(previous.get("active_modes") or []))
+    snapshot.setdefault("active_port", int(previous.get("active_port") or 0))
+    snapshot.setdefault("container", str(previous.get("container") or ""))
+    snapshot.setdefault("containers", list(previous.get("containers") or []))
+    snapshot.setdefault("ai_studio", dict(previous.get("ai_studio") or {}))
+    snapshot.setdefault("club3090_dir", CLUB3090_DIR)
+    snapshot["script_version"] = SCRIPT_VERSION
+    snapshot["control_started_at"] = int(startup_time)
+    snapshot["uptime_seconds"] = int(time.time() - startup_time)
+    snapshot["machine_uptime_seconds"] = machine_uptime_seconds()
+    snapshot["system_metric_peaks"] = system_metric_peaks_snapshot()
+    snapshot.setdefault("local_installer_metadata", previous.get("local_installer_metadata") if isinstance(previous.get("local_installer_metadata"), dict) else {})
+    snapshot.setdefault("remote_update", previous.get("remote_update") if isinstance(previous.get("remote_update"), dict) else {})
+    snapshot.setdefault("club3090_compat", previous.get("club3090_compat") if isinstance(previous.get("club3090_compat"), dict) else {})
+    snapshot.setdefault("vllm_service", str(previous.get("vllm_service") or "unknown"))
+    snapshot.setdefault("control_service", str(previous.get("control_service") or "unknown"))
+    snapshot.setdefault("updater_service", str(previous.get("updater_service") or "unknown"))
+    snapshot.setdefault("caddy_service", str(previous.get("caddy_service") or "unknown"))
+    snapshot.setdefault("console_service", str(previous.get("console_service") or "unknown"))
+    snapshot.setdefault("power", previous.get("power") if isinstance(previous.get("power"), dict) else {})
+    snapshot.setdefault("ui_config", previous.get("ui_config") if isinstance(previous.get("ui_config"), dict) else {})
+    snapshot.setdefault("resource_colors", previous.get("resource_colors") if isinstance(previous.get("resource_colors"), dict) else {})
+    snapshot.setdefault("preset_tps_stats", previous.get("preset_tps_stats") if isinstance(previous.get("preset_tps_stats"), dict) else {})
+    snapshot.setdefault("presets", previous.get("presets") if isinstance(previous.get("presets"), dict) else {})
+    snapshot.setdefault("gpu_count", int(previous.get("gpu_count") or len(snapshot.get("gpus") or []) or 0))
+    snapshot.setdefault("instances", list(previous.get("instances") or []))
+    snapshot.setdefault("runtime_inventory", previous.get("runtime_inventory") if isinstance(previous.get("runtime_inventory"), dict) else {"models": [], "variants": []})
+    snapshot.setdefault("models", list((snapshot.get("runtime_inventory") or {}).get("models") or previous.get("models") or []))
+    snapshot.setdefault("variants", list((snapshot.get("runtime_inventory") or {}).get("variants") or previous.get("variants") or []))
+    snapshot.setdefault("nvlink", previous.get("nvlink") if isinstance(previous.get("nvlink"), dict) else {})
+    snapshot.setdefault("upstream_services", list(previous.get("upstream_services") or []))
+    snapshot.setdefault("model_install_job", previous.get("model_install_job") if isinstance(previous.get("model_install_job"), dict) else {})
+    snapshot.setdefault("model_install_jobs", list(previous.get("model_install_jobs") or []))
+    snapshot.setdefault("custom_model_job", previous.get("custom_model_job") if isinstance(previous.get("custom_model_job"), dict) else {})
+    snapshot.setdefault("script_job", previous.get("script_job") if isinstance(previous.get("script_job"), dict) else {})
+    snapshot.setdefault("benchmarks", previous.get("benchmarks") if isinstance(previous.get("benchmarks"), dict) else {})
+    snapshot["benchmarks"] = ensure_benchmark_scores_for_status(snapshot.get("benchmarks"))
+    snapshot.setdefault("single_gpu_modes", list(previous.get("single_gpu_modes") or SINGLE_GPU_MODES))
+    snapshot.setdefault("dual_gpu_modes", list(previous.get("dual_gpu_modes") or DUAL_GPU_MODES))
+    snapshot.setdefault("running_dual_mode", previous.get("running_dual_mode"))
+    snapshot.setdefault("running_dual_gpu_indices", list(previous.get("running_dual_gpu_indices") or []))
+    snapshot.setdefault("running_dual_instances", list(previous.get("running_dual_instances") or []))
+    snapshot.setdefault("running_runtimes", list(previous.get("running_runtimes") or []))
+    snapshot.setdefault("instance_runtime_metrics", dict(previous.get("instance_runtime_metrics") or {}))
+    snapshot.setdefault("switch_failure", previous.get("switch_failure") if isinstance(previous.get("switch_failure"), dict) else {})
+    snapshot.setdefault("switch_job", previous.get("switch_job") if isinstance(previous.get("switch_job"), dict) else {})
+    snapshot.setdefault("users", list(previous.get("users") or []))
+    snapshot.setdefault("groups", list(previous.get("groups") or []))
+    snapshot.setdefault("server_config", previous.get("server_config") if isinstance(previous.get("server_config"), dict) else {})
+    snapshot.setdefault("local_api", previous.get("local_api") if isinstance(previous.get("local_api"), dict) else {"enabled": False, "port": LOCAL_API_PORT})
+    snapshot.setdefault("admin_port", ADMIN_PORT)
+    snapshot.setdefault("proxy_port", PROXY_PORT)
+    if reason:
+        snapshot["status_error"] = str(reason or "").strip()[-1200:]
+        snapshot["status_error_at"] = int(time.time())
+    else:
+        snapshot.pop("status_error", None)
+        snapshot.pop("status_error_at", None)
+    status_lightweight_cache = dict(snapshot)
+    status_lightweight_updated_at = time.time()
+    return snapshot
+
+
+def build_status_stale_overlay_snapshot(previous=None, reason="", series_limit=None):
+    return build_status_lightweight_snapshot(previous, reason or "status snapshot refresh is stale", series_limit=series_limit)
+
+
+def get_lightweight_status_snapshot(series_limit=None):
+    with status_snapshot_lock:
+        previous_lightweight = dict(status_lightweight_cache or {})
+    with status_snapshot_lock:
+        snapshot = dict(status_snapshot_cache or {})
+    if previous_lightweight:
+        snapshot.update(previous_lightweight)
+    return build_status_lightweight_snapshot(snapshot, series_limit=series_limit)
+
+
+def get_status_snapshot(force=False, refresh_remote_metadata=False):
+    global status_snapshot_cache, status_snapshot_updated_at, status_snapshot_refresh_started_at
     with status_snapshot_lock:
         snapshot = status_snapshot_cache
         updated_at = status_snapshot_updated_at
     try:
-        if force or not snapshot or not updated_at:
-            return refresh_status_snapshot(force_remote_metadata=force)
+        if not snapshot or not updated_at:
+            started = start_status_snapshot_refresh(refresh_remote_metadata=refresh_remote_metadata)
+            if started:
+                log_control("status snapshot cold cache; started background refresh and serving lightweight overlay")
+            else:
+                started_at = float(globals().get("status_snapshot_refresh_started_at") or 0.0)
+                busy_for = max(0.0, time.time() - started_at) if started_at else 0.0
+                log_control(f"status snapshot cold cache; refresh already running for {round(busy_for, 1)}s; serving lightweight overlay")
+            return build_status_stale_overlay_snapshot({}, "status snapshot is warming up")
+        if force and snapshot and updated_at:
+            now = time.time()
+            age = max(0.0, now - float(updated_at or 0.0))
+            if age >= 10.0:
+                started = start_status_snapshot_refresh(refresh_remote_metadata=refresh_remote_metadata)
+                if not started:
+                    started_at = float(globals().get("status_snapshot_refresh_started_at") or 0.0)
+                    busy_for = max(0.0, now - started_at) if started_at else age
+                    log_control(f"status snapshot stale age={round(age, 1)}s refresh_busy_for={round(busy_for, 1)}s; serving lightweight overlay")
+                return build_status_stale_overlay_snapshot(snapshot, f"status snapshot refresh is stale ({round(age, 1)}s old)")
+            start_status_snapshot_refresh(refresh_remote_metadata=refresh_remote_metadata)
+            return snapshot
         return snapshot
     except Exception as e:
         log_control(f"status snapshot fallback: {e}")
@@ -1804,29 +2442,178 @@ def get_status_snapshot(force=False):
 def parse_status_request_options(params):
     params = params if isinstance(params, dict) else {}
     tab = str(params.get("tab") or "").strip().lower()
+    inventory_detail = str(params.get("inventory_detail") or "").strip().lower()
+    if inventory_detail not in {"full", "compact"}:
+        inventory_detail = "compact"
+    series_limit = normalize_status_series_limit(params.get("series_limit"))
     return {
         "tab": tab,
         "include_series": str(params.get("include_series") or "").strip().lower() in {"1", "true", "yes", "on"},
+        "series_limit": series_limit,
         "include_inventory": str(params.get("include_inventory") or "").strip().lower() in {"1", "true", "yes", "on"},
+        "inventory_detail": inventory_detail,
         "include_config": str(params.get("include_config") or "").strip().lower() in {"1", "true", "yes", "on"},
-        "include_remote_update": str(params.get("include_remote_update") or "").strip().lower() not in {"0", "false", "no", "off"},
+        "include_remote_update": str(params.get("include_remote_update") or "").strip().lower() in {"1", "true", "yes", "on"},
+        "include_benchmark_details": str(params.get("include_benchmark_details") or "").strip().lower() in {"1", "true", "yes", "on"},
     }
+
+
+STATUS_COMPACT_VARIANT_DROP_FIELDS = {
+    "compose_abs_path",
+    "compose_dir_abs_path",
+    "compose_project_dir_abs_path",
+    "default_engine_switches",
+    "derived_compose_path",
+    "launch_settings",
+    "resource_paths",
+    "status_raw",
+}
+
+STATUS_COMPACT_PROFILE_LIKE_DROP_FIELDS = {
+    "default_engine_switches",
+}
+
+
+def compact_runtime_inventory_for_status(inventory):
+    if not isinstance(inventory, dict):
+        return inventory
+    compact = dict(inventory)
+    compact["inventory_detail"] = "compact"
+    compact["variants"] = [
+        {
+            key: value
+            for key, value in dict(row).items()
+            if key not in STATUS_COMPACT_VARIANT_DROP_FIELDS
+        }
+        for row in (inventory.get("variants") or [])
+        if isinstance(row, dict)
+    ]
+    compact["profile_likes"] = [
+        {
+            key: value
+            for key, value in dict(row).items()
+            if key not in STATUS_COMPACT_PROFILE_LIKE_DROP_FIELDS
+        }
+        for row in (inventory.get("profile_likes") or [])
+        if isinstance(row, dict)
+    ]
+    return compact
+
+
+def compact_benchmark_job_for_status(job):
+    if not isinstance(job, dict):
+        return job
+    keep = {
+        "active",
+        "cancel_requested",
+        "current_index",
+        "current_selector",
+        "finished_at",
+        "job_id",
+        "mode",
+        "overall_progress",
+        "progress",
+        "running_indices",
+        "started_at",
+        "status",
+        "step_id",
+        "step_label",
+        "summary",
+    }
+    row_keep = {
+        "assigned_gpu_indices",
+        "assigned_instance_id",
+        "display_name",
+        "error",
+        "finished_at",
+        "mode",
+        "run_id",
+        "score",
+        "score_icon",
+        "score_tier",
+        "selector",
+        "skip_reason",
+        "started_at",
+        "status",
+        "step_count",
+        "step_id",
+        "step_index",
+        "step_label",
+        "step_progress",
+        "step_started_at",
+    }
+    compact = {key: value for key, value in job.items() if key in keep}
+    if isinstance(job.get("queue"), list):
+        compact["queue"] = [
+            {key: value for key, value in dict(row).items() if key in row_keep}
+            for row in (job.get("queue") or [])
+            if isinstance(row, dict)
+        ]
+    return compact
+
+
+def compact_benchmarks_for_status(benchmarks):
+    if not isinstance(benchmarks, dict):
+        return benchmarks
+    compact = dict(benchmarks)
+    compact["job"] = compact_benchmark_job_for_status(compact.get("job"))
+    compact.pop("current_log", None)
+    compact.pop("running_logs", None)
+    return compact
+
+
+def ensure_benchmark_scores_for_status(benchmarks):
+    base = dict(benchmarks or {}) if isinstance(benchmarks, dict) else {}
+    scores = base.get("scores")
+    if isinstance(scores, dict) and scores:
+        return base
+    try:
+        return benchmarks_status_snapshot(base, include_scores=True)
+    except Exception as exc:
+        log_control(f"benchmark status score summary refresh failed: {exc}")
+        base.setdefault("scores", {})
+        return base
 
 
 def shape_status_snapshot(snapshot, options=None):
     options = options if isinstance(options, dict) else {}
     shaped = dict(snapshot or {})
+    if benchmark_job_active_from_state_file():
+        shaped["benchmarks"] = benchmarks_live_status_overlay(
+            shaped.get("benchmarks"),
+            include_logs=False,
+        )
+    shaped["benchmarks"] = ensure_benchmark_scores_for_status(shaped.get("benchmarks"))
     if not options.get("include_series"):
         shaped.pop("series", None)
+    elif isinstance(shaped.get("series"), list) and len(shaped.get("series") or []) > normalize_status_series_limit(options.get("series_limit")):
+        series = shaped.get("series") or []
+        series_limit = normalize_status_series_limit(options.get("series_limit"))
+        step = max(1, int(math.ceil(len(series) / max(1, series_limit))))
+        shaped["series"] = ([point for index, point in enumerate(series) if index % step == 0] + series[-1:])[-series_limit:]
     if not options.get("include_inventory"):
         shaped.pop("runtime_inventory", None)
         shaped.pop("models", None)
         shaped.pop("variants", None)
+    else:
+        if isinstance(shaped.get("runtime_inventory"), dict):
+            try:
+                shaped["runtime_inventory"] = enrich_runtime_inventory_cache_sizes(shaped.get("runtime_inventory"))
+            except Exception as exc:
+                log_control(f"runtime inventory resource enrichment failed: {exc}")
+        if options.get("inventory_detail") != "full":
+            shaped["runtime_inventory"] = compact_runtime_inventory_for_status(shaped.get("runtime_inventory"))
+        elif isinstance(shaped.get("runtime_inventory"), dict):
+            shaped["runtime_inventory"] = dict(shaped.get("runtime_inventory") or {})
+            shaped["runtime_inventory"]["inventory_detail"] = "full"
+        shaped.pop("models", None)
+        shaped.pop("variants", None)
+    if not options.get("include_benchmark_details"):
+        shaped["benchmarks"] = compact_benchmarks_for_status(shaped.get("benchmarks"))
     if not options.get("include_config"):
         shaped.pop("server_config", None)
-    if not options.get("include_remote_update", True):
+    if not options.get("include_remote_update"):
         shaped.pop("remote_update", None)
-        shaped.pop("club3090_compat", None)
     shaped.pop("recent_requests", None)
     return shaped
 
@@ -2454,7 +3241,7 @@ def apply_performance_profile(name):
     log_control(f"PROFILE requested name={name}")
     write_server_config({"active_power_profile": profile_name})
     clear_gpu_session_peaks()
-    result = {"cpu": apply_cpu_active_power(), "gpu": apply_gpu_active_power(), "profile": profile_name}
+    result = {"cpu": apply_cpu_active_power(), "gpu": apply_gpu_active_power(force=True), "profile": profile_name}
     log_control(f"PROFILE applied name={profile_name} cpu={result.get('cpu')} gpu={result.get('gpu')}")
     return result
 
@@ -2467,35 +3254,121 @@ def restore_persisted_performance_profile(apply_now=False):
     _apply_profile_globals(profile_name)
     if apply_now:
         clear_gpu_session_peaks()
-        return {"cpu": apply_cpu_active_power(), "gpu": apply_gpu_active_power(), "profile": profile_name}
+        return {"cpu": apply_cpu_active_power(), "gpu": apply_gpu_active_power(force=True), "profile": profile_name}
     return {"profile": profile_name}
 
 
+def persist_fan_manual_override_state():
+    try:
+        write_server_config({
+            "fan_manual_override": fan_manual_override,
+            "fan_override_instance_id": cooling_scope_instance_id,
+        })
+    except Exception as exc:
+        log_control(f"FAN persist state warning: {exc}")
+
+
+def restore_persisted_fan_state(apply_now=False):
+    global fan_manual_override, fan_curve_pause_until, cooling_scope_instance_id
+    cfg = read_server_config()
+    fan_manual_override = bool(cfg.get("fan_manual_override", False))
+    cooling_scope_instance_id = str(cfg.get("fan_override_instance_id") or "GLOBAL").strip().upper() or "GLOBAL"
+    if fan_manual_override:
+        fan_curve_pause_until = 0.0
+        power_state["fans"] = "manual_max"
+        if apply_now:
+            return set_gpu_fans(
+                speed=FAN_MAX_SPEED,
+                auto=False,
+                indices=fan_target_gpu_indices(cooling_scope_instance_id),
+            )
+        return {"fans": "manual_max", "scope": cooling_scope_instance_id}
+    power_state["fans"] = "auto"
+    fan_curve_pause_until = time.time() + (1 if power_optimizations_enabled else 0)
+    return {"fans": "auto", "scope": cooling_scope_instance_id}
+
+
 runtime_default_power_last = 0.0
+ai_studio_power_prep_last = 0.0
+
+
+def benchmark_power_actions_owned():
+    checker = globals().get("benchmark_worker_service_active")
+    thread_checker = globals().get("benchmark_worker_thread_active")
+    state_reader = globals().get("read_benchmark_state")
+    try:
+        if callable(checker) and checker():
+            return True
+    except Exception:
+        pass
+    try:
+        if callable(thread_checker) and thread_checker():
+            return True
+    except Exception:
+        pass
+    try:
+        if callable(state_reader) and bool((state_reader() or {}).get("active")):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def ensure_default_runtime_power(reason="runtime_activity", force=False):
     global runtime_default_power_last
+    if benchmark_power_actions_owned():
+        return {"skipped": True, "profile": current_profile, "reason": "benchmark_active"}
     now = time.time()
     current = str(current_profile or "").strip().lower()
     with metrics_lock:
         gpu_state = str(power_state.get("gpu") or "").strip().lower()
-    if not force and current == "default" and gpu_state == "active" and now - runtime_default_power_last < 10:
-        return {"skipped": True, "profile": "default", "reason": reason}
-    reset_peaks = force or current != "default" or gpu_state != "active"
-    _apply_profile_globals("default")
-    write_server_config({"active_power_profile": "default"})
+    if current in {"fast", "turbo"}:
+        if not force and gpu_state == "active" and now - runtime_default_power_last < 10:
+            return {"skipped": True, "profile": current, "reason": reason}
+        out = {
+            "cpu": apply_cpu_active_power(),
+            "gpu": apply_gpu_active_power(skip_fans=True),
+            "profile": current,
+            "reason": str(reason or ""),
+            "preserved": True,
+        }
+        runtime_default_power_last = now
+        log_control(
+            f"PROFILE runtime wake reason={reason} profile={current} preserved=true"
+        )
+        return out
+    if not force and current == "balanced" and gpu_state == "active" and now - runtime_default_power_last < 10:
+        return {"skipped": True, "profile": "balanced", "reason": reason}
+    reset_peaks = force or current != "balanced" or gpu_state != "active"
+    _apply_profile_globals("balanced")
+    write_server_config({"active_power_profile": "balanced"})
     if reset_peaks:
         clear_gpu_session_peaks()
     out = {
         "cpu": apply_cpu_active_power(),
         "gpu": apply_gpu_active_power(skip_fans=True),
-        "profile": "default",
+        "profile": "balanced",
         "reason": str(reason or ""),
     }
     runtime_default_power_last = now
-    log_control(f"PROFILE runtime wake reason={reason} profile=default")
+    log_control(f"PROFILE runtime wake reason={reason} profile=balanced")
     return out
+
+
+def ensure_ai_studio_runtime_power(reason="ai_studio_generation", force=False):
+    global ai_studio_power_prep_last
+    out = ensure_default_runtime_power(reason, force=force)
+    if benchmark_power_actions_owned():
+        return {**(out if isinstance(out, dict) else {"power": out}), "fans": ["benchmark active; AI Studio fan prep skipped"]}
+    now = time.time()
+    with metrics_lock:
+        fan_state = str(power_state.get("fans") or "").strip().lower()
+    if not force and fan_state == "manual_max" and now - ai_studio_power_prep_last < 60:
+        return {**(out if isinstance(out, dict) else {"power": out}), "fans": ["manual max fans already active"]}
+    fan_results = set_fan_max_toggle(True, instance_id="GLOBAL")
+    ai_studio_power_prep_last = now
+    log_control(f"PROFILE AI Studio prep reason={reason} fans=manual_max")
+    return {**(out if isinstance(out, dict) else {"power": out}), "fans": fan_results}
 
 
 
@@ -2900,6 +3773,8 @@ def set_gpu_fans(speed=None, auto=False, indices=None):
     return results
 
 def apply_fan_curve_once():
+    if benchmark_power_actions_owned():
+        return ["benchmark active; fan curve deferred"]
     if fan_manual_override or not power_optimizations_enabled:
         return []
     if time.time() < fan_curve_pause_until:
@@ -2944,6 +3819,8 @@ def set_cpu_governor(governor):
 
 
 def apply_gpu_idle_power(skip_fans=False):
+    if benchmark_power_actions_owned():
+        return ["benchmark active; gpu idle power deferred"]
     if not power_optimizations_enabled:
         return ["power optimizations disabled"]
     results = []
@@ -2962,8 +3839,8 @@ def apply_gpu_idle_power(skip_fans=False):
     return results
 
 
-def apply_gpu_active_power(skip_fans=False):
-    if not power_optimizations_enabled:
+def apply_gpu_active_power(skip_fans=False, force=False):
+    if not power_optimizations_enabled and not force:
         return ["power optimizations disabled"]
     results = []
     if not shutil.which("nvidia-smi"):
@@ -2985,6 +3862,8 @@ def apply_gpu_active_power(skip_fans=False):
 
 
 def apply_cpu_idle_power():
+    if benchmark_power_actions_owned():
+        return ["benchmark active; cpu idle power deferred"]
     results = set_cpu_governor(CPU_IDLE_GOVERNOR)
     with metrics_lock:
         power_state["cpu"] = "idle"
@@ -3052,16 +3931,23 @@ def idle_watchdog():
     idle_power_applied = False
     while True:
         try:
+            if benchmark_power_actions_owned():
+                idle_power_applied = False
+                time.sleep(15)
+                continue
             now = time.time()
+            studio_active = bool(globals().get("image_studio_activity_active", lambda: False)())
+            if studio_active:
+                ensure_default_runtime_power("ai_studio_queue")
             with metrics_lock:
                 active = metrics.get("active_requests", 0)
                 booting = switch_job_active()
-                idle_for = 0 if active > 0 or booting else max(0.0, now - last_request_finished_at)
-            if active == 0 and not booting and idle_for >= POWER_IDLE_AFTER_SECONDS and not idle_power_applied:
+                idle_for = 0 if active > 0 or booting or studio_active else max(0.0, now - last_request_finished_at)
+            if active == 0 and not booting and not studio_active and idle_for >= POWER_IDLE_AFTER_SECONDS and not idle_power_applied:
                 apply_cpu_idle_power()
                 apply_gpu_idle_power()
                 idle_power_applied = True
-            if active > 0 or booting or idle_for < POWER_IDLE_AFTER_SECONDS:
+            if active > 0 or booting or studio_active or idle_for < POWER_IDLE_AFTER_SECONDS:
                 idle_power_applied = False
             if power_optimizations_enabled and not fan_manual_override:
                 # Refresh manual fan curve periodically even while idle; Linux/NVIDIA
@@ -3070,6 +3956,18 @@ def idle_watchdog():
         except Exception as e:
             log_control(f"POWER watchdog error: {e}")
         time.sleep(15)
+
+
+def image_studio_power_watchdog():
+    while True:
+        try:
+            if not benchmark_power_actions_owned():
+                checker = globals().get("image_studio_activity_active")
+                if callable(checker) and checker(max_age=0):
+                    ensure_default_runtime_power("ai_studio_queue")
+        except Exception as e:
+            log_control(f"POWER AI Studio queue watchdog error: {e}")
+        time.sleep(0.1)
 
 
 
@@ -3084,7 +3982,7 @@ def reset_gpu_power_defaults():
     # back under default NVIDIA control as much as Linux allows.
     results += set_gpu_fans(auto=True)
     with metrics_lock:
-        power_state["gpu"] = "default"
+        power_state["gpu"] = "balanced"
         power_state["fans"] = "auto"
         power_state["last_action"] = "power_defaults"
         power_state["last_error"] = " | ".join([r for r in results if "rc=0" not in r])[-1000:]
@@ -3154,22 +4052,38 @@ def set_fan_max_toggle(enable, instance_id=None):
     fan_manual_override = bool(enable)
     if fan_manual_override:
         fan_curve_pause_until = 0.0
-        return set_gpu_fans(speed=FAN_MAX_SPEED, auto=False, indices=target_indices)
+        results = set_gpu_fans(speed=FAN_MAX_SPEED, auto=False, indices=target_indices)
+        persist_fan_manual_override_state()
+        return results
     fan_curve_pause_until = time.time() + (1 if power_optimizations_enabled else 0)
     results = set_gpu_fans(auto=True, indices=target_indices)
     if power_optimizations_enabled:
         schedule_fan_curve_resume(indices=target_indices, delay=1.0)
     else:
         fan_curve_pause_until = 0.0
+    persist_fan_manual_override_state()
     return results
 
 def power_status():
+    refresh_power_config_globals()
+    try:
+        studio_active = bool(globals().get("image_studio_activity_active", lambda **kwargs: False)(max_age=2.0))
+    except Exception:
+        studio_active = False
     with metrics_lock:
         active = int(metrics.get("active_requests", 0) or 0)
+        benchmark_active = bool(metrics.get("benchmark_active")) or benchmark_job_active_from_state_file() or any(
+            bool((row or {}).get("benchmark_active"))
+            for row in (target_request_metrics or {}).values()
+            if isinstance(row, dict)
+        )
         booting = switch_job_active()
-        idle_for = 0 if active > 0 or booting else int(max(0.0, time.time() - last_request_finished_at))
+        idle_for = 0 if active > 0 or benchmark_active or booting or studio_active else int(max(0.0, time.time() - last_request_finished_at))
         fan_curve_text = ", ".join([f"<{temp}C={speed}%" for temp, speed in FAN_CURVE]) + ", >=65C=100%"
-        return {**power_state, "profile": current_profile, "idle_for_seconds": idle_for, "idle_power_after_seconds": POWER_IDLE_AFTER_SECONDS, "container_stop_after_seconds": 0, "container_auto_stop_enabled": CONTAINER_AUTO_STOP_ENABLED, "gpu_active_power_limit_w": GPU_ACTIVE_POWER_LIMIT_W, "gpu_idle_power_limit_w": GPU_IDLE_POWER_LIMIT_W, "gpu_idle_lock_clocks": GPU_IDLE_LOCK_CLOCKS, "cpu_active_governor": CPU_ACTIVE_GOVERNOR, "cpu_idle_governor": CPU_IDLE_GOVERNOR, "optimizations_enabled": power_optimizations_enabled, "fan_manual_override": fan_manual_override, "fan_curve": fan_curve_text, "fan_min_safe_speed": FAN_MIN_SAFE_SPEED, "wol_default_mac": str(WOL_MAC or "").replace("-", ":").strip().upper()}
+        status = {**power_state, "profile": current_profile, "idle_for_seconds": idle_for, "benchmark_active": benchmark_active, "ai_studio_active": studio_active, "idle_power_after_seconds": POWER_IDLE_AFTER_SECONDS, "container_stop_after_seconds": 0, "container_auto_stop_enabled": CONTAINER_AUTO_STOP_ENABLED, "gpu_active_power_limit_w": GPU_ACTIVE_POWER_LIMIT_W, "gpu_idle_power_limit_w": GPU_IDLE_POWER_LIMIT_W, "gpu_idle_lock_clocks": GPU_IDLE_LOCK_CLOCKS, "cpu_active_governor": CPU_ACTIVE_GOVERNOR, "cpu_idle_governor": CPU_IDLE_GOVERNOR, "optimizations_enabled": power_optimizations_enabled, "fan_manual_override": fan_manual_override, "fan_curve": fan_curve_text, "fan_min_safe_speed": FAN_MIN_SAFE_SPEED, "wol_default_mac": str(WOL_MAC or "").replace("-", ":").strip().upper()}
+    if benchmark_active:
+        status.update(benchmark_power_status_overlay_from_state_file())
+    return status
 
 def _docker_inspect_state(container_name):
     name = str(container_name or "").strip()
@@ -3458,14 +4372,14 @@ def run_switch(mode):
             selected_indices = list(range(max(gpu_count, 0)))
         if selected_indices:
             visible_devices = ",".join(str(int(idx)) for idx in selected_indices)
-            container_visible_devices = ",".join(str(idx) for idx in range(len(selected_indices)))
             env["ESTATE_GPUS"] = visible_devices
-            env["CUDA_VISIBLE_DEVICES"] = container_visible_devices
-            env["NVIDIA_VISIBLE_DEVICES"] = container_visible_devices
-        env = _apply_variant_hardware_guard(target_spec, env)
+            env["CUDA_VISIBLE_DEVICES"] = visible_devices
+            env["NVIDIA_VISIBLE_DEVICES"] = visible_devices
+        cleanup_msg = ""
         ensure_default_runtime_power("switch_launch", force=True)
         log_control(f"SWITCH {label} cleanup before mode={target_mode}")
         cleanup_msg = cleanup_vllm_containers()
+        env = _apply_variant_hardware_guard(target_spec, env)
         log_control(f"SWITCH {label} start mode={target_mode} port={env['PORT']} ready_url={ready_url}")
         output = ""
         compose_file = str(target_spec.get("compose_abs_path") or "").strip()
@@ -3536,17 +4450,24 @@ def run_switch(mode):
         try:
             return attempt(selector, "primary")
         except Exception as first_error:
-            write_switch_failure(selector, first_error)
             if read_active_mode_file() == selector:
                 clear_active_mode()
-            _set_switch_job(
-                active=False,
-                status="failed",
-                mode=selector,
-                target="GLOBAL",
-                finished_at=int(time.time()),
-                error=str(first_error)[-12000:],
+            current_job = switch_job_snapshot()
+            stopped_by_user = (
+                str(current_job.get("status") or "") == "stopped"
+                and str(current_job.get("mode") or "") == selector
+                and str(current_job.get("target") or "").upper() == "GLOBAL"
             )
+            if not stopped_by_user:
+                write_switch_failure(selector, first_error)
+                _set_switch_job(
+                    active=False,
+                    status="failed",
+                    mode=selector,
+                    target="GLOBAL",
+                    finished_at=int(time.time()),
+                    error=str(first_error)[-12000:],
+                )
             with metrics_lock:
                 power_state["container"] = "stopped"
                 power_state["last_action"] = f"switch_failed_{selector}"

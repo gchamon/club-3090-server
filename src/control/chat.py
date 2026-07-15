@@ -1,3 +1,35 @@
+from datetime import datetime, timezone
+
+
+def chat_timestamp_ms(value, default=None):
+    fallback = int(default if default not in (None, "") else time.time() * 1000)
+    if value in (None, ""):
+        return fallback
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if number <= 0:
+            return fallback
+        return int(number * 1000) if number < 100000000000 else int(number)
+    text = str(value).strip()
+    if not text:
+        return fallback
+    try:
+        number = float(text)
+        if number <= 0:
+            return fallback
+        return int(number * 1000) if number < 100000000000 else int(number)
+    except Exception:
+        pass
+    iso_text = text.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(iso_text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return int(parsed.timestamp() * 1000)
+    except Exception:
+        return fallback
+
+
 def default_chat_state():
     return {
         "revision": 0,
@@ -29,13 +61,14 @@ def chat_conversation_file_path(conversation):
 
 def chat_conversation_index_row(item):
     row = sanitize_chat_conversation(item)
+    now_ms = int(time.time() * 1000)
     index_row = {
         "id": str(row.get("id") or "").strip(),
         "title": str(row.get("title") or "Untitled conversation").strip() or "Untitled conversation",
         "folder": chat_folder_name(row.get("folder")),
-        "createdAt": int(row.get("createdAt") or int(time.time() * 1000)),
-        "updatedAt": int(row.get("updatedAt") or int(time.time() * 1000)),
-        "lastUsedAt": int(row.get("lastUsedAt") or int(time.time() * 1000)),
+        "createdAt": chat_timestamp_ms(row.get("createdAt"), now_ms),
+        "updatedAt": chat_timestamp_ms(row.get("updatedAt"), now_ms),
+        "lastUsedAt": chat_timestamp_ms(row.get("lastUsedAt"), now_ms),
         "summary": str(row.get("summary") or ""),
         "autoNamed": bool(row.get("autoNamed")),
         "smartTitleEnabled": row.get("smartTitleEnabled") is not False,
@@ -49,7 +82,7 @@ def chat_conversation_index_row(item):
     if isinstance(runtime_snapshot, dict) and runtime_snapshot:
         index_row["runtimeSnapshot"] = runtime_snapshot
     if row.get("archivedAt") not in (None, ""):
-        index_row["archivedAt"] = int(row.get("archivedAt") or 0)
+        index_row["archivedAt"] = chat_timestamp_ms(row.get("archivedAt"), 0)
     return index_row
 
 
@@ -64,8 +97,8 @@ def split_chat_conversations_by_archive(rows):
             archived_rows.append(row)
         else:
             active_rows.append(row)
-    active_rows.sort(key=lambda item: int(item.get("updatedAt") or 0), reverse=True)
-    archived_rows.sort(key=lambda item: int(item.get("archivedAt") or item.get("updatedAt") or 0), reverse=True)
+    active_rows.sort(key=lambda item: chat_timestamp_ms(item.get("updatedAt"), 0), reverse=True)
+    archived_rows.sort(key=lambda item: chat_timestamp_ms(item.get("archivedAt") or item.get("updatedAt"), 0), reverse=True)
     return active_rows, archived_rows
 
 
@@ -74,7 +107,7 @@ def _iter_chat_conversation_file_paths():
         return []
     rows = []
     for root, dirnames, filenames in os.walk(CHAT_CONVERSATIONS_DIR):
-        dirnames[:] = [name for name in dirnames if name not in {"attachments", "backups", "manual-backups"}]
+        dirnames[:] = [name for name in dirnames if name not in {"attachments", "backups", "manual-backups", "media"}]
         for filename in filenames:
             if not filename.endswith(".json"):
                 continue
@@ -127,7 +160,7 @@ def load_chat_conversations_from_storage(index_state):
         if row:
             file_rows.append(row)
     if file_rows:
-        file_rows.sort(key=lambda item: int(item.get("updatedAt") or 0), reverse=True)
+        file_rows.sort(key=lambda item: chat_timestamp_ms(item.get("updatedAt"), 0), reverse=True)
         return file_rows
     fallback_rows = []
     for item in list(index_state.get("conversations") or []) + list(index_state.get("archivedConversations") or []):
@@ -144,6 +177,7 @@ def write_chat_conversations_to_storage(state):
     archived_index_rows = []
     for conversation in list(state.get("conversations") or []) + list(state.get("archivedConversations") or []):
         row = sanitize_chat_conversation(conversation)
+        ensure_chat_generated_media_persisted(row)
         path = chat_conversation_file_path(row)
         expected_paths.add(os.path.normpath(path))
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -173,21 +207,28 @@ def write_chat_conversations_to_storage(state):
 
 
 def _chat_attachment_kind(value):
-    return "image" if str(value or "").strip().lower() == "image" else "text"
+    kind = str(value or "").strip().lower()
+    if kind in {"image", "audio", "video"}:
+        return kind
+    return "text"
 
 
 def sanitize_chat_attachment(item):
     item = item if isinstance(item, dict) else {}
     kind = _chat_attachment_kind(item.get("kind"))
+    default_name = kind if kind in {"image", "audio", "video"} else "attachment"
     row = {
         "id": str(item.get("id") or "").strip(),
         "kind": kind,
-        "name": str(item.get("name") or "").strip() or ("image" if kind == "image" else "attachment"),
+        "name": str(item.get("name") or "").strip() or default_name,
         "mime": str(item.get("mime") or "").strip(),
         "source": str(item.get("source") or "").strip(),
     }
-    if kind == "image":
+    if kind in {"image", "audio", "video"}:
         row["url"] = str(item.get("url") or "").strip()
+        thumbnail_url = str(item.get("thumbnail_url") or item.get("thumbnailUrl") or "").strip()
+        if kind == "video" and thumbnail_url:
+            row["thumbnail_url"] = thumbnail_url
     else:
         row["text"] = str(item.get("text") or "")
     size_bytes = item.get("size_bytes")
@@ -197,6 +238,158 @@ def sanitize_chat_attachment(item):
     except Exception:
         pass
     return row
+
+
+def sanitize_chat_generated_media(item):
+    item = item if isinstance(item, dict) else {}
+    kind = _chat_attachment_kind(item.get("kind"))
+    if kind == "text":
+        kind = "image"
+    name = str(item.get("name") or "").strip() or kind
+    row = {
+        "kind": kind,
+        "name": name,
+        "root_path": str(item.get("root_path") or item.get("rootPath") or "").strip(),
+        "relative_path": str(item.get("relative_path") or item.get("relativePath") or "").strip(),
+        "url": str(item.get("url") or "").strip(),
+    }
+    for key in ("source_root_path", "source_relative_path", "source_url", "conversation_media"):
+        value = item.get(key)
+        if value not in (None, ""):
+            row[key] = value
+    size_bytes = item.get("size_bytes")
+    try:
+        if size_bytes not in (None, ""):
+            row["size_bytes"] = max(0, int(size_bytes))
+    except Exception:
+        pass
+    return row
+
+
+def sanitize_chat_json_value(value):
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, list):
+        return [sanitize_chat_json_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            str(key): sanitize_chat_json_value(item)
+            for key, item in value.items()
+            if isinstance(key, str)
+        }
+    return str(value)
+
+
+def sanitize_chat_generated_media_value(value):
+    if isinstance(value, list):
+        return [
+            sanitize_chat_generated_media(item)
+            for item in value
+            if isinstance(item, dict)
+        ]
+    if isinstance(value, dict):
+        return sanitize_chat_generated_media(value)
+    return None
+
+
+def _chat_generated_media_source_path(media):
+    media = media if isinstance(media, dict) else {}
+    root_path = str(media.get("root_path") or media.get("source_root_path") or "").strip()
+    relative_path = str(media.get("relative_path") or media.get("source_relative_path") or "").strip()
+    if not root_path or not relative_path:
+        return ""
+    root_abs = os.path.realpath(os.path.abspath(root_path))
+    source_abs = os.path.realpath(os.path.abspath(os.path.join(root_abs, relative_path.replace("/", os.sep))))
+    if not source_abs.startswith(root_abs.rstrip(os.sep) + os.sep) and source_abs != root_abs:
+        return ""
+    return source_abs if os.path.isfile(source_abs) else ""
+
+
+def _chat_conversation_media_dir(conversation):
+    conversation_id = re.sub(r"[^A-Za-z0-9._-]+", "", str(conversation.get("id") or "").strip())
+    if not conversation_id:
+        return ""
+    return os.path.join(CHAT_CONVERSATIONS_DIR, "media", conversation_id)
+
+
+def _chat_media_preview_url(relative_path):
+    query = urllib.parse.urlencode({"root_path": "/", "relative_path": relative_path.replace(os.sep, "/")})
+    return f"/admin/storage-browser/preview?{query}"
+
+
+def ensure_chat_generated_media_persisted(conversation):
+    conversation = conversation if isinstance(conversation, dict) else {}
+    media_dir = _chat_conversation_media_dir(conversation)
+    if not media_dir:
+        return conversation
+    os.makedirs(media_dir, exist_ok=True)
+    persisted_by_source = {}
+    media_serial = 0
+
+    def persist_media(media, message_index):
+        nonlocal media_serial
+        media = sanitize_chat_generated_media(media)
+        if media.get("conversation_media") and media.get("relative_path") and media.get("url"):
+            return media
+        source_abs = _chat_generated_media_source_path(media)
+        if not source_abs:
+            return media
+        source_key = os.path.realpath(source_abs)
+        if source_key in persisted_by_source:
+            return dict(persisted_by_source[source_key])
+        suffix = Path(source_abs).suffix or ".bin"
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", str(media.get("name") or Path(source_abs).name).strip()) or f"studio-{message_index}{suffix}"
+        if not safe_name.lower().endswith(suffix.lower()):
+            safe_name = f"{safe_name}{suffix}"
+        target_name = f"{message_index:04d}-{media_serial:04d}-{safe_name}"
+        media_serial += 1
+        target_abs = os.path.join(media_dir, target_name)
+        if not os.path.exists(target_abs):
+            try:
+                os.link(source_abs, target_abs)
+            except Exception:
+                shutil.copy2(source_abs, target_abs)
+        try:
+            current_mode = os.stat(target_abs).st_mode & 0o777
+            readable_mode = current_mode | 0o444
+            if readable_mode != current_mode:
+                os.chmod(target_abs, readable_mode)
+        except Exception:
+            pass
+        rel = os.path.relpath(target_abs, "/").replace("\\", "/")
+        media["source_root_path"] = str(media.get("root_path") or media.get("source_root_path") or "/")
+        media["source_relative_path"] = str(media.get("relative_path") or media.get("source_relative_path") or "")
+        media["source_url"] = str(media.get("url") or media.get("source_url") or "")
+        media["root_path"] = "/"
+        media["relative_path"] = rel
+        media["url"] = _chat_media_preview_url(rel)
+        media["conversation_media"] = True
+        try:
+            media["size_bytes"] = os.path.getsize(target_abs)
+        except Exception:
+            pass
+        persisted_by_source[source_key] = dict(media)
+        return media
+
+    def persist_nested(value, message_index):
+        if isinstance(value, list):
+            return [persist_nested(item, message_index) for item in value]
+        if isinstance(value, dict):
+            if value.get("kind") in {"image", "audio", "video"} and (
+                value.get("relative_path") or value.get("relativePath")
+            ):
+                return persist_media(value, message_index)
+            return {key: persist_nested(item, message_index) for key, item in value.items()}
+        return value
+
+    for index, message in enumerate(conversation.get("messages") or []):
+        if not isinstance(message, dict):
+            continue
+        if isinstance(message.get("generatedMedia"), (dict, list)):
+            message["generatedMedia"] = persist_nested(message.get("generatedMedia"), index)
+        if isinstance(message.get("studioPlanResults"), list):
+            message["studioPlanResults"] = persist_nested(message.get("studioPlanResults"), index)
+    return conversation
 
 
 def sanitize_chat_message(item):
@@ -211,6 +404,8 @@ def sanitize_chat_message(item):
         "reasoning_content",
         "reasoning",
         "modelLabel",
+        "studioLane",
+        "studioPrompt",
         "inputTokens",
         "inputTokensEstimate",
         "inputTokensApprox",
@@ -218,6 +413,10 @@ def sanitize_chat_message(item):
         "ttftSeconds",
         "tokensPerSecond",
         "maxTokensPerSecond",
+        "createdAt",
+        "generationStartedAt",
+        "generationFinishedAt",
+        "generationDurationSeconds",
         "thinkingExpanded",
         "thinkingDone",
         "thinkingLive",
@@ -228,11 +427,19 @@ def sanitize_chat_message(item):
         value = item.get(key)
         if value not in (None, ""):
             row[key] = value
+    generated_media = sanitize_chat_generated_media_value(item.get("generatedMedia"))
+    if generated_media:
+        row["generatedMedia"] = generated_media
+    if isinstance(item.get("interactivePlan"), dict):
+        row["interactivePlan"] = sanitize_chat_json_value(item.get("interactivePlan"))
+    if isinstance(item.get("studioPlanResults"), list):
+        row["studioPlanResults"] = sanitize_chat_json_value(item.get("studioPlanResults"))
     return row
 
 
 def sanitize_chat_conversation(item):
     item = item if isinstance(item, dict) else {}
+    now_ms = int(time.time() * 1000)
     try:
         threshold_pct = int(item.get("autoCompactThresholdPct") or 95)
     except Exception:
@@ -248,9 +455,9 @@ def sanitize_chat_conversation(item):
         "folder": str(item.get("folder") or "").strip(),
         "summary": str(item.get("summary") or ""),
         "autoNamed": bool(item.get("autoNamed")),
-        "createdAt": int(item.get("createdAt") or int(time.time() * 1000)),
-        "updatedAt": int(item.get("updatedAt") or int(time.time() * 1000)),
-        "lastUsedAt": int(item.get("lastUsedAt") or int(time.time() * 1000)),
+        "createdAt": chat_timestamp_ms(item.get("createdAt"), now_ms),
+        "updatedAt": chat_timestamp_ms(item.get("updatedAt"), now_ms),
+        "lastUsedAt": chat_timestamp_ms(item.get("lastUsedAt"), now_ms),
         "statsCollapsed": bool(item.get("statsCollapsed")),
         "presetId": str(item.get("presetId") or ""),
         "apiPresetName": str(item.get("apiPresetName") or ""),
@@ -340,8 +547,8 @@ def merge_stream_state_into_chat_conversation(conversation, stream_state):
     if changed:
         row["messages"] = [sanitize_chat_message(message) for message in messages if isinstance(message, dict)]
         updated_at = max(
-            int(row.get("updatedAt") or 0),
-            int(stream.get("updated_at") or 0),
+            chat_timestamp_ms(row.get("updatedAt"), 0),
+            chat_timestamp_ms(stream.get("updated_at"), 0),
             int(time.time() * 1000),
         )
         row["updatedAt"] = updated_at
@@ -469,10 +676,11 @@ def merge_chat_state_payload(payload, current_state):
             existing = dict(existing_by_id[conversation_id])
             existing["title"] = str(raw_row.get("title") or existing.get("title") or "Untitled conversation").strip() or "Untitled conversation"
             existing["folder"] = str(raw_row.get("folder") or existing.get("folder") or "").strip()
-            existing["updatedAt"] = int(raw_row.get("updatedAt") or existing.get("updatedAt") or int(time.time() * 1000))
-            existing["lastUsedAt"] = int(raw_row.get("lastUsedAt") or existing.get("lastUsedAt") or int(time.time() * 1000))
+            now_ms = int(time.time() * 1000)
+            existing["updatedAt"] = chat_timestamp_ms(raw_row.get("updatedAt") or existing.get("updatedAt"), now_ms)
+            existing["lastUsedAt"] = chat_timestamp_ms(raw_row.get("lastUsedAt") or existing.get("lastUsedAt"), now_ms)
             if raw_row.get("archivedAt") not in (None, ""):
-                existing["archivedAt"] = int(raw_row.get("archivedAt") or 0)
+                existing["archivedAt"] = chat_timestamp_ms(raw_row.get("archivedAt"), 0)
             else:
                 existing.pop("archivedAt", None)
             target_rows.append(existing)
@@ -663,17 +871,21 @@ def read_chat_attachment_meta(attachment_id):
 def save_chat_attachment(item):
     item = item if isinstance(item, dict) else {}
     kind = _chat_attachment_kind(item.get("kind"))
-    if kind != "image":
-        raise ValueError("Only image attachments are uploaded separately.")
+    if kind not in {"image", "audio", "video"}:
+        raise ValueError("Only image, audio, and video attachments are uploaded separately.")
     data_url = str(item.get("data_url") or "").strip()
     if not data_url.startswith("data:") or ";base64," not in data_url:
-        raise ValueError("Image attachment must include a base64 data URL.")
+        raise ValueError("Media attachment must include a base64 data URL.")
     header, encoded = data_url.split(",", 1)
     mime = str(item.get("mime") or "").strip()
     if not mime:
         mime = str(header[5:].split(";", 1)[0] or "").strip()
-    if not mime.startswith("image/"):
-        raise ValueError("Only image attachments are supported.")
+    if kind == "image" and not mime.startswith("image/"):
+        raise ValueError("Image attachments must use an image MIME type.")
+    if kind == "audio" and not mime.startswith("audio/"):
+        raise ValueError("Audio attachments must use an audio MIME type.")
+    if kind == "video" and not mime.startswith("video/"):
+        raise ValueError("Video attachments must use a video MIME type.")
     try:
         raw = base64.b64decode(encoded, validate=True)
     except Exception as exc:
@@ -686,14 +898,17 @@ def save_chat_attachment(item):
         handle.write(raw)
     meta = {
         "id": attachment_id,
-        "kind": "image",
-        "name": str(item.get("name") or "image").strip() or "image",
+        "kind": kind,
+        "name": str(item.get("name") or kind).strip() or kind,
         "mime": mime,
         "source": str(item.get("source") or "").strip(),
         "size_bytes": len(raw),
         "created_at": int(time.time()),
         "url": chat_attachment_url(attachment_id),
     }
+    thumbnail_url = str(item.get("thumbnail_url") or item.get("thumbnailUrl") or "").strip()
+    if kind == "video" and thumbnail_url.startswith("data:image/"):
+        meta["thumbnail_url"] = thumbnail_url
     write_json_file(_chat_attachment_meta_path(attachment_id), meta)
     return meta
 

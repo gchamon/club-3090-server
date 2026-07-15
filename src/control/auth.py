@@ -68,6 +68,20 @@ def normalize_limits(raw, fill_defaults=False):
     }
 
 
+def normalize_permissions(raw):
+    data = raw if isinstance(raw, dict) else {}
+    permissions = data.get("permissions") if isinstance(data.get("permissions"), dict) else data
+    permissions = permissions if isinstance(permissions, dict) else {}
+    return {
+        "proxy_swap": bool(
+            permissions.get("proxy_swap")
+            or permissions.get("allow_proxy_swap")
+            or data.get("proxy_swap")
+            or data.get("allow_proxy_swap")
+        ),
+    }
+
+
 def default_user_usage():
     return {
         "events": [],
@@ -213,6 +227,7 @@ def normalize_group_record(raw_name, raw):
         allowed_clean = ["*"]
     limits_raw = raw.get("limits") if isinstance(raw.get("limits"), dict) else raw
     limits = normalize_limits(limits_raw)
+    permissions = normalize_permissions(raw)
     return {
         "name": name,
         "enabled": bool(raw.get("enabled", True)),
@@ -220,6 +235,7 @@ def normalize_group_record(raw_name, raw):
         "description": str(raw.get("description") or "").strip(),
         "allowed_targets": sorted(set(allowed_clean), key=lambda x: ("*" not in x, x)),
         "limits": limits,
+        "permissions": permissions,
     }
 
 
@@ -255,6 +271,7 @@ def public_group_view(group):
         "allowed_targets": list(group.get("allowed_targets") or ["*"]),
         "limits": dict(group.get("limits") or {}),
         "resolved_limits": normalize_limits(group.get("limits") or {}, fill_defaults=True),
+        "permissions": normalize_permissions(group.get("permissions") or {}),
     }
 
 
@@ -283,6 +300,7 @@ def normalize_user_record(raw_name, raw):
     groups = normalize_group_names(raw.get("groups"))
     limits_raw = raw.get("limits") if isinstance(raw.get("limits"), dict) else raw
     limits = normalize_limits(limits_raw)
+    permissions = normalize_permissions(raw)
     usage = default_user_usage()
     raw_usage = raw.get("usage") if isinstance(raw.get("usage"), dict) else {}
     usage["last_request_at"] = int(raw_usage.get("last_request_at") or 0)
@@ -300,6 +318,7 @@ def normalize_user_record(raw_name, raw):
         "allowed_targets": sorted(set(allowed_clean), key=lambda x: ("*" not in x, x)),
         "groups": groups,
         "limits": limits,
+        "permissions": permissions,
         "usage": usage,
         "api_key_hash": api_key_hash,
         "api_key_plain": api_key_plain,
@@ -353,11 +372,21 @@ def effective_limits(user):
     return normalize_limits(merged, fill_defaults=True)
 
 
+def effective_permissions(user):
+    merged = normalize_permissions(user.get("permissions") or {})
+    for group in effective_group_records(user):
+        group_permissions = normalize_permissions(group.get("permissions") or {})
+        for key, value in group_permissions.items():
+            merged[key] = bool(merged.get(key) or value)
+    return merged
+
+
 def public_user_view(user):
     usage = user.get("usage") or default_user_usage()
     now = int(time.time())
     effective_targets = effective_allowed_targets(user)
     merged_limits = effective_limits(user)
+    merged_permissions = effective_permissions(user)
     window_5h = usage_window_totals(usage.get("events") or [], now - (5 * 3600), merged_limits)
     window_week = usage_window_totals(usage.get("events") or [], now - (7 * 24 * 3600), merged_limits)
     return {
@@ -369,6 +398,8 @@ def public_user_view(user):
         "effective_allowed_targets": effective_targets,
         "limits": dict(user.get("limits") or {}),
         "effective_limits": merged_limits,
+        "permissions": normalize_permissions(user.get("permissions") or {}),
+        "effective_permissions": merged_permissions,
         "usage": {
             "last_request_at": int(usage.get("last_request_at") or 0),
             "window_5h": window_5h,
@@ -419,6 +450,7 @@ def save_user_record(payload):
         "allowed_targets": payload.get("allowed_targets", existing.get("allowed_targets", ["*"]) if existing else ["*"]),
         "groups": payload.get("groups", existing.get("groups", []) if existing else []),
         "limits": payload.get("limits", existing.get("limits", {}) if existing else {}),
+        "permissions": payload.get("permissions", existing.get("permissions", {}) if existing else {}),
         "usage": existing.get("usage", default_user_usage()) if existing else default_user_usage(),
         "api_key_hash": existing.get("api_key_hash", "") if existing else "",
         "api_key_plain": existing.get("api_key_plain", "") if existing else "",
@@ -459,6 +491,7 @@ def save_group_record(payload):
         "description": str(payload.get("description", existing.get("description", "") if existing else "")),
         "allowed_targets": payload.get("allowed_targets", existing.get("allowed_targets", ["*"]) if existing else ["*"]),
         "limits": payload.get("limits", existing.get("limits", {}) if existing else {}),
+        "permissions": payload.get("permissions", existing.get("permissions", {}) if existing else {}),
     }
     groups[name] = normalize_group_record(name, merged)
     write_groups(groups)
@@ -644,6 +677,9 @@ def authorize_proxy_request(headers, instance_id, upstream_path, request_usage=N
     count_request = is_quota_counted_path(upstream_path)
     raw_key = extract_api_key(headers)
     user = get_user_by_api_key(raw_key) if raw_key else None
+    if raw_key and user is None:
+        log_audit("proxy_auth_denied", reason="invalid_api_key", target=target_id, path=upstream_path)
+        return False, 401, {"error": "Invalid API key"}
     if user is not None:
         if not user_can_access_target(user, target_id):
             log_audit("proxy_access_denied", reason="target_not_allowed", user=user["name"], target=target_id, path=upstream_path)
@@ -652,9 +688,10 @@ def authorize_proxy_request(headers, instance_id, upstream_path, request_usage=N
         if err:
             log_audit("proxy_quota_denied", user=user["name"], target=target_id, path=upstream_path, reason=err)
             return False, 429, {"error": err, "user": user["name"]}
-        return True, {"mode": "user", "user_name": user["name"], "target_id": target_id, "count_request": count_request}
+        permissions = effective_permissions(user)
+        return True, {"mode": "user", "user_name": user["name"], "target_id": target_id, "count_request": count_request, "permissions": permissions}
     if cfg.get("allow_proxy_without_api_key", True):
-        return True, {"mode": "anonymous", "user_name": None, "target_id": target_id, "count_request": False}
+        return True, {"mode": "anonymous", "user_name": None, "target_id": target_id, "count_request": False, "permissions": normalize_permissions({})}
     log_audit("proxy_auth_denied", reason="missing_or_invalid_api_key", target=target_id, path=upstream_path)
     return False, 401, {"error": "Missing or invalid API key"}
 
@@ -745,4 +782,3 @@ def local_api_token_ok(header_value):
     token = ensure_local_api_token()
     supplied = str(header_value or "").strip()
     return bool(token) and bool(supplied) and secrets.compare_digest(token, supplied)
-

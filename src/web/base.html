@@ -29,17 +29,17 @@
         </div>
       </div>
       <div class="tabs">
-        <button class="tab active" onclick="tab(event, 'overview')">Main</button
-        ><button class="tab" onclick="tab(event, 'system')">System</button
-        ><button class="tab" onclick="tab(event, 'presets')">Presets</button
-        ><button class="tab" id="usersTabBtn" onclick="tab(event, 'users')">
+        <button class="tab" data-tab="overview" onclick="tab(event, 'overview')">Main</button
+        ><button class="tab" data-tab="system" onclick="tab(event, 'system')">System</button
+        ><button class="tab" data-tab="presets" onclick="tab(event, 'presets')">Presets</button
+        ><button class="tab" data-tab="users" id="usersTabBtn" onclick="tab(event, 'users')">
           Users</button
-        ><button class="tab" onclick="tab(event, 'metrics')">Metrics</button
-        ><button class="tab" onclick="tab(event, 'logs')">Logs</button>
+        ><button class="tab" data-tab="metrics" onclick="tab(event, 'metrics')">Metrics</button
+        ><button class="tab" data-tab="logs" onclick="tab(event, 'logs')">Logs</button>
       </div>
     </header>
     <main class="container">
-      <section id="overview" class="tabpane content-tab active">
+      <section id="overview" class="tabpane content-tab">
         <div class="panel">
           <h2>Status</h2>
           <div class="grid">
@@ -128,9 +128,9 @@
             <button class="btn amber" onclick="wol()">Wake-on-LAN</button
             ><button class="btn blue" id="systemUpdateBtn" onclick="promptUpdateRun()">
               Update</button
-            ><button class="btn red" onclick="machineAction('reboot')">
+            ><button class="btn red" id="restartMachineBtn" onpointerdown="beginMachineRestartPress(event)" onpointerup="endMachineRestartPress(event)" onpointercancel="cancelMachineRestartPress()" onpointerleave="cancelMachineRestartPress()" onclick="machineAction('reboot', event)">
               Restart Machine</button
-            ><button class="btn red" onclick="machineAction('shutdown')">
+            ><button class="btn red" onclick="machineAction('shutdown', event)">
               Shutdown Machine
             </button>
           </div>
@@ -162,41 +162,48 @@
               aria-hidden="true"
             ></span
             ><button
-              class="btn blue hidden"
-              id="instanceBenchmarkBtn"
-              onclick="promptBenchmarkRun()"
+              class="btn run-script-trigger hidden"
+              id="instanceRunScriptBtn"
+              onclick="openRunScriptModal()"
             >
-              Benchmark</button
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="m5 7 4.5 5L5 17M11 17h8" fill="none" />
+              </svg>
+              <span>Run Script … </span>
+            </button
             ><button
-              class="btn blue hidden"
-              id="instanceReportBtn"
-              onclick="promptReportRun()"
+              class="btn run-script-trigger hidden"
+              id="instanceSetupImageStudioBtn"
+              onclick="startImageStudioSetup()"
             >
-              Run Report</button
-            ><button
-              class="btn blue hidden"
-              id="instanceRebenchBtn"
-              onclick="promptRebenchRun()"
-            >
-              Rebench
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 17l4.5-5 3.5 4 2-2.5 6 7H4zM6 5h12v9" fill="none" />
+                <circle cx="9" cy="8" r="1.5" fill="currentColor" />
+              </svg>
+              <span>Setup AI Studio</span>
             </button>
           </div>
           <div class="panel" style="margin-top:12px">
             <h2>Power Profiles</h2>
             <div class="actions" id="profileActionRow">
-              <button class="btn green" onclick="profile('eco')">Eco</button
+              <button
+                class="btn benchmark-profile"
+                onclick="profile('benchmark-ready')"
+              >
+                Benchmark Ready (220W)</button
+              ><button class="btn eco-profile" onclick="profile('eco')">Eco (240W)</button
               ><button
                 class="btn profile-balanced"
                 onclick="profile('balanced')"
               >
-                Balanced</button
+                Balanced (280W)</button
               ><button
-                class="btn default-profile"
-                onclick="profile('default')"
+                class="btn fast-profile"
+                onclick="profile('fast')"
               >
-                Default</button
+                Fast (300W)</button
               ><button class="btn orange" onclick="profile('turbo')">
-                Turbo
+                Turbo (350W)
               </button>
             </div>
           </div>
@@ -224,25 +231,25 @@
           <h2>Services</h2>
           <div class="system-service-sections" id="services">
             <div class="service-section-card" id="serverServicesCard" data-collapsed="false">
-              <div class="service-section-head">
-                <div class="service-section-title">Server Services</div>
-                <button type="button" class="iconbtn service-section-toggle" id="serverServicesToggle" title="Collapse server services" aria-label="Collapse server services" aria-expanded="true" onclick="toggleSystemServiceSection('server')">
+              <button type="button" class="service-section-head service-section-toggle" id="serverServicesToggle" title="Collapse server services" aria-label="Collapse server services" aria-expanded="true" onclick="toggleSystemServiceSection('server')">
+                <span class="service-section-cue" aria-hidden="true">
                   <svg viewBox="0 0 24 24" aria-hidden="true">
                     <path d="m6 15 6-6 6 6" fill="none" />
                   </svg>
-                </button>
-              </div>
+                </span>
+                <span class="service-section-title">Server Services</span>
+              </button>
               <div class="service-section-body" id="serverServices">-</div>
             </div>
             <div class="service-section-card" id="club3090ServicesCard" data-collapsed="false">
-              <div class="service-section-head">
-                <div class="service-section-title">Club3090 Services</div>
-                <button type="button" class="iconbtn service-section-toggle" id="club3090ServicesToggle" title="Collapse Club3090 services" aria-label="Collapse Club3090 services" aria-expanded="true" onclick="toggleSystemServiceSection('club3090')">
+              <button type="button" class="service-section-head service-section-toggle" id="club3090ServicesToggle" title="Collapse Club3090 services" aria-label="Collapse Club3090 services" aria-expanded="true" onclick="toggleSystemServiceSection('club3090')">
+                <span class="service-section-cue" aria-hidden="true">
                   <svg viewBox="0 0 24 24" aria-hidden="true">
                     <path d="m6 15 6-6 6 6" fill="none" />
                   </svg>
-                </button>
-              </div>
+                </span>
+                <span class="service-section-title">Club3090 Services</span>
+              </button>
               <div class="service-section-body" id="club3090Services">-</div>
             </div>
           </div>
@@ -253,16 +260,135 @@
         <div class="panel">
           <div class="panel-head">
             <h2>Model Presets</h2>
-            <div class="actions">
-              <button class="btn blue" onclick="openSetupAssistantModal()">
-                Setup Assistant
-              </button>
+            <div class="preset-head-actions" id="presetHeadActions">
               <button
-                class="btn green"
-                onclick="promptRuntimeInventoryRebuild()"
+                type="button"
+                class="preset-menu-button preset-filter-button"
+                title="Filter presets"
+                aria-label="Filter presets"
+                onclick="openPresetFilterModal()"
               >
-                Rebuild Model DB
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M4 5h16l-6.2 7.1v5.4l-3.6 1.8v-7.2L4 5Z" fill="none" />
+                </svg>
               </button>
+              <div class="preset-head-menu" id="presetActionsMenu">
+              <button
+                type="button"
+                class="preset-menu-button"
+                id="presetActionsMenuButton"
+                title="Preset actions"
+                aria-label="Preset actions"
+                aria-haspopup="menu"
+                aria-expanded="false"
+                onclick="togglePresetActionsMenu(event)"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M5 7h14M5 12h14M5 17h14" fill="none" />
+                </svg>
+              </button>
+              <div
+                class="preset-actions-menu hidden"
+                id="presetActionsMenuList"
+                role="menu"
+              >
+                <button
+                  type="button"
+                  class="preset-menu-item preset-menu-setup"
+                  role="menuitem"
+                  onclick="closePresetActionsMenu(); openSetupAssistantModal()"
+                >
+                  <span class="preset-menu-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M12 3l1.6 4.4L18 9l-4.4 1.6L12 15l-1.6-4.4L6 9l4.4-1.6L12 3Zm6 10 .9 2.1L21 16l-2.1.9L18 19l-.9-2.1L15 16l2.1-.9L18 13ZM5.5 14l.8 1.7 1.7.8-1.7.8-.8 1.7-.8-1.7-1.7-.8 1.7-.8.8-1.7Z" fill="none" />
+                    </svg>
+                  </span>
+                  <span>Setup Assistant</span>
+                </button>
+                <button
+                  type="button"
+                  class="preset-menu-item preset-menu-rebuild"
+                  role="menuitem"
+                  onclick="closePresetActionsMenu(); promptRuntimeInventoryRebuild()"
+                >
+                  <span class="preset-menu-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M5 6c0-1.7 3.1-3 7-3s7 1.3 7 3-3.1 3-7 3-7-1.3-7-3Zm0 0v6c0 1.7 3.1 3 7 3s7-1.3 7-3V6M5 12v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6" fill="none" />
+                    </svg>
+                  </span>
+                  <span>Rebuild Model DB</span>
+                </button>
+                <div class="preset-menu-separator" aria-hidden="true"></div>
+                <button
+                  type="button"
+                  class="preset-menu-item preset-menu-hidden"
+                  role="menuitem"
+                  onclick="closePresetActionsMenu(); selectPresetModel('__hidden_presets__')"
+                >
+                  <span class="preset-menu-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M2.5 12s3.6-6 9.5-6 9.5 6 9.5 6-3.6 6-9.5 6-9.5-6-9.5-6Z" fill="none" />
+                      <circle cx="12" cy="12" r="3.25" fill="none" />
+                      <path d="M4 20 20 4" fill="none" />
+                    </svg>
+                  </span>
+                  <span>Hidden Presets</span>
+                </button>
+                <button
+                  type="button"
+                  class="preset-menu-item preset-menu-custom"
+                  role="menuitem"
+                  onclick="closePresetActionsMenu(); openCustomModelModal()"
+                >
+                  <span class="preset-menu-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M12 5v14M5 12h14" fill="none" />
+                    </svg>
+                  </span>
+                  <span>Custom Model</span>
+                </button>
+                <button
+                  type="button"
+                  class="preset-menu-item preset-menu-manager"
+                  role="menuitem"
+                  onclick="closePresetActionsMenu(); selectPresetModel('__model_resources__')"
+                >
+                  <span class="preset-menu-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M12 8.5a3.5 3.5 0 1 0 0 7a3.5 3.5 0 0 0 0-7Zm8 3.5l-2.1.8a6.9 6.9 0 0 1-.6 1.4l.9 2l-2.1 2.1l-2-.9a6.9 6.9 0 0 1-1.4.6L12 20l-1.1-2.1a6.9 6.9 0 0 1-1.4-.6l-2 .9l-2.1-2.1l.9-2a6.9 6.9 0 0 1-.6-1.4L4 12l2.1-1.1a6.9 6.9 0 0 1 .6-1.4l-.9-2l2.1-2.1l2 .9a6.9 6.9 0 0 1 1.4-.6L12 4l1.1 2.1a6.9 6.9 0 0 1 1.4.6l2-.9l2.1 2.1l-.9 2a6.9 6.9 0 0 1 .6 1.4L20 12Z" fill="none" />
+                    </svg>
+                  </span>
+                  <span>Model Manager</span>
+                </button>
+                <button
+                  type="button"
+                  class="preset-menu-item preset-menu-ai-studio"
+                  role="menuitem"
+                  onclick="closePresetActionsMenu(); selectPresetModel('__ai_studio__')"
+                >
+                  <span class="preset-menu-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="m12 3 1.4 4.3L18 9l-4.6 1.7L12 15l-1.4-4.3L6 9l4.6-1.7L12 3Z" fill="none" />
+                      <path d="m5 14 .8 2.2L8 17l-2.2.8L5 20l-.8-2.2L2 17l2.2-.8L5 14Zm14 1 .7 1.8 1.8.7-1.8.7L19 21l-.7-1.8-1.8-.7 1.8-.7L19 15Z" fill="none" />
+                    </svg>
+                  </span>
+                  <span>AI Studio</span>
+                </button>
+                <button
+                  type="button"
+                  class="preset-menu-item preset-menu-benchmarks"
+                  role="menuitem"
+                  onclick="closePresetActionsMenu(); openBenchmarkAllModal()"
+                >
+                  <span class="preset-menu-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M8 5.5 18 12 8 18.5Z" />
+                    </svg>
+                  </span>
+                  <span>Benchmarks</span>
+                </button>
+              </div>
+              </div>
             </div>
           </div>
           <div class="preset-help">
@@ -270,7 +396,7 @@
             <code>/opt/ai/club-3090</code> clone. Global applies single-GPU
             presets across every GPU, dual presets across every two-GPU pair,
             and multi-GPU presets to the shared runtime. Use
-            the Custom Model button to bridge upstream
+            the Custom Model menu item to bridge upstream
             <code>pull.sh</code> into this panel without changing the core UI
             flow.
           </div>
@@ -559,7 +685,21 @@
               <div class="msg chat-status-msg" id="chatMsg"></div>
               <div class="resizable-surface resizable-surface-chat">
                 <div class="chat-transcript" id="chatTranscript"></div>
-                <div class="chat-transcript-footer">
+                <button
+                  type="button"
+                  class="surface-resize-handle"
+                  id="chatTranscriptResizeHandle"
+                  aria-label="Resize chat transcript"
+                  title="Resize chat transcript"
+                ></button>
+              </div>
+              <div class="chat-input-wrap">
+                <div class="chat-studio-row" id="chatStudioRow">
+                  <label>
+                    <span class="chat-studio-label-text">Generate</span>
+                    <select id="chatStudioLane" class="chat-control-select"></select>
+                  </label>
+                  <span class="chat-studio-hint">Studio outputs embed in this conversation.</span>
                   <label class="label chat-transcript-autoscroll">
                     <input
                       type="checkbox"
@@ -570,15 +710,6 @@
                     auto-scroll
                   </label>
                 </div>
-                <button
-                  type="button"
-                  class="surface-resize-handle"
-                  id="chatTranscriptResizeHandle"
-                  aria-label="Resize chat transcript"
-                  title="Resize chat transcript"
-                ></button>
-              </div>
-              <div class="chat-input-wrap">
                 <div class="chat-composer-row">
                   <textarea
                     id="chatInput"
@@ -614,8 +745,8 @@
                       class="iconbtn chat-action-btn chat-attach-btn"
                       onclick="openChatAttachmentPicker()"
                       id="chatAttachBtn"
-                      title="Attach files or images"
-                      aria-label="Attach files or images"
+                      title="Attach files, images, audio, or video"
+                      aria-label="Attach files, images, audio, or video"
                     >
                       <svg viewBox="-3 0 28 28" aria-hidden="true">
                         <path d="M8 12.5 14.5 6a3.5 3.5 0 1 1 5 5L10.5 20a5 5 0 1 1-7-7L13 3.5" fill="none" />
@@ -628,7 +759,7 @@
                   type="file"
                   multiple
                   class="hidden-file-input"
-                  accept="image/*,.txt,.md,.markdown,.json,.jsonl,.csv,.tsv,.yaml,.yml,.xml,.html,.css,.js,.mjs,.cjs,.ts,.tsx,.jsx,.py,.sh,.bash,.zsh,.log,.ini,.cfg,.conf"
+                  accept="image/*,audio/*,video/*,.txt,.md,.markdown,.json,.jsonl,.csv,.tsv,.yaml,.yml,.xml,.html,.css,.js,.mjs,.cjs,.ts,.tsx,.jsx,.py,.sh,.bash,.zsh,.log,.ini,.cfg,.conf"
                   onchange="handleChatAttachmentSelect(event)"
                 />
                 <div class="chat-attachment-rail" id="chatAttachmentRow"></div>
@@ -657,8 +788,7 @@
       <section id="metrics" class="tabpane content-tab">
         <div class="panel">
           <div class="panel-head">
-            <h2>Metrics</h2>
-            <div class="preset-actions">
+            <div class="logheadtitle">
               <button
                 class="iconbtn metric-popout-btn"
                 id="metricsPopoutBtn"
@@ -671,6 +801,9 @@
                   <path d="M10 7H7a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-3" fill="none" />
                 </svg>
               </button>
+              <h2>Metrics</h2>
+            </div>
+            <div class="preset-actions">
               <button
                 class="iconbtn"
                 id="metricsResetBtn"
@@ -685,17 +818,25 @@
             </div>
           </div>
           <div class="subtabs">
-            <button class="subtab active" onclick="metricTab(event, 'mMain')">
+            <button class="subtab active" data-metric-pane="mMain" onclick="metricTab(event, 'mMain')">
               Main</button
-            ><button class="subtab" onclick="metricTab(event, 'mGpu')">
+            ><button class="subtab" data-metric-pane="mGpu" onclick="metricTab(event, 'mGpu')">
               GPUs</button
-            ><button class="subtab" onclick="metricTab(event, 'mCpuRam')">
+            ><button class="subtab" data-metric-pane="mCpuRam" onclick="metricTab(event, 'mCpuRam')">
               CPU+RAM</button
-            ><button class="subtab" onclick="metricTab(event, 'mSystem')">
+            ><button class="subtab" data-metric-pane="mSystem" onclick="metricTab(event, 'mSystem')">
               System</button
-            ><button class="subtab" onclick="metricTab(event, 'mNetwork')">
+            ><button class="subtab" data-metric-pane="mNetwork" onclick="metricTab(event, 'mNetwork')">
               Network
             </button>
+          </div>
+          <div
+            id="metricsDetachedNotice"
+            class="empty-variant-note hidden"
+          >
+            The Metrics panel is currently detached into a separate window.
+            Use the reattach icon there or close that window to bring it back
+            here.
           </div>
           <div id="mMain" class="metricpane active">
             <div class="chartgrid">

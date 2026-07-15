@@ -2,3 +2,7 @@ __pycache__/
 *.py[cod]
 
 logs/
+node_modules/
+club-3090/
+artifacts/
+backups/

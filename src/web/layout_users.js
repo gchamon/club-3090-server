@@ -355,7 +355,10 @@ function normalizeDockerLogInstanceId(value = "") {
   if (!options.length) return "";
   const candidate = String(value || "").trim().toUpperCase();
   const exact = options.find((row) => row.id === candidate);
-  return String((exact || options[0]).id || "");
+  if (exact) return String(exact.id || "");
+  const targetId = String(dockerLogTarget()?.id || "").trim().toUpperCase();
+  const scoped = targetId ? options.find((row) => row.id === targetId) : null;
+  return String((scoped || options[0]).id || "");
 }
 function selectedDockerLogInstanceId() {
   const id = normalizeDockerLogInstanceId(selectedLogInstanceId);
@@ -374,6 +377,7 @@ function setDockerLogInstance(id) {
   selectedLogInstanceId = normalizeDockerLogInstanceId(id);
   renderLogInstanceSelector();
   applyLogVisibility();
+  queueUiStateSave({ selected_log_instance_id: selectedLogInstanceId });
   connectLogs(true);
 }
 function formatCtxTokens(value) {
@@ -523,6 +527,12 @@ function formatRuntimeModeValue(j, runtime) {
   if (runtime) return `${runtime.mode || "-"} / ${runtime.port || "-"}`;
   const modes = Array.isArray(j?.active_modes) ? j.active_modes.filter(Boolean) : [];
   const port = j?.active_port || "-";
+  const studio = j?.ai_studio || {};
+  const activity = Number(studio.queue_running || 0) + Number(studio.queue_pending || 0);
+  const activeMode = modes[0] || j?.active_mode;
+  if (activeMode === "ai-studio" && activity > 0) {
+    return `ai-studio / ${port} (${activity} active)`;
+  }
   return modes.length > 1
     ? `${modes.join(", ")} / multiple`
     : `${modes[0] || j?.active_mode || "-"} / ${port}`;
@@ -542,17 +552,35 @@ function formatUsersValue(j) {
 function formatRuntimeRequestSummaryLine(runtime, statusHistory) {
   const rawStatus = runtime?.last_status;
   const statusNum = Number(rawStatus);
+  const statusText = String(rawStatus ?? "").trim();
+  const statusIsBenchmark = /benchmark/i.test(statusText);
   const requestText = formatAbsoluteTimestamp(runtime?.last_request_at);
   const pathText = String(runtime?.last_path || "");
   return [
-    Number.isFinite(statusNum)
+    statusIsBenchmark
+      ? `benchmark status: ${statusText.replace(/-/g, " ")}`
+      : Number.isFinite(statusNum)
       ? `HTTP: ${Math.trunc(statusNum)}`
-      : rawStatus !== null && rawStatus !== undefined && rawStatus !== ""
-        ? `HTTP: ${String(rawStatus)}`
+      : statusText
+        ? `HTTP: ${statusText}`
         : "HTTP: -",
     `last path: ${pathText}`,
     requestText ? `last request: ${requestText}` : "last request: -",
   ].filter(Boolean);
+}
+function benchmarkRuntimeModeLabel(runtime) {
+  const raw = String(runtime?.benchmark_mode || runtime?.last_status || "").toLowerCase();
+  if (raw.includes("full")) return "Full";
+  return "Quick";
+}
+function formatBenchmarkRuntimeLine(runtime) {
+  const modeLabel = benchmarkRuntimeModeLabel(runtime);
+  const stage = String(runtime?.benchmark_step || "running").trim() || "running";
+  const stepIndex = Math.max(0, Number(runtime?.benchmark_step_index || 0));
+  const stepCount = Math.max(0, Number(runtime?.benchmark_step_count || 0));
+  const stageText = stepIndex && stepCount ? `${stage} ${stepIndex}/${stepCount}` : stage;
+  const progress = Math.round(normalizeBenchmarkProgress(runtime?.benchmark_step_progress) * 100);
+  return `${modeLabel} benchmark stage: ${stageText}${progress ? ` ${progress}%` : ""}`;
 }
 function formatGenerationMetaLine(runtime) {
   return [
@@ -644,12 +672,6 @@ function deriveRuntimeKvUsagePct(target = {}) {
   const contextUsage = deriveRuntimeContextUsage(target);
   return Number.isFinite(contextUsage?.pct) ? contextUsage.pct : null;
 }
-function variantStatusBadgeHtml(variant, stateLabel = "", options = {}) {
-  return renderStatusBadgesHtml(variant, {
-    ...options,
-    stateLabel,
-  });
-}
 function formatLastStatusCard(target, perfHistory = {}, options = {}) {
   const latency = target?.last_latency_s;
   const ttft = target?.last_ttft_s;
@@ -660,8 +682,8 @@ function formatLastStatusCard(target, perfHistory = {}, options = {}) {
   ].find((value) => Number(value) > 0);
   const generationTps = [
     target?.last_generation_tps,
-    target?.generation_tps,
     target?.last_tokens_per_second,
+    target?.generation_tps,
   ].find((value) => Number(value) > 0);
   const peakPromptTps = Math.max(
     Number(target?.max_prompt_tokens_per_second || 0),
@@ -786,6 +808,9 @@ function formatChatRuntimeStatsFlat(runtime, options = {}) {
       )
     : { current: currentStatus, previous: "" };
   const queueBits = [];
+  if (runtime.benchmark_active) {
+    queueBits.push(formatBenchmarkRuntimeLine(runtime));
+  }
   if (Number(runtime.waiting_requests || 0) > 0) queueBits.push(`waiting: ${runtime.waiting_requests}`);
   if (Number(runtime.pending_requests || 0) > 0) queueBits.push(`pending: ${runtime.pending_requests}`);
   if (Number(runtime.swapped_requests || 0) > 0) queueBits.push(`swapped: ${runtime.swapped_requests}`);
@@ -817,6 +842,9 @@ function formatGenerationRuntimeCard(runtime) {
     runtimeActivityStatus(runtime),
   );
   const queueBits = [];
+  if (runtime.benchmark_active) {
+    queueBits.push(formatBenchmarkRuntimeLine(runtime));
+  }
   if (Number(runtime.waiting_requests || 0) > 0) queueBits.push(`waiting: ${runtime.waiting_requests}`);
   if (Number(runtime.pending_requests || 0) > 0) queueBits.push(`pending: ${runtime.pending_requests}`);
   if (Number(runtime.swapped_requests || 0) > 0) queueBits.push(`swapped: ${runtime.swapped_requests}`);
@@ -853,6 +881,9 @@ function renderGenerationStats(j) {
   const rows = runtimeStatsRows(j);
   const started = rows.filter((row) => {
     const signalFields = [
+      row?.benchmark_active,
+      row?.benchmark_step,
+      row?.benchmark_mode,
       row?.last_status,
       row?.last_latency_s,
       row?.last_ttft_s,
@@ -923,13 +954,26 @@ function renderLogTracker() {
 function renderOverviewStatus(j) {
   const metrics = (j && j.metrics) || {};
   const power = (j && j.power) || {};
+  const benchmarkJob = j?.benchmarks?.job || {};
+  const benchmarkRows = Array.isArray(benchmarkJob.queue) ? benchmarkJob.queue : [];
+  const benchmarkRunningRows = benchmarkRows.filter((row) => row && row.status === "running");
+  const benchmarkPowerActive = !!benchmarkJob.active && benchmarkRunningRows.length > 0;
+  const benchmarkPowerText = benchmarkPowerActive
+    ? `benchmarking ${benchmarkRunningRows.map((row) => row.display_name || row.selector || "preset").join(", ")}`
+    : power.container || "-";
   const runtime = trackedOverviewRuntime();
   const containers = Array.isArray(j?.containers) ? j.containers.filter(Boolean) : [];
   const modes = Array.isArray(j?.active_modes) ? j.active_modes.filter(Boolean) : [];
-  if ($("summary"))
-    $("summary").textContent = runtime
+  const baseSummary = runtime
       ? `${runtime.id || runtime.instance_id} | ${runtime.mode || j.active_mode} | ${runtime.container || "no container"} | ${power.profile || "balanced"} | GPUs ${j.gpu_count | 0}`
       : `${modes[0] || j.active_mode || "-"} | ${containers[0] || j.container || "no container"} | ${power.profile || "balanced"} | GPUs ${j.gpu_count | 0}`;
+  const cacheMeta = j?.__status_cache || {};
+  const cachePrefix = cacheMeta.disconnected
+    ? `Disconnected | cached ${typeof statusCacheSavedLabel === "function" ? statusCacheSavedLabel(cacheMeta.saved_at) : "snapshot"}`
+    : cacheMeta.connecting
+      ? `Cached | ${typeof statusCacheSavedLabel === "function" ? statusCacheSavedLabel(cacheMeta.saved_at) : "snapshot"}`
+      : "";
+  if ($("summary")) $("summary").textContent = cachePrefix ? `${cachePrefix} | ${baseSummary}` : baseSummary;
   if ($("mode"))
     $("mode").textContent = formatRuntimeModeValue(j, runtime);
   if ($("container"))
@@ -947,7 +991,7 @@ function renderOverviewStatus(j) {
   }
   if ($("powerbox"))
     $("powerbox").textContent =
-      `profile=${power.profile || "-"}, GPU=${power.gpu || "-"}, CPU=${power.cpu || "-"}, fans=${power.fans || "-"}, container=${power.container || "-"}, idle=${power.idle_for_seconds | 0}s`;
+      `profile=${power.profile || "-"}, GPU=${power.gpu || "-"}, CPU=${power.cpu || "-"}, fans=${power.fans || "-"}, container=${benchmarkPowerText}, ${benchmarkPowerActive ? "benchmark active" : `idle=${fmtUptime(power.idle_for_seconds)}`}`;
   renderGenerationStats(j);
   renderOverviewTracker();
 }
@@ -1012,7 +1056,7 @@ ensureUsersUi = function () {
   }
   if (section.dataset.v414Users !== "1") {
     section.dataset.v414Users = "1";
-    section.innerHTML = `<div class="panel"><div class="panel-head"><h2>User Accounts</h2><button class="add-preset-btn" title="New user" aria-label="New user" onclick="resetUserForm(false)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none"/></svg></button></div><div class="preset-intro" id="userIntro">Manage per-user API keys, access scopes, and Codex-style scored budgets. The configured list stays visible while the editor is collapsed.</div><div class="preset-editor" id="userEditor"><div class="formgrid"><label>User name<input id="userName" placeholder="client_a" /></label><label>Allowed targets<input id="userTargets" placeholder="*, GLOBAL, GPU0, PAIR0_1" /></label><label>Groups<input id="userGroups" placeholder="starter, premium" /></label><label>5h score budget<input id="userScore5h" type="number" step="0.1" placeholder="unlimited" /></label><label>Weekly score budget<input id="userScoreWeek" type="number" step="0.1" placeholder="unlimited" /></label><label>Max tokens / message<input id="userMaxTokensMsg" type="number" step="1" placeholder="unlimited" /></label><label>Max tool calls / message<input id="userMaxToolsMsg" type="number" step="1" placeholder="unlimited" /></label><label>Input token weight<input id="userInputTokenWeight" type="number" step="0.001" placeholder="default" /></label><label>Output token weight<input id="userOutputTokenWeight" type="number" step="0.001" placeholder="default" /></label><label>Tool-call weight<input id="userToolCallWeight" type="number" step="0.001" placeholder="default" /></label><label>Thinking-second weight<input id="userThinkingSecondWeight" type="number" step="0.001" placeholder="default" /></label><label>Enabled<select id="userEnabled"><option value="true">Enabled</option><option value="false">Disabled</option></select></label></div><div class="preset-form-actions"><button class="btn green" onclick="saveUserForm()">Save User</button><button class="btn red" onclick="resetUserForm(true)">Cancel</button></div></div><div class="msg" id="usersMsg"></div><div class="panel" style="margin-top:12px"><h2>Configured Users</h2><div id="usersGrid" class="api-grid"></div></div></div>`;
+    section.innerHTML = `<div class="panel"><div class="panel-head"><h2>User Accounts</h2><button class="add-preset-btn" title="New user" aria-label="New user" onclick="resetUserForm(false)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none"/></svg></button></div><div class="preset-intro" id="userIntro">Manage per-user API keys, access scopes, and Codex-style scored budgets. The configured list stays visible while the editor is collapsed.</div><div class="preset-editor" id="userEditor"><div class="formgrid"><label>User name<input id="userName" placeholder="client_a" /></label><label>Allowed targets<input id="userTargets" placeholder="*, GLOBAL, GPU0, PAIR0_1" /></label><label>Proxy swap permission<select id="userProxySwap"><option value="false">Disabled</option><option value="true">Allowed</option></select></label><label>Groups<input id="userGroups" placeholder="starter, premium" /></label><label>5h score budget<input id="userScore5h" type="number" step="0.1" placeholder="unlimited" /></label><label>Weekly score budget<input id="userScoreWeek" type="number" step="0.1" placeholder="unlimited" /></label><label>Max tokens / message<input id="userMaxTokensMsg" type="number" step="1" placeholder="unlimited" /></label><label>Max tool calls / message<input id="userMaxToolsMsg" type="number" step="1" placeholder="unlimited" /></label><label>Input token weight<input id="userInputTokenWeight" type="number" step="0.001" placeholder="default" /></label><label>Output token weight<input id="userOutputTokenWeight" type="number" step="0.001" placeholder="default" /></label><label>Tool-call weight<input id="userToolCallWeight" type="number" step="0.001" placeholder="default" /></label><label>Thinking-second weight<input id="userThinkingSecondWeight" type="number" step="0.001" placeholder="default" /></label><label>Enabled<select id="userEnabled"><option value="true">Enabled</option><option value="false">Disabled</option></select></label></div><div class="preset-form-actions"><button class="btn green" onclick="saveUserForm()">Save User</button><button class="btn red" onclick="resetUserForm(true)">Cancel</button></div></div><div class="msg" id="usersMsg"></div><div class="panel" style="margin-top:12px"><h2>Configured Users</h2><div id="usersGrid" class="api-grid"></div></div></div>`;
   }
 };
 resetUserForm = function (collapse = true) {
@@ -1021,6 +1065,7 @@ resetUserForm = function (collapse = true) {
   $("userName").disabled = false;
   $("userName").value = "";
   $("userTargets").value = "*";
+  $("userProxySwap").value = "false";
   $("userGroups").value = "";
   $("userScore5h").value = "";
   $("userScoreWeek").value = "";
@@ -1048,6 +1093,9 @@ collectUserForm = function () {
       .split(",")
       .map((x) => x.trim())
       .filter(Boolean),
+    permissions: {
+      proxy_swap: $("userProxySwap").value === "true",
+    },
     enabled: $("userEnabled").value === "true",
     generate_api_key: !selectedUserName,
     limits: {
@@ -1072,6 +1120,7 @@ editUser = function (name) {
   $("userName").disabled = true;
   $("userName").value = user.name;
   $("userTargets").value = (user.allowed_targets || []).join(", ");
+  $("userProxySwap").value = String(!!((user.permissions || {}).proxy_swap));
   $("userGroups").value = (user.groups || []).join(", ");
   $("userScore5h").value = user.limits.score_per_5h ?? "";
   $("userScoreWeek").value = user.limits.score_per_week ?? "";
@@ -1117,7 +1166,7 @@ renderUsers = function (users) {
             icon: "delete",
           }),
         ].join("");
-        return `<div class="api-card"><div class="api-card-head"><h3>${u.name}<br><span class="label">${u.enabled ? "enabled" : "disabled"} &middot; access ${(u.effective_allowed_targets || u.allowed_targets || []).join(", ") || "*"}</span></h3><span class="preset-actions">${actions}</span></div><p>Groups: ${(u.groups || []).join(", ") || "none"}</p><p>API key: ${u.has_api_key ? (u.api_key_available ? "stored and viewable" : "legacy key, reset once to store it") : "not issued yet"}</p><p>Last 5h: ${quotaWindowText((u.usage || {}).window_5h)}</p><p>Last week: ${quotaWindowText((u.usage || {}).window_week)}</p><p class="label">Direct budgets &middot; ${quotaBudgetLine(u.limits || {})}</p><p class="label">Direct weights &middot; ${quotaWeightLine(u.limits || {})}</p><p class="label">Effective budgets &middot; ${quotaBudgetLine(u.effective_limits || {})}</p><p class="label">Effective weights &middot; ${quotaWeightLine(u.effective_limits || {})}</p></div>`;
+        return `<div class="api-card"><div class="api-card-head"><h3>${u.name}<br><span class="label">${u.enabled ? "enabled" : "disabled"} &middot; access ${(u.effective_allowed_targets || u.allowed_targets || []).join(", ") || "*"}</span></h3><span class="preset-actions">${actions}</span></div><p>Groups: ${(u.groups || []).join(", ") || "none"}</p><p>API key: ${u.has_api_key ? (u.api_key_available ? "stored and viewable" : "legacy key, reset once to store it") : "not issued yet"}</p><p>Last 5h: ${quotaWindowText((u.usage || {}).window_5h)}</p><p>Last week: ${quotaWindowText((u.usage || {}).window_week)}</p><p class="label">Permissions &middot; proxy swap ${((u.effective_permissions || {}).proxy_swap) ? "allowed" : "disabled"}</p><p class="label">Direct budgets &middot; ${quotaBudgetLine(u.limits || {})}</p><p class="label">Direct weights &middot; ${quotaWeightLine(u.limits || {})}</p><p class="label">Effective budgets &middot; ${quotaBudgetLine(u.effective_limits || {})}</p><p class="label">Effective weights &middot; ${quotaWeightLine(u.effective_limits || {})}</p></div>`;
       })
       .join("") || '<div class="value">No API users configured yet.</div>';
   setHtmlIfChanged(grid, nextHtml);
@@ -1135,7 +1184,7 @@ ensureGroupUi = function () {
   }
   if (panel.dataset.v414Groups !== "1") {
     panel.dataset.v414Groups = "1";
-    panel.innerHTML = `<div class="panel-head"><h2>User Groups / Plans</h2><button class="add-preset-btn" title="New group" aria-label="New group" onclick="resetGroupForm(false)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none"/></svg></button></div><div class="preset-intro" id="groupIntro">Define reusable plans that carry scored budgets, per-message caps, and access scopes. The configured list stays visible while the editor is collapsed.</div><div class="preset-editor" id="groupEditor"><div class="formgrid"><label>Group name<input id="groupName" placeholder="starter" /></label><label>Description<input id="groupDescription" placeholder="Shared plan description" /></label><label>Allowed targets<input id="groupTargets" placeholder="*, GLOBAL, GPU0, PAIR0_1" /></label><label>5h score budget<input id="groupScore5h" type="number" step="0.1" placeholder="unlimited" /></label><label>Weekly score budget<input id="groupScoreWeek" type="number" step="0.1" placeholder="unlimited" /></label><label>Max tokens / message<input id="groupMaxTokensMsg" type="number" step="1" placeholder="unlimited" /></label><label>Max tool calls / message<input id="groupMaxToolsMsg" type="number" step="1" placeholder="unlimited" /></label><label>Input token weight<input id="groupInputTokenWeight" type="number" step="0.001" placeholder="default" /></label><label>Output token weight<input id="groupOutputTokenWeight" type="number" step="0.001" placeholder="default" /></label><label>Tool-call weight<input id="groupToolCallWeight" type="number" step="0.001" placeholder="default" /></label><label>Thinking-second weight<input id="groupThinkingSecondWeight" type="number" step="0.001" placeholder="default" /></label><label>Enabled<select id="groupEnabled"><option value="true">Enabled</option><option value="false">Disabled</option></select></label></div><div class="preset-form-actions"><button class="btn green" onclick="saveGroupForm()">Save Group</button><button class="btn red" onclick="resetGroupForm(true)">Cancel</button></div></div><div class="msg" id="groupsMsg"></div><div class="panel" style="margin-top:12px"><h2>Configured Groups</h2><div id="groupsGrid" class="api-grid"></div></div>`;
+    panel.innerHTML = `<div class="panel-head"><h2>User Groups / Plans</h2><button class="add-preset-btn" title="New group" aria-label="New group" onclick="resetGroupForm(false)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none"/></svg></button></div><div class="preset-intro" id="groupIntro">Define reusable plans that carry scored budgets, per-message caps, and access scopes. The configured list stays visible while the editor is collapsed.</div><div class="preset-editor" id="groupEditor"><div class="formgrid"><label>Group name<input id="groupName" placeholder="starter" /></label><label>Description<input id="groupDescription" placeholder="Shared plan description" /></label><label>Allowed targets<input id="groupTargets" placeholder="*, GLOBAL, GPU0, PAIR0_1" /></label><label>Proxy swap permission<select id="groupProxySwap"><option value="false">Disabled</option><option value="true">Allowed</option></select></label><label>5h score budget<input id="groupScore5h" type="number" step="0.1" placeholder="unlimited" /></label><label>Weekly score budget<input id="groupScoreWeek" type="number" step="0.1" placeholder="unlimited" /></label><label>Max tokens / message<input id="groupMaxTokensMsg" type="number" step="1" placeholder="unlimited" /></label><label>Max tool calls / message<input id="groupMaxToolsMsg" type="number" step="1" placeholder="unlimited" /></label><label>Input token weight<input id="groupInputTokenWeight" type="number" step="0.001" placeholder="default" /></label><label>Output token weight<input id="groupOutputTokenWeight" type="number" step="0.001" placeholder="default" /></label><label>Tool-call weight<input id="groupToolCallWeight" type="number" step="0.001" placeholder="default" /></label><label>Thinking-second weight<input id="groupThinkingSecondWeight" type="number" step="0.001" placeholder="default" /></label><label>Enabled<select id="groupEnabled"><option value="true">Enabled</option><option value="false">Disabled</option></select></label></div><div class="preset-form-actions"><button class="btn green" onclick="saveGroupForm()">Save Group</button><button class="btn red" onclick="resetGroupForm(true)">Cancel</button></div></div><div class="msg" id="groupsMsg"></div><div class="panel" style="margin-top:12px"><h2>Configured Groups</h2><div id="groupsGrid" class="api-grid"></div></div>`;
   }
 };
 resetGroupForm = function (collapse = true) {
@@ -1145,6 +1194,7 @@ resetGroupForm = function (collapse = true) {
   $("groupName").value = "";
   $("groupDescription").value = "";
   $("groupTargets").value = "*";
+  $("groupProxySwap").value = "false";
   $("groupScore5h").value = "";
   $("groupScoreWeek").value = "";
   $("groupMaxTokensMsg").value = "";
@@ -1168,6 +1218,9 @@ collectGroupForm = function () {
       .split(",")
       .map((x) => x.trim())
       .filter(Boolean),
+    permissions: {
+      proxy_swap: $("groupProxySwap").value === "true",
+    },
     enabled: $("groupEnabled").value === "true",
     limits: {
       score_per_5h: parseQuotaNumber("groupScore5h"),
@@ -1192,6 +1245,7 @@ editGroup = function (name) {
   $("groupName").value = group.name;
   $("groupDescription").value = group.description || "";
   $("groupTargets").value = (group.allowed_targets || []).join(", ");
+  $("groupProxySwap").value = String(!!((group.permissions || {}).proxy_swap));
   $("groupScore5h").value = group.limits.score_per_5h ?? "";
   $("groupScoreWeek").value = group.limits.score_per_week ?? "";
   $("groupMaxTokensMsg").value = group.limits.max_tokens_per_message ?? "";
@@ -1215,7 +1269,7 @@ renderGroups = function (groups) {
     groups
       .map(
         (g) =>
-          `<div class="api-card"><div class="api-card-head"><h3>${g.name}<br><span class="label">${g.enabled ? "enabled" : "disabled"} · access ${(g.allowed_targets || []).join(", ") || "*"}</span></h3><span class="preset-actions"><button class="iconbtn" title="Edit" onclick="editGroup('${g.name}')">${svgIcon("edit")}</button><button class="iconbtn" title="Delete" onclick="deleteGroupByName('${g.name}')">${svgIcon("delete")}</button></span></div><p>${g.description || "No description"}</p><p class="label">Configured budgets · ${quotaBudgetLine(g.limits || {})}</p><p class="label">Configured weights · ${quotaWeightLine(g.limits || {})}</p><p class="label">Resolved budgets · ${quotaBudgetLine(g.resolved_limits || g.limits || {})}</p><p class="label">Resolved weights · ${quotaWeightLine(g.resolved_limits || g.limits || {})}</p></div>`,
+          `<div class="api-card"><div class="api-card-head"><h3>${g.name}<br><span class="label">${g.enabled ? "enabled" : "disabled"} · access ${(g.allowed_targets || []).join(", ") || "*"}</span></h3><span class="preset-actions"><button class="iconbtn" title="Edit" onclick="editGroup('${g.name}')">${svgIcon("edit")}</button><button class="iconbtn" title="Delete" onclick="deleteGroupByName('${g.name}')">${svgIcon("delete")}</button></span></div><p>${g.description || "No description"}</p><p class="label">Permissions · proxy swap ${((g.permissions || {}).proxy_swap) ? "allowed" : "disabled"}</p><p class="label">Configured budgets · ${quotaBudgetLine(g.limits || {})}</p><p class="label">Configured weights · ${quotaWeightLine(g.limits || {})}</p><p class="label">Resolved budgets · ${quotaBudgetLine(g.resolved_limits || g.limits || {})}</p><p class="label">Resolved weights · ${quotaWeightLine(g.resolved_limits || g.limits || {})}</p></div>`,
       )
       .join("") || '<div class="value">No groups configured yet.</div>';
   setHtmlIfChanged(grid, nextHtml);

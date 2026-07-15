@@ -5,12 +5,15 @@ function renderLogSourcePanel() {
     const services = Array.isArray(lastStatus?.upstream_services)
       ? lastStatus.upstream_services.filter((row) => row && row.running)
       : [];
+    const scriptActive = !!lastStatus?.script_job?.active || currentLogSource === "script";
     panel.className = `panel log-source-panel${updateActive ? " log-source-panel-disabled" : ""}`;
     const disabledAttr = updateActive ? ' disabled aria-disabled="true"' : "";
     panel.innerHTML = `<div class="panel-head"><h2>Log Sources</h2><div class="preset-actions">${renderIconButton({ title: "Export", action: "exportCurrentLog()", icon: "upload", disabled: updateActive })}</div></div><div class="subtabs">${[
       { id: "docker", label: "Docker" },
       { id: "audit", label: "Audit" },
       { id: "debug", label: "Debug" },
+      { id: "benchmarks", label: "Benchmarks" },
+      ...(scriptActive ? [{ id: "script", label: "Script" }] : []),
       ...(updateActive || currentLogSource === "update"
         ? [{ id: "update", label: "Update" }]
         : []),
@@ -40,6 +43,20 @@ function renderLogSourcePanel() {
   if (currentLogSource === "debug") {
     $("logsSourceSummary").innerHTML =
       "Debug selected. The live viewer follows <code>/opt/club3090-control/debug.log</code>.";
+    return;
+  }
+  if (currentLogSource === "benchmarks") {
+    const current = lastStatus?.benchmarks?.current_log || {};
+    const label = current.label || "benchmark script output";
+    const progress = Number(current.progress || 0);
+    $("logsSourceSummary").innerHTML =
+      `Benchmarks selected. Showing <code>${escapeHtml(label)}</code>${Number.isFinite(progress) && progress > 0 ? ` · ${Math.round(progress * 100)}%` : ""}.`;
+    return;
+  }
+  if (currentLogSource === "script") {
+    const job = lastStatus?.script_job || {};
+    $("logsSourceSummary").innerHTML =
+      `Script selected. ${escapeHtml(job.summary || "The live viewer follows the active upstream script output.")}${job.label ? ` <code>${escapeHtml(job.label)}</code>` : ""}`;
     return;
   }
   if (String(currentLogSource || "").startsWith("service:")) {
@@ -690,6 +707,8 @@ currentLogHeading = function () {
   if (currentLogSource === "update") return "Update Logs";
   if (currentLogSource === "audit") return "Audit Logs";
   if (currentLogSource === "debug") return "Debug Logs";
+  if (currentLogSource === "benchmarks") return "Benchmark Logs";
+  if (currentLogSource === "script") return "Script Logs";
   if (String(currentLogSource || "").startsWith("service:")) {
     const serviceId = String(currentLogSource).split(":", 2)[1] || "";
     const service = (lastStatus?.upstream_services || []).find(
@@ -703,6 +722,8 @@ currentLogLabel = function () {
   if (currentLogSource === "update") return "source: updater";
   if (currentLogSource === "audit") return "source: audit";
   if (currentLogSource === "debug") return "source: debug";
+  if (currentLogSource === "benchmarks") return "source: benchmarks";
+  if (currentLogSource === "script") return "source: script";
   if (String(currentLogSource || "").startsWith("service:")) {
     const serviceId = String(currentLogSource).split(":", 2)[1] || "";
     const service = (lastStatus?.upstream_services || []).find(
@@ -758,6 +779,8 @@ function logSourceNameFromSignature(signature = "") {
   const value = String(signature || "").trim().toLowerCase();
   if (!value) return "docker";
   if (value === "audit" || value === "debug") return value;
+  if (value === "benchmarks") return "benchmarks";
+  if (value.startsWith("script:")) return "script";
   if (value.startsWith("update:")) return "update";
   if (value.startsWith("service:")) return "service";
   if (value.startsWith("docker:")) return "docker";
@@ -940,6 +963,12 @@ applyLogVisibility = function () {
 };
 function logStreamConfig() {
   if (currentLogSource === "update") {
+    if (!updateMonitor.streamUrl && !updateMonitor.token) {
+      return {
+        signature: "update:pending",
+        url: "",
+      };
+    }
     return {
       signature: `update:${updateMonitor.token || "active"}`,
       url: updateMonitor.streamUrl || "/admin/update-stream",
@@ -949,6 +978,10 @@ function logStreamConfig() {
     return { signature: "audit", url: "/admin/audit-stream?tail=4000" };
   if (currentLogSource === "debug")
     return { signature: "debug", url: "/admin/debug-stream?tail=4000" };
+  if (currentLogSource === "benchmarks")
+    return { signature: "benchmarks", url: "/admin/logs?source=benchmarks&tail=4000" };
+  if (currentLogSource === "script")
+    return { signature: `script:${lastStatus?.script_job?.job_id || "latest"}`, url: "/admin/logs?source=script&tail=4000" };
   if (String(currentLogSource || "").startsWith("service:")) {
     const serviceId = String(currentLogSource).split(":", 2)[1] || "";
     return {
@@ -956,9 +989,13 @@ function logStreamConfig() {
       url: `/admin/logs?source=service&service=${encodeURIComponent(serviceId)}`,
     };
   }
-  const tracked = trackedLogRuntime();
-  const target = tracked || dockerLogTarget();
   const explicit = selectedDockerLogInstanceId();
+  const tracked = explicit
+    ? runtimeTrackingItems().find(
+        (row) => String(row?.id || row?.instance_id || "").trim().toUpperCase() === explicit,
+      )
+    : null;
+  const target = tracked || dockerLogTarget();
   const instanceId = explicit
     ? explicit
     : tracked && (tracked.id || tracked.instance_id)
@@ -973,6 +1010,8 @@ function noteKnownLogSource(source) {
   const normalized =
     source === "audit" ||
     source === "debug" ||
+    source === "benchmarks" ||
+    source === "script" ||
     source === "docker" ||
     source === "update" ||
     String(source || "").startsWith("service:")
@@ -995,13 +1034,19 @@ function logBootstrapUrlForSource(source) {
   if (normalized === "update") return null;
   if (normalized === "audit") return "/admin/log-bootstrap?source=audit&tail=250";
   if (normalized === "debug") return "/admin/log-bootstrap?source=debug&tail=250";
+  if (normalized === "benchmarks") return "/admin/log-bootstrap?source=benchmarks&tail=250";
+  if (normalized === "script") return "/admin/log-bootstrap?source=script&tail=250";
   if (String(normalized).startsWith("service:")) {
     const serviceId = String(normalized).split(":", 2)[1] || "";
     return `/admin/log-bootstrap?source=service&service=${encodeURIComponent(serviceId)}&tail=250`;
   }
-  const tracked = trackedLogRuntime();
-  const target = tracked || dockerLogTarget();
   const explicit = selectedDockerLogInstanceId();
+  const tracked = explicit
+    ? runtimeTrackingItems().find(
+        (row) => String(row?.id || row?.instance_id || "").trim().toUpperCase() === explicit,
+      )
+    : null;
+  const target = tracked || dockerLogTarget();
   const instanceId = explicit
     ? explicit
     : tracked && (tracked.id || tracked.instance_id)
@@ -1043,6 +1088,13 @@ function scheduleLogCacheRefresh(delayMs = LOG_CACHE_REFRESH_MS) {
   }, delay);
   if (delayMs === 0) refreshBackgroundLogCaches().catch(() => {});
 }
+function scheduleLogStreamReconnect(delayMs = 5000) {
+  if (logReconnectTimer) clearTimeout(logReconnectTimer);
+  logReconnectTimer = setTimeout(() => {
+    logReconnectTimer = null;
+    if (logViewerVisible()) connectLogs(false);
+  }, Math.max(1000, Number(delayMs || 5000)));
+}
 function currentLogExportRequest() {
   if (currentLogSource === "update") {
     return { source: "update", instance_id: null };
@@ -1064,12 +1116,9 @@ function currentLogExportRequest() {
   }
   const explicit = selectedDockerLogInstanceId();
   if (explicit) return { source: "docker", instance_id: explicit };
-  const tracked = trackedLogRuntime();
-  const target = tracked || dockerLogTarget();
+  const target = dockerLogTarget();
   const instanceId =
-    tracked && (tracked.id || tracked.instance_id)
-      ? tracked.id || tracked.instance_id
-      : target && target.id;
+    target && target.id;
   return { source: "docker", instance_id: instanceId || null };
 }
 function detachedPopupDockerInstanceId(state) {
@@ -1363,11 +1412,14 @@ function syncDetachedLogPopupStream(state) {
   es.addEventListener("append", (event) => handle("append", event.data));
   es.onmessage = (event) => handle("append", event.data);
   es.onerror = () => {
-    if (!popupLogWindowOpen(signature) && state.es) {
+    if (state.es) {
       try {
         state.es.close();
       } catch (e) {}
       state.es = null;
+    }
+    if (popupLogWindowOpen(signature)) {
+      setTimeout(() => syncDetachedLogPopupStream(state), 5000);
     }
   };
 }
@@ -1467,11 +1519,27 @@ connectLogs = function (force = false) {
     return;
   }
   currentLogSignature = cfg.signature;
+  if (!cfg.url && cfg.signature === "update:pending") {
+    replaceLogBuffer(cfg.signature, "Waiting for updater handoff...\n");
+  }
   renderCurrentLog(cfg.signature, { follow: !!$("autoscroll")?.checked });
   updateLogVisualMode();
   renderDebugLogCommandUi();
   refreshLogCacheSnapshot(currentLogSource, { signature: cfg.signature }).catch(() => {});
+  if (!cfg.url) {
+    if (logEs) {
+      try {
+        logEs.close();
+      } catch (e) {}
+      logEs = null;
+    }
+    return;
+  }
   if (!visible) return;
+  if (logReconnectTimer) {
+    clearTimeout(logReconnectTimer);
+    logReconnectTimer = null;
+  }
   const token = ++logConnectToken;
   if (logEs) {
     try {
@@ -1530,6 +1598,11 @@ connectLogs = function (force = false) {
   };
   es.onerror = () => {
     if (token !== logConnectToken) return;
+    try {
+      es.close();
+    } catch (error) {}
+    if (logEs === es) logEs = null;
+    scheduleLogStreamReconnect(5000);
   };
 };
 setCurrentLogSource = function (source) {
@@ -1537,6 +1610,8 @@ setCurrentLogSource = function (source) {
     source === "audit" ||
     source === "debug" ||
     source === "docker" ||
+    source === "benchmarks" ||
+    source === "script" ||
     source === "update" ||
     String(source || "").startsWith("service:")
       ? String(source)
@@ -1581,6 +1656,14 @@ setScope = function (scope, reconnect = true) {
 };
 function focusAuditLogs() {
   if (currentLogSource !== "audit") setCurrentLogSource("audit");
+  activateTab("logs", true);
+}
+function focusBenchmarkLogs() {
+  if (currentLogSource !== "benchmarks") setCurrentLogSource("benchmarks");
+  activateTab("logs", true);
+}
+function focusScriptLogs() {
+  if (currentLogSource !== "script") setCurrentLogSource("script");
   activateTab("logs", true);
 }
 function clearActiveLogJump() {
@@ -1684,6 +1767,8 @@ post = async function (path, obj, label = "", options = {}) {
     if (!r.ok || (payload && payload.ok === false))
       throw new Error((payload && payload.error) || text || `${path} failed`);
     if (payload && payload.focus_log_source === "audit") focusAuditLogs();
+    if (payload && payload.focus_log_source === "benchmarks") focusBenchmarkLogs();
+    if (payload && payload.focus_log_source === "script") focusScriptLogs();
     if (payload && payload.focus_log_source === "update") beginUpdateMonitor(payload, obj?.scope);
     if (!silentSuccess) {
       syntheticLog(`request finished: ${requestLabel}`);
@@ -1707,15 +1792,9 @@ post = async function (path, obj, label = "", options = {}) {
   }
 };
 metricTab = function (e, n) {
-  document
-    .querySelectorAll(".metricpane")
-    .forEach((x) => x.classList.remove("active"));
-  document
-    .querySelectorAll(".subtab")
-    .forEach((x) => x.classList.remove("active"));
-  const pane = $(n);
-  if (pane) pane.classList.add("active");
-  if (e && e.target) e.target.classList.add("active");
+  setActiveMetricPaneInDocument(document, n);
+  writeCachedUiState(currentUiState());
+  queueUiStateSave();
   redrawMetricsSoon();
   refreshStatus({ force: true }).catch(() => {});
 };
@@ -1823,17 +1902,48 @@ async function submitWakeOnLanModal() {
   }
   resolveWakeOnLanModal(mac);
 }
-async function machineAction(action) {
-  const label = action === "reboot" ? "RESTART" : "SHUT DOWN";
-  if (!(await openClubConfirmModal(label + " machine now?"))) return;
-  if (!(await openClubConfirmModal("Final confirmation: " + label + " now."))) return;
+let machineRestartLongPressTimer = null;
+let machineRestartForceArmed = false;
+function beginMachineRestartPress(event) {
+  if (event?.button !== undefined && event.button !== 0) return;
+  machineRestartForceArmed = false;
+  if (machineRestartLongPressTimer) clearTimeout(machineRestartLongPressTimer);
+  machineRestartLongPressTimer = setTimeout(() => {
+    machineRestartForceArmed = true;
+    $("restartMachineBtn")?.classList.add("force-armed");
+  }, 900);
+}
+function endMachineRestartPress() {
+  if (machineRestartLongPressTimer) clearTimeout(machineRestartLongPressTimer);
+  machineRestartLongPressTimer = null;
+}
+function cancelMachineRestartPress() {
+  if (machineRestartLongPressTimer) clearTimeout(machineRestartLongPressTimer);
+  machineRestartLongPressTimer = null;
+  machineRestartForceArmed = false;
+  $("restartMachineBtn")?.classList.remove("force-armed");
+}
+async function machineAction(action, event = null) {
+  const forceRestart = action === "reboot" && (!!event?.shiftKey || machineRestartForceArmed);
+  machineRestartForceArmed = false;
+  $("restartMachineBtn")?.classList.remove("force-armed");
+  const label = forceRestart ? "FORCE RESTART" : action === "reboot" ? "RESTART" : "SHUT DOWN";
+  const firstPrompt = forceRestart
+    ? "Force restart machine now? This bypasses graceful shutdown and is intended for unrecoverable GPU/driver failures."
+    : label + " machine now?";
+  const secondPrompt = forceRestart
+    ? "Final confirmation: FORCE RESTART now. This is equivalent to pressing the case reset button."
+    : "Final confirmation: " + label + " now.";
+  if (!(await openClubConfirmModal(firstPrompt))) return;
+  if (!(await openClubConfirmModal(secondPrompt))) return;
   try {
-    await post("/admin/machine", { action });
+    await post("/admin/machine", { action: forceRestart ? "force_reboot" : action });
   } catch (e) {
     alert(e);
   }
 }
 function syncActiveTabDisplay() {
+  applyLocationUiStateOverride();
   document
     .querySelectorAll(".tabpane")
     .forEach((x) => x.classList.remove("active"));

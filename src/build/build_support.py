@@ -5,6 +5,7 @@ import base64
 import gzip
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -19,18 +20,27 @@ ROOT = SRC_DIR.parent
 CONTROL_SOURCE_DIR = SRC_DIR / "control"
 WEB_SOURCE_DIR = SRC_DIR / "web"
 VENDOR_SOURCE_DIR = BUILD_DIR / "vendor"
+EXTENSIONS_SOURCE_DIR = ROOT / "extensions"
+UPSTREAM_RUNTIME_DIR = ROOT / "club-3090"
+UPSTREAM_RUNTIME_REPO_URL = os.environ.get("CLUB3090_UPSTREAM_REPO_URL", "https://github.com/noonghunna/club-3090.git")
 LOGS_DIR = ROOT / "logs"
+ARTIFACTS_DIR = ROOT / "artifacts"
 SCRIPT_SOURCE_NAME = "base.sh"
 SCRIPT_OUTPUT_NAME = "install-club3090-server.sh"
 SCRIPT_SOURCE_PATH = BUILD_DIR / SCRIPT_SOURCE_NAME
 SCRIPT_OUTPUT_PATH = ROOT / SCRIPT_OUTPUT_NAME
 METADATA_FILE = ROOT / "metadata.json"
 UPDATER_SOURCE_PATH = BUILD_DIR / "updater.py"
-UPDATER_OUTPUT_PATH = ROOT / "updater.py"
-CONTROL_OUTPUT_PATH = ROOT / "control.py"
-WEB_HTML_OUTPUT_PATH = ROOT / "web-ui.html"
-WEB_CSS_OUTPUT_PATH = ROOT / "web-ui.css"
-WEB_JS_OUTPUT_PATH = ROOT / "web-ui.js"
+UPDATER_OUTPUT_PATH = ARTIFACTS_DIR / "updater.py"
+CONTROL_OUTPUT_PATH = ARTIFACTS_DIR / "control.py"
+WEB_HTML_OUTPUT_PATH = ARTIFACTS_DIR / "base.html"
+WEB_CSS_OUTPUT_PATH = ARTIFACTS_DIR / "base.css"
+WEB_JS_OUTPUT_PATH = ARTIFACTS_DIR / "base.js"
+WEB_BUNDLE_HTML_OUTPUT_PATH = ARTIFACTS_DIR / "web-ui.bundle.html"
+WEB_MIN_CSS_OUTPUT_PATH = ARTIFACTS_DIR / "web-ui.min.css"
+WEB_MIN_JS_OUTPUT_PATH = ARTIFACTS_DIR / "web-ui.min.js"
+WEB_SHIP_RAW_HTML_OUTPUT_PATH = ARTIFACTS_DIR / "web-ui.ship.raw.html"
+WEB_SHIP_HTML_OUTPUT_PATH = ARTIFACTS_DIR / "web-ui.html"
 WEB_BASE_HTML_PATH = WEB_SOURCE_DIR / "base.html"
 WEB_BASE_CSS_PATH = WEB_SOURCE_DIR / "base.css"
 CODE_SYNTAX_PATH = WEB_SOURCE_DIR / "code_syntax.json"
@@ -40,7 +50,7 @@ FIXTURES_DIR = BUILD_DIR / "text-fixtures"
 BUILD_REPORT_PATH = LOGS_DIR / "build-report.json"
 BUILD_LAST_SUCCESS_PATH = LOGS_DIR / "build-last-success.json"
 BUILD_LOG_PATH = LOGS_DIR / "build.log"
-TEST_HTML_PATH = ROOT / "web-ui.test.html"
+TEST_HTML_PATH = ARTIFACTS_DIR / "web-ui.test.html"
 HIGHLIGHT_SUPPORTED_LANGUAGES_PATH = ROOT / "node_modules" / "highlight.js" / "SUPPORTED_LANGUAGES.md"
 CONTROL_SOURCE_ORDER = [
     "shared.py",
@@ -51,6 +61,9 @@ CONTROL_SOURCE_ORDER = [
     "auth.py",
     "presets.py",
     "instances.py",
+    "benchmarks.py",
+    "scripts.py",
+    "image_studio.py",
     "logs.py",
     "system.py",
     "proxy_chat.py",
@@ -102,6 +115,7 @@ GENERATED_ROOT_OUTPUTS = [
     "web-ui.html",
     "web-ui.css",
     "web-ui.js",
+    "web-ui.test.html",
 ]
 DERIVED_ROOT_GLOBS = [
     "_tmp_*",
@@ -168,12 +182,35 @@ def compose_web_js_source() -> str:
     return compose_split_source(WEB_SOURCE_DIR, WEB_JS_SOURCE_ORDER, comment_prefix="//")
 
 
-def sync_generated_root_sources(control_source: str, updater_text: str, html_text: str, css_text: str, js_text: str, script_text: str) -> None:
+def sync_generated_root_sources(
+    *,
+    control_source: str,
+    updater_text: str,
+    html_text: str,
+    css_text: str,
+    js_text: str,
+    script_text: str,
+    bundle_html: str = "",
+    min_css: str = "",
+    min_js: str = "",
+    ship_raw_html: str = "",
+    ship_html: str = "",
+) -> None:
     write_text(CONTROL_OUTPUT_PATH, control_source)
     write_text(UPDATER_OUTPUT_PATH, updater_text)
     write_text(WEB_HTML_OUTPUT_PATH, html_text)
     write_text(WEB_CSS_OUTPUT_PATH, css_text)
     write_text(WEB_JS_OUTPUT_PATH, js_text)
+    if bundle_html:
+        write_text(WEB_BUNDLE_HTML_OUTPUT_PATH, bundle_html)
+    if min_css:
+        write_text(WEB_MIN_CSS_OUTPUT_PATH, min_css)
+    if min_js:
+        write_text(WEB_MIN_JS_OUTPUT_PATH, min_js)
+    if ship_raw_html:
+        write_text(WEB_SHIP_RAW_HTML_OUTPUT_PATH, ship_raw_html)
+    if ship_html:
+        write_text(WEB_SHIP_HTML_OUTPUT_PATH, ship_html)
     write_text(SCRIPT_OUTPUT_PATH, script_text)
 
 
@@ -198,6 +235,83 @@ def load_build_metadata_inputs() -> dict[str, str]:
         "hash": hashlib.sha256(raw_text.encode("utf-8")).hexdigest(),
         "mtime": METADATA_FILE.stat().st_mtime,
     }
+
+
+def expected_upstream_runtime_commit() -> str:
+    try:
+        payload = json.loads(read_text(METADATA_FILE))
+    except Exception:
+        return ""
+    compat = payload.get("club3090_version") or {}
+    if not isinstance(compat, dict):
+        return ""
+    commit = str(compat.get("commit") or "").strip()
+    return commit if re.fullmatch(r"[0-9a-fA-F]{7,40}", commit) else ""
+
+
+def ensure_upstream_runtime_checkout() -> Path:
+    target = UPSTREAM_RUNTIME_DIR
+    commit = expected_upstream_runtime_commit()
+    if not target.exists():
+        result = subprocess.run(
+            ["git", "clone", UPSTREAM_RUNTIME_REPO_URL, str(target)],
+            cwd=str(ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=600,
+        )
+        if result.returncode != 0:
+            detail = (result.stdout or "git clone failed").strip()[-2000:]
+            raise RuntimeError(f"Could not clone upstream club-3090 checkout from {UPSTREAM_RUNTIME_REPO_URL}: {detail}")
+    if not (target / ".git").exists():
+        raise RuntimeError(f"{target.relative_to(ROOT)} exists but is not a Git checkout")
+    if commit:
+        current = subprocess.run(
+            ["git", "-C", str(target), "rev-parse", "HEAD"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=30,
+        )
+        current_head = str(current.stdout or "").strip()
+        if current.returncode != 0:
+            detail = (current.stdout or "git rev-parse failed").strip()[-1200:]
+            raise RuntimeError(f"Could not inspect upstream club-3090 checkout: {detail}")
+        if not current_head.lower().startswith(commit.lower()):
+            fetch = subprocess.run(
+                ["git", "-C", str(target), "fetch", "--tags", "origin"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=600,
+            )
+            if fetch.returncode != 0:
+                detail = (fetch.stdout or "git fetch failed").strip()[-2000:]
+                raise RuntimeError(f"Could not fetch upstream club-3090 commit {commit}: {detail}")
+            checkout = subprocess.run(
+                ["git", "-C", str(target), "checkout", "--detach", commit],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=120,
+            )
+            if checkout.returncode != 0:
+                detail = (checkout.stdout or "git checkout failed").strip()[-2000:]
+                raise RuntimeError(f"Could not check out upstream club-3090 commit {commit}: {detail}")
+    return target
 
 
 def bump_version_suffix(suffix: str) -> str:
@@ -271,24 +385,70 @@ def normalize_release_change_entries(changes: list[str]) -> list[str]:
     return entries
 
 
+def dedupe_release_change_entries(entries: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw in entries or []:
+        text = sanitize_metadata_text(raw)
+        if not text:
+            continue
+        key = re.sub(r"\s+", " ", text.strip())
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(text)
+    return cleaned
+
+
+def dedupe_release_change_text(text: str) -> str:
+    lines = sanitize_metadata_text(text).splitlines()
+    entries: list[str] = []
+    passthrough: list[str] = []
+    for raw in lines:
+        stripped = raw.strip()
+        if stripped.startswith("• "):
+            entries.append(stripped)
+        elif stripped:
+            passthrough.append(stripped)
+    deduped_entries = dedupe_release_change_entries(entries)
+    return "\n".join([*passthrough, *deduped_entries]).strip()
+
+
 def update_metadata_for_build(
     changes: list[str],
     *,
     iterative: bool = False,
     release_date: str | None = None,
+    target_version: str | None = None,
 ) -> tuple[dict[str, str], str]:
     raw_text = read_text(METADATA_FILE)
     payload = json.loads(raw_text)
     current_version = str(payload.get("version") or "").strip()
-    current_latest = sanitize_metadata_text(payload.get("change_log_latest") or "")
+    current_latest = dedupe_release_change_text(payload.get("change_log_latest") or "")
     current_release = sanitize_metadata_text(payload.get("change_log_release") or "")
-    next_version = bump_iterative_version(current_version) if iterative else bump_patch_version(current_version)
+    requested_version = str(target_version or "").strip()
+    if requested_version:
+        if iterative:
+            raise ValueError("--version cannot be combined with --iterative")
+        if not re.fullmatch(r"\d+\.\d+\.\d+(?:[a-z]*)?", requested_version):
+            raise ValueError("target version must use major.minor.patch with an optional letter suffix")
+        next_version = requested_version
+    else:
+        next_version = bump_iterative_version(current_version) if iterative else bump_patch_version(current_version)
     current_base_version = base_release_version(current_version)
     next_base_version = base_release_version(next_version)
     next_release_date = str(release_date or date.today().isoformat()).strip()
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", next_release_date):
         raise ValueError("release_date must use YYYY-MM-DD format")
-    change_entries = normalize_release_change_entries(changes)
+    normalized_change_entries = normalize_release_change_entries(changes)
+    icon_issues = validate_changelog_icons(
+        "\n".join(normalized_change_entries),
+        payload.get("change_log_icons") or {},
+        "--change",
+    )
+    if icon_issues:
+        raise ValueError("; ".join(icon_issues))
+    change_entries = dedupe_release_change_entries(normalized_change_entries)
     release_sections = split_release_sections(current_release)
     carried_latest_entries = [current_latest] if current_latest and current_base_version == next_base_version else []
     remaining_release_sections: list[tuple[str, str]] = []
@@ -296,14 +456,14 @@ def update_metadata_for_build(
         section_base = base_release_version(section_version.lstrip("v"))
         if section_base == next_base_version:
             if section_body:
-                carried_latest_entries.append(section_body)
+                carried_latest_entries.append(dedupe_release_change_text(section_body))
             continue
         remaining_release_sections.append((section_version, section_body))
-    next_latest = "\n".join(
+    next_latest = dedupe_release_change_text("\n".join(
         part
         for part in [*carried_latest_entries, "\n".join(change_entries)]
         if str(part or "").strip()
-    )
+    ))
     release_sections: list[str] = []
     if current_latest and current_base_version != next_base_version:
         release_sections.append(f"v{base_release_version(current_version)}\n\n{current_latest}")
@@ -316,8 +476,9 @@ def update_metadata_for_build(
     payload["change_log_latest"] = next_latest
     payload["change_log_release"] = "\n\n".join(section for section in release_sections if section.strip())
     write_text(METADATA_FILE, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-    build_mode = "iterative letter suffix" if iterative else "patch version bump"
-    detail = f"metadata.json updated automatically from v{current_version} to v{next_version} using {len(normalize_release_change_entries(changes))} supplied change entr{'y' if len(normalize_release_change_entries(changes)) == 1 else 'ies'} via {build_mode}"
+    build_mode = "explicit version override" if requested_version else ("iterative letter suffix" if iterative else "patch version bump")
+    entry_count = len(normalized_change_entries)
+    detail = f"metadata.json updated automatically from v{current_version} to v{next_version} using {entry_count} supplied change entr{'y' if entry_count == 1 else 'ies'} via {build_mode}"
     return load_build_metadata_inputs(), detail
 
 
@@ -427,9 +588,15 @@ def bash_single_quote(value: str) -> str:
     return "'" + str(value or "").replace("'", "'\"'\"'") + "'"
 
 
+CHANGELOG_ICON_SEQUENCE_RE = r"(?:🟢|🐞|🔴|🔒|⚡|🖥️|🛠️|🧪|🔄|📝|🧰|🧩|⚙️)"
+
+
 def sanitize_metadata_text(value: str) -> str:
     text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+    text = re.sub(r"(?:\|\||\\n)\s*•\s*", "\n• ", text)
+    text = re.sub(rf"(?:\|\||\\n)\s*(?={CHANGELOG_ICON_SEQUENCE_RE})", "\n• ", text)
+    text = re.sub(rf"\n\s*(?={CHANGELOG_ICON_SEQUENCE_RE})", "\n• ", text)
     return text.strip()
 
 
@@ -461,9 +628,10 @@ def validate_changelog_icons(change_log_text: str, icons: dict[str, str], field_
     allowed_icons = {str(value).strip() for value in (icons or {}).values() if str(value).strip()}
     for line in text.splitlines():
         stripped = line.strip()
-        if not stripped or not stripped.startswith("- "):
+        if stripped.startswith("- ") or stripped.startswith("• "):
+            body = stripped[2:].strip()
+        else:
             continue
-        body = stripped[2:].strip()
         if not body:
             continue
         icon = body.split(" ", 1)[0].strip()
@@ -537,6 +705,186 @@ def parse_highlight_supported_languages(markdown_text: str) -> list[tuple[str, l
     return rows
 
 
+def fallback_highlight_supported_languages() -> list[tuple[str, list[str]]]:
+    rows = """
+1C Enterprise|1c
+4D|4d
+ABNF|abnf
+Access logs|accesslog
+Ada|ada
+AngelScript|angelscript,asc
+Apache|apache,apacheconf
+AppleScript|applescript,osascript
+Arcade|arcade
+Arduino|arduino,ino
+ARM Assembly|armasm,arm
+AsciiDoc|asciidoc,adoc
+AspectJ|aspectj
+AutoHotkey|autohotkey,ahk
+AutoIt|autoit
+AVR Assembly|avrasm
+Awk|awk,mawk,nawk,gawk
+Bash|bash,sh,zsh,shell
+Basic|basic
+BNF|bnf
+Brainfuck|brainfuck,bf
+C|c,h
+C#|csharp,cs
+C++|cpp,c,cc,c++,h,hpp,hxx
+C/AL|cal
+Cache Object Script|cos,cls
+CMake|cmake,cmake.in
+Coq|coq
+CSP|csp
+CSS|css
+D|d
+Dart|dart
+Delphi|delphi,dpr,dfm,pas,pascal
+Diff|diff,patch
+Django|django,jinja
+DNS Zone|dns,zone,bind
+Dockerfile|dockerfile,docker
+DOS|dos,bat,cmd
+DSConfig|dsconfig
+DTS|dts
+Dust|dust,dst
+EBNF|ebnf
+Elixir|elixir,ex,exs
+Elm|elm
+ERB|erb
+Erlang|erlang,erl
+Excel|excel,xls,xlsx
+FIX|fix
+Flix|flix
+Fortran|fortran,f90,f95
+F#|fsharp,fs,fsx
+G-Code|gcode,nc
+Gams|gams,gms
+GAUSS|gauss,gss
+Gherkin|gherkin,feature
+GLSL|glsl,vert,frag
+GML|gml
+Go|go,golang
+Golo|golo
+Gradle|gradle
+GraphQL|graphql,gql
+Groovy|groovy
+HTML/XML|xml,html,xhtml,rss,atom,xjb,xsd,xsl,plist,svg
+HTTP|http,https
+Haml|haml
+Handlebars|handlebars,hbs,html.hbs,html.handlebars
+Haskell|haskell,hs
+Haxe|haxe,hx
+Hy|hy,hylang
+Ini|ini,toml,properties,conf,cfg,dosini,env,dotenv
+Inform7|inform7,i7
+IRPF90|irpf90
+JSON|json,jsonc,json5
+Java|java,jsp
+JavaScript|javascript,js,jsx,mjs,cjs
+Julia|julia,jl
+Kotlin|kotlin,kt,kts
+LaTeX|latex,tex
+Leaf|leaf
+Less|less
+Lisp|lisp,cl,el,clojure,clj,edn,scheme,scm,racket
+LiveCode Server|livecodeserver
+LiveScript|livescript,ls
+LLVM IR|llvm
+Lua|lua
+Makefile|makefile,mk,mak
+Markdown|markdown,md,mkdown,mkd
+Mathematica|mathematica,mma,wl
+Matlab|matlab
+Maxima|maxima
+MEL|mel
+Mercury|mercury
+MIPS Assembly|mipsasm,mips
+Mizar|mizar
+Mojolicious|mojolicious
+Monkey|monkey
+Moonscript|moonscript,moon
+N1QL|n1ql
+NestedText|nestedtext,nt
+Nginx|nginx,nginxconf
+Nim|nim
+Nix|nix
+NSIS|nsis
+Objective-C|objectivec,obj-c,objc,mm
+OCaml|ocaml,ml
+OpenSCAD|openscad,scad
+Oxygene|oxygene
+Parser3|parser3
+Perl|perl,pl,pm
+PF|pf,pf.conf
+PHP|php,php3,php4,php5,php6,php7,php8,php-template
+Pony|pony
+PowerShell|powershell,ps,ps1,pwsh
+Processing|processing
+Profile|profile
+Prolog|prolog
+Protocol Buffers|protobuf,proto
+Puppet|puppet,pp
+PureBASIC|purebasic,pb,pbi
+Python|python,py,gyp,ipython
+Q|q,k,kdb
+QML|qml
+R|r
+ReasonML|reasonml,re
+RenderMan RIB|rib
+RenderMan RSL|rsl
+Roboconf|roboconf,graph,instances
+RouterOS|routeros,mikrotik
+Ruby|ruby,rb,gemspec,podspec,thor,irb
+Rust|rust,rs
+SAS|sas
+Scala|scala
+Scheme|scheme,scm
+Scilab|scilab,sci
+SCSS|scss
+Shell Session|shellsession,console
+Smali|smali
+Smalltalk|smalltalk,st
+SML|sml,ml
+SQF|sqf
+SQL|sql,postgres,postgresql,pgsql,mysql,sqlite,plsql
+Stan|stan,stanfuncs
+Stata|stata
+STEP Part 21|step,p21,step21
+Stylus|stylus,styl
+SubUnit|subunit
+Swift|swift
+Tagger Script|taggerscript
+TAP|tap
+Tcl|tcl,tk
+Thrift|thrift
+TP|tp
+Twig|twig,craftcms
+TypeScript|typescript,ts,tsx,mts,cts
+VB.NET|vbnet,vb
+VBScript|vbscript,vbs
+VHDL|vhdl
+Vim Script|vim
+WebAssembly|wasm
+Wren|wren
+X86 Assembly|x86asm,asm,nasm
+XL|xl,tao
+XQuery|xquery,xq,xqm,xqy
+YAML|yaml,yml
+Zephir|zephir,zep
+""".strip()
+    parsed: list[tuple[str, list[str]]] = []
+    for raw in rows.splitlines():
+        name, _, aliases_text = raw.partition("|")
+        aliases = [
+            normalize_code_syntax_alias(alias)
+            for alias in aliases_text.split(",")
+            if normalize_code_syntax_alias(alias)
+        ]
+        parsed.append((name.strip(), aliases))
+    return parsed
+
+
 def guess_code_syntax_family(language_name: str, aliases: list[str], configured_aliases: dict[str, str]) -> str:
     candidates = [normalize_code_syntax_alias(language_name), *[normalize_code_syntax_alias(alias) for alias in aliases]]
     for candidate in candidates:
@@ -603,14 +951,16 @@ def load_embedded_code_syntax_json() -> str:
     }
     if HIGHLIGHT_SUPPORTED_LANGUAGES_PATH.exists():
         supported_rows = parse_highlight_supported_languages(read_text(HIGHLIGHT_SUPPORTED_LANGUAGES_PATH))
-        for language_name, language_aliases in supported_rows:
-            family = guess_code_syntax_family(language_name, language_aliases, aliases)
-            canonical = normalize_code_syntax_alias(language_name)
-            if canonical and canonical not in aliases:
-                aliases[canonical] = family
-            for alias in language_aliases:
-                if alias and alias not in aliases:
-                    aliases[alias] = family
+    else:
+        supported_rows = fallback_highlight_supported_languages()
+    for language_name, language_aliases in supported_rows:
+        family = guess_code_syntax_family(language_name, language_aliases, aliases)
+        canonical = normalize_code_syntax_alias(language_name)
+        if canonical and canonical not in aliases:
+            aliases[canonical] = family
+        for alias in language_aliases:
+            if alias and alias not in aliases:
+                aliases[alias] = family
     base_config["aliases"] = dict(sorted(aliases.items()))
     base_config["language_alias_count"] = len(base_config["aliases"])
     if base_config["language_alias_count"] < 300:
@@ -622,6 +972,37 @@ def load_embedded_code_syntax_json() -> str:
 
 def compress_code_syntax_json_to_gzip_base64(code_syntax_json: str) -> str:
     return compress_text_to_gzip_base64(code_syntax_json)
+
+
+def compress_ai_studio_extensions_payload_to_gzip_base64() -> str:
+    root = EXTENSIONS_SOURCE_DIR / "comfyui-club3090-preview"
+    payload: dict[str, str] = {}
+    if root.is_dir():
+        for path in sorted(item for item in root.rglob("*") if item.is_file()):
+            rel = path.relative_to(EXTENSIONS_SOURCE_DIR).as_posix()
+            if ".." in rel.split("/"):
+                raise ValueError(f"Invalid AI Studio extension path: {rel}")
+            payload[rel] = read_text(path)
+    else:
+        payload = {
+            "comfyui-club3090-preview/__init__.py": (
+                'WEB_DIRECTORY = "./js"\n'
+                "NODE_CLASS_MAPPINGS = {}\n"
+                "NODE_DISPLAY_NAME_MAPPINGS = {}\n"
+            ),
+            "comfyui-club3090-preview/js/club3090-preview.js": (
+                "import { app } from '../../../scripts/app.js';\n"
+                "app.registerExtension({ name: 'club3090.workflow_preview' });\n"
+            ),
+        }
+    required = {
+        "comfyui-club3090-preview/__init__.py",
+        "comfyui-club3090-preview/js/club3090-preview.js",
+    }
+    missing = sorted(required.difference(payload))
+    if missing:
+        raise ValueError(f"AI Studio extension payload missing required file(s): {', '.join(missing)}")
+    return compress_text_to_gzip_base64(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
 
 
 def compress_html_to_gzip_base64(html_text: str) -> str:
@@ -702,6 +1083,20 @@ def inject_code_syntax_payload_into_control(control_source: str, code_syntax_gzi
     )
     if count != 1:
         raise ValueError("Could not find the code syntax payload placeholder in control.py")
+    return updated
+
+
+def inject_ai_studio_extensions_payload_into_control(control_source: str, payload_gzip_base64: str) -> str:
+    replacement = f'AI_STUDIO_EXTENSION_PAYLOAD_GZIP_BASE64 = {json.dumps(str(payload_gzip_base64 or ""))}\n'
+    updated, count = re.subn(
+        r'^AI_STUDIO_EXTENSION_PAYLOAD_GZIP_BASE64 = ""\s+# Injected by build\.py for shipped outputs\.\n',
+        lambda _: replacement,
+        control_source,
+        count=1,
+        flags=re.M,
+    )
+    if count != 1:
+        raise ValueError("Could not find the AI Studio extension payload placeholder in control.py")
     return updated
 
 
@@ -832,9 +1227,30 @@ def validate_flow_branches(script_text: str) -> list[str]:
         'if [[ "${ACTION}" == "update" || "${ACTION}" == "migrate" ]]',
         'if [[ "${ACTION}" == "migrate" ]]',
         'migrate_repo_checkout',
+        'migrate_custom_presets_cli',
         'log_step "Writing embedded control backend to ${CONTROL_PY}"',
+        'ufw status numbered',
+        'systemctl is-active --quiet club3090-caddy.service',
+        'CONTROL_HTTP_READY_TIMEOUT_SECONDS:-60',
+        'wait_for_control_http "${CONTROL_ADMIN_BIND_PORT}" "${control_wait_seconds}"',
+        'Caddy obtains and renews ts.net certificates directly from tailscaled.',
+        'get_certificate tailscale',
+        'emit_fallback_routes="false"',
+        'Environment=XDG_DATA_HOME=${CONTROL_DIR}/caddy-data',
+        'EXISTING_CONTROL_ADMIN_BIND_PORT',
+        'club3090-cert-refresh.timer',
+        'OnUnitActiveSec=1d',
+        '--webroot-path "${ACME_WEBROOT}"',
+        'temporary NAT-PMP TCP/80 lease opened',
+        'ExecReload=$(command -v caddy) reload',
+        'admin 127.0.0.1:2019',
+        'default_sni %s',
     ]
     missing = [item for item in required if item not in script_text]
+    if "admin off" in script_text:
+        missing.append("Caddy reload support requires its loopback-only admin API")
+    if "tailscale cert --cert-file" in script_text:
+        missing.append("Tailscale HTTPS must use Caddy's auto-renewing certificate manager")
     return missing
 
 
@@ -895,6 +1311,8 @@ def run_command(args: list[str], cwd: Path, timeout_seconds: int = DEFAULT_TOOL_
             cwd=str(cwd),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
             timeout=timeout_seconds,
         )
@@ -914,7 +1332,7 @@ def minify_css_with_clean_css(css_text: str, cwd: Path) -> tuple[str, str]:
     out_path = cwd / "web-ui.cleancss.min.css"
     cli_path = (ROOT / "node_modules" / "clean-css-cli" / "bin" / "cleancss").resolve()
     if not cli_path.exists():
-        raise RuntimeError("Local clean-css-cli install was not found at node_modules/clean-css-cli/bin/cleancss")
+        return minify_css(css_text), "internal CSS minifier fallback; clean-css-cli was not installed"
     write_text(source_path, css_text)
     result = run_command(["node", str(cli_path), "-O1", "-o", str(out_path), str(source_path)], cwd)
     try:
@@ -954,7 +1372,7 @@ def minify_js_with_terser(js_text: str, cwd: Path) -> tuple[str, str]:
     runner_path = cwd / "web-ui.terser.runner.cjs"
     terser_entry = (ROOT / "node_modules" / "terser" / "dist" / "bundle.min.js").resolve()
     if not terser_entry.exists():
-        raise RuntimeError("Local terser install was not found at node_modules/terser/dist/bundle.min.js")
+        return js_text.strip(), "unminified JavaScript fallback; terser was not installed"
     write_text(source_path, js_text)
     runner = """const fs = require('fs');
 const terser = require(process.argv[4]);

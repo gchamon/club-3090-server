@@ -242,7 +242,16 @@ def read_instances_config():
         rows = normalize_instances(data, substitutions=substitutions)
     except Exception:
         rows = normalize_instances([], substitutions=substitutions)
+    rows, overlap_changed, overlap_skipped = normalize_enabled_instance_selection(rows)
     changed = bool(substitutions)
+    if overlap_changed:
+        changed = True
+        for item in overlap_skipped:
+            inst = item.get("instance") or {}
+            log_control(
+                f"INSTANCE enabled overlap repaired {inst.get('id') or 'instance'}: "
+                f"{item.get('reason') or 'overlaps selected autoboot runtime'}"
+            )
     if changed or not os.path.exists(INSTANCES_CONFIG_FILE):
         write_instances_config(rows)
     for item in substitutions:
@@ -256,6 +265,7 @@ def read_instances_config():
 
 def write_instances_config(rows):
     rows = normalize_instances(rows)
+    rows, _, _ = normalize_enabled_instance_selection(rows)
     write_json_atomic_if_changed(INSTANCES_CONFIG_FILE, rows, indent=2)
     return rows
 
@@ -384,25 +394,184 @@ def instance_patch_bind_overrides(spec):
     return bindings
 
 
+def ensure_compose_chat_template_targets(spec, model_dir_root):
+    row = spec if isinstance(spec, dict) else {}
+    compose_file = str(row.get("compose_abs_path") or "").strip()
+    model_root = os.path.normpath(str(model_dir_root or "").strip())
+    if not compose_file or not model_root or not os.path.exists(compose_file):
+        return []
+    try:
+        with open(compose_file, "r", encoding="utf-8") as f:
+            text = f.read()
+    except Exception:
+        return []
+    prepared = []
+    prefix = "/root/.cache/huggingface/"
+    compose_dir = str(row.get("compose_project_dir_abs_path") or os.path.dirname(os.path.abspath(compose_file)) or "").strip()
+    bindings = []
+    for raw_line in text.splitlines():
+        match = re.search(
+            r"^\s*-\s*(?P<source>[^:\n#]+):\s*(?P<target>/root/\.cache/huggingface/[^:\s#]+/chat_template\.jinja)(?::|$)",
+            str(raw_line or ""),
+        )
+        if match:
+            bindings.append((str(match.group("source") or "").strip().strip("'\""), match.group("target")))
+    if not bindings:
+        bindings = [("", match.group(1)) for match in re.finditer(r":\s*(/root/\.cache/huggingface/[^:\s#]+/chat_template\.jinja)(?::|$)", text)]
+    for source_text, target in bindings:
+        rel_path = target[len(prefix):] if target.startswith(prefix) else ""
+        if not rel_path or rel_path.startswith("/") or ".." in rel_path.split("/"):
+            continue
+        host_target = os.path.normpath(os.path.join(model_root, *rel_path.split("/")))
+        if not _path_is_within(model_root, host_target):
+            continue
+        source_path = ""
+        if source_text and "$" not in source_text:
+            source_path = os.path.normpath(source_text if os.path.isabs(source_text) else os.path.join(compose_dir, source_text))
+        try:
+            if os.path.isdir(host_target):
+                if os.listdir(host_target):
+                    continue
+                os.rmdir(host_target)
+            os.makedirs(os.path.dirname(host_target), exist_ok=True)
+            if (not os.path.isfile(host_target) or os.path.getsize(host_target) == 0) and source_path and os.path.isfile(source_path):
+                shutil.copy2(source_path, host_target)
+            elif not os.path.exists(host_target):
+                with open(host_target, "w", encoding="utf-8"):
+                    pass
+            if os.path.isfile(host_target):
+                prepared.append(host_target)
+        except Exception:
+            continue
+    return prepared
+
+
+def ensure_carnice_model_support_files(spec, model_dir_root):
+    row = spec if isinstance(spec, dict) else {}
+    selector = str(row.get("selector") or row.get("upstream_tag") or row.get("registry_key") or "").strip()
+    if selector != "vllm/dual-carnice-bf16mtp":
+        return []
+    model_root = os.path.normpath(str(model_dir_root or "").strip())
+    if not model_root:
+        return []
+    source_root = os.path.join(model_root, "qwen3.6-27b-autoround-int4")
+    target_root = os.path.join(model_root, "carnice-v2-27b-int4-recipe-d-bf16mtp")
+    copied = []
+    try:
+        if not _path_is_within(model_root, source_root) or not _path_is_within(model_root, target_root):
+            return []
+        os.makedirs(target_root, exist_ok=True)
+        for name in ("preprocessor_config.json", "processor_config.json"):
+            source = os.path.join(source_root, name)
+            target = os.path.join(target_root, name)
+            if os.path.isfile(target) or not os.path.isfile(source):
+                continue
+            shutil.copy2(source, target)
+            copied.append(target)
+    except Exception:
+        return copied
+    return copied
+
+
 def instance_host_visible_devices(instance):
     return ",".join(str(int(idx)) for idx in (instance.get("gpu_indices") or [instance["gpu_index"]]))
 
 
+def variant_uses_compose_device_ids(spec):
+    compose_file = str((spec or {}).get("compose_abs_path") or "").strip()
+    if not compose_file or not os.path.exists(compose_file):
+        return False
+    try:
+        with open(compose_file, "r", encoding="utf-8") as f:
+            text = f.read()
+    except Exception:
+        return False
+    return "device_ids:" in text and ("ESTATE_GPUS" in text or "CUDA_VISIBLE_DEVICES" in text)
+
+
 def instance_container_cuda_visible_devices(instance):
-    indices = list(instance.get("gpu_indices") or [instance["gpu_index"]])
-    if not indices:
-        return "0"
-    return ",".join(str(idx) for idx in range(len(indices)))
+    indices = [int(idx) for idx in (instance.get("gpu_indices") or [instance["gpu_index"]])]
+    if indices:
+        return ",".join(str(idx) for idx in range(len(indices)))
+    return ""
+
+
+def instance_runtime_cuda_visible_devices(instance, spec=None):
+    # Generated instance overrides replace upstream GPU reservations with
+    # device_ids, so CUDA inside the container must use remapped local ordinals.
+    return instance_container_cuda_visible_devices(instance)
+
+
+def instance_entrypoint_override(spec):
+    row = spec if isinstance(spec, dict) else {}
+    selector = str(row.get("selector") or row.get("upstream_tag") or "").strip()
+    engine_profile = str(row.get("engine_profile") or row.get("profile_engine_id") or "").strip()
+    if selector != "vllm/diffusiongemma-dual" and engine_profile != "vllm-diffusion-gemma":
+        return ""
+    return (
+        "    entrypoint: !override\n"
+        "      - bash\n"
+        "      - -c\n"
+        "      - |\n"
+        "        if [ -r /etc/club3090/detect_nvlink.sh ]; then\n"
+        "          source /etc/club3090/detect_nvlink.sh\n"
+        "        else\n"
+        "          _NVLINK_ENABLED=0\n"
+        "        fi\n"
+        "        args=(\"$$@\")\n"
+        "        model_arg=\"\"\n"
+        "        if [ \"$${#args[@]}\" -gt 0 ]; then\n"
+        "          case \"$${args[0]}\" in\n"
+        "            --model)\n"
+        "              if [ \"$${#args[@]}\" -gt 1 ]; then\n"
+        "                model_arg=\"$${args[1]}\"\n"
+        "                args=(\"$${args[@]:2}\")\n"
+        "              fi\n"
+        "              ;;\n"
+        "            --model=*)\n"
+        "              model_arg=\"$${args[0]#--model=}\"\n"
+        "              args=(\"$${args[@]:1}\")\n"
+        "              ;;\n"
+        "            -*)\n"
+        "              ;;\n"
+        "            *)\n"
+        "              model_arg=\"$${args[0]}\"\n"
+        "              args=(\"$${args[@]:1}\")\n"
+        "              ;;\n"
+        "          esac\n"
+        "        fi\n"
+        "        if [ \"$${_NVLINK_ENABLED:-0}\" = \"1\" ]; then\n"
+        "          if [ -n \"$${model_arg}\" ]; then\n"
+        "            exec vllm serve \"$${model_arg}\" \"$${args[@]}\"\n"
+        "          fi\n"
+        "          exec vllm serve \"$${args[@]}\"\n"
+        "        fi\n"
+        "        if [ -n \"$${model_arg}\" ]; then\n"
+        "          exec vllm serve \"$${model_arg}\" --disable-custom-all-reduce \"$${args[@]}\"\n"
+        "        fi\n"
+        "        exec vllm serve --disable-custom-all-reduce \"$${args[@]}\"\n"
+        "      - --\n"
+    )
+
 
 def write_instance_artifacts(instance):
     spec = instance_variant_spec(instance)
     paths = instance_paths(instance)
     os.makedirs(paths["dir"], exist_ok=True)
     visible_devices = instance_host_visible_devices(instance)
-    container_cuda_visible_devices = instance_container_cuda_visible_devices(instance)
-    cache_root = os.path.join(paths["dir"], "cache")
+    runtime_cuda_visible_devices = instance_runtime_cuda_visible_devices(instance, spec)
+    device_id_lines = "".join(
+        f'                - "{int(idx)}"\n'
+        for idx in (instance.get("gpu_indices") or [instance["gpu_index"]])
+    )
+    cache_root = variant_persistent_cache_host_root(spec) if variant_uses_vllm(spec) else ""
+    if not cache_root:
+        cache_root = ensure_instance_runtime_cache_link(instance["id"])
     ensure_vllm_runtime_cache_dirs(cache_root)
     patch_bindings = instance_patch_bind_overrides(spec)
+    model_dir_root = _resolve_variant_model_dir_root(spec)
+    ensure_compose_chat_template_targets(spec, model_dir_root)
+    ensure_carnice_model_support_files(spec, model_dir_root)
     repo_env = _load_repo_env_map()
     launch_env = resolve_variant_launch_env(spec)
     with open(paths["env"], "w", encoding="utf-8") as f:
@@ -414,27 +583,36 @@ def write_instance_artifacts(instance):
         for key in sorted(launch_env):
             value = str(launch_env.get(key) or "").replace("\r", " ").replace("\n", " ")
             f.write(f"{key}={value}\n")
-        f.write(f"MODEL_DIR={_resolve_variant_model_dir_root(spec)}\n")
+        f.write(f"MODEL_DIR={model_dir_root}\n")
         f.write(f"PORT={int(instance['port'])}\n")
         f.write(f"ESTATE_GPUS={visible_devices}\n")
-        f.write(f"CUDA_VISIBLE_DEVICES={visible_devices}\n")
+        f.write(f"CUDA_VISIBLE_DEVICES={runtime_cuda_visible_devices}\n")
         f.write(f"NVIDIA_VISIBLE_DEVICES={visible_devices}\n")
     override = (
         "services:\n"
         f"  {spec['service_name']}:\n"
         f"    container_name: {instance_container_name(instance)}\n"
         "    environment:\n"
-        f"      ESTATE_GPUS: \"{visible_devices}\"\n"
-        f"      CUDA_VISIBLE_DEVICES: \"{container_cuda_visible_devices}\"\n"
-        f"      NVIDIA_VISIBLE_DEVICES: \"{container_cuda_visible_devices}\"\n"
-        f"      VLLM_CACHE_ROOT: {INSTANCE_VLLM_CACHE_CONTAINER_ROOT}/vllm\n"
-        f"      TORCHINDUCTOR_CACHE_DIR: {INSTANCE_VLLM_CACHE_CONTAINER_ROOT}/torchinductor\n"
-        f"      TRITON_CACHE_DIR: {INSTANCE_VLLM_CACHE_CONTAINER_ROOT}/triton\n"
+        f"      - ESTATE_GPUS={visible_devices}\n"
+        f"      - CUDA_VISIBLE_DEVICES={runtime_cuda_visible_devices}\n"
+        f"      - NVIDIA_VISIBLE_DEVICES={visible_devices}\n"
+        f"      - VLLM_CACHE_ROOT={GLOBAL_VLLM_CACHE_CONTAINER_ROOT}/vllm\n"
+        f"      - TORCHINDUCTOR_CACHE_DIR={GLOBAL_VLLM_CACHE_CONTAINER_ROOT}/torchinductor\n"
+        f"      - TRITON_CACHE_DIR={GLOBAL_VLLM_CACHE_CONTAINER_ROOT}/triton\n"
+        "    deploy:\n"
+        "      resources:\n"
+        "        reservations:\n"
+        "          devices: !override\n"
+        "            - driver: nvidia\n"
+        "              device_ids:\n"
+        f"{device_id_lines}"
+        "              capabilities: [gpu]\n"
         "    volumes:\n"
-        f"      - {cache_root}:{INSTANCE_VLLM_CACHE_CONTAINER_ROOT}\n"
+        f"      - {cache_root}:{GLOBAL_VLLM_CACHE_CONTAINER_ROOT}\n"
     )
     for source, target in patch_bindings:
         override += f"      - {source}:{target}:ro\n"
+    override += instance_entrypoint_override(spec)
     override += (
         "    labels:\n"
         f"      club3090.instance_id: \"{instance['id']}\"\n"
@@ -467,7 +645,12 @@ def instance_compose_args(instance):
     compose_project_dir = os.path.dirname(compose_file) or str(spec.get("compose_project_dir_abs_path") or "").strip()
     if not os.path.exists(compose_file):
         raise RuntimeError(f"Compose file missing for {instance['mode']}: {compose_file}")
-    return compose_cmd() + ["--project-directory", compose_project_dir, "-p", instance_project_name(instance), "--env-file", paths["env"], "-f", compose_file, "-f", paths["override"]]
+    args = compose_cmd() + ["--project-directory", compose_project_dir, "-p", instance_project_name(instance), "--env-file", paths["env"], "-f", compose_file]
+    variant_override = refresh_variant_cache_override(spec)
+    if variant_override:
+        args.extend(["-f", variant_override])
+    args.extend(["-f", paths["override"]])
+    return args
 
 
 def instance_compose_project_dir(instance):
@@ -485,10 +668,15 @@ def instance_subprocess_env(instance):
     env.pop("CLUB3090_GPU", None)
     env["MODEL_DIR"] = _resolve_variant_model_dir_root(spec)
     env["PORT"] = str(int(instance["port"]))
+    env["ESTATE_GPUS"] = visible_devices
     env["CUDA_VISIBLE_DEVICES"] = visible_devices
     env["NVIDIA_VISIBLE_DEVICES"] = visible_devices
     env["COMPOSE_BIN"] = COMPOSE_BIN
-    return _apply_variant_hardware_guard(spec, env)
+    guarded = _apply_variant_hardware_guard(spec, env)
+    guarded["ESTATE_GPUS"] = visible_devices
+    guarded["NVIDIA_VISIBLE_DEVICES"] = visible_devices
+    guarded["CUDA_VISIBLE_DEVICES"] = instance_runtime_cuda_visible_devices(instance, spec)
+    return guarded
 
 
 def instance_stop_subprocess_env():
@@ -496,9 +684,42 @@ def instance_stop_subprocess_env():
     env["COMPOSE_BIN"] = COMPOSE_BIN
     return env
 
+
+def compose_images_for_instance(instance):
+    spec = instance_variant_spec(instance)
+    paths = ensure_instance_artifacts(instance)
+    compose_file = str(spec.get("compose_abs_path") or "").strip()
+    compose_files = [compose_file]
+    variant_override = refresh_variant_cache_override(spec)
+    if variant_override:
+        compose_files.append(variant_override)
+    compose_files.append(paths["override"])
+    return docker_compose_config_images(
+        instance_compose_project_dir(instance),
+        compose_files,
+        env=instance_subprocess_env(instance),
+        env_file=paths["env"],
+        project_name=instance_project_name(instance),
+        timeout=90,
+    )
+
+
+def preflight_instance_docker_images(instance, context="preset launch"):
+    images = compose_images_for_instance(instance)
+    plan = _preflight_docker_pull_space(context, images)
+    missing = plan.get("missing") or []
+    if missing:
+        sizes = ", ".join(f"{image}={_format_bytes_gib(size)}" for image, size in sorted((plan.get("sizes") or {}).items()))
+        log_control(
+            f"INSTANCE docker pull preflight ok context={context} missing={', '.join(missing)} "
+            f"incoming={_format_bytes_gib(plan.get('image_bytes') or 0)} buffer={_format_bytes_gib(plan.get('buffer_bytes') or 0)}"
+            f"{f' sizes={sizes}' if sizes else ''}"
+        )
+
 def _instance_launch(instance):
     spec = instance_variant_spec(instance)
     ensure_variant_install_ready(spec)
+    preflight_instance_docker_images(instance, context="preset launch")
     cmd = instance_compose_args(instance) + ["up", "-d", "--force-recreate"]
     rc, out = run_cmd(
         cmd,
@@ -621,16 +842,25 @@ def start_instance(instance_id, track_switch_job=True):
             )
         return result
     except Exception as e:
-        write_switch_failure(instance["mode"], e)
         if track_switch_job:
-            _set_switch_job(
-                active=False,
-                status="failed",
-                mode=str(instance.get("mode") or ""),
-                target=str(instance.get("id") or ""),
-                finished_at=int(time.time()),
-                error=str(e)[-12000:],
+            current_job = switch_job_snapshot()
+            stopped_by_user = (
+                str(current_job.get("status") or "") == "stopped"
+                and str(current_job.get("mode") or "") == str(instance.get("mode") or "")
+                and str(current_job.get("target") or "") == str(instance.get("id") or "")
             )
+            if not stopped_by_user:
+                write_switch_failure(instance["mode"], e)
+                _set_switch_job(
+                    active=False,
+                    status="failed",
+                    mode=str(instance.get("mode") or ""),
+                    target=str(instance.get("id") or ""),
+                    finished_at=int(time.time()),
+                    error=str(e)[-12000:],
+                )
+        else:
+            write_switch_failure(instance["mode"], e)
         raise
 
 def stop_instance(instance_id):
@@ -672,6 +902,21 @@ def _configured_scope_targets_for_mode(instance_id="", mode=""):
 def stop_runtime_scope(instance_id=None, mode=None):
     selector = canonical_mode_selector(mode) if mode else ""
     target_id = str(instance_id or "").strip().upper()
+    current_job = switch_job_snapshot()
+    current_target = str(current_job.get("target") or "").strip().upper()
+    current_mode = canonical_mode_selector(current_job.get("mode")) if current_job.get("mode") else ""
+    if current_job.get("active") and (
+        (target_id == "GLOBAL" or not target_id or current_target == target_id)
+        and (not selector or current_mode == selector)
+    ):
+        _set_switch_job(
+            active=False,
+            status="stopped",
+            mode=current_mode,
+            target=current_target,
+            finished_at=int(time.time()),
+            error="",
+        )
     if target_id and target_id != "GLOBAL":
         return stop_instance(target_id)
     matching = []
@@ -721,6 +966,8 @@ def update_instance(instance_id, mode=None, enabled=None):
         break
     if updated is None:
         raise ValueError(f"Unknown instance: {instance_id}")
+    if enabled is not None and bool(enabled):
+        rows, _, _ = normalize_enabled_instance_selection(rows, preferred_ids=[updated["id"]])
     write_instances_config(rows)
     return get_instance(updated["id"])
 
@@ -755,6 +1002,8 @@ def save_pair_instance(gpu_indices, mode=None, enabled=None):
         if enabled is not None:
             existing["enabled"] = bool(enabled)
         existing["auto_pair"] = bool(existing.get("auto_pair")) or is_auto_pair_indices(pair)
+    if enabled is not None and bool(enabled):
+        rows, _, _ = normalize_enabled_instance_selection(rows, preferred_ids=[pair_id])
     write_instances_config(rows)
     return get_instance(pair_id)
 
@@ -799,6 +1048,96 @@ def instance_running(instance):
 def instance_runtime_container_name(instance):
     return instance_container_name(instance)
 
+def instance_gpu_index_set(instance):
+    indices = []
+    raw_indices = (instance or {}).get("gpu_indices")
+    if isinstance(raw_indices, list) and raw_indices:
+        indices = raw_indices
+    elif (instance or {}).get("gpu_index") is not None:
+        indices = [(instance or {}).get("gpu_index")]
+    clean = set()
+    for idx in indices:
+        try:
+            clean.add(int(idx))
+        except Exception:
+            pass
+    return clean
+
+def select_non_overlapping_instances(instances, preferred_modes=None, preferred_ids=None):
+    candidates = [dict(instance) for instance in (instances or []) if instance]
+    if not candidates:
+        return [], []
+    preferences = []
+    for mode in preferred_modes or []:
+        selector = canonical_mode_selector(mode)
+        if selector and selector not in preferences:
+            preferences.append(selector)
+    pinned_ids = []
+    for instance_id in preferred_ids or []:
+        normalized_id = str(instance_id or "").strip().upper()
+        if normalized_id and normalized_id not in pinned_ids:
+            pinned_ids.append(normalized_id)
+
+    def rank(instance):
+        instance_id = str(instance.get("id") or "").strip().upper()
+        try:
+            pinned = pinned_ids.index(instance_id)
+        except ValueError:
+            pinned = 9999
+        selector = canonical_mode_selector(instance.get("mode"))
+        try:
+            preferred = preferences.index(selector)
+        except ValueError:
+            preferred = 9999
+        gpu_indices = instance_gpu_index_set(instance)
+        gpu_count = len(gpu_indices) if gpu_indices else 9999
+        first_gpu = min(gpu_indices) if gpu_indices else 9999
+        return (pinned, preferred, gpu_count, first_gpu, str(instance.get("id") or ""))
+
+    selected = []
+    skipped = []
+    occupied = set()
+    for instance in sorted(candidates, key=rank):
+        gpu_indices = instance_gpu_index_set(instance)
+        overlap = gpu_indices.intersection(occupied)
+        if overlap:
+            blocker = next(
+                (
+                    row
+                    for row in selected
+                    if instance_gpu_index_set(row).intersection(gpu_indices)
+                ),
+                {},
+            )
+            skipped.append({
+                "instance": instance,
+                "reason": f"overlaps {str(blocker.get('id') or 'selected runtime')} on GPUs {', '.join(str(idx) for idx in sorted(overlap))}",
+            })
+            continue
+        selected.append(instance)
+        occupied.update(gpu_indices)
+    return selected, skipped
+
+
+def normalize_enabled_instance_selection(rows, preferred_modes=None, preferred_ids=None):
+    clean_rows = [dict(row) for row in (rows or []) if row]
+    enabled_rows = [row for row in clean_rows if row.get("enabled")]
+    if len(enabled_rows) < 2:
+        return clean_rows, False, []
+    selected, skipped = select_non_overlapping_instances(
+        enabled_rows,
+        preferred_modes=preferred_modes,
+        preferred_ids=preferred_ids,
+    )
+    selected_ids = {str(row.get("id") or "").strip().upper() for row in selected}
+    changed = False
+    for row in clean_rows:
+        row_id = str(row.get("id") or "").strip().upper()
+        if row.get("enabled") and row_id and row_id not in selected_ids:
+            row["enabled"] = False
+            changed = True
+    return clean_rows, changed, skipped
+
 def primary_instance():
     rows = visible_instances(read_instances_config())
     if not rows:
@@ -813,11 +1152,25 @@ def primary_instance():
 
 def boot_enabled_instances():
     outputs = []
+    try:
+        benchmark_state_file = globals().get("BENCHMARKS_STATE_FILE") or globals().get("BENCHMARK_STATE_FILE") or os.path.join(CONTROL_DIR, "benchmarks", "state.json")
+        state = read_json_file(benchmark_state_file, {})
+        if bool((state or {}).get("active")):
+            message = "benchmark active; enabled instance autoboot skipped"
+            log_control(f"BOOT instances: {message}")
+            return [message]
+    except Exception as exc:
+        log_control(f"BOOT instances benchmark guard warning: {exc}")
     rows = visible_instances(read_instances_config())
     file_mode = read_active_mode_file()
+    last_good_mode = read_last_good_mode_file()
     enabled_rows = [inst for inst in rows if inst.get("enabled")]
     if enabled_rows:
-        result = start_instances_parallel(enabled_rows)
+        selected_rows, skipped_rows = select_non_overlapping_instances(enabled_rows, [file_mode, last_good_mode])
+        for row in skipped_rows:
+            inst = row.get("instance") or {}
+            outputs.append(f"{inst.get('id') or 'instance'} skipped: {row.get('reason') or 'overlaps selected autoboot runtime'}")
+        result = start_instances_parallel(selected_rows)
         for row in result.get("started") or []:
             inst = row.get("instance") or {}
             outputs.append(f"{inst.get('id') or 'instance'} started: {str(row.get('output') or '')[-800:]}")
@@ -894,10 +1247,21 @@ def global_scope_power_action(action, enabled=None):
     outputs = []
     changed = []
     if action_name == "toggle_enabled":
+        selected_ids = {row["id"] for row in rows}
+        if enabled:
+            selected_rows, skipped_rows = select_non_overlapping_instances(
+                rows,
+                preferred_modes=[read_active_mode_file(), read_last_good_mode_file()],
+            )
+            selected_ids = {str(row.get("id") or "").strip().upper() for row in selected_rows}
+            for skipped in skipped_rows:
+                inst = skipped.get("instance") or {}
+                outputs.append(f"{inst.get('id') or 'instance'}: autoboot disabled ({skipped.get('reason') or 'overlaps selected runtime'})")
         for row in rows:
-            updated = update_instance(row["id"], enabled=bool(enabled))
+            should_enable = bool(enabled) and str(row.get("id") or "").strip().upper() in selected_ids
+            updated = update_instance(row["id"], enabled=should_enable)
             changed.append(instance_snapshot(updated))
-            outputs.append(f"{row['id']}: autoboot {'enabled' if enabled else 'disabled'}")
+            outputs.append(f"{row['id']}: autoboot {'enabled' if should_enable else 'disabled'}")
         return {"instances": changed, "output": "\n".join(outputs)[-12000:]}
     if action_name == "start_instance":
         for row in rows:
@@ -1064,7 +1428,7 @@ def runtime_boot_state(container_name="", ready_url="", engine_family=""):
 def detected_mode():
     load_runtime_inventory()
     primary = primary_instance()
-    if primary:
+    if primary and instance_running(primary):
         return primary["mode"]
     # Source of truth is the mode selected by this controller/switch.sh.
     # If the file is stale, use a TCP-only port scan as a fallback. Never call /health.
@@ -1100,25 +1464,84 @@ def active_mode():
 
 def active_port():
     primary = primary_instance()
-    if primary:
+    if primary and instance_running(primary):
         return int(primary["port"])
     return mode_default_port(active_mode(), 8020)
+
+def admin_auth_cache_key(username, password):
+    digest = hashlib.sha256(f"{username}\0{password}".encode("utf-8", errors="surrogatepass")).hexdigest()
+    return (str(username or ""), digest)
+
+
+def prune_admin_auth_caches(now=None):
+    current = float(now or time.time())
+    max_entries = max(32, int(AUTH_CACHE_MAX_ENTRIES or 256))
+    with auth_lock:
+        for key, timestamp in list(auth_cache.items()):
+            if current - float(timestamp or 0.0) >= AUTH_CACHE_SECONDS:
+                auth_cache.pop(key, None)
+        for key, timestamp in list(auth_failure_cache.items()):
+            if current - float(timestamp or 0.0) >= AUTH_FAILURE_CACHE_SECONDS:
+                auth_failure_cache.pop(key, None)
+        while len(auth_cache) > max_entries:
+            oldest = min(auth_cache.items(), key=lambda item: float(item[1] or 0.0))[0]
+            auth_cache.pop(oldest, None)
+        while len(auth_failure_cache) > max_entries:
+            oldest = min(auth_failure_cache.items(), key=lambda item: float(item[1] or 0.0))[0]
+            auth_failure_cache.pop(oldest, None)
+        if len(auth_inflight_locks) > max_entries:
+            for key, lock in list(auth_inflight_locks.items()):
+                if len(auth_inflight_locks) <= max_entries:
+                    break
+                try:
+                    locked = bool(lock.locked())
+                except Exception:
+                    locked = True
+                if not locked and key not in auth_cache and key not in auth_failure_cache:
+                    auth_inflight_locks.pop(key, None)
+
 
 def password_ok(username, password):
     if not username or not password or not shutil.which("pamtester"):
         return False
-    key = (username, password)
+    key = admin_auth_cache_key(username, password)
     now = time.time()
-    if key in auth_cache and now - auth_cache[key] < AUTH_CACHE_SECONDS:
-        return True
-    try:
-        p = subprocess.run(["pamtester", "login", username, "authenticate"], input=password+"\n", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True, timeout=8)
-        ok = p.returncode == 0
-        if ok:
-            auth_cache[key] = now
+    with auth_lock:
+        cached_at = float(auth_cache.get(key) or 0.0)
+        if cached_at and now - cached_at < AUTH_CACHE_SECONDS:
+            return True
+        failed_at = float(auth_failure_cache.get(key) or 0.0)
+        if failed_at and now - failed_at < AUTH_FAILURE_CACHE_SECONDS:
+            return False
+        lock = auth_inflight_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            auth_inflight_locks[key] = lock
+    with lock:
+        now = time.time()
+        with auth_lock:
+            cached_at = float(auth_cache.get(key) or 0.0)
+            if cached_at and now - cached_at < AUTH_CACHE_SECONDS:
+                return True
+            failed_at = float(auth_failure_cache.get(key) or 0.0)
+            if failed_at and now - failed_at < AUTH_FAILURE_CACHE_SECONDS:
+                return False
+        try:
+            p = subprocess.run(["pamtester", "login", username, "authenticate"], input=password+"\n", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True, timeout=8)
+            ok = p.returncode == 0
+        except Exception:
+            ok = False
+        now = time.time()
+        with auth_lock:
+            if ok:
+                auth_cache[key] = now
+                auth_failure_cache.pop(key, None)
+            else:
+                auth_failure_cache[key] = now
+            prune_needed = len(auth_cache) > AUTH_CACHE_MAX_ENTRIES or len(auth_failure_cache) > AUTH_CACHE_MAX_ENTRIES or len(auth_inflight_locks) > AUTH_CACHE_MAX_ENTRIES
+        if prune_needed:
+            prune_admin_auth_caches(now)
         return ok
-    except Exception:
-        return False
 
 def check_basic_auth(header):
     if not header or not header.startswith("Basic "):
@@ -1144,22 +1567,98 @@ def parse_cookie_header(header):
     return values
 
 
+def admin_session_ttl_seconds():
+    return max(300, int(ADMIN_SESSION_TTL_SECONDS or 86400))
+
+
+def _normalize_admin_session_entry(token, info, now=None):
+    token = str(token or "").strip()
+    if not token or len(token) > 512 or not isinstance(info, dict):
+        return None
+    current = float(now or time.time())
+    try:
+        expires_at = float(info.get("expires_at") or 0.0)
+    except Exception:
+        return None
+    if expires_at <= current:
+        return None
+    max_expires_at = current + admin_session_ttl_seconds()
+    if expires_at > max_expires_at:
+        expires_at = max_expires_at
+    return token, {
+        "client": str(info.get("client") or "")[:128],
+        "expires_at": expires_at,
+    }
+
+
+def _save_admin_sessions_locked():
+    payload = {
+        "schema_version": 1,
+        "saved_at": int(time.time()),
+        "sessions": dict(admin_sessions),
+    }
+    try:
+        write_json_atomic_if_changed(ADMIN_SESSIONS_FILE, payload, indent=2, sort_keys=True)
+        try:
+            os.chmod(ADMIN_SESSIONS_FILE, 0o600)
+        except Exception:
+            pass
+    except Exception as exc:
+        try:
+            log_control(f"Admin session persistence failed: {exc}")
+        except Exception:
+            pass
+
+
+def load_admin_sessions():
+    global admin_sessions_loaded
+    now = time.time()
+    with admin_session_lock:
+        if admin_sessions_loaded:
+            return
+        admin_sessions_loaded = True
+        loaded = {}
+        try:
+            with open(ADMIN_SESSIONS_FILE, "r", encoding="utf-8") as handle:
+                raw = json.load(handle)
+            sessions = raw.get("sessions") if isinstance(raw, dict) and isinstance(raw.get("sessions"), dict) else raw
+            if isinstance(sessions, dict):
+                for token, info in sessions.items():
+                    normalized = _normalize_admin_session_entry(token, info, now=now)
+                    if normalized:
+                        loaded[normalized[0]] = normalized[1]
+        except FileNotFoundError:
+            loaded = {}
+        except Exception:
+            loaded = {}
+        max_entries = max(32, int(AUTH_CACHE_MAX_ENTRIES or 256))
+        if len(loaded) > max_entries:
+            loaded = dict(sorted(loaded.items(), key=lambda item: float((item[1] or {}).get("expires_at") or 0.0), reverse=True)[:max_entries])
+        admin_sessions.clear()
+        admin_sessions.update(loaded)
+
+
 def _prune_admin_sessions(now=None):
+    load_admin_sessions()
     current = float(now or time.time())
     with admin_session_lock:
         expired = [token for token, info in admin_sessions.items() if float((info or {}).get("expires_at") or 0.0) <= current]
         for token in expired:
             admin_sessions.pop(token, None)
+        if expired:
+            _save_admin_sessions_locked()
 
 
 def create_admin_session(client_ip=""):
+    load_admin_sessions()
     now = time.time()
     token = secrets.token_urlsafe(32)
     with admin_session_lock:
         admin_sessions[token] = {
             "client": str(client_ip or ""),
-            "expires_at": now + max(300, int(ADMIN_SESSION_TTL_SECONDS or 86400)),
+            "expires_at": now + admin_session_ttl_seconds(),
         }
+        _save_admin_sessions_locked()
     return token
 
 
@@ -1171,7 +1670,7 @@ def request_is_https(headers):
 
 
 def build_admin_session_cookie(token, secure=False):
-    ttl = max(300, int(ADMIN_SESSION_TTL_SECONDS or 86400))
+    ttl = admin_session_ttl_seconds()
     suffix = "; Secure" if secure else ""
     return f"{ADMIN_SESSION_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={ttl}{suffix}"
 
@@ -1197,8 +1696,11 @@ def admin_session_ok(headers, client_ip=""):
         bound_client = str(info.get("client") or "")
         if bound_client and client_ip and bound_client != client_ip:
             return False
-        info["expires_at"] = now + max(300, int(ADMIN_SESSION_TTL_SECONDS or 86400))
+        previous_expires_at = float(info.get("expires_at") or 0.0)
+        info["expires_at"] = now + admin_session_ttl_seconds()
         admin_sessions[token] = info
+        if float(info["expires_at"] or 0.0) - previous_expires_at >= 60:
+            _save_admin_sessions_locked()
         return True
 
 
@@ -1283,12 +1785,19 @@ def _inspect_container_gpu_targets(name):
         parsed, parsed_all = _parse_gpu_index_set(labels.get(key))
         indices.update(parsed)
         all_gpus = all_gpus or parsed_all
+    if indices or all_gpus:
+        return indices, all_gpus
     env_map = {}
     for item in ((data.get("Config") or {}).get("Env") or []):
         if "=" in str(item):
             key, value = str(item).split("=", 1)
             env_map[key] = value
-    for key in ("ESTATE_GPUS", "NVIDIA_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
+    parsed, parsed_all = _parse_gpu_index_set(env_map.get("ESTATE_GPUS"))
+    indices.update(parsed)
+    all_gpus = all_gpus or parsed_all
+    if indices or all_gpus:
+        return indices, all_gpus
+    for key in ("NVIDIA_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
         parsed, parsed_all = _parse_gpu_index_set(env_map.get(key))
         indices.update(parsed)
         all_gpus = all_gpus or parsed_all
@@ -1299,6 +1808,13 @@ def _inspect_container_gpu_targets(name):
             parsed, parsed_all = _parse_gpu_index_set(raw)
             indices.update(parsed)
             all_gpus = all_gpus or parsed_all
+    if not indices and not all_gpus:
+        match = re.search(r"(?:^|[-_])gpu(\d+)(?:[-_]|$)", str(name or ""), re.IGNORECASE)
+        if match:
+            try:
+                indices.add(int(match.group(1)))
+            except Exception:
+                pass
     if not indices and not all_gpus and is_runtime_container_name(name):
         # Most direct single-GPU compose launches default to GPU0 when no explicit
         # target is surfaced in inspect metadata.

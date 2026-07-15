@@ -109,13 +109,34 @@ function updateSearchUI(reset) {
   }
 }
 function fmtUptime(s) {
-  s = Number(s || 0);
-  return Math.floor(s / 3600) + "h " + Math.floor((s % 3600) / 60) + "m";
+  s = Math.max(0, Math.floor(Number(s || 0)));
+  const days = Math.floor(s / 86400);
+  const hours = Math.floor((s % 86400) / 3600);
+  const minutes = Math.floor((s % 3600) / 60);
+  const seconds = s % 60;
+  const parts = [];
+  if (days) parts.push(`${days}d`);
+  if (days || hours) parts.push(`${hours}h`);
+  if (days || hours || minutes) parts.push(`${minutes}m`);
+  parts.push(`${seconds}s`);
+  return parts.join(" ");
 }
 function mibToGiB(v) {
   return (Number(v || 0) / 1024).toFixed(2);
 }
 function inferGpuStatus(g) {
+  const benchmarkStatus = inferGpuBenchmarkStatus(g);
+  if (benchmarkStatus) return benchmarkStatus;
+  const studio = lastStatus?.ai_studio || {};
+  const studioGpuIndices = Array.isArray(studio.gpu_indices) ? studio.gpu_indices.map(Number) : [];
+  if (studio.generation_active && studioGpuIndices.includes(Number(g?.index))) {
+    const jobs = Array.isArray(studio.active_jobs) ? studio.active_jobs : [];
+    const job = jobs.find((row) => row && !["success", "failed", "cancelled"].includes(String(row.status || "")));
+    const label = String(job?.label || job?.lane || "").trim();
+    const state = String(job?.status || "").trim().toLowerCase();
+    const action = state === "queued" || state === "submitting" ? "Prompt Processing" : "Generation";
+    return `AI Studio${label ? ` · ${label}` : ""} · ${action}`;
+  }
   const u = Number(g.util_pct || 0);
   if (
     lastStatus &&
@@ -126,8 +147,65 @@ function inferGpuStatus(g) {
   }
   return u > 5 ? "Active" : "Idle";
 }
-function tempClass(t) {
+function gpuBenchmarkQueueRows() {
+  const job = lastStatus?.benchmarks?.job || {};
+  const rows = Array.isArray(job.queue) ? job.queue : [];
+  return { job, rows };
+}
+function benchmarkRowGpuIndices(row) {
+  const values = Array.isArray(row?.assigned_gpu_indices)
+    ? row.assigned_gpu_indices
+    : Array.isArray(row?.gpu_indices)
+      ? row.gpu_indices
+      : [];
+  return values
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value));
+}
+function benchmarkRowDisplayName(row) {
+  return String(row?.display_name || row?.selector || "preset").replace(/^ik-llama\//, "").replace(/^vllm\//, "");
+}
+function formatBenchmarkElapsedLabel(startedAt, finishedAt = "") {
+  const startMs = Date.parse(String(startedAt || ""));
+  if (!Number.isFinite(startMs)) return "";
+  const endMs = Date.parse(String(finishedAt || ""));
+  const seconds = Math.max(0, Math.floor(((Number.isFinite(endMs) ? endMs : Date.now()) - startMs) / 1000));
+  if (!seconds) return "";
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = seconds % 60;
+  if (hours) return `${hours}h ${String(minutes).padStart(2, "0")}m ${String(secs).padStart(2, "0")}s`;
+  if (minutes) return `${minutes}m ${String(secs).padStart(2, "0")}s`;
+  return `${secs}s`;
+}
+function inferGpuBenchmarkStatus(g) {
+  const gpuIndex = Number(g?.index);
+  if (!Number.isFinite(gpuIndex)) return "";
+  const { job, rows } = gpuBenchmarkQueueRows();
+  if (!job?.active || !rows.length) return "";
+  const activeRows = rows.filter((row) => row && row.status === "running");
+  const row = activeRows.find((candidate) => benchmarkRowGpuIndices(candidate).includes(gpuIndex));
+  if (!row) return "";
+  const workRows = rows.filter((candidate) => candidate && candidate.status !== "skipped");
+  const presetIndex = Math.max(1, workRows.findIndex((candidate) => candidate === row) + 1);
+  const presetTotal = Math.max(workRows.length || rows.length || 1, presetIndex);
+  const stepIndex = Math.max(0, Number(row.step_index || 0));
+  const stepCount = Math.max(0, Number(row.step_count || 0));
+  const stage = String(row.step_label || row.step_id || "Benchmark").trim();
+  const stepText = stepCount ? `${stage} ${stepIndex}/${stepCount}` : stage;
+  return `Benchmarking ${benchmarkRowDisplayName(row)} ${presetIndex}/${presetTotal} · ${stepText}`;
+}
+function tempClass(t, sensor = "core") {
   t = Number(t || 0);
+  const kind = String(sensor || "core").toLowerCase();
+  if (kind === "junction" || kind === "hotspot" || kind === "vram" || kind === "memory" || kind === "mem") {
+    if (t < 45) return "temp-blue";
+    if (t < 65) return "temp-green";
+    if (t < 80) return "temp-yellow";
+    if (t < 90) return "temp-orange";
+    if (t < 95) return "temp-red";
+    return "temp-crimson";
+  }
   if (t < 35) return "temp-blue";
   if (t < 50) return "temp-green";
   if (t < 60) return "temp-yellow";
@@ -138,18 +216,29 @@ function tempClass(t) {
 function trimFormattedNumber(text) {
   return String(text || "").replace(/(\.\d*?[1-9])0+$|\.0+$/, "$1");
 }
-function formatTempWithPeak(current, peak) {
+function formatTempWithPeak(current, peak, sensor = "core") {
   const currentText = formatMaybeNumber(current, 0);
   if (!currentText) return "N/A";
-  const currentWarn = Number(current || 0) >= 80 ? " ⚠️" : "";
+  const tempWarn = (value) => {
+    const className = tempClass(value, sensor);
+    return className === "temp-crimson" ? " ⚠️" : "";
+  };
+  const currentWarn = tempWarn(current);
   const peakText = formatMaybeNumber(peak, 0);
   if (!peakText)
-    return `<span class="${tempClass(current)}">${currentText}°C${currentWarn}</span>`;
-  const peakWarn = Number(peak || 0) >= 80 ? " ⚠️" : "";
-  return `<span class="${tempClass(current)}">${currentText}°C${currentWarn}</span> <span class="${tempClass(peak)}">( ${peakText}°↑ C${peakWarn})</span>`;
+    return `<span class="${tempClass(current, sensor)}">${currentText}°C${currentWarn}</span>`;
+  const peakWarn = tempWarn(peak);
+  return `<span class="${tempClass(current, sensor)}">${currentText}°C${currentWarn}</span> <span class="${tempClass(peak, sensor)}">( ↑${peakText}°C${peakWarn})</span>`;
 }
 const gpuStatusHistoryByIndex = {};
 const runtimeStatusHistoryById = {};
+function normalizeStatusHistoryText(value = "") {
+  return String(value || "")
+    .replace(/\s+[·-]\s*(?:(?:elapsed|duration)\s*)?(?:(?:\d+d\s*)?(?:\d+h\s*)?(?:\d+m\s*)?\d+s)(?:\s*elapsed)?$/i, "")
+    .replace(/\s+\((?:(?:elapsed|duration)\s*)?(?:(?:\d+d\s*)?(?:\d+h\s*)?(?:\d+m\s*)?\d+s)(?:\s*elapsed)?\)$/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 function formatMaybeNumber(value, digits = 2) {
   const num = Number(value);
   if (Number.isFinite(num)) return trimFormattedNumber(num.toFixed(digits));
@@ -160,16 +249,22 @@ function formatGpuMetricWithPeak(current, peak, unit, digits = 2) {
   const currentText = formatMaybeNumber(current, digits);
   if (!currentText) return "N/A";
   const peakText = formatMaybeNumber(peak, digits);
-  return `${currentText} ${unit}${peakText ? ` ( ${peakText}&uarr; ${unit})` : ""}`;
+  return `${currentText} ${unit}${peakText ? ` ( ↑${peakText} ${unit})` : ""}`;
 }
 function updateStatusHistory(store, key, nextStatus) {
   const normalizedKey = String(key || "").trim();
-  const status = String(nextStatus || "").trim();
+  const status = normalizeStatusHistoryText(nextStatus);
   if (!normalizedKey || !status) return { current: status, previous: "" };
-  const existing = store[normalizedKey] || { current: "", previous: "" };
+  const existingRaw = store[normalizedKey] || { current: "", previous: "" };
+  const existing = {
+    current: normalizeStatusHistoryText(existingRaw.current),
+    previous: normalizeStatusHistoryText(existingRaw.previous),
+  };
   if (existing.current && existing.current !== status) {
     store[normalizedKey] = { current: status, previous: existing.current };
   } else if (!existing.current) {
+    store[normalizedKey] = { current: status, previous: existing.previous || "" };
+  } else {
     store[normalizedKey] = { current: status, previous: existing.previous || "" };
   }
   const resolved = store[normalizedKey] || { current: status, previous: "" };
@@ -186,6 +281,12 @@ function runtimeActivityStatus(runtime) {
   const swapped = Number(runtime?.swapped_requests || 0);
   const generationTps = Number(runtime?.generation_tps || 0);
   const lastTps = Number(runtime?.last_tokens_per_second || 0);
+  if (runtime?.benchmark_active) {
+    const modeLabel = String(runtime?.benchmark_mode || runtime?.last_status || "").toLowerCase().includes("full")
+      ? "Full"
+      : "Quick";
+    return generationTps > 0.1 || lastTps > 0.1 ? `${modeLabel} Benchmark Generation` : `${modeLabel} Benchmarking`;
+  }
   if ((running > 0 || waiting > 0 || pending > 0 || swapped > 0) && (generationTps > 0.1 || lastTps > 0.1))
     return "Generation";
   if (running > 0 || waiting > 0 || pending > 0 || swapped > 0)
@@ -202,35 +303,40 @@ function renderGpuCards(gs) {
       g.error
         ? `<div class="gpu-card">${g.error}</div>`
         : (() => {
+            const failedGpu = !!(g.failed || g.frozen);
             const statusHistory = updateStatusHistory(
               gpuStatusHistoryByIndex,
               g.index,
-              inferGpuStatus(g),
+              failedGpu ? `Failure: ${g.failure_mode || "Missing from telemetry"}` : inferGpuStatus(g),
             );
             const currentStatus = statusHistory.current;
-            const previousStatus = statusHistory.previous;
+            const previousStatus = failedGpu ? "" : statusHistory.previous;
             const gpuIndex = Number(g.index || 0);
             const title = `GPU ${g.index} - ${g.name || "RTX 3090"}${g.vendor ? " (" + g.vendor + ")" : ""}`;
-            const freeButton = renderIconButton({
+            const freeButton = failedGpu ? "" : renderIconButton({
               title: `Free resources using GPU ${gpuIndex}`,
               action: `promptFreeGpuResources(${gpuIndex})`,
               icon: "delete",
               className: "gpu-free-btn",
             });
+            const failedBadge = failedGpu ? `<span class="gpu-failure-badge">Failure</span>` : "";
             const tempRows = [
-              `<div class="gpu-line"><span>Core</span><b>${formatTempWithPeak(g.temp_c, g.temp_peak_c)}</b></div>`,
+              `<div class="gpu-line"><span>Core</span><b>${formatTempWithPeak(g.temp_c, g.temp_peak_c, "core")}</b></div>`,
             ];
             if (formatMaybeNumber(g.temp_junction_c, 0)) {
               tempRows.push(
-                `<div class="gpu-line"><span>Junction</span><b>${formatTempWithPeak(g.temp_junction_c, g.temp_junction_peak_c)}</b></div>`,
+                `<div class="gpu-line"><span>Junction</span><b>${formatTempWithPeak(g.temp_junction_c, g.temp_junction_peak_c, "junction")}</b></div>`,
               );
             }
             if (formatMaybeNumber(g.temp_vram_c, 0)) {
               tempRows.push(
-                `<div class="gpu-line"><span>VRAM</span><b>${formatTempWithPeak(g.temp_vram_c, g.temp_vram_peak_c)}</b></div>`,
+                `<div class="gpu-line"><span>VRAM</span><b>${formatTempWithPeak(g.temp_vram_c, g.temp_vram_peak_c, "vram")}</b></div>`,
               );
             }
-            return `<div class="gpu-card"><div class="gpu-title"><span class="gpu-title-text">${escapeHtml(title)}</span>${freeButton}</div><div class="gpu-grid"><div><div class="gpu-section-title">Temperature</div>${tempRows.join("")}</div><div><div class="gpu-section-title">VRAM</div><div class="gpu-line"><span>Free</span><b>${mibToGiB(g.mem_free_mib)} GB</b></div><div class="gpu-line"><span>Used</span><b>${mibToGiB(g.mem_used_mib)} GB</b></div><div class="gpu-line"><span>Max</span><b>${mibToGiB(g.mem_total_mib)} GB</b></div><div class="meter"><span style="width:${Number(g.mem_pct || 0)}%"></span></div></div><div><div class="gpu-section-title">Power</div><div class="gpu-line"><span>Draw</span><b>${formatGpuMetricWithPeak(g.power_w, g.power_peak_w, "W", 2)}</b></div><div class="gpu-line"><span>Max Power</span><b>${g.power_limit_w || "N/A"} W</b></div></div><div><div class="gpu-section-title">Fans</div><div class="gpu-line"><span>Speed</span><b>${g.fan_pct || "N/A"}%</b></div></div><div><div class="gpu-section-title">Clocks</div><div class="gpu-line"><span>Core</span><b>${formatGpuMetricWithPeak(g.core_clock_mhz, g.core_clock_peak_mhz, "MHz", 0)}</b></div><div class="gpu-line"><span>Mem</span><b>${formatGpuMetricWithPeak(g.mem_clock_mhz, g.mem_clock_peak_mhz, "MHz", 0)}</b></div></div><div><div class="gpu-section-title">Usage</div><div class="gpu-line"><span>Load</span><b>${g.util_pct || "N/A"}%</b></div><div class="gpu-line"><span>Status</span><b>${currentStatus}${previousStatus ? ` (Previous: ${previousStatus})` : ""}</b></div></div></div></div>`;
+            const previousStatusHtml = previousStatus ? `<span class="gpu-status-previous">(Previous: ${escapeHtml(previousStatus)})</span>` : "";
+            const lastSeen = g.last_seen_iso ? `<div class="gpu-line"><span>Last Seen</span><b>${escapeHtml(String(g.last_seen_iso))}</b></div>` : "";
+            const failureDetail = failedGpu && g.failure_detail ? `<div class="gpu-line"><span>Mode</span><b class="gpu-failure-status">${escapeHtml(String(g.failure_mode || "Failure"))}</b></div>` : "";
+            return `<div class="gpu-card${failedGpu ? " failed-gpu-card" : ""}"><div class="gpu-title"><span class="gpu-title-text">${escapeHtml(title)}</span>${failedBadge}${freeButton}</div><div class="gpu-grid"><div><div class="gpu-section-title">Temperature</div>${tempRows.join("")}</div><div><div class="gpu-section-title">VRAM</div><div class="gpu-line"><span>Free</span><b>${mibToGiB(g.mem_free_mib)} GB</b></div><div class="gpu-line"><span>Used</span><b>${mibToGiB(g.mem_used_mib)} GB</b></div><div class="gpu-line"><span>Max</span><b>${mibToGiB(g.mem_total_mib)} GB</b></div><div class="meter"><span style="width:${Number(g.mem_pct || 0)}%"></span></div></div><div><div class="gpu-section-title">Power</div><div class="gpu-line"><span>Draw</span><b>${formatGpuMetricWithPeak(g.power_w, g.power_peak_w, "W", 2)}</b></div><div class="gpu-line"><span>Max Power</span><b>${g.power_limit_w || "N/A"} W</b></div></div><div><div class="gpu-section-title">Fans</div><div class="gpu-line"><span>Speed</span><b>${g.fan_pct || "N/A"}%</b></div></div><div><div class="gpu-section-title">Clocks</div><div class="gpu-line"><span>Core</span><b>${formatGpuMetricWithPeak(g.core_clock_mhz, g.core_clock_peak_mhz, "MHz", 0)}</b></div><div class="gpu-line"><span>Mem</span><b>${formatGpuMetricWithPeak(g.mem_clock_mhz, g.mem_clock_peak_mhz, "MHz", 0)}</b></div></div><div><div class="gpu-section-title">Usage</div><div class="gpu-line"><span>Load</span><b>${g.util_pct || "N/A"}%</b></div><div class="gpu-line"><span>Status</span><b class="${failedGpu ? "gpu-failure-status" : ""}">${escapeHtml(currentStatus)}${previousStatusHtml}</b></div>${failureDetail}${lastSeen}</div></div></div>`;
           })(),
     )
     .join("");
