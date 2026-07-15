@@ -3254,30 +3254,50 @@ def _monitor_hf_download_progress(process, prefix, plan, env_map):
 
 
 def _resolve_hf_cli_binary():
+    searched = []
+    for key in ("CLUB3090_HF_BIN", "HF_BIN"):
+        configured = str(os.environ.get(key) or "").strip()
+        if not configured:
+            continue
+        searched.append(configured)
+        if os.path.isfile(configured) and os.access(configured, os.X_OK):
+            return configured
     for candidate in ("hf", "huggingface-cli"):
         resolved = shutil.which(candidate)
         if resolved:
             return resolved
+        searched.append(candidate)
     extra_candidates = []
-    sudo_user = str(os.environ.get("SUDO_USER") or "").strip()
-    if sudo_user and sudo_user.lower() != "root":
+    user_names = []
+    for key in ("SUDO_USER", "USER", "LOGNAME"):
+        value = str(os.environ.get(key) or "").strip()
+        if value and value.lower() != "root" and value not in user_names:
+            user_names.append(value)
+    for sudo_user in user_names:
         extra_candidates.extend(
             [
                 f"/home/{sudo_user}/.local/bin/hf",
                 f"/home/{sudo_user}/.local/bin/huggingface-cli",
             ]
         )
-        try:
-            user_base = site.USER_BASE
-        except Exception:
-            user_base = ""
-        if user_base:
-            extra_candidates.extend(
-                [
-                    os.path.join(user_base, "bin", "hf"),
-                    os.path.join(user_base, "bin", "huggingface-cli"),
-                ]
-            )
+    for home_dir in glob.glob("/home/*"):
+        extra_candidates.extend(
+            [
+                os.path.join(home_dir, ".local", "bin", "hf"),
+                os.path.join(home_dir, ".local", "bin", "huggingface-cli"),
+            ]
+        )
+    try:
+        user_base = site.USER_BASE
+    except Exception:
+        user_base = ""
+    if user_base:
+        extra_candidates.extend(
+            [
+                os.path.join(user_base, "bin", "hf"),
+                os.path.join(user_base, "bin", "huggingface-cli"),
+            ]
+        )
     extra_candidates.extend(
         [
             "/root/.local/bin/hf",
@@ -3286,10 +3306,14 @@ def _resolve_hf_cli_binary():
     )
     for candidate in extra_candidates:
         path = str(candidate or "").strip()
+        if path and path not in searched:
+            searched.append(path)
         if path and os.path.isfile(path) and os.access(path, os.X_OK):
             return path
+    searched_text = ", ".join(dict.fromkeys(searched))
     raise RuntimeError(
-        "Neither 'hf' nor 'huggingface-cli' is installed on the server, so the built-in model downloader cannot start."
+        "Neither 'hf' nor 'huggingface-cli' is installed on the server, so the built-in model downloader cannot start. "
+        f"Searched: {searched_text}. Re-run the installer with HF_BIN=/path/to/hf if it is installed in a user-local tool directory."
     )
 
 

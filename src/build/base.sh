@@ -323,6 +323,14 @@ SELF_UPDATE_SECRET_FILE="${CONTROL_DIR}/self-update-secret"
 SELF_UPDATE_SCRIPT_PATH="${CONTROL_DIR}/install-club3090-server.sh"
 SELF_UPDATE_RELOAD_FLAG_FILE="${CONTROL_DIR}/self-update-reload-updater"
 BASH_BIN="${BASH_BIN:-$(command -v bash || true)}"
+HF_BIN="${HF_BIN:-$(command -v hf || true)}"
+if [[ -z "${HF_BIN}" && -x "${HOME:-}/.local/bin/hf" ]]; then
+  HF_BIN="${HOME}/.local/bin/hf"
+fi
+CONTROL_SERVICE_PATH="${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
+if [[ -n "${HF_BIN}" ]]; then
+  CONTROL_SERVICE_PATH="$(dirname "${HF_BIN}"):${CONTROL_SERVICE_PATH}"
+fi
 if [[ -n "${PYTHON_BIN:-}" ]] && command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
   PYTHON_BIN="$(command -v "${PYTHON_BIN}")"
 else
@@ -487,6 +495,167 @@ request_root_permissions() {
   fi
 }
 
+log_resolved_pre_sudo_config() {
+  local hf_token_state="unset"
+  local repo_model_dir repo_hf_home repo_hf_hub_cache repo_huggingface_hub_cache repo_transformers_cache
+  local hf_home hf_hub_cache transformers_cache model_root model_dir_source hf_home_source hf_cache_source transformers_cache_source
+  repo_model_dir="$(read_repo_env_value "${REPO_ENV_FILE}" "MODEL_DIR" || true)"
+  repo_hf_home="$(read_repo_env_value "${REPO_ENV_FILE}" "HF_HOME" || true)"
+  repo_hf_hub_cache="$(read_repo_env_value "${REPO_ENV_FILE}" "HF_HUB_CACHE" || true)"
+  repo_huggingface_hub_cache="$(read_repo_env_value "${REPO_ENV_FILE}" "HUGGINGFACE_HUB_CACHE" || true)"
+  repo_transformers_cache="$(read_repo_env_value "${REPO_ENV_FILE}" "TRANSFORMERS_CACHE" || true)"
+  hf_home="${HF_HOME:-${repo_hf_home:-}}"
+  hf_hub_cache="${HF_HUB_CACHE:-${HUGGINGFACE_HUB_CACHE:-${repo_hf_hub_cache:-${repo_huggingface_hub_cache:-}}}}"
+  transformers_cache="${TRANSFORMERS_CACHE:-${repo_transformers_cache:-}}"
+  model_root="${MODEL_DIR:-${repo_model_dir:-models-cache}}"
+  model_dir_source="default"
+  hf_home_source="unset"
+  hf_cache_source="unset"
+  transformers_cache_source="unset"
+  if [[ -n "${repo_model_dir}" ]]; then
+    model_dir_source="${REPO_ENV_FILE}"
+  fi
+  if [[ -n "${MODEL_DIR:-}" ]]; then
+    model_dir_source="environment"
+  fi
+  if [[ -n "${repo_hf_home}" ]]; then
+    hf_home_source="${REPO_ENV_FILE}"
+  fi
+  if [[ -n "${HF_HOME:-}" ]]; then
+    hf_home_source="environment"
+  fi
+  if [[ -n "${repo_hf_hub_cache}" || -n "${repo_huggingface_hub_cache}" ]]; then
+    hf_cache_source="${REPO_ENV_FILE}"
+  fi
+  if [[ -n "${HF_HUB_CACHE:-}" || -n "${HUGGINGFACE_HUB_CACHE:-}" ]]; then
+    hf_cache_source="environment"
+  fi
+  if [[ -n "${repo_transformers_cache}" ]]; then
+    transformers_cache_source="${REPO_ENV_FILE}"
+  fi
+  if [[ -n "${TRANSFORMERS_CACHE:-}" ]]; then
+    transformers_cache_source="environment"
+  fi
+  if [[ "${model_root}" != /* ]]; then
+    model_root="${CLUB3090_DIR}/${model_root}"
+  fi
+  if [[ -n "${HF_TOKEN_VALUE}" ]]; then
+    hf_token_state="set (${#HF_TOKEN_VALUE} chars)"
+  fi
+  printf '\n[%s] resolved configuration before sudo\n' "$(date +%H:%M:%S)"
+  printf '  action: %s\n' "${ACTION}"
+  printf '  club-3090 dir: %s\n' "${CLUB3090_DIR}"
+  printf '  repo env file: %s\n' "${REPO_ENV_FILE}"
+  if [[ -r "${REPO_ENV_FILE}" ]]; then
+    printf '  repo env status: loaded\n'
+  else
+    printf '  repo env status: not found/readable yet\n'
+  fi
+  printf '  effective MODEL_DIR: %s (%s)\n' "${model_root}" "${model_dir_source}"
+  printf '  default mode: %s\n' "${DEFAULT_MODE:-<auto>}"
+  printf '  control dir: %s\n' "${CONTROL_DIR}"
+  printf '  bash binary: %s\n' "${BASH_BIN:-<not found>}"
+  printf '  python binary: %s\n' "${PYTHON_BIN:-<not found>}"
+  printf '  hf binary: %s\n' "${HF_BIN:-<not found>}"
+  printf '  hf token: %s\n' "${hf_token_state}"
+  printf '  effective HF_HOME: %s (%s)\n' "${hf_home:-<unset>}" "${hf_home_source}"
+  printf '  effective HF_HUB_CACHE/HUGGINGFACE_HUB_CACHE: %s (%s)\n' "${hf_hub_cache:-<unset>}" "${hf_cache_source}"
+  printf '  effective TRANSFORMERS_CACHE: %s (%s)\n' "${transformers_cache:-<unset>}" "${transformers_cache_source}"
+  if [[ -z "${PYTHON_BIN}" || ! -r "${CONTROL_DIR}/runtime_inventory.json" ]]; then
+    printf '  runtime inventory: %s\n' "${CONTROL_DIR}/runtime_inventory.json not readable yet"
+    return 0
+  fi
+  env CLUB3090_DIR="${CLUB3090_DIR}" MODEL_DIR="${model_root}" DEFAULT_MODE="${DEFAULT_MODE}" HF_HOME="${hf_home}" HF_HUB_CACHE="${hf_hub_cache}" "${PYTHON_BIN}" - "${CONTROL_DIR}/runtime_inventory.json" <<'PYPREFLIGHT' || true
+import json
+import os
+import shlex
+import sys
+
+inventory_path = sys.argv[1]
+default_mode = str(os.environ.get("DEFAULT_MODE") or "").strip()
+club_dir = str(os.environ.get("CLUB3090_DIR") or "").rstrip("/")
+model_root = str(os.environ.get("MODEL_DIR") or "").rstrip("/")
+hf_home = str(os.environ.get("HF_HOME") or "").strip()
+hf_hub_cache = str(os.environ.get("HF_HUB_CACHE") or "").strip()
+try:
+    with open(inventory_path, "r", encoding="utf-8") as f:
+        inventory = json.load(f)
+except Exception as exc:
+    print(f"  runtime inventory: unreadable ({exc})")
+    raise SystemExit(0)
+variants = list(inventory.get("variants") or [])
+variant = None
+if default_mode:
+    for row in variants:
+        if default_mode in {str(row.get("variant_id") or ""), str(row.get("upstream_tag") or ""), str(row.get("compose_rel_path") or "")}:
+            variant = row
+            break
+print(f"  runtime inventory: {inventory_path}")
+if not default_mode:
+    print("  selected mode inventory: <auto mode not resolved before setup>")
+    raise SystemExit(0)
+if not variant:
+    print(f"  selected mode inventory: not found for {default_mode}")
+    raise SystemExit(0)
+print(f"  selected mode inventory: {variant.get('variant_id') or default_mode}")
+
+def host_path(container_path):
+    path = str(container_path or "").strip()
+    if not path:
+        return ""
+    normalized = path.replace("\\", "/")
+    for prefix in ("/models/", "models/"):
+        if normalized.startswith(prefix):
+            rel = normalized[len(prefix):].lstrip("/")
+            if model_root:
+                return os.path.join(model_root, rel)
+            return f"{club_dir}/models-cache/{rel}" if club_dir else ""
+    cache_prefix = "/root/.cache/huggingface/"
+    if normalized.startswith(cache_prefix):
+        rel = normalized[len(cache_prefix):].lstrip("/")
+        cache_root = hf_hub_cache or (os.path.join(hf_home, "hub") if hf_home else "")
+        return os.path.join(cache_root, rel) if cache_root else "<root huggingface cache under sudo>"
+    return ""
+
+for label, key in (("model path", "model_path"), ("draft model path", "draft_model_path"), ("projector path", "mmproj_path")):
+    value = str(variant.get(key) or "").strip()
+    if value:
+        mapped = host_path(value)
+        if mapped:
+            print(f"  {label}: {value} -> {mapped}")
+        else:
+            print(f"  {label}: {value}")
+command = str(variant.get("setup_command") or variant.get("install_command") or "").strip()
+if command:
+    print(f"  setup/download command: {command}")
+    try:
+        parts = shlex.split(command)
+    except Exception:
+        parts = []
+    if parts and parts[0] == "hf" and "download" in parts:
+        for flag in ("--local-dir", "--cache-dir"):
+            if flag in parts:
+                idx = parts.index(flag)
+                if idx + 1 < len(parts):
+                    print(f"  hf {flag[2:]}: {parts[idx + 1]}")
+else:
+    print("  setup/download command: <none>")
+PYPREFLIGHT
+}
+
+log_resolved_pre_sudo_config
+if [[ "${CLUB3090_ASSUME_YES:-}" != "1" && "${CLUB3090_ASSUME_YES:-}" != "true" && "${CLUB3090_ASSUME_YES:-}" != "yes" ]]; then
+  printf '\nProceed with these settings? [Y/n] '
+  read -r proceed_reply
+  case "${proceed_reply}" in
+    ""|Y|y|YES|Yes|yes)
+      ;;
+    *)
+      echo "Aborted before requesting root permissions."
+      exit 0
+      ;;
+  esac
+fi
 request_root_permissions
 
 log_step() {
@@ -886,9 +1055,19 @@ run_live_command() {
   local label="$1"
   local cwd="$2"
   local command="$3"
+  local run_path="${PATH:-}"
+  local preserved_env=()
+  if [[ -n "${HF_BIN:-}" ]]; then
+    run_path="$(dirname "${HF_BIN}"):${run_path}"
+  fi
+  for key in MODEL_DIR HF_HOME HF_HUB_CACHE HUGGINGFACE_HUB_CACHE TRANSFORMERS_CACHE HF_TOKEN HUGGINGFACE_HUB_TOKEN; do
+    if [[ -n "${!key:-}" ]]; then
+      preserved_env+=("${key}=${!key}")
+    fi
+  done
   status_line "${label}: starting"
   status_line "${label}: command: ${command}"
-  "${SUDO[@]}" env CLUB3090_STATUS_LABEL="${label}" CLUB3090_STATUS_CWD="${cwd}" CLUB3090_STATUS_COMMAND="${command}" CLUB3090_STATUS_HEARTBEAT_SECONDS="2" "${PYTHON_BIN}" - <<'PYRUNLIVE'
+  "${SUDO[@]}" env PATH="${run_path}" "${preserved_env[@]}" CLUB3090_STATUS_LABEL="${label}" CLUB3090_STATUS_CWD="${cwd}" CLUB3090_STATUS_COMMAND="${command}" CLUB3090_STATUS_HEARTBEAT_SECONDS="2" "${PYTHON_BIN}" - <<'PYRUNLIVE'
 import os
 import selectors
 import subprocess
@@ -2628,6 +2807,8 @@ Environment=CLUB3090_PROXY_BIND_PORT=${CONTROL_PROXY_BIND_PORT}
 Environment=CLUB3090_UPDATER_BIND_HOST=${CONTROL_UPDATER_BIND_HOST}
 Environment=CLUB3090_UPDATER_BIND_PORT=${CONTROL_UPDATER_BIND_PORT}
 Environment=CLUB3090_CONTROL_DIR=${CONTROL_DIR}
+Environment=CLUB3090_HF_BIN=${HF_BIN}
+Environment="PATH=${CONTROL_SERVICE_PATH}"
 Environment=CLUB3090_SELF_UPDATE_REPO_URL=${CLUB3090_SELF_UPDATE_REPO_URL}
 Environment=CLUB3090_SELF_UPDATE_REF=${CLUB3090_SELF_UPDATE_REF}
 Environment=CLUB3090_SELF_UPDATE_BRANCH=${CLUB3090_SELF_UPDATE_BRANCH}
@@ -3012,6 +3193,14 @@ refresh_updater_service_if_safe() {
   "${SUDO[@]}" systemctl restart club3090-updater.service >/dev/null 2>&1 || true
 }
 
+restart_control_plane_services_after_refresh() {
+  if [[ "${CLUB3090_RUNNING_FROM_UPDATER:-0}" == "1" ]]; then
+    return 0
+  fi
+  "${SUDO[@]}" systemctl restart club3090-control.service >/dev/null 2>&1 || true
+  "${SUDO[@]}" systemctl restart club3090-updater.service >/dev/null 2>&1 || true
+}
+
 if [[ "${ACTION}" == "install" ]]; then
   log_step "Writing and enabling systemd units for a fresh install"
   write_vllm_unit
@@ -3025,6 +3214,7 @@ if [[ "${ACTION}" == "install" ]]; then
   log_step "Enabling managed club-3090 services"
   enable_managed_units
   refresh_updater_service_if_safe
+  restart_control_plane_services_after_refresh
   reload_caddy_if_active
   log_step "Starting control-plane services when server boot mode is active"
   start_control_plane_services_if_booted
@@ -3049,6 +3239,7 @@ elif [[ "${ACTION}" == "update" ]]; then
   log_step "Re-enabling managed club-3090 services"
   enable_managed_units
   refresh_updater_service_if_safe
+  restart_control_plane_services_after_refresh
   reload_caddy_if_active
   log_step "Starting control-plane services if the server boot flag is active"
   start_control_plane_services_if_booted
@@ -3069,6 +3260,7 @@ else
   log_step "Re-enabling managed club-3090 services"
   enable_managed_units
   refresh_updater_service_if_safe
+  restart_control_plane_services_after_refresh
   reload_caddy_if_active
   log_step "Starting control-plane services if the server boot flag is active"
   start_control_plane_services_if_booted
