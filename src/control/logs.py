@@ -22,6 +22,8 @@ def resolve_runtime_log_container(requested_instance_id=""):
 
 def resolve_log_source(source="docker", instance_id="", service_id=""):
     source_name = str(source or "docker").strip().lower()
+    if source_name == "control":
+        return {"source": "control", "instance": None, "container": "", "service": {}, "label": "Web UI Server"}
     if source_name == "audit":
         return {"source": "audit", "instance": None, "container": "", "service": {}, "label": "Audit"}
     if source_name == "debug":
@@ -48,6 +50,12 @@ def resolve_log_source(source="docker", instance_id="", service_id=""):
 def read_selected_log_snapshot(source="docker", instance_id="", service_id="", tail_lines=250):
     resolved = resolve_log_source(source, instance_id, service_id)
     source_name = str(resolved.get("source") or "docker")
+    if source_name == "control":
+        return {
+            "source": source_name,
+            "signature": "control",
+            "text": query_text_log_file(CONTROL_LOG_FILE, tail_lines=tail_lines),
+        }
     if source_name == "audit":
         return {
             "source": source_name,

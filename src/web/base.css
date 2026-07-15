@@ -14,6 +14,76 @@
   --cyan: #7dd3fc;
   --turquoise: #26d6c6;
 }
+
+.system-config-grid {
+  display: grid;
+  gap: 10px;
+}
+.system-config-row {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) minmax(220px, 0.75fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.025);
+}
+.system-config-row-dirty {
+  border-color: rgba(245, 158, 11, 0.65);
+  background: rgba(245, 158, 11, 0.08);
+}
+.system-config-copy,
+.system-config-control {
+  min-width: 0;
+}
+.system-config-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+.system-config-title {
+  font-weight: 700;
+  color: var(--text);
+}
+.system-config-current {
+  color: var(--muted);
+  font-size: 13px;
+  margin-bottom: 4px;
+}
+.system-config-current strong {
+  color: var(--text);
+  font-weight: 700;
+}
+.system-config-select {
+  width: 100%;
+  min-height: 36px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--text);
+  padding: 7px 10px;
+  font: inherit;
+}
+.system-config-control-pair {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 0.85fr);
+  gap: 8px;
+}
+.system-config-apply-btn {
+  min-width: 82px;
+}
+@media (max-width: 760px) {
+  .system-config-row {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+  .system-config-control-pair {
+    grid-template-columns: 1fr;
+  }
+}
 * {
   box-sizing: border-box;
 }
@@ -5146,6 +5216,12 @@ details[open] > summary .score-collapse-cue::before {
 .resource-manager-intro {
   color: #b9d1e5;
   line-height: 1.5;
+}
+.resource-manager-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
 }
 .resource-manager-total-card {
   justify-self: center;

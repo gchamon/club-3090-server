@@ -218,9 +218,10 @@ updateScopedCards = function () {
     $("profileScopeNote").innerHTML = profileNote;
   if ($("powerScopeNote"))
     $("powerScopeNote").innerHTML = powerNote;
-  [...(document.querySelectorAll("#profileActionRow .btn, #optToggle, #fanToggle") || [])].forEach((button) =>
+  [...(document.querySelectorAll("#systemConfigPanel button, #systemConfigPanel select") || [])].forEach((button) =>
     setInstanceScopeDisabled(button, scoreLock),
   );
+  if (typeof renderSystemConfiguration === "function") renderSystemConfiguration(lastStatus);
   renderLogSourcePanel();
 };
 powerAction = async function (a) {
@@ -477,6 +478,159 @@ function profileDescription(p) {
       "Turbo profile: 350W active GPU allowance, performance CPU governor, relaxed idle timers, and minimal downclocking. Use when performance matters more than power.",
   };
   return d[p] || "Apply profile?";
+}
+const SYSTEM_POWER_PROFILE_OPTIONS = [
+  ["benchmark-ready", "Benchmark Ready (220W)"],
+  ["eco", "Eco (240W)"],
+  ["balanced", "Balanced (280W)"],
+  ["fast", "Fast (300W)"],
+  ["turbo", "Turbo (350W)"],
+];
+let systemConfigDraft = {};
+function systemConfigCurrent(status = lastStatus) {
+  const power = status?.power || {};
+  const cfg = status?.server_config || {};
+  return {
+    profile: String(power.profile || cfg.active_power_profile || "balanced").trim().toLowerCase(),
+    optimizations: power.optimizations_enabled === false ? "disabled" : "enabled",
+    fan_mode: power.fan_manual_override ? "manual_max" : "auto",
+    fan_scope: String(cfg.fan_override_instance_id || currentScope() || "GLOBAL").trim().toUpperCase() || "GLOBAL",
+  };
+}
+function systemConfigValue(key, current) {
+  return Object.prototype.hasOwnProperty.call(systemConfigDraft, key)
+    ? String(systemConfigDraft[key] || "")
+    : String(current[key] || "");
+}
+function systemConfigScopeOptions(currentValue) {
+  const rows = [{ id: "GLOBAL", label: "Global" }, ...scopeItems().map((row) => ({ id: row.id, label: scopeLabel(row) }))];
+  const seen = new Set();
+  return rows
+    .filter((row) => {
+      const id = String(row.id || "").trim().toUpperCase();
+      if (!id || seen.has(id)) return false;
+      seen.add(id);
+      return true;
+    })
+    .map((row) => {
+      const id = String(row.id || "").trim().toUpperCase();
+      return `<option value="${escapeHtml(id)}"${id === String(currentValue || "").toUpperCase() ? " selected" : ""}>${escapeHtml(row.label || id)}</option>`;
+    })
+    .join("");
+}
+function systemConfigSelectOptions(options, currentValue) {
+  const selected = String(currentValue || "");
+  return options
+    .map(([value, label]) => `<option value="${escapeHtml(value)}"${String(value) === selected ? " selected" : ""}>${escapeHtml(label)}</option>`)
+    .join("");
+}
+function systemConfigPrettyValue(key, value) {
+  const raw = String(value || "");
+  if (key === "profile") return (SYSTEM_POWER_PROFILE_OPTIONS.find(([id]) => id === raw) || [raw, raw])[1] || raw;
+  if (key === "optimizations") return raw === "enabled" ? "Enabled" : "Disabled";
+  if (key === "fan_mode") return raw === "manual_max" ? "Fans Max" : "Automatic Fans";
+  if (key === "fan_scope") {
+    if (raw === "GLOBAL") return "Global";
+    return scopeLabel(scopeItems().find((row) => String(row?.id || "").toUpperCase() === raw) || { id: raw });
+  }
+  return raw;
+}
+function systemConfigRowHtml({ key, title, detail, current, controlHtml, applyAction }) {
+  const currentValue = String(current[key] || "");
+  const draftValue = systemConfigValue(key, current);
+  const dirty = draftValue !== currentValue;
+  const locked = typeof benchmarkJobActive === "function" && benchmarkJobActive();
+  return `<div class="system-config-row${dirty ? " system-config-row-dirty" : ""}" data-system-config-key="${escapeHtml(key)}"><div class="system-config-copy"><div class="system-config-title-row"><span class="system-config-title">${escapeHtml(title)}</span>${dirty ? '<span class="status-badge status-warning">changed</span>' : '<span class="status-badge status-production">saved</span>'}</div><div class="system-config-current">Current: <strong>${escapeHtml(systemConfigPrettyValue(key, currentValue))}</strong></div><div class="preset-help">${escapeHtml(detail)}</div></div><div class="system-config-control">${controlHtml}</div><button class="btn green system-config-apply-btn" ${dirty && !locked ? "" : "disabled"} onclick="${escapeHtml(applyAction)}">Apply</button></div>`;
+}
+function renderSystemConfiguration(status = lastStatus) {
+  const grid = $("systemConfigGrid");
+  if (!grid) return;
+  const current = systemConfigCurrent(status);
+  const profileValue = systemConfigValue("profile", current);
+  const optimizationsValue = systemConfigValue("optimizations", current);
+  const fanModeValue = systemConfigValue("fan_mode", current);
+  const fanScopeValue = systemConfigValue("fan_scope", current);
+  const dirtyKeys = ["profile", "optimizations", "fan_mode", "fan_scope"].filter((key) => systemConfigValue(key, current) !== String(current[key] || ""));
+  if ($("systemConfigCurrentBadge")) {
+    $("systemConfigCurrentBadge").textContent = dirtyKeys.length ? `${dirtyKeys.length} unsaved` : "current";
+    $("systemConfigCurrentBadge").className = `status-badge ${dirtyKeys.length ? "status-warning" : "status-production"}`;
+  }
+  grid.innerHTML = [
+    systemConfigRowHtml({
+      key: "profile",
+      title: "Power Profile",
+      detail: "Sets GPU power limits, CPU governors, idle clocks, and idle timers.",
+      current,
+      controlHtml: `<select class="system-config-select" id="systemConfigProfile" onchange="setSystemConfigDraft('profile', this.value)">${systemConfigSelectOptions(SYSTEM_POWER_PROFILE_OPTIONS, profileValue)}</select>`,
+      applyAction: "applySystemConfigProfile()",
+    }),
+    systemConfigRowHtml({
+      key: "optimizations",
+      title: "Power Optimizations",
+      detail: "Controls active power management and idle power behavior for the selected scope.",
+      current,
+      controlHtml: `<select class="system-config-select" id="systemConfigOptimizations" onchange="setSystemConfigDraft('optimizations', this.value)">${systemConfigSelectOptions([["enabled", "Enabled"], ["disabled", "Disabled"]], optimizationsValue)}</select>`,
+      applyAction: "applySystemConfigOptimizations()",
+    }),
+    `<div class="system-config-row${fanModeValue !== current.fan_mode || fanScopeValue !== current.fan_scope ? " system-config-row-dirty" : ""}" data-system-config-key="cooling"><div class="system-config-copy"><div class="system-config-title-row"><span class="system-config-title">Cooling</span>${fanModeValue !== current.fan_mode || fanScopeValue !== current.fan_scope ? '<span class="status-badge status-warning">changed</span>' : '<span class="status-badge status-production">saved</span>'}</div><div class="system-config-current">Current: <strong>${escapeHtml(systemConfigPrettyValue("fan_mode", current.fan_mode))}</strong> · <strong>${escapeHtml(systemConfigPrettyValue("fan_scope", current.fan_scope))}</strong></div><div class="preset-help">Sets fans to automatic control or manual max for the selected GPU scope.</div></div><div class="system-config-control system-config-control-pair"><select class="system-config-select" id="systemConfigFanMode" onchange="setSystemConfigDraft('fan_mode', this.value)">${systemConfigSelectOptions([["auto", "Automatic Fans"], ["manual_max", "Fans Max"]], fanModeValue)}</select><select class="system-config-select" id="systemConfigFanScope" onchange="setSystemConfigDraft('fan_scope', this.value)">${systemConfigScopeOptions(fanScopeValue)}</select></div><button class="btn green system-config-apply-btn" ${fanModeValue !== current.fan_mode || fanScopeValue !== current.fan_scope ? "" : "disabled"} onclick="applySystemConfigCooling()">Apply</button></div>`,
+  ].join("");
+  syncPowerCoolingBusyState();
+}
+function setSystemConfigDraft(key, value) {
+  systemConfigDraft[String(key || "")] = String(value || "");
+  renderSystemConfiguration(lastStatus);
+}
+async function applySystemConfigProfile() {
+  const current = systemConfigCurrent(lastStatus);
+  const next = systemConfigValue("profile", current);
+  if (!next || next === current.profile) return;
+  try {
+    await withPowerCoolingBusy("Applying power profile...", async () => {
+      await post("/admin/profile", { profile: next, instance_id: currentScope() || "GLOBAL" }, `/admin/profile ${next}`);
+    });
+    delete systemConfigDraft.profile;
+    await refreshStatus({ force: true });
+  } catch (e) {
+    setMsg(`Power profile failed: ${messageText(e)}`);
+  }
+}
+async function applySystemConfigOptimizations() {
+  const current = systemConfigCurrent(lastStatus);
+  const next = systemConfigValue("optimizations", current);
+  if (!next || next === current.optimizations) return;
+  try {
+    await withPowerCoolingBusy(`${next === "enabled" ? "Enabling" : "Disabling"} power optimizations...`, async () => {
+      await post(
+        "/admin/power",
+        { action: next === "enabled" ? "enable_optimizations" : "disable_optimizations", instance_id: currentScope() || "GLOBAL" },
+        `/admin/power ${next}`,
+      );
+    });
+    delete systemConfigDraft.optimizations;
+    await refreshStatus({ force: true });
+  } catch (e) {
+    setMsg(`Power optimizations failed: ${messageText(e)}`);
+  }
+}
+async function applySystemConfigCooling() {
+  const current = systemConfigCurrent(lastStatus);
+  const mode = systemConfigValue("fan_mode", current);
+  const scope = systemConfigValue("fan_scope", current) || "GLOBAL";
+  if (mode === current.fan_mode && scope === current.fan_scope) return;
+  try {
+    await withPowerCoolingBusy(mode === "manual_max" ? "Setting fans to max..." : "Resetting fans to automatic...", async () => {
+      await post(
+        "/admin/power",
+        { action: mode === "manual_max" ? "fans_max" : "fans_auto", instance_id: scope },
+        `/admin/power ${mode} ${scope}`,
+      );
+    });
+    delete systemConfigDraft.fan_mode;
+    delete systemConfigDraft.fan_scope;
+    await refreshStatus({ force: true });
+  } catch (e) {
+    setMsg(`Cooling configuration failed: ${messageText(e)}`);
+  }
 }
 profile = async function (p) {
   if (typeof benchmarkJobActive === "function" && benchmarkJobActive()) {

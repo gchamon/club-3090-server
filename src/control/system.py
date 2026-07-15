@@ -2021,7 +2021,7 @@ def build_status_snapshot(refresh_remote_metadata=False):
         m = dict(metrics)
         recent = list(recent_requests)
         series = metric_series_status_snapshot_unlocked()
-    runtime_inventory = load_runtime_inventory()
+    runtime_inventory = enrich_inventory_model_update_state(load_runtime_inventory())
     local_installer_metadata = read_local_installer_metadata()
     self_update_state = read_self_update_state()
     remote_update_metadata = cached_remote_script_metadata(refresh=refresh_remote_metadata)
@@ -2167,6 +2167,7 @@ def build_status_snapshot(refresh_remote_metadata=False):
         "gpu_count": gpu_count,
         "instances": instances,
         "runtime_inventory": runtime_inventory,
+        "model_updates": model_update_state_snapshot(),
         "models": list(runtime_inventory.get("models") or []),
         "variants": list(runtime_inventory.get("variants") or []),
         "nvlink": detect_nvlink_status(),
@@ -3010,13 +3011,31 @@ def _runtime_log_export_candidates(instance_id=""):
     return candidates
 
 
-def export_selected_log(source="docker", instance_id=""):
+def export_selected_log(source="docker", instance_id="", service_id=""):
     source_name = str(source or "docker").strip().lower()
-    service_id = ""
     if source_name.startswith("service:"):
         service_id = source_name.split(":", 1)[1]
         source_name = "service"
     exported_at = time.strftime("%Y-%m-%d %H:%M:%S")
+    if source_name == "control":
+        raw_text = _tail_text_lines(CONTROL_LOG_FILE, max_lines=4000)
+        if not raw_text.strip():
+            raise ValueError("Web UI server log is empty")
+        file_name = f"club3090-web-ui-server-{time.strftime('%Y%m%d-%H%M%S')}.log"
+        header = (
+            "# club-3090 log export\n"
+            f"source: web-ui-server\n"
+            f"exported_at: {exported_at}\n"
+            f"script_version: {SCRIPT_VERSION}\n"
+            f"path: {CONTROL_LOG_FILE}\n\n"
+        )
+        return {
+            "source": "control",
+            "instance_id": None,
+            "container": "",
+            "file_name": file_name,
+            "text": header + raw_text,
+        }
     if source_name == "audit":
         raw_text = _tail_text_lines(AUDIT_LOG_FILE, max_lines=4000)
         if not raw_text.strip():

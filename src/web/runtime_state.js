@@ -654,6 +654,11 @@ function hydrateUiState(cfg) {
     state.current_log_source === "audit" ||
     state.current_log_source === "debug" ||
     state.current_log_source === "docker" ||
+    state.current_log_source === "benchmarks" ||
+    state.current_log_source === "script" ||
+    state.current_log_source === "control" ||
+    state.current_log_source === "update" ||
+    String(state.current_log_source || "").startsWith("model:") ||
     String(state.current_log_source || "").startsWith("service:")
       ? String(state.current_log_source)
       : "docker";
@@ -707,7 +712,7 @@ function ensureChatHydrationForActiveTab() {
 }
 let powerCoolingBusyState = { active: false, message: "" };
 function syncPowerCoolingBusyState() {
-  const panel = findPanelByHeading("system", "Optimizations + Cooling");
+  const panel = $("systemConfigPanel") || findPanelByHeading("system", "System Configuration");
   if (!panel) return;
   const benchmarkLocked = typeof benchmarkJobActive === "function" && benchmarkJobActive();
   const locked = !!powerCoolingBusyState.active || benchmarkLocked;

@@ -5,13 +5,15 @@ function renderLogSourcePanel() {
     const services = Array.isArray(lastStatus?.upstream_services)
       ? lastStatus.upstream_services.filter((row) => row && row.running)
       : [];
+    const modelSources = modelLogSourceEntries();
     const scriptActive = !!lastStatus?.script_job?.active || currentLogSource === "script";
     panel.className = `panel log-source-panel${updateActive ? " log-source-panel-disabled" : ""}`;
     const disabledAttr = updateActive ? ' disabled aria-disabled="true"' : "";
     panel.innerHTML = `<div class="panel-head"><h2>Log Sources</h2><div class="preset-actions">${renderIconButton({ title: "Export", action: "exportCurrentLog()", icon: "upload", disabled: updateActive })}</div></div><div class="subtabs">${[
-      { id: "docker", label: "Docker" },
+      { id: "control", label: "Web UI Server" },
       { id: "audit", label: "Audit" },
       { id: "debug", label: "Debug" },
+      ...modelSources,
       { id: "benchmarks", label: "Benchmarks" },
       ...(scriptActive ? [{ id: "script", label: "Script" }] : []),
       ...(updateActive || currentLogSource === "update"
@@ -21,6 +23,7 @@ function renderLogSourcePanel() {
         id: `service:${String(row.id || "")}`,
         label: String(row.display_name || row.id || "Service"),
       })),
+      { id: "docker", label: "Runtime Docker" },
     ]
       .map(
         (row) =>
@@ -33,6 +36,11 @@ function renderLogSourcePanel() {
   if (currentLogSource === "update") {
     $("logsSourceSummary").innerHTML =
       "Update selected. The live viewer follows the separate updater service and keeps the self-update stream visible while the control plane restarts.";
+    return;
+  }
+  if (currentLogSource === "control") {
+    $("logsSourceSummary").innerHTML =
+      "Web UI Server selected. The live viewer follows <code>/opt/club3090-control/control.log</code>.";
     return;
   }
   if (currentLogSource === "audit") {
@@ -59,6 +67,13 @@ function renderLogSourcePanel() {
       `Script selected. ${escapeHtml(job.summary || "The live viewer follows the active upstream script output.")}${job.label ? ` <code>${escapeHtml(job.label)}</code>` : ""}`;
     return;
   }
+  if (String(currentLogSource || "").startsWith("model:")) {
+    const modelSource = modelLogSourceFromSource(currentLogSource);
+    $("logsSourceSummary").innerHTML = modelSource
+      ? `${escapeHtml(modelSource.label)} selected. The live viewer follows container <code>${escapeHtml(modelSource.container || modelSource.instanceId)}</code>.`
+      : "Model service log source selected.";
+    return;
+  }
   if (String(currentLogSource || "").startsWith("service:")) {
     const serviceId = String(currentLogSource).split(":", 2)[1] || "";
     const service = (lastStatus?.upstream_services || []).find(
@@ -73,13 +88,48 @@ function renderLogSourcePanel() {
     const options = dockerLogInstanceOptions();
     const current = selectedDockerLogInstanceOption();
     if (!options.length) {
-      return "Docker selected. No managed runtime is active yet.";
+      return "Runtime Docker selected. No managed runtime is active yet.";
     }
     if (options.length > 1 && current) {
-      return `Docker selected. The instance selector is focused on <code>${escapeHtml(current.id)}</code> so you can switch between the active fanned-out runtimes.`;
+      return `Runtime Docker selected. The instance selector is focused on <code>${escapeHtml(current.id)}</code> so you can switch between active fanned-out runtimes.`;
     }
-    return `Docker selected. The live viewer follows <code>${escapeHtml(current?.id || "primary")}</code>.`;
+    return `Runtime Docker selected. The live viewer follows <code>${escapeHtml(current?.id || "primary")}</code>.`;
   })();
+}
+function modelLogSourceEntries() {
+  const seen = new Set();
+  return runtimeStatsRows(lastStatus)
+    .filter((row) => row && (row.running || row.booting))
+    .map((row) => {
+      const instanceId = String(row.id || row.instance_id || "").trim().toUpperCase();
+      if (!instanceId || seen.has(instanceId)) return null;
+      seen.add(instanceId);
+      const selector = String(row.selector || row.mode || "").trim();
+      const variant = selector ? variantMapBySelector().get(selector) : null;
+      const preset = variant ? variantDisplayLabel(variant) : selector || row.display_name || instanceId;
+      const scope = String(row.display_name || instanceId).trim();
+      return {
+        id: `model:${instanceId}`,
+        label: `Model: ${preset}${scope ? ` · ${scope}` : ""}`,
+        instanceId,
+        selector,
+        container: String(row.container || "").trim(),
+      };
+    })
+    .filter(Boolean);
+}
+function modelLogSourceFromSource(source) {
+  const instanceId = String(source || "").startsWith("model:")
+    ? String(source).slice("model:".length).trim().toUpperCase()
+    : "";
+  if (!instanceId) return null;
+  return modelLogSourceEntries().find((row) => row.instanceId === instanceId) || {
+    id: `model:${instanceId}`,
+    label: `Model Service · ${instanceId}`,
+    instanceId,
+    selector: "",
+    container: "",
+  };
 }
 function debugLogCommandEnabled() {
   return currentLogSource === "debug" && !selfUpdateActive(lastStatus);
@@ -705,10 +755,15 @@ async function downloadDebugTransferFiles() {
 }
 currentLogHeading = function () {
   if (currentLogSource === "update") return "Update Logs";
+  if (currentLogSource === "control") return "Web UI Server Logs";
   if (currentLogSource === "audit") return "Audit Logs";
   if (currentLogSource === "debug") return "Debug Logs";
   if (currentLogSource === "benchmarks") return "Benchmark Logs";
   if (currentLogSource === "script") return "Script Logs";
+  if (String(currentLogSource || "").startsWith("model:")) {
+    const modelSource = modelLogSourceFromSource(currentLogSource);
+    return `${String(modelSource?.label || "Model Service").replace(/^Model:\s*/, "")} Logs`;
+  }
   if (String(currentLogSource || "").startsWith("service:")) {
     const serviceId = String(currentLogSource).split(":", 2)[1] || "";
     const service = (lastStatus?.upstream_services || []).find(
@@ -716,14 +771,19 @@ currentLogHeading = function () {
     );
     return `${String(service?.display_name || serviceId || "Service")} Logs`;
   }
-  return "Docker Logs";
+  return "Runtime Docker Logs";
 };
 currentLogLabel = function () {
   if (currentLogSource === "update") return "source: updater";
+  if (currentLogSource === "control") return "source: web ui server";
   if (currentLogSource === "audit") return "source: audit";
   if (currentLogSource === "debug") return "source: debug";
   if (currentLogSource === "benchmarks") return "source: benchmarks";
   if (currentLogSource === "script") return "source: script";
+  if (String(currentLogSource || "").startsWith("model:")) {
+    const modelSource = modelLogSourceFromSource(currentLogSource);
+    return `source: ${modelSource?.label || "model service"}`;
+  }
   if (String(currentLogSource || "").startsWith("service:")) {
     const serviceId = String(currentLogSource).split(":", 2)[1] || "";
     const service = (lastStatus?.upstream_services || []).find(
@@ -974,6 +1034,8 @@ function logStreamConfig() {
       url: updateMonitor.streamUrl || "/admin/update-stream",
     };
   }
+  if (currentLogSource === "control")
+    return { signature: "control", url: "/admin/control-stream?tail=4000" };
   if (currentLogSource === "audit")
     return { signature: "audit", url: "/admin/audit-stream?tail=4000" };
   if (currentLogSource === "debug")
@@ -987,6 +1049,14 @@ function logStreamConfig() {
     return {
       signature: `service:${serviceId}`,
       url: `/admin/logs?source=service&service=${encodeURIComponent(serviceId)}`,
+    };
+  }
+  if (String(currentLogSource || "").startsWith("model:")) {
+    const modelSource = modelLogSourceFromSource(currentLogSource);
+    const instanceId = modelSource?.instanceId || "";
+    return {
+      signature: `model:${instanceId || "primary"}`,
+      url: `/admin/logs${instanceId ? `?instance=${encodeURIComponent(instanceId)}` : ""}`,
     };
   }
   const explicit = selectedDockerLogInstanceId();
@@ -1009,11 +1079,13 @@ function logStreamConfig() {
 function noteKnownLogSource(source) {
   const normalized =
     source === "audit" ||
+    source === "control" ||
     source === "debug" ||
     source === "benchmarks" ||
     source === "script" ||
     source === "docker" ||
     source === "update" ||
+    String(source || "").startsWith("model:") ||
     String(source || "").startsWith("service:")
       ? String(source)
       : "docker";
@@ -1033,12 +1105,18 @@ function logBootstrapUrlForSource(source) {
   const normalized = noteKnownLogSource(source);
   if (normalized === "update") return null;
   if (normalized === "audit") return "/admin/log-bootstrap?source=audit&tail=250";
+  if (normalized === "control") return "/admin/log-bootstrap?source=control&tail=250";
   if (normalized === "debug") return "/admin/log-bootstrap?source=debug&tail=250";
   if (normalized === "benchmarks") return "/admin/log-bootstrap?source=benchmarks&tail=250";
   if (normalized === "script") return "/admin/log-bootstrap?source=script&tail=250";
   if (String(normalized).startsWith("service:")) {
     const serviceId = String(normalized).split(":", 2)[1] || "";
     return `/admin/log-bootstrap?source=service&service=${encodeURIComponent(serviceId)}&tail=250`;
+  }
+  if (String(normalized).startsWith("model:")) {
+    const modelSource = modelLogSourceFromSource(normalized);
+    const instanceId = modelSource?.instanceId || "";
+    return `/admin/log-bootstrap${instanceId ? `?instance=${encodeURIComponent(instanceId)}&tail=250` : "?tail=250"}`;
   }
   const explicit = selectedDockerLogInstanceId();
   const tracked = explicit
@@ -1099,14 +1177,22 @@ function currentLogExportRequest() {
   if (currentLogSource === "update") {
     return { source: "update", instance_id: null };
   }
+  if (currentLogSource === "control") {
+    return { source: "control", instance_id: null };
+  }
   if (currentLogSource === "audit") {
     return { source: "audit", instance_id: null };
   }
   if (currentLogSource === "debug") {
     return { source: "debug", instance_id: null };
   }
+  if (String(currentLogSource || "").startsWith("model:")) {
+    const modelSource = modelLogSourceFromSource(currentLogSource);
+    return { source: "docker", instance_id: modelSource?.instanceId || null };
+  }
   if (String(currentLogSource || "").startsWith("service:")) {
-    return { source: String(currentLogSource), instance_id: null };
+    const serviceId = String(currentLogSource).split(":", 2)[1] || "";
+    return { source: "service", service_id: serviceId, instance_id: null };
   }
   if (currentLogSignature && currentLogSignature.startsWith("docker:")) {
     const fromSignature = currentLogSignature.slice("docker:".length);
@@ -1612,7 +1698,9 @@ setCurrentLogSource = function (source) {
     source === "docker" ||
     source === "benchmarks" ||
     source === "script" ||
+    source === "control" ||
     source === "update" ||
+    String(source || "").startsWith("model:") ||
     String(source || "").startsWith("service:")
       ? String(source)
       : "docker";

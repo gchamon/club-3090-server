@@ -183,47 +183,12 @@
               <span>Setup AI Studio</span>
             </button>
           </div>
-          <div class="panel" style="margin-top:12px">
-            <h2>Power Profiles</h2>
-            <div class="actions" id="profileActionRow">
-              <button
-                class="btn benchmark-profile"
-                onclick="profile('benchmark-ready')"
-              >
-                Benchmark Ready (220W)</button
-              ><button class="btn eco-profile" onclick="profile('eco')">Eco (240W)</button
-              ><button
-                class="btn profile-balanced"
-                onclick="profile('balanced')"
-              >
-                Balanced (280W)</button
-              ><button
-                class="btn fast-profile"
-                onclick="profile('fast')"
-              >
-                Fast (300W)</button
-              ><button class="btn orange" onclick="profile('turbo')">
-                Turbo (350W)
-              </button>
+          <div class="panel" id="systemConfigPanel" style="margin-top:12px">
+            <div class="panel-head">
+              <h2>System Configuration</h2>
+              <span class="status-badge status-production" id="systemConfigCurrentBadge">current</span>
             </div>
-          </div>
-          <div class="panel">
-            <h2>Optimizations + Cooling</h2>
-            <div class="actions" id="powerCoolingActionRow">
-              <button
-                class="btn green"
-                id="optToggle"
-                onclick="togglePowerOptimizations()"
-              >
-                Disable Power Optimizations</button
-              ><button
-                class="btn green"
-                id="fanToggle"
-                onclick="toggleFansMax()"
-              >
-                Set Fans to Max
-              </button>
-            </div>
+            <div class="system-config-grid" id="systemConfigGrid"></div>
           </div>
           <div class="msg" id="instanceMsg"></div>
         </div>

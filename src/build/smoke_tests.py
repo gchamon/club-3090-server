@@ -1642,6 +1642,70 @@ process.on("uncaughtException", (error) => {{
   if (vm.runInContext("currentLogSource", context) !== "update") {{
     throw new Error("log source switching should stay pinned to update logs while a self-update is active");
   }}
+  context.__modelLogStatus = {{
+    ...statusPayload,
+    running_runtimes: [
+      {{
+        id: "GPU0",
+        instance_id: "GPU0",
+        display_name: "GPU0",
+        selector: "beellama/dflash",
+        mode: "beellama/dflash",
+        container: "club3090-gpu0",
+        running: true,
+      }},
+    ],
+    variants: [
+      {{
+        upstream_tag: "beellama/dflash",
+        selector: "beellama/dflash",
+        variant_id: "beellama-dflash",
+        display_name: "beellama/dflash",
+        model_id: "qwen3.6-27b",
+      }},
+    ],
+  }};
+  vm.runInContext("updateMonitor.active = false; lastStatus = __modelLogStatus; currentLogSource = 'control'; renderLogSourcePanel(); __controlLogConfig = logStreamConfig(); __controlBootstrap = logBootstrapUrlForSource('control');", context);
+  if (!String(getElement("logSourcePanel").innerHTML || "").includes("Web UI Server")) {{
+    throw new Error("log source controls should expose Web UI Server logs");
+  }}
+  if (vm.runInContext("__controlLogConfig.url", context) !== "/admin/control-stream?tail=4000" || vm.runInContext("__controlBootstrap", context) !== "/admin/log-bootstrap?source=control&tail=250") {{
+    throw new Error("Web UI Server logs should use the control stream and bootstrap source");
+  }}
+  vm.runInContext("setCurrentLogSource('control');", context);
+  if (vm.runInContext("currentLogSource", context) !== "control") {{
+    throw new Error("clicking Web UI Server logs should not redirect to Runtime Docker");
+  }}
+  vm.runInContext("currentLogSource = 'model:GPU0'; renderLogSourcePanel(); __modelLogConfig = logStreamConfig(); __modelBootstrap = logBootstrapUrlForSource('model:GPU0'); __modelExport = currentLogExportRequest();", context);
+  if (!String(getElement("logSourcePanel").innerHTML || "").includes("Model: beellama/dflash · GPU0")) {{
+    throw new Error("log source controls should expose active model service logs by preset and scope");
+  }}
+  if (vm.runInContext("__modelLogConfig.url", context) !== "/admin/logs?instance=GPU0" || vm.runInContext("__modelBootstrap", context) !== "/admin/log-bootstrap?instance=GPU0&tail=250") {{
+    throw new Error("model service log source should route to the runtime container log stream");
+  }}
+  if (vm.runInContext("__modelExport.source", context) !== "docker" || vm.runInContext("__modelExport.instance_id", context) !== "GPU0") {{
+    throw new Error("model service log export should export the selected runtime docker log");
+  }}
+  vm.runInContext("setCurrentLogSource('model:GPU0');", context);
+  if (vm.runInContext("currentLogSource", context) !== "model:GPU0") {{
+    throw new Error("clicking model service logs should not redirect to Runtime Docker");
+  }}
+  context.__systemConfigStatus = {{
+    ...statusPayload,
+    power: {{ profile: "balanced", optimizations_enabled: true, fan_manual_override: false }},
+    server_config: {{ active_power_profile: "balanced", fan_override_instance_id: "GLOBAL" }},
+    instances: [{{ id: "GPU0", kind: "single", gpu_index: 0, gpu_indices: [0], enabled: true }}],
+  }};
+  vm.runInContext("lastStatus = __systemConfigStatus; renderSystemConfiguration(lastStatus);", context);
+  const systemConfigHtml = String(getElement("systemConfigGrid").innerHTML || "");
+  if (!systemConfigHtml.includes("System") && (!systemConfigHtml.includes("Power Profile") || !systemConfigHtml.includes("Balanced (280W)") || !systemConfigHtml.includes("Power Optimizations") || !systemConfigHtml.includes("Cooling"))) {{
+    throw new Error("System Configuration should render current power, optimization, and cooling settings");
+  }}
+  vm.runInContext("setSystemConfigDraft('profile', 'fast');", context);
+  const dirtySystemConfigHtml = String(getElement("systemConfigGrid").innerHTML || "");
+  if (!dirtySystemConfigHtml.includes("system-config-row-dirty") || !dirtySystemConfigHtml.includes("changed")) {{
+    throw new Error("System Configuration should mark changed dropdown values as unsaved");
+  }}
   vm.runInContext("updateMonitor.active = false; reconcileUpdateUiFromStatus(__updateStatus);", context);
   if (!vm.runInContext("updateMonitor.active", context)) {{
     throw new Error("self-update state from status should resume the update monitor after a reload");
@@ -1778,6 +1842,8 @@ process.on("uncaughtException", (error) => {{
         drafter: "",
         kv_format: "q4_0",
         max_model_len: 131072,
+        model_update_state: "current",
+        model_update_checked_at: 1710000000,
       }},
       {{
         upstream_tag: "vllm/qwen-a3b-preview-single",
@@ -1817,6 +1883,34 @@ process.on("uncaughtException", (error) => {{
   const summarySideHtml = summaryCardHtml.slice(summaryCardHtml.indexOf('<aside class="variant-card-side">'), summaryCardHtml.indexOf("</aside>") + 8);
   if (!summarySideHtml.includes("preset-score-label") || !summarySideHtml.includes("variant-settings-cluster")) {{
     throw new Error("Summary preset score and settings controls should share the stretchable right column");
+  }}
+  if (!summaryCardHtml.includes("model current") || !summaryCardHtml.includes("Model update:") || !summaryCardHtml.includes("matches the last checked Hugging Face revision")) {{
+    throw new Error("Summary preset cards should visibly show current model update state");
+  }}
+  context.__pendingUpdateVariant = {{
+    ...presetStatus.variants[0],
+    variant_id: "pending-update-test",
+    model_update_state: "pending_update",
+  }};
+  const pendingSummaryCardHtml = String(vm.runInContext("renderSummaryVariantCard(__pendingUpdateVariant, 'qwen3.6-27b')", context) || "");
+  if (!pendingSummaryCardHtml.includes("update available") || !pendingSummaryCardHtml.includes(">Update<") || !pendingSummaryCardHtml.includes("A newer Hugging Face file revision is available.")) {{
+    throw new Error("Summary preset cards should show pending model updates and an update action");
+  }}
+  context.__warningUpdateVariant = {{
+    ...presetStatus.variants[0],
+    variant_id: "warning-update-test",
+    model_update_state: "check_error",
+    model_update_error: "metadata unavailable",
+  }};
+  const warningSummaryCardHtml = String(vm.runInContext("renderSummaryVariantCard(__warningUpdateVariant, 'qwen3.6-27b')", context) || "");
+  if (!warningSummaryCardHtml.includes("update check warning") || !warningSummaryCardHtml.includes("metadata unavailable")) {{
+    throw new Error("Summary preset cards should show model update warning details");
+  }}
+  const familyPendingBadge = String(vm.runInContext("modelFamilyUpdateBadgeHtml([lastStatus.variants[0], __pendingUpdateVariant])", context) || "");
+  const familyWarningBadge = String(vm.runInContext("modelFamilyUpdateBadgeHtml([lastStatus.variants[0], __warningUpdateVariant])", context) || "");
+  const familyCurrentBadge = String(vm.runInContext("modelFamilyUpdateBadgeHtml([lastStatus.variants[0]])", context) || "");
+  if (!familyPendingBadge.includes("updates available") || !familyWarningBadge.includes("update warnings") || !familyCurrentBadge.includes("models current")) {{
+    throw new Error("Model family headers should aggregate model update state");
   }}
   context.__quickScoreStatus = {{
     benchmarks: {{
@@ -5901,8 +5995,8 @@ def generate_test_html_artifact() -> tuple[str, str]:
     lane_section_source = js_source.split("function renderAIStudioLaneSection", 1)[-1].split("function renderAIStudioResourceCard", 1)[0]
     if "ai-studio-modality-badge" in lane_section_source or "resourceManagerModalityIcon" in lane_section_source:
         raise ValueError("AI Studio parent lane columns must stay collapsible without parent icons or modality badges")
-    if 'class="btn eco-profile"' not in html_source:
-        raise ValueError("Eco power profile must use the lighter green Eco profile style")
+    if 'id="systemConfigPanel"' not in html_source or 'id="systemConfigGrid"' not in html_source or 'id="profileActionRow"' in html_source:
+        raise ValueError("System power controls must render through the staged System Configuration panel instead of the legacy profile button row")
     if 'class="btn blue" onclick="openSetupAssistantModal()"' in html_source or "class=\"btn green\"\n                onclick=\"promptRuntimeInventoryRebuild()\"" in html_source:
         raise ValueError("Model Presets header actions must be collapsed into the hamburger menu")
     for preset_menu_marker in (
@@ -5918,16 +6012,17 @@ def generate_test_html_artifact() -> tuple[str, str]:
         if preset_menu_marker not in html_source:
             raise ValueError("Model Presets header menu is missing " + preset_menu_marker)
     power_profile_markers = [
-        ("profile('benchmark-ready')", "Benchmark Ready (220W)"),
-        ("profile('eco')", "Eco (240W)"),
-        ("profile('balanced')", "Balanced (280W)"),
-        ("profile('fast')", "Fast (300W)"),
-        ("profile('turbo')", "Turbo (350W)"),
+        ("benchmark-ready", "Benchmark Ready (220W)"),
+        ("eco", "Eco (240W)"),
+        ("balanced", "Balanced (280W)"),
+        ("fast", "Fast (300W)"),
+        ("turbo", "Turbo (350W)"),
     ]
+    profile_options_source = js_source.split("const SYSTEM_POWER_PROFILE_OPTIONS", 1)[-1].split("let systemConfigDraft", 1)[0]
     last_profile_offset = -1
     for profile_marker, label_marker in power_profile_markers:
-        profile_offset = html_source.find(profile_marker)
-        label_offset = html_source.find(label_marker)
+        profile_offset = profile_options_source.find(profile_marker)
+        label_offset = profile_options_source.find(label_marker)
         if profile_offset < 0 or label_offset < 0:
             raise ValueError("Power profile controls must include watt-limited labels for every profile")
         if profile_offset <= last_profile_offset:
@@ -12308,6 +12403,7 @@ def run_remote_update_metadata_smoke_test(control_path: Path, cwd: Path, filenam
 
 def model_install_progress_smoke_harness() -> str:
     return """import importlib.util
+import inspect
 import pathlib
 import shutil
 import sys
@@ -12544,6 +12640,41 @@ try:
     waiter.join(timeout=2)
     assert second_acquired.is_set(), "waiting model target should resume after release"
     module._release_model_install_download_locks(second_locks)
+    update_file = temp_root / "model_update_state.json"
+    module.MODEL_UPDATE_STATE_FILE = str(update_file)
+    local_dir = temp_root / "update-target"
+    local_dir.mkdir(parents=True, exist_ok=True)
+    (local_dir / "model.gguf").write_text("placeholder", encoding="utf-8")
+    update_variant = {
+        "variant_id": "update-owner",
+        "selector": "llamacpp/update-owner",
+        "model_id": "update-model",
+        "install_state": "ready",
+        "install_command": f'hf download org/model model.gguf --local-dir "{local_dir}"',
+    }
+    update_resources = module._model_update_plan_resources(update_variant)
+    assert len(update_resources) == 1, update_resources
+    assert update_resources[0]["filename"] == "model.gguf", update_resources
+    initial_state = module.write_model_update_state({
+        "resources": {
+            update_resources[0]["key"]: {
+                **update_resources[0],
+                "baseline_remote_identity": "old",
+                "remote_identity": "new",
+                "status": "pending_update",
+                "checked_at": 123,
+            }
+        }
+    })
+    assert initial_state["summary"]["pending"] == 1, initial_state
+    enriched = module.enrich_inventory_model_update_state({"models": [], "variants": [update_variant]})
+    enriched_variant = enriched["variants"][0]
+    assert enriched_variant["model_update_state"] == "pending_update", enriched_variant
+    assert enriched["model_updates"]["pending"] == 1, enriched
+    download_plan_source = inspect.getsource(module._run_hf_download_step)
+    assert "--force-download" in download_plan_source, download_plan_source
+    start_source = inspect.getsource(module.start_model_update_job)
+    assert "_start_model_download_job" in start_source and "update_mode=True" in start_source, start_source
     print("model install progress smoke ok")
 finally:
     shutil.rmtree(temp_root, ignore_errors=True)

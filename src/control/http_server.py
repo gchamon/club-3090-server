@@ -492,6 +492,21 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             finally:
                 self.end_admin_stream(stream_key, stop_event)
             return
+        if path == "/admin/control-stream":
+            params = parse_admin_query_params(parsed)
+            stream_key, stop_event = self.begin_admin_stream("logs:control")
+            self.close_connection = True
+            self.send_response(200)
+            self.send_header("Content-Type","text/event-stream")
+            self.send_header("Cache-Control","no-cache")
+            self.send_header("Connection","close")
+            self.emit_pending_headers()
+            self.end_headers()
+            try:
+                self.stream_text_file(CONTROL_LOG_FILE, "no web UI server entries yet; waiting...", initial_tail_lines=parse_tail_lines_param(params, 250), stop_event=stop_event)
+            finally:
+                self.end_admin_stream(stream_key, stop_event)
+            return
         if path == "/admin/debug-stream":
             params = parse_admin_query_params(parsed)
             stream_key, stop_event = self.begin_admin_stream("logs:debug")
@@ -801,6 +816,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             try:
                 ensure_benchmark_idle("Model DB rebuild")
                 inventory = enrich_runtime_inventory_cache_sizes(rebuild_runtime_inventory())
+                inventory = enrich_inventory_model_update_state(inventory)
                 benchmark_inventory = benchmark_rebuild_inventory_state_file(reason="runtime inventory rebuilt from admin")
                 log_audit("admin_runtime_inventory_rebuilt", models=len(inventory.get("models") or []), variants=len(inventory.get("variants") or []))
                 self.send_json({
@@ -810,6 +826,33 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                     "models": inventory.get("models") or [],
                     "variants": inventory.get("variants") or [],
                 })
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path == "/admin/model-updates/check":
+            try:
+                summary = start_model_update_check("manual")
+                inventory = enrich_inventory_model_update_state(enrich_runtime_inventory_cache_sizes(load_runtime_inventory(force=True)))
+                self.send_json({
+                    "ok": True,
+                    "model_updates": summary,
+                    "runtime_inventory": inventory,
+                    "models": inventory.get("models") or [],
+                    "variants": inventory.get("variants") or [],
+                    "focus_log_source": "audit",
+                })
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path == "/admin/model-update":
+            try:
+                data = self.read_json_body()
+                job = start_model_update_job(
+                    data.get("model_id"),
+                    data.get("variant_id"),
+                    data.get("resource_key"),
+                )
+                self.send_json({"ok": True, "model_install_job": job, "model_install_jobs": model_install_jobs_snapshot(), "focus_log_source": "audit"})
             except Exception as e:
                 self.send_json({"ok": False, "error": str(e)}, 500)
             return
@@ -1558,6 +1601,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                 export_payload = export_selected_log(
                     source=data.get("source") or "docker",
                     instance_id=data.get("instance_id") or "",
+                    service_id=data.get("service_id") or "",
                 )
                 upload = upload_text_to_share_host(
                     export_payload.get("text") or "",
@@ -2659,11 +2703,21 @@ def start_control_background_loops():
             log_control(f"docker logrotate bootstrap error: {e}")
         docker_logrotate_refresher()
 
+    def model_update_check_bootstrap():
+        time.sleep(20)
+        while True:
+            try:
+                run_model_update_check("scheduled")
+            except Exception as e:
+                log_control(f"model update check error: {e}")
+            time.sleep(max(300, int(MODEL_UPDATE_CHECK_INTERVAL_SECONDS or 3600)))
+
     threading.Thread(target=idle_watchdog, daemon=True).start()
     threading.Thread(target=image_studio_power_watchdog, daemon=True).start()
     threading.Thread(target=metrics_bootstrap, daemon=True).start()
     threading.Thread(target=status_bootstrap, daemon=True).start()
     threading.Thread(target=docker_logrotate_bootstrap, daemon=True).start()
+    threading.Thread(target=model_update_check_bootstrap, daemon=True).start()
     threading.Thread(target=startup_power_primer, daemon=True).start()
 
 def startup_runtime_inventory_bootstrap():

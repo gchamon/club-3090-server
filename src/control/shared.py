@@ -461,6 +461,8 @@ INSTANCES_DIR = os.path.join(CONTROL_DIR, "instances")
 GENERATED_COMPOSE_OVERRIDES_DIR = os.path.join(CONTROL_DIR, "compose-overrides")
 INSTANCE_RUNTIME_CACHE_HOST_ROOT = os.path.join(CLUB3090_DIR, "models-cache", ".runtime", "instances")
 RUNTIME_INVENTORY_FILE = os.path.join(CONTROL_DIR, "runtime_inventory.json")
+MODEL_UPDATE_STATE_FILE = os.path.join(CONTROL_DIR, "model_update_state.json")
+MODEL_UPDATE_CHECK_INTERVAL_SECONDS = max(300, _env_int("CLUB3090_MODEL_UPDATE_CHECK_INTERVAL_SECONDS", 3600))
 SWITCH_FAILURE_FILE = os.path.join(CONTROL_DIR, "switch_failure.json")
 DEFAULT_MODE = os.environ.get("DEFAULT_MODE", "vllm/default")
 ADMIN_PORT = config_int("network", "admin_port", _env_int("CLUB3090_ADMIN_PORT", 8008))
@@ -689,6 +691,14 @@ model_install_cleanup_targets = {}
 model_install_process_lock = threading.Lock()
 model_install_download_lock_guard = threading.Lock()
 model_install_download_locks = {}
+model_update_state_lock = threading.RLock()
+model_update_check_lock = threading.Lock()
+model_update_check_status = {
+    "active": False,
+    "last_started_at": 0,
+    "last_finished_at": 0,
+    "last_error": "",
+}
 custom_model_job_lock = threading.Lock()
 custom_model_job = {
     "active": False,
@@ -3503,6 +3513,48 @@ def _hf_repo_file_sizes(repo_ids, filenames, env_map):
     return {}
 
 
+def _hf_repo_file_metadata(repo_ids, filenames, env_map):
+    wanted = [str(name or "").strip().lstrip("/") for name in (filenames or []) if str(name or "").strip()]
+    if not wanted:
+        return {}
+    candidates = repo_ids if isinstance(repo_ids, (list, tuple)) else [repo_ids]
+    for repo_id in candidates:
+        repo = str(repo_id or "").strip()
+        if not repo:
+            continue
+        url = f"https://huggingface.co/api/models/{quote(repo, safe='/')}"
+        req = urllib.request.Request(url, headers=_hf_auth_headers(env_map))
+        with urllib.request.urlopen(req, timeout=25) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+        siblings = payload.get("siblings") or []
+        by_name = {}
+        for row in siblings:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("rfilename") or "").strip().lstrip("/")
+            if not name or name not in wanted:
+                continue
+            lfs = row.get("lfs") if isinstance(row.get("lfs"), dict) else {}
+            size = row.get("size")
+            if size in (None, ""):
+                size = lfs.get("size")
+            identity = (
+                str(lfs.get("sha256") or "").strip()
+                or str(row.get("blob_id") or "").strip()
+                or str(row.get("oid") or "").strip()
+            )
+            by_name[name] = {
+                "repo_id": repo,
+                "filename": name,
+                "size": int(size or 0) if str(size or "").strip().isdigit() else 0,
+                "remote_identity": identity,
+                "repo_sha": str(payload.get("sha") or "").strip(),
+            }
+        if all(name in by_name for name in wanted):
+            return by_name
+    return {}
+
+
 def _hf_download_target_paths(plan):
     rows = []
     seen = set()
@@ -3522,6 +3574,258 @@ def _hf_download_target_paths(plan):
                 rows.append({"path": local_dir, "name": ""})
                 seen.add(local_dir)
     return rows
+
+
+def _model_update_resource_key(path):
+    return os.path.realpath(os.path.abspath(str(path or "").strip())) if str(path or "").strip() else ""
+
+
+def _model_update_empty_state():
+    now = int(time.time())
+    return {
+        "schema_version": 1,
+        "updated_at": 0,
+        "last_check_started_at": 0,
+        "last_check_finished_at": 0,
+        "resources": {},
+        "summary": {"pending": 0, "errors": 0, "checked": 0, "checking": False, "checked_at": 0},
+        "created_at": now,
+    }
+
+
+def read_model_update_state():
+    with model_update_state_lock:
+        state = read_json_file(MODEL_UPDATE_STATE_FILE, {})
+        if not isinstance(state, dict) or int(state.get("schema_version") or 0) != 1:
+            state = _model_update_empty_state()
+        state.setdefault("resources", {})
+        state.setdefault("summary", {})
+        return state
+
+
+def write_model_update_state(state):
+    payload = dict(state or {})
+    payload["schema_version"] = 1
+    payload["updated_at"] = int(time.time())
+    resources = payload.get("resources") if isinstance(payload.get("resources"), dict) else {}
+    pending = sum(1 for row in resources.values() if str((row or {}).get("status") or "") == "pending_update")
+    errors = sum(1 for row in resources.values() if str((row or {}).get("status") or "") == "error")
+    checked = sum(1 for row in resources.values() if int((row or {}).get("checked_at") or 0) > 0)
+    payload["summary"] = {
+        "pending": pending,
+        "errors": errors,
+        "checked": checked,
+        "checking": bool(model_update_check_status.get("active")),
+        "checked_at": int(payload.get("last_check_finished_at") or 0),
+    }
+    with model_update_state_lock:
+        write_json_file(MODEL_UPDATE_STATE_FILE, payload)
+    return payload
+
+
+def model_update_state_snapshot():
+    state = read_model_update_state()
+    summary = dict(state.get("summary") or {})
+    summary["checking"] = bool(model_update_check_status.get("active"))
+    summary["last_started_at"] = int(model_update_check_status.get("last_started_at") or state.get("last_check_started_at") or 0)
+    summary["last_finished_at"] = int(model_update_check_status.get("last_finished_at") or state.get("last_check_finished_at") or 0)
+    summary["last_error"] = str(model_update_check_status.get("last_error") or "")
+    return summary
+
+
+def _model_update_plan_resources(variant, install_command=""):
+    row = variant if isinstance(variant, dict) else {}
+    command = str(install_command or row.get("install_command") or "").strip()
+    plan = _monitor_plan_from_variant_install(row, command)
+    resources = []
+    for step in plan:
+        local_dir = str(step.get("local_dir") or "").strip()
+        filenames = [str(name or "").strip().lstrip("/") for name in (step.get("filenames") or []) if str(name or "").strip()]
+        if not local_dir or not filenames:
+            continue
+        for name in filenames:
+            path = os.path.join(local_dir, name.replace("/", os.sep))
+            key = _model_update_resource_key(path)
+            if not key or not os.path.isfile(path):
+                continue
+            resources.append({
+                "key": key,
+                "path": path,
+                "repo_ids": list(step.get("repo_ids") or []),
+                "filename": name,
+                "local_dir": local_dir,
+                "variant_id": str(row.get("variant_id") or ""),
+                "selector": str(row.get("selector") or row.get("upstream_tag") or ""),
+                "model_id": str(row.get("model_id") or ""),
+            })
+    return resources
+
+
+def _runtime_variants_for_model_update(inventory=None):
+    inv = inventory if isinstance(inventory, dict) else load_runtime_inventory()
+    rows = []
+    for variant in inv.get("variants") or []:
+        if not isinstance(variant, dict):
+            continue
+        if str(variant.get("install_state") or "").strip() != "ready":
+            continue
+        resources = _model_update_plan_resources(variant)
+        if resources:
+            rows.append((variant, resources))
+    return rows
+
+
+def _model_update_remote_identity(meta):
+    row = meta if isinstance(meta, dict) else {}
+    return (
+        str(row.get("remote_identity") or "").strip()
+        or str(row.get("repo_sha") or "").strip()
+        or (str(row.get("size") or "").strip() if row.get("size") else "")
+    )
+
+
+def run_model_update_check(reason="scheduled", inventory=None):
+    if not model_update_check_lock.acquire(blocking=False):
+        return model_update_state_snapshot()
+    started = int(time.time())
+    model_update_check_status.update({"active": True, "last_started_at": started, "last_error": ""})
+    state = read_model_update_state()
+    state["last_check_started_at"] = started
+    checked = 0
+    try:
+        env_map = _repo_subprocess_env()
+        resources_by_key = {}
+        for variant, resources in _runtime_variants_for_model_update(inventory):
+            for resource in resources:
+                entry = resources_by_key.setdefault(resource["key"], dict(resource))
+                entry.setdefault("variant_ids", set()).add(str(variant.get("variant_id") or ""))
+                entry.setdefault("selectors", set()).add(str(variant.get("selector") or variant.get("upstream_tag") or ""))
+        current_resources = dict(state.get("resources") or {})
+        for key, resource in resources_by_key.items():
+            prior = dict(current_resources.get(key) or {})
+            now = int(time.time())
+            row = {
+                **prior,
+                "key": key,
+                "path": resource.get("path") or prior.get("path") or key,
+                "repo_ids": list(resource.get("repo_ids") or prior.get("repo_ids") or []),
+                "filename": resource.get("filename") or prior.get("filename") or "",
+                "variant_ids": sorted(item for item in resource.get("variant_ids", set()) if item),
+                "selectors": sorted(item for item in resource.get("selectors", set()) if item),
+                "checked_at": now,
+                "error": "",
+            }
+            try:
+                metadata = _hf_repo_file_metadata(row.get("repo_ids") or [], [row.get("filename")], env_map)
+                meta = metadata.get(row.get("filename") or "") or {}
+                if not meta:
+                    raise RuntimeError("HF metadata did not include this file")
+                remote_identity = _model_update_remote_identity(meta)
+                if not remote_identity:
+                    raise RuntimeError("HF metadata did not include a comparable file identity")
+                baseline = str(row.get("baseline_remote_identity") or "").strip()
+                row.update({
+                    "repo_id": meta.get("repo_id") or (row.get("repo_ids") or [""])[0],
+                    "remote_identity": remote_identity,
+                    "remote_size": int(meta.get("size") or 0),
+                    "repo_sha": str(meta.get("repo_sha") or ""),
+                })
+                if not baseline:
+                    row["baseline_remote_identity"] = remote_identity
+                    row["baseline_size"] = int(meta.get("size") or 0)
+                    row["status"] = "current"
+                elif baseline != remote_identity:
+                    row["status"] = "pending_update"
+                else:
+                    row["status"] = "current"
+                checked += 1
+            except Exception as exc:
+                row["status"] = "error"
+                row["error"] = str(exc)
+            current_resources[key] = row
+        known_keys = set(resources_by_key.keys())
+        for key, row in list(current_resources.items()):
+            if key not in known_keys:
+                current_resources.pop(key, None)
+        state["resources"] = current_resources
+        state["last_check_finished_at"] = int(time.time())
+        append_audit_text_line(f"[model-update-check] {reason}: checked {checked} resource{'s' if checked != 1 else ''}")
+        return write_model_update_state(state).get("summary") or {}
+    except Exception as exc:
+        model_update_check_status["last_error"] = str(exc)
+        append_audit_text_line(f"[model-update-check] {reason}: failed: {exc}")
+        state["last_check_finished_at"] = int(time.time())
+        return write_model_update_state(state).get("summary") or {}
+    finally:
+        model_update_check_status.update({"active": False, "last_finished_at": int(time.time())})
+        model_update_check_lock.release()
+        try:
+            refresh_status_snapshot()
+        except Exception:
+            pass
+
+
+def start_model_update_check(reason="manual"):
+    threading.Thread(
+        target=run_model_update_check,
+        args=(reason,),
+        name="club3090-model-update-check",
+        daemon=True,
+    ).start()
+    return model_update_state_snapshot()
+
+
+def _variant_model_update_rows(variant, state=None):
+    current = state if isinstance(state, dict) else read_model_update_state()
+    resources = current.get("resources") if isinstance(current.get("resources"), dict) else {}
+    rows = []
+    for resource in _model_update_plan_resources(variant):
+        row = dict(resources.get(resource.get("key")) or {})
+        if row:
+            rows.append(row)
+    return rows
+
+
+def enrich_inventory_model_update_state(inventory):
+    inv = dict(inventory or {}) if isinstance(inventory, dict) else {"models": [], "variants": []}
+    state = read_model_update_state()
+    summary = dict(state.get("summary") or {})
+    summary["checking"] = bool(model_update_check_status.get("active"))
+    inv["model_updates"] = summary
+    variants = []
+    for variant in inv.get("variants") or []:
+        if not isinstance(variant, dict):
+            variants.append(variant)
+            continue
+        row = dict(variant)
+        update_rows = _variant_model_update_rows(row, state)
+        pending = [item for item in update_rows if str(item.get("status") or "") == "pending_update"]
+        errors = [item for item in update_rows if str(item.get("status") or "") == "error"]
+        if pending:
+            row["model_update_state"] = "pending_update"
+        elif errors:
+            row["model_update_state"] = "check_error"
+        elif update_rows:
+            row["model_update_state"] = "current"
+        else:
+            row["model_update_state"] = ""
+        row["model_update_resources"] = [
+            {
+                "key": item.get("key") or "",
+                "path": item.get("path") or "",
+                "filename": item.get("filename") or "",
+                "repo_id": item.get("repo_id") or (item.get("repo_ids") or [""])[0],
+                "status": item.get("status") or "",
+                "checked_at": item.get("checked_at") or 0,
+                "error": item.get("error") or "",
+            }
+            for item in update_rows
+        ]
+        row["model_update_checked_at"] = max([int(item.get("checked_at") or 0) for item in update_rows] or [0])
+        row["model_update_error"] = "; ".join(str(item.get("error") or "") for item in errors[:2] if item.get("error"))
+        variants.append(row)
+    inv["variants"] = variants
+    return inv
 
 
 def _model_install_download_lock_keys(plan):
@@ -5494,7 +5798,7 @@ def _resolve_hf_cli_binary():
     )
 
 
-def _run_hf_download_step(job_id, prefix, step, env_map, progress_plan=None):
+def _run_hf_download_step(job_id, prefix, step, env_map, progress_plan=None, force_download=False):
     row = step if isinstance(step, dict) else {}
     repo_ids = [
         str(repo_id or "").strip()
@@ -5522,6 +5826,8 @@ def _run_hf_download_step(job_id, prefix, step, env_map, progress_plan=None):
                 raise RuntimeError("model install stopped by request")
             argv = [hf_cli, "download", repo_id]
             argv.extend(filenames)
+            if force_download:
+                argv.append("--force-download")
             argv.extend(["--local-dir", local_dir])
             append_audit_text_line(
                 f"{prefix} built-in downloader fetching {repo_id} -> {local_dir} (attempt {attempt}/{attempts})"
@@ -5560,7 +5866,7 @@ def _run_hf_download_step(job_id, prefix, step, env_map, progress_plan=None):
     raise RuntimeError(last_error or "hf download failed")
 
 
-def _run_hf_download_plan(job_id, prefix, plan, env_map):
+def _run_hf_download_plan(job_id, prefix, plan, env_map, force_download=False):
     steps = [dict(step or {}) for step in (plan or []) if isinstance(step, dict)]
     if not steps:
         return 0
@@ -5568,7 +5874,7 @@ def _run_hf_download_plan(job_id, prefix, plan, env_map):
         f"{prefix} using built-in downloader for {len(steps)} Hugging Face step{'s' if len(steps) != 1 else ''}"
     )
     for step in steps:
-        _run_hf_download_step(job_id, prefix, step, env_map, progress_plan=steps)
+        _run_hf_download_step(job_id, prefix, step, env_map, progress_plan=steps, force_download=force_download)
     return 0
 
 
@@ -5931,13 +6237,32 @@ def switch_job_active():
         return bool(switch_job.get("active"))
 
 
-def _run_model_install_job(job_id, model_id, variant_id, install_command):
-    prefix = f"[model-install {model_id}]"
+def _wait_for_model_update_targets(job_id, prefix, affected_variants):
+    while True:
+        if _model_install_stop_requested(job_id):
+            raise RuntimeError("Model update stopped while waiting for affected presets")
+        try:
+            ensure_preset_resources_not_running(affected_variants, "updating model resources")
+            return
+        except Exception as exc:
+            _set_model_install_job_entry(
+                job_id,
+                status="waiting",
+                summary=str(exc),
+                progress_percent=0,
+            )
+            append_audit_text_line(f"{prefix} waiting: {exc}")
+            time.sleep(10)
+
+
+def _run_model_install_job(job_id, model_id, variant_id, install_command, update_mode=False):
+    prefix = f"[model-update {model_id}]" if update_mode else f"[model-install {model_id}]"
     append_audit_text_line(f"{prefix} starting {install_command}")
     _set_model_install_job_entry(
         job_id,
         active=True,
         status="running",
+        action="update" if update_mode else "install",
         model_id=model_id,
         variant_id=variant_id,
         command=install_command,
@@ -5965,6 +6290,9 @@ def _run_model_install_job(job_id, model_id, variant_id, install_command):
         )
         plan = _monitor_plan_from_variant_install(variant, install_command)
         env_map = _repo_subprocess_env()
+        affected_variants = _model_install_affected_variants(inventory, plan)
+        if update_mode:
+            _wait_for_model_update_targets(job_id, prefix, affected_variants)
         download_locks = _acquire_model_install_download_locks(job_id, prefix, plan)
         cleanup_targets = _snapshot_model_install_cleanup_targets(plan)
         with model_install_process_lock:
@@ -5978,11 +6306,11 @@ def _run_model_install_job(job_id, model_id, variant_id, install_command):
         shell_command = str(install_command or "").strip()
         used_builtin_downloads = False
         if plan and _parse_simple_hf_download_plan(install_command):
-            _run_hf_download_plan(job_id, prefix, plan, env_map)
+            _run_hf_download_plan(job_id, prefix, plan, env_map, force_download=bool(update_mode))
             used_builtin_downloads = True
             shell_command = ""
         elif plan and setup_install:
-            _run_hf_download_plan(job_id, prefix, plan, env_map)
+            _run_hf_download_plan(job_id, prefix, plan, env_map, force_download=bool(update_mode))
             used_builtin_downloads = True
             shell_command = _setup_install_command_with_skip_model(setup_install)
             append_audit_text_line(
@@ -6031,6 +6359,18 @@ def _run_model_install_job(job_id, model_id, variant_id, install_command):
             for line in normalized_files:
                 append_audit_text_line(f"{prefix} {line}")
             rebuild_runtime_inventory()
+            if update_mode:
+                state = read_model_update_state()
+                for resource in _model_update_plan_resources(variant, install_command):
+                    key = resource.get("key") or ""
+                    row = dict((state.get("resources") or {}).get(key) or {})
+                    if row.get("remote_identity"):
+                        row["baseline_remote_identity"] = row.get("remote_identity")
+                        row["baseline_size"] = int(row.get("remote_size") or 0)
+                        row["status"] = "current"
+                        row["error"] = ""
+                        state.setdefault("resources", {})[key] = row
+                write_model_update_state(state)
             rebuild_ok = True
             append_audit_text_line(f"{prefix} inventory rebuild succeeded")
         except Exception as e:
@@ -6056,9 +6396,9 @@ def _run_model_install_job(job_id, model_id, variant_id, install_command):
     was_stopped = bool(current_job.get("stop_requested"))
     status = "stopped" if was_stopped and rc != 0 else ("success" if rc == 0 else "failed")
     summary = (
-        "Model install stopped by request"
+        f"Model {'update' if update_mode else 'install'} stopped by request"
         if was_stopped and rc != 0
-        else f"Model install {'completed' if rc == 0 else 'failed'} (rc={rc})"
+        else f"Model {'update' if update_mode else 'install'} {'completed' if rc == 0 else 'failed'} (rc={rc})"
     )
     _set_model_install_job_entry(
         job_id,
@@ -6086,6 +6426,41 @@ def _run_model_install_job(job_id, model_id, variant_id, install_command):
 
 
 def start_model_install_job(model_id, variant_id, install_command):
+    return _start_model_download_job(model_id, variant_id, install_command, update_mode=False)
+
+
+def start_model_update_job(model_id="", variant_id="", resource_key=""):
+    inventory = load_runtime_inventory()
+    key = str(resource_key or "").strip()
+    variant = None
+    if key:
+        for row in inventory.get("variants") or []:
+            if any(str(resource.get("key") or "") == key for resource in _model_update_plan_resources(row)):
+                variant = row
+                break
+    if variant is None:
+        variant_key = str(variant_id or "").strip()
+        variant = next(
+            (
+                row for row in inventory.get("variants") or []
+                if variant_key and (
+                    str(row.get("variant_id") or "") == variant_key
+                    or str(row.get("selector") or "") == variant_key
+                )
+            ),
+            None,
+        )
+    if not variant:
+        raise ValueError("Unknown model update target")
+    return _start_model_download_job(
+        str(model_id or variant.get("model_id") or ""),
+        str(variant.get("variant_id") or ""),
+        str(variant.get("install_command") or ""),
+        update_mode=True,
+    )
+
+
+def _start_model_download_job(model_id, variant_id, install_command, update_mode=False):
     inventory = load_runtime_inventory()
     variant_key = str(variant_id or "").strip()
     variant = next(
@@ -6126,7 +6501,7 @@ def start_model_install_job(model_id, variant_id, install_command):
                 str(job.get("model_id") or "") == str(model_id or "")
                 and str(job.get("variant_id") or "") == str(variant_id or "")
             ):
-                raise RuntimeError("This preset is already downloading")
+                raise RuntimeError("This preset is already downloading or updating")
             active_targets = {
                 str(item or "").strip()
                 for item in (job.get("download_target_keys") or [])
@@ -6147,6 +6522,7 @@ def start_model_install_job(model_id, variant_id, install_command):
             finished_at=0,
             return_code=None,
             summary="Queued model install job",
+            action="update" if update_mode else "install",
             inventory_rebuild_ok=None,
             progress_percent=0,
             progress_loaded_bytes=0,
@@ -6164,11 +6540,11 @@ def start_model_install_job(model_id, variant_id, install_command):
         )
     threading.Thread(
         target=_run_model_install_job,
-        args=(job_id, str(model_id), str(variant_id), expected_command),
+        args=(job_id, str(model_id), str(variant_id), expected_command, bool(update_mode)),
         name=f"club3090-model-install-{_selector_token(model_id)}",
         daemon=True,
     ).start()
-    log_audit("model_install_job_started", job_id=job_id, model_id=model_id, variant_id=variant_id)
+    log_audit("model_update_job_started" if update_mode else "model_install_job_started", job_id=job_id, model_id=model_id, variant_id=variant_id)
     return dict(model_install_jobs_snapshot()[0] if model_install_jobs_snapshot() else {})
 
 

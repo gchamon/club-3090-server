@@ -5547,15 +5547,8 @@ function renderStatusUi(j, previousStatus = null, options = {}) {
   safeRenderStep("overview", () => renderOverviewStatus(j), renderErrors);
   safeRenderStep("gpu", () => renderGpuCards(j.gpus), renderErrors);
   safeRenderStep("services", () => renderSystemServices(j), renderErrors);
-  safeRenderStep("power controls", () => {
-    if ($("optToggle"))
-      $("optToggle").textContent = power.optimizations_enabled
-        ? "Disable Power Optimizations"
-        : "Enable Power Optimizations";
-    if ($("fanToggle"))
-      $("fanToggle").textContent = power.fan_manual_override
-        ? "Reset Fans to Default"
-        : "Set Fans to Max";
+  safeRenderStep("system configuration", () => {
+    if (typeof renderSystemConfiguration === "function") renderSystemConfiguration(j);
     if (typeof syncPowerCoolingBusyState === "function") syncPowerCoolingBusyState();
   }, renderErrors);
   safeRenderStep(
@@ -6569,6 +6562,8 @@ function variantUncensoredBadgeHtml(variant) {
 }
 function variantCapabilityBadges(variant) {
   const bits = [];
+  const updateBadge = variantModelUpdateBadgeHtml(variant);
+  if (updateBadge) bits.push(updateBadge);
   const uncensoredBadge = variantUncensoredBadgeHtml(variant);
   if (uncensoredBadge) bits.push(uncensoredBadge);
   const nvlinkMode = variantNvlinkMode(variant);
@@ -6578,6 +6573,44 @@ function variantCapabilityBadges(variant) {
   const provenance = variantProvenanceBadges(variant);
   if (provenance) bits.push(provenance);
   return bits.join("");
+}
+function variantModelUpdateState(variant) {
+  return String(variant?.model_update_state || "").trim();
+}
+function variantModelUpdateBadgeHtml(variant) {
+  const state = variantModelUpdateState(variant);
+  const checking = !!(lastStatus?.model_updates?.checking || runtimeInventory()?.model_updates?.checking);
+  if (checking && state !== "pending_update" && state !== "check_error") return '<span class="status-badge status-warning" title="The server is checking Hugging Face update metadata.">checking updates</span>';
+  if (state === "pending_update") return '<span class="status-badge status-warning" title="A newer Hugging Face file revision is available for this preset.">update available</span>';
+  if (state === "check_error") return '<span class="status-badge status-caveats" title="The server could not verify Hugging Face update metadata for this preset.">update check warning</span>';
+  if (state === "current") return '<span class="status-badge status-production" title="The last Hugging Face metadata check found this model current.">model current</span>';
+  return "";
+}
+function variantModelUpdateMessage(variant) {
+  const state = variantModelUpdateState(variant);
+  if (state === "pending_update") return "A newer Hugging Face file revision is available.";
+  if (state === "check_error") return variant?.model_update_error || "The last update check could not verify this model.";
+  if (state === "current") return "The installed model file matches the last checked Hugging Face revision.";
+  return "";
+}
+function variantModelUpdateNoteHtml(variant) {
+  const updateMessage = variantModelUpdateMessage(variant);
+  if (!updateMessage) return "";
+  return `<div class="variant-install-note${variantModelUpdateState(variant) === "check_error" ? " error-note" : ""}"><strong>Model update:</strong> ${escapeHtml(updateMessage)}</div>`;
+}
+function variantModelUpdateButtonHtml(variant) {
+  return variantModelUpdateState(variant) === "pending_update"
+    ? `<button class="btn amber" onclick="startModelUpdateForVariant('${escapeJs(variant.variant_id)}')">Update</button>`
+    : "";
+}
+function modelFamilyUpdateBadgeHtml(modelVariants) {
+  const states = (modelVariants || []).map((variant) => variantModelUpdateState(variant)).filter(Boolean);
+  const checking = !!(lastStatus?.model_updates?.checking || runtimeInventory()?.model_updates?.checking);
+  if (states.includes("pending_update")) return '<span class="status-badge status-warning" title="One or more presets in this model family have newer Hugging Face revisions available.">updates available</span>';
+  if (states.includes("check_error")) return '<span class="status-badge status-caveats" title="One or more presets in this model family could not verify Hugging Face update metadata.">update warnings</span>';
+  if (checking) return '<span class="status-badge status-warning" title="The server is checking Hugging Face update metadata.">checking updates</span>';
+  if (states.includes("current")) return '<span class="status-badge status-production" title="Checked presets in this model family are current.">models current</span>';
+  return "";
 }
 function installStateLabel(variant) {
   const state = variantEffectiveInstallState(variant);
@@ -7906,6 +7939,45 @@ function promptModelInstallById(variantId) {
   const variant = inventoryVariants().find((row) => String(row?.variant_id || "") === String(variantId || ""));
   if (!variant) throw new Error("Preset not found in runtime inventory.");
   return promptModelInstall(variant);
+}
+async function checkModelUpdatesNow() {
+  setElementMsg("presetResourceMsg", "Checking Hugging Face model updates...", "warning");
+  const payload = await post("/admin/model-updates/check", {}, "/admin/model-updates/check");
+  if (payload?.runtime_inventory) {
+    lastStatus = lastStatus || {};
+    lastStatus.runtime_inventory = payload.runtime_inventory;
+    lastStatus.models = payload.models || payload.runtime_inventory.models || [];
+    lastStatus.variants = payload.variants || payload.runtime_inventory.variants || [];
+    lastStatus.model_updates = payload.model_updates || lastStatus.model_updates;
+    writeRuntimeInventoryCacheFromStatus(lastStatus);
+  }
+  setElementMsg("presetResourceMsg", "Model update check started. Results will refresh automatically.", "success");
+  refreshStatus({ force: true }).catch(() => {});
+  renderDynamicPresetModels({ force: true });
+}
+async function startModelUpdateForVariant(variantId) {
+  const variant = inventoryVariants().find((row) => String(row?.variant_id || "") === String(variantId || ""));
+  if (!variant) throw new Error("Preset not found in runtime inventory.");
+  if (!(await openClubConfirmModal(`Update downloaded model files for ${variantDisplayLabel(variant)}? Running affected presets will be updated after they stop.`))) return;
+  if (typeof focusAuditLogs === "function") focusAuditLogs();
+  await post(
+    "/admin/model-update",
+    { model_id: variant.model_id, variant_id: variant.variant_id },
+    `/admin/model-update ${variant.model_id} ${variant.variant_id}`,
+  );
+  refreshStatus({ force: true }).catch(() => {});
+}
+async function startModelUpdateForResource(resourceKey, label = "model resource") {
+  const key = String(resourceKey || "").trim();
+  if (!key) return;
+  if (!(await openClubConfirmModal(`Update ${label}? Running affected presets will be updated after they stop.`))) return;
+  if (typeof focusAuditLogs === "function") focusAuditLogs();
+  await post(
+    "/admin/model-update",
+    { resource_key: key },
+    `/admin/model-update ${key}`,
+  );
+  refreshStatus({ force: true }).catch(() => {});
 }
 function presetLaunchOverridesMap() {
   const rows = lastStatus?.server_config?.preset_launch_overrides;
@@ -9484,6 +9556,32 @@ function inventoryResourceManagerRows() {
       models: new Set(["Shared runtime cache"]),
     });
   }
+  rows.forEach((row) => {
+    const updateRows = [];
+    const rowPath = String(row.path || "").replaceAll("\\", "/").replace(/\/+$/, "");
+    (row.usages || []).forEach(({ variant }) => {
+      (variant?.model_update_resources || []).forEach((resource) => {
+        const resourcePath = String(resource?.path || "").replaceAll("\\", "/").replace(/\/+$/, "");
+        if (!resourcePath) return;
+        if (!rowPath || resourcePath === rowPath || resourcePath.startsWith(`${rowPath}/`)) {
+          updateRows.push(resource);
+        }
+      });
+    });
+    const unique = new Map();
+    updateRows.forEach((resource) => {
+      const key = String(resource?.key || resource?.path || "");
+      if (key) unique.set(key, resource);
+    });
+    row.updateResources = [...unique.values()];
+    row.updateState = row.updateResources.some((resource) => resource.status === "pending_update")
+      ? "pending_update"
+      : row.updateResources.some((resource) => resource.status === "error")
+        ? "check_error"
+        : row.updateResources.length
+          ? "current"
+          : "";
+  });
   return rows
     .map((entry) => ({
       ...entry,
@@ -9926,7 +10024,11 @@ function renderModelResourceManagerView() {
   const totalCacheBytes = inventoryUniqueCacheUsageBytes();
   const cacheBytes = modelCacheRootBytes > 0 ? modelCacheRootBytes : totalCacheBytes;
   const totalHint = `Models: ${formatDiskBytes(totalBytes)}. Cache: ${formatDiskBytes(cacheBytes)}. Model resource directories are never cleared by cache cleanup.`;
-  return `<div class="resource-manager-shell"><div class="resource-manager-intro">Downloaded resources are grouped below by the shared disk asset they point at. Model resources are the actual GGUF/safetensors payloads. Cache is runtime/precompile/transient data and is managed separately.</div><div class="resource-manager-total-card" title="${escapeHtml(totalHint)}"><div class="resource-manager-total-label">Total Downloaded Resource Disk Usage</div><div class="resource-manager-total-value">${escapeHtml(formatResourcePlusCacheBytes(totalBytes, cacheBytes))}</div><div class="preset-help">Models + Cache</div></div>${rows.length ? `<div class="resource-manager-grid">${rows
+  const updateSummary = lastStatus?.model_updates || runtimeInventory()?.model_updates || {};
+  const updateSummaryText = updateSummary?.checking
+    ? "Checking for updates..."
+    : `${Number(updateSummary?.pending || 0)} pending update${Number(updateSummary?.pending || 0) === 1 ? "" : "s"}${Number(updateSummary?.errors || 0) ? `, ${Number(updateSummary.errors)} warning${Number(updateSummary.errors) === 1 ? "" : "s"}` : ""}`;
+  return `<div class="resource-manager-shell"><div class="resource-manager-intro">Downloaded resources are grouped below by the shared disk asset they point at. Model resources are the actual GGUF/safetensors payloads. Cache is runtime/precompile/transient data and safe cleanup is exposed only for cache entries.</div><div class="resource-manager-actions"><button type="button" class="btn blue" onclick="checkModelUpdatesNow()">Check Updates</button><span class="preset-help">${escapeHtml(updateSummaryText)}</span></div><div class="resource-manager-total-card" title="${escapeHtml(totalHint)}"><div class="resource-manager-total-label">Total Downloaded Resource Disk Usage</div><div class="resource-manager-total-value">${escapeHtml(formatResourcePlusCacheBytes(totalBytes, cacheBytes))}</div><div class="preset-help">Models + Cache</div></div>${rows.length ? `<div class="resource-manager-grid">${rows
     .map((entry) => {
       const markerStyle = `--preset-resource-color:${resourceColorForKey(entry.key)};`;
       const modelLabel = entry.models.join(" · ") || "Preset resource";
@@ -9947,7 +10049,18 @@ function renderModelResourceManagerView() {
       const deleteAction = entry.unattachedCache
         ? `promptDeleteModelCachePaths([${cacheDeletePaths}], '${escapeJs(entry.label || "model cache")}')`
         : `promptDeleteResourcePaths([${(entry.deletePaths || entry.usages.map(({ resource }) => String(resource?.path || ""))).map((path) => `'${escapeJs(String(path || ""))}'`).join(",")}], '${escapeJs(entry.label || "resource")}', [${entry.selectors.map((selector) => `'${escapeJs(selector)}'`).join(",")}])`;
-      return `<div class="resource-manager-card"><div class="resource-manager-card-head"><div class="resource-manager-title-row">${diskMarker}${modalityIcon}<div class="resource-manager-title">${escapeHtml(entry.label || "Resource")}</div></div><div class="resource-manager-card-subrow"><div class="resource-manager-card-copy"><div class="resource-manager-meta">${escapeHtml(modelLabel)}</div><div class="resource-manager-usage-count">${escapeHtml(usageLabel)}</div></div><div class="resource-manager-card-actions"><span class="resource-size-badge">${escapeHtml(formatResourcePlusCacheBytes(entry.sizeBytes || 0, entry.cacheSizeBytes || 0))}</span>${repoUrl ? `<a class="resource-hf-btn" href="${escapeHtml(repoUrl)}" target="_blank" rel="noopener noreferrer">${huggingFaceLogoSvg()}<span>HF</span></a>` : ""}${renderIconButton({ title: entry.unattachedCache ? "Clear model cache" : "Clear resource", action: deleteAction, icon: "delete", className: "resource-manager-delete-btn" })}</div></div></div><div class="resource-manager-path"><code>${escapeHtml(entry.path || "")}</code></div><div class="resource-manager-usage-list">${entry.unattachedCache ? '<div class="empty-variant-note">This cache entry is present on disk but is not referenced by the current preset inventory.</div>' : entry.unattachedResource ? '<div class="empty-variant-note">This model resource is present on disk but is not referenced by the current preset inventory.</div>' : entry.usages
+      const updateBadge = entry.updateState === "pending_update"
+        ? '<span class="status-badge status-warning">update available</span>'
+        : entry.updateState === "check_error"
+          ? '<span class="status-badge status-caveats">check warning</span>'
+          : "";
+      const updateButton = entry.updateState === "pending_update"
+        ? `<button class="btn amber" onclick="startModelUpdateForResource('${escapeJs(entry.updateResources[0]?.key || entry.key)}', '${escapeJs(entry.label || "model resource")}')">Update</button>`
+        : "";
+      const updateWarning = entry.updateState === "check_error"
+        ? `<div class="empty-variant-note">Update check warning: ${escapeHtml(entry.updateResources.find((resource) => resource.status === "error")?.error || "metadata check failed")}</div>`
+        : "";
+      return `<div class="resource-manager-card"><div class="resource-manager-card-head"><div class="resource-manager-title-row">${diskMarker}${modalityIcon}<div class="resource-manager-title">${escapeHtml(entry.label || "Resource")}</div>${updateBadge}</div><div class="resource-manager-card-subrow"><div class="resource-manager-card-copy"><div class="resource-manager-meta">${escapeHtml(modelLabel)}</div><div class="resource-manager-usage-count">${escapeHtml(usageLabel)}</div></div><div class="resource-manager-card-actions"><span class="resource-size-badge">${escapeHtml(formatResourcePlusCacheBytes(entry.sizeBytes || 0, entry.cacheSizeBytes || 0))}</span>${updateButton}${repoUrl ? `<a class="resource-hf-btn" href="${escapeHtml(repoUrl)}" target="_blank" rel="noopener noreferrer">${huggingFaceLogoSvg()}<span>HF</span></a>` : ""}${renderIconButton({ title: entry.unattachedCache ? "Clear model cache" : "Clear resource", action: deleteAction, icon: "delete", className: "resource-manager-delete-btn" })}</div></div></div><div class="resource-manager-path"><code>${escapeHtml(entry.path || "")}</code></div>${updateWarning}<div class="resource-manager-usage-list">${entry.unattachedCache ? '<div class="empty-variant-note">This cache entry is present on disk but is not referenced by the current preset inventory.</div>' : entry.unattachedResource ? '<div class="empty-variant-note">This model resource is present on disk but is not referenced by the current preset inventory.</div>' : entry.usages
         .map(({ variant }) => {
           const selector = variantSelector(variant);
           return `<button type="button" class="resource-manager-usage-row resource-manager-usage-button" title="Open this preset card" onclick="openPresetCardFromResourceManager('${escapeJs(selector)}')"><div class="resource-manager-usage-copy"><div class="resource-manager-usage-title">${escapeHtml(variantDisplayLabel(variant))}</div><div class="resource-manager-usage-meta">${escapeHtml(resourceManagerPresetUsageMeta(variant))}</div></div></button>`;
@@ -10759,7 +10872,9 @@ function renderSummaryVariantCard(variant, modelId, options = {}) {
   const metricsGroup = renderVariantMetricsGroup(variant);
   const sideControls = renderVariantSettingsCluster(variant, { cacheDisabled: active || switching, deleteDisabled: active || switching || scoreLock });
   const badges = `<div class="badge-row"><span class="state-badge ${rigBlockedReason ? "state-hardware_blocked" : stateClass}">${escapeHtml(stateLabel)}</span>${variantStatusBadgeHtml(variant, stateLabel, { failed, rigBlockedReason })}${variantCapabilityBadges(variant)}${renderVariantLineageStar(variant)}${removeAction}</div>`;
-  return `<div class="summary-preset-card${active || switching ? "" : " summary-preset-card-inactive"}" data-preset-selector="${escapeHtml(selector)}"><div class="summary-preset-head"><div class="summary-preset-title">${renderPresetQueueTitleTag(selector)}<span>${escapeHtml(title)}</span></div>${badges}</div><div class="variant-card-body"><div class="variant-card-main">${runtimeMeta}<div class="summary-preset-meta">${escapeHtml(variant.best_for || variant.quality_summary || "Cached preset")}</div><div class="variant-actions variant-card-main-actions"><button class="btn ${buttonClass}" ${rigBlockedReason || scoreLock ? "disabled" : ""} onclick="${action}">${escapeHtml(buttonLabel)}</button>${metricsGroup}</div></div><aside class="variant-card-side">${renderPresetScoreLabel(selector, variant)}${sideControls}</aside></div></div>`;
+  const updateNote = variantModelUpdateNoteHtml(variant);
+  const updateButton = variantModelUpdateButtonHtml(variant);
+  return `<div class="summary-preset-card${active || switching ? "" : " summary-preset-card-inactive"}" data-preset-selector="${escapeHtml(selector)}"><div class="summary-preset-head"><div class="summary-preset-title">${renderPresetQueueTitleTag(selector)}<span>${escapeHtml(title)}</span></div>${badges}</div><div class="variant-card-body"><div class="variant-card-main">${runtimeMeta}<div class="summary-preset-meta">${escapeHtml(variant.best_for || variant.quality_summary || "Cached preset")}</div>${updateNote}<div class="variant-actions variant-card-main-actions"><button class="btn ${buttonClass}" ${rigBlockedReason || scoreLock ? "disabled" : ""} onclick="${action}">${escapeHtml(buttonLabel)}</button>${updateButton}${metricsGroup}</div></div><aside class="variant-card-side">${renderPresetScoreLabel(selector, variant)}${sideControls}</aside></div></div>`;
 }
 function renderSummaryModelBody(model, modelVariants) {
   const entries = summaryEntriesForModel(model.model_id);
@@ -10877,6 +10992,7 @@ function renderVariantCard(variant) {
   const rigBlockedNote = rigBlockedReason
     ? `<div class="variant-install-note error-note"><strong>Blocked on this rig:</strong> ${escapeHtml(rigBlockedReason)}</div>`
     : "";
+  const updateNote = variantModelUpdateNoteHtml(variant);
   const statusBadge = variantStatusBadgeHtml(variant, stateLabel, {
     failed,
     rigBlockedReason,
@@ -10922,7 +11038,8 @@ function renderVariantCard(variant) {
   const settingsCluster = renderVariantSettingsCluster(variant, { cacheDisabled: active || switching || installing || scoreLock, deleteDisabled: active || switching || installing || scoreLock });
   const actionDisabled = !!rigBlockedReason || launchLocked || sharedInstalling || (ready && !target);
   const sideControls = settingsCluster;
-  return `<div class="variant-card${active ? " active-variant" : ""}" data-preset-selector="${escapeHtml(selector)}"><div class="variant-card-head"><div class="variant-card-title">${renderPresetQueueTitleTag(selector)}<span>${escapeHtml(variantDisplayLabel(variant))}</span></div><div class="badge-row"><span class="state-badge ${stateClass}"${stateAttrs}>${escapeHtml(stateLabel)}</span>${statusBadge}${variantCapabilityBadges(variant)}${renderVariantLineageStar(variant)}</div></div><div class="variant-card-body"><div class="variant-card-main"><div class="variant-meta"><strong>Best for:</strong> ${escapeHtml(variant.best_for || "No summary yet.")}</div><div class="variant-meta"><strong>Max ctx:</strong> ${escapeHtml(variantMaxCtx(variant))} <strong>Engine:</strong> ${escapeHtml(prettyEngineName(variant.engine_display || variant.engine))} <strong>Drafter:</strong> ${escapeHtml(variant.drafter || "none")} <strong>KV:</strong> ${escapeHtml(variant.kv_format || "n/a")}</div>${provenanceNote}${gateNote}${hardwareNote}${rigBlockedNote}${caveat}${installNote}${failureNote}<div class="variant-actions variant-card-main-actions"><button class="btn ${buttonClass}" title="${escapeHtml(buttonTitle)}" ${actionDisabled ? "disabled" : ""} onclick="${action}">${escapeHtml(buttonLabel)}</button>${metricsGroup}</div>${footer}</div><aside class="variant-card-side">${renderPresetScoreLabel(selector, variant)}${sideControls}</aside></div></div>`;
+  const updateButton = variantModelUpdateButtonHtml(variant);
+  return `<div class="variant-card${active ? " active-variant" : ""}" data-preset-selector="${escapeHtml(selector)}"><div class="variant-card-head"><div class="variant-card-title">${renderPresetQueueTitleTag(selector)}<span>${escapeHtml(variantDisplayLabel(variant))}</span></div><div class="badge-row"><span class="state-badge ${stateClass}"${stateAttrs}>${escapeHtml(stateLabel)}</span>${statusBadge}${variantCapabilityBadges(variant)}${renderVariantLineageStar(variant)}</div></div><div class="variant-card-body"><div class="variant-card-main"><div class="variant-meta"><strong>Best for:</strong> ${escapeHtml(variant.best_for || "No summary yet.")}</div><div class="variant-meta"><strong>Max ctx:</strong> ${escapeHtml(variantMaxCtx(variant))} <strong>Engine:</strong> ${escapeHtml(prettyEngineName(variant.engine_display || variant.engine))} <strong>Drafter:</strong> ${escapeHtml(variant.drafter || "none")} <strong>KV:</strong> ${escapeHtml(variant.kv_format || "n/a")}</div>${provenanceNote}${gateNote}${hardwareNote}${rigBlockedNote}${caveat}${installNote}${updateNote}${failureNote}<div class="variant-actions variant-card-main-actions"><button class="btn ${buttonClass}" title="${escapeHtml(buttonTitle)}" ${actionDisabled ? "disabled" : ""} onclick="${action}">${escapeHtml(buttonLabel)}</button>${updateButton}${metricsGroup}</div>${footer}</div><aside class="variant-card-side">${renderPresetScoreLabel(selector, variant)}${sideControls}</aside></div></div>`;
 }
 function renderVariantGroup(title, rows, options = {}) {
   const items =
@@ -11039,6 +11156,8 @@ function dynamicPresetModelsRenderSignature() {
     variant?.status_kind,
     variant?.resource_size_bytes,
     variant?.cache_size_bytes,
+    variant?.model_update_state,
+    variant?.model_update_checked_at,
   ]);
   return JSON.stringify({
     selectedPresetModelId,
@@ -11061,6 +11180,7 @@ function dynamicPresetModelsRenderSignature() {
     switch_failure: status?.switch_failure,
     model_install_job: status?.model_install_job,
     model_install_jobs: status?.model_install_jobs,
+    model_updates: status?.model_updates || inventory?.model_updates,
     custom_model_job: status?.custom_model_job,
     instances: status?.instances,
     runtimes: status?.runtime_stats,
@@ -11143,11 +11263,12 @@ function renderDynamicPresetModels(options = {}) {
       const customBadge = modelIsCustom(model) && !modelVariants.some((row) => variantIsMigrated(row))
         ? '<span class="status-badge status-custom">custom</span>'
         : "";
+      const familyUpdateBadge = modelFamilyUpdateBadgeHtml(unhiddenModelVariants);
       const body = selected
         ? renderSelectedVariantGroups({ customRows, singleRows, dualRows, advancedRows, deprecatedRows, experimentalRows })
         : summaryBody;
       const filteredCount = selected && presetFilterIsActive() ? `${visibleModelVariants.length}/${presetCount}` : String(presetCount);
-      return `<div class="model-card${selected ? " selected-model-card" : " collapsed-model-card"}${familyActive ? " model-card-active-family" : ""}"><div class="model-card-head"><div><div class="model-card-title-row">${customDelete}<h3>${escapeHtml(model.display_name || model.model_id)} (${escapeHtml(filteredCount)} Presets)</h3></div><div class="model-summary">${escapeHtml(model.summary || "No summary available yet.")}</div></div><div class="badge-row"><span class="state-badge ${badgeClass("state", model.installed_state)}">${escapeHtml(String(model.installed_state || "unknown"))}</span>${customBadge}</div></div>${body}</div>`;
+      return `<div class="model-card${selected ? " selected-model-card" : " collapsed-model-card"}${familyActive ? " model-card-active-family" : ""}"><div class="model-card-head"><div><div class="model-card-title-row">${customDelete}<h3>${escapeHtml(model.display_name || model.model_id)} (${escapeHtml(filteredCount)} Presets)</h3></div><div class="model-summary">${escapeHtml(model.summary || "No summary available yet.")}</div></div><div class="badge-row"><span class="state-badge ${badgeClass("state", model.installed_state)}">${escapeHtml(String(model.installed_state || "unknown"))}</span>${familyUpdateBadge}${customBadge}</div></div>${body}</div>`;
     })
     .join("")}${!selectedPresetModelId ? renderSummaryActionBar() : ""}`;
   setHtmlIfChanged(host, nextHtml);
@@ -11177,14 +11298,14 @@ function renderModelInstallStatus() {
   const activeJobs = jobs.filter((row) => row && row.active);
   if (activeJobs.length) {
     const labels = activeJobs
-      .map((row) => `${row.model_id || "unknown model"} (${row.variant_id || "preset"})`)
+      .map((row) => `${row.model_id || "unknown model"} (${row.action === "update" ? "update" : "download"}: ${row.variant_id || "preset"})`)
       .slice(0, 3);
     const suffix = activeJobs.length > 3 ? `, +${activeJobs.length - 3} more` : "";
-    target.textContent = `${activeJobs.length} model download job${activeJobs.length === 1 ? "" : "s"} running: ${labels.join(", ")}${suffix}. Output is streaming to Audit Logs.`;
+    target.textContent = `${activeJobs.length} model job${activeJobs.length === 1 ? "" : "s"} running: ${labels.join(", ")}${suffix}. Output is streaming to Audit Logs.`;
     return;
   }
   if (job.active) {
-    target.textContent = `Model install running for ${job.model_id || "unknown model"} (${job.variant_id || "preset"}). Output is streaming to Audit Logs.`;
+    target.textContent = `Model ${job.action === "update" ? "update" : "install"} ${job.status === "waiting" ? "waiting" : "running"} for ${job.model_id || "unknown model"} (${job.variant_id || "preset"}). Output is streaming to Audit Logs.`;
     return;
   }
   if (job.status === "success") {
