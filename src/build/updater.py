@@ -23,13 +23,13 @@ UPDATE_SECRET_FILE = os.path.join(CONTROL_DIR, "self-update-secret")
 UPDATE_RELOAD_FLAG_FILE = os.path.join(CONTROL_DIR, "self-update-reload-updater")
 REMOTE_UPDATE_REPO_URL = os.environ.get(
     "CLUB3090_SELF_UPDATE_REPO_URL",
-    "https://github.com/VykosX/club-3090-server.git",
+    "__CLUB3090_SELF_UPDATE_REPO_URL__",
 )
-REMOTE_UPDATE_REF = os.environ.get("CLUB3090_SELF_UPDATE_REF", "refs/heads/master")
-REMOTE_UPDATE_BRANCH = os.environ.get("CLUB3090_SELF_UPDATE_BRANCH", "master")
+REMOTE_UPDATE_REF = os.environ.get("CLUB3090_SELF_UPDATE_REF", "__CLUB3090_SELF_UPDATE_REF__")
+REMOTE_UPDATE_BRANCH = os.environ.get("CLUB3090_SELF_UPDATE_BRANCH", "__CLUB3090_SELF_UPDATE_BRANCH__")
 REMOTE_UPDATE_RAW_URL_TEMPLATE = os.environ.get(
     "CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE",
-    "https://raw.githubusercontent.com/VykosX/club-3090-server/{sha}/install-club3090-server.sh",
+    "__CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE__",
 )
 UPDATER_BIND_HOST = os.environ.get("CLUB3090_UPDATER_BIND_HOST", "127.0.0.1")
 UPDATER_BIND_PORT = int(os.environ.get("CLUB3090_UPDATER_BIND_PORT", "18010") or "18010")

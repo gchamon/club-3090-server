@@ -323,7 +323,8 @@ def build_release(
     change_log_latest_text = metadata["change_log_latest"]
     change_log_icons_text = metadata["change_log_icons"]
     club3090_version_text = metadata["club3090_version"]
-    control_source = compose_control_source()
+    self_update_defaults_map = self_update_defaults()
+    control_source = inject_self_update_defaults(compose_control_source(), self_update_defaults_map)
     club3090_compat = json.loads(club3090_version_text or "{}")
     compat_marker = "SCRIPT_CLUB3090_COMPAT = {}"
     if control_source.count(compat_marker) != 1:
@@ -337,11 +338,11 @@ def build_release(
         1,
     )
     report.add_test("control_compat_metadata", "passed", "embedded tested Club-3090 compatibility metadata into control.py")
-    updater_source = read_text(UPDATER_SOURCE_PATH)
+    updater_source = inject_self_update_defaults(read_text(UPDATER_SOURCE_PATH), self_update_defaults_map)
     html_source = read_text(WEB_BASE_HTML_PATH)
     css_source = read_text(WEB_BASE_CSS_PATH)
     js_source = compose_web_js_source()
-    script_source_raw = read_text(SCRIPT_SOURCE_PATH)
+    script_source_raw = inject_self_update_defaults(read_text(SCRIPT_SOURCE_PATH), self_update_defaults_map)
     try:
         script_source = inject_script_metadata(
             script_source_raw,

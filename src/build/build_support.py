@@ -23,6 +23,14 @@ VENDOR_SOURCE_DIR = BUILD_DIR / "vendor"
 EXTENSIONS_SOURCE_DIR = ROOT / "extensions"
 UPSTREAM_RUNTIME_DIR = ROOT / "club-3090"
 UPSTREAM_RUNTIME_REPO_URL = os.environ.get("CLUB3090_UPSTREAM_REPO_URL", "https://github.com/noonghunna/club-3090.git")
+DEFAULT_SELF_UPDATE_REPO_URL = "https://github.com/VykosX/club-3090-server.git"
+SELF_UPDATE_PLACEHOLDERS = {
+    "__CLUB3090_SELF_UPDATE_REPO_URL__",
+    "__CLUB3090_SELF_UPDATE_REF__",
+    "__CLUB3090_SELF_UPDATE_BRANCH__",
+    "__CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE__",
+    "__CLUB3090_SELF_UPDATE_METADATA_URL_TEMPLATE__",
+}
 LOGS_DIR = ROOT / "logs"
 ARTIFACTS_DIR = ROOT / "artifacts"
 SCRIPT_SOURCE_NAME = "base.sh"
@@ -160,6 +168,83 @@ def configure_build_identity(version: str, script_version: str) -> None:
         "package-lock.json",
         "v07_CHECKLIST.MD",
     ]
+
+
+def run_git_config(args: list[str]) -> str:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except Exception:
+        return ""
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def github_owner_repo_from_remote(remote_url: str) -> tuple[str, str] | None:
+    value = str(remote_url or "").strip()
+    patterns = [
+        r"^git@github\.com:([^/]+)/(.+?)(?:\.git)?$",
+        r"^https://github\.com/([^/]+)/(.+?)(?:\.git)?$",
+        r"^ssh://git@github\.com/([^/]+)/(.+?)(?:\.git)?$",
+    ]
+    for pattern in patterns:
+        match = re.match(pattern, value)
+        if not match:
+            continue
+        owner = match.group(1).strip()
+        repo = match.group(2).strip().rstrip("/")
+        if owner and repo:
+            return owner, repo
+    return None
+
+
+def self_update_defaults() -> dict[str, str]:
+    remote_url = (
+        os.environ.get("CLUB3090_SELF_UPDATE_REPO_URL")
+        or run_git_config(["config", "--get", "remote.origin.url"])
+        or DEFAULT_SELF_UPDATE_REPO_URL
+    )
+    owner_repo = github_owner_repo_from_remote(remote_url)
+    if not owner_repo:
+        remote_url = DEFAULT_SELF_UPDATE_REPO_URL
+        owner_repo = github_owner_repo_from_remote(remote_url)
+    if not owner_repo:
+        raise ValueError(f"Could not derive GitHub owner/repo from {remote_url!r}")
+    owner, repo = owner_repo
+    repo_url = f"https://github.com/{owner}/{repo}.git"
+    branch = os.environ.get("CLUB3090_SELF_UPDATE_BRANCH") or run_git_config(["branch", "--show-current"]) or "master"
+    ref = os.environ.get("CLUB3090_SELF_UPDATE_REF") or f"refs/heads/{branch}"
+    raw_template = os.environ.get("CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE") or (
+        f"https://raw.githubusercontent.com/{owner}/{repo}/{{sha}}/install-club3090-server.sh"
+    )
+    metadata_template = os.environ.get("CLUB3090_SELF_UPDATE_METADATA_URL_TEMPLATE") or (
+        f"https://raw.githubusercontent.com/{owner}/{repo}/{{sha}}/metadata.json"
+    )
+    return {
+        "__CLUB3090_SELF_UPDATE_REPO_URL__": repo_url,
+        "__CLUB3090_SELF_UPDATE_REF__": ref,
+        "__CLUB3090_SELF_UPDATE_BRANCH__": branch,
+        "__CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE__": raw_template,
+        "__CLUB3090_SELF_UPDATE_METADATA_URL_TEMPLATE__": metadata_template,
+    }
+
+
+def inject_self_update_defaults(text: str, defaults: dict[str, str] | None = None) -> str:
+    resolved = defaults or self_update_defaults()
+    output = text
+    for placeholder in SELF_UPDATE_PLACEHOLDERS:
+        replacement = resolved.get(placeholder)
+        if replacement is None:
+            raise ValueError(f"Missing self-update replacement for {placeholder}")
+        output = output.replace(placeholder, replacement)
+    return output
 
 
 def compose_split_source(base_dir: Path, names: list[str], *, comment_prefix: str, preserve_first_file: bool = False) -> str:

@@ -2,26 +2,26 @@
 set -euo pipefail
 
 SCRIPT_VERSION="2026-05-18.v0.6.108"
-CLUB3090_SELF_UPDATE_REPO_URL="${CLUB3090_SELF_UPDATE_REPO_URL:-https://github.com/VykosX/club-3090-server.git}"
-CLUB3090_SELF_UPDATE_REF="${CLUB3090_SELF_UPDATE_REF:-refs/heads/master}"
-CLUB3090_SELF_UPDATE_BRANCH="${CLUB3090_SELF_UPDATE_BRANCH:-master}"
-CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE="${CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE:-https://raw.githubusercontent.com/VykosX/club-3090-server/{sha}/install-club3090-server.sh}"
-CLUB3090_SELF_UPDATE_METADATA_URL_TEMPLATE="${CLUB3090_SELF_UPDATE_METADATA_URL_TEMPLATE:-https://raw.githubusercontent.com/VykosX/club-3090-server/{sha}/metadata.json}"
+CLUB3090_SELF_UPDATE_REPO_URL="${CLUB3090_SELF_UPDATE_REPO_URL:-__CLUB3090_SELF_UPDATE_REPO_URL__}"
+CLUB3090_SELF_UPDATE_REF="${CLUB3090_SELF_UPDATE_REF:-__CLUB3090_SELF_UPDATE_REF__}"
+CLUB3090_SELF_UPDATE_BRANCH="${CLUB3090_SELF_UPDATE_BRANCH:-__CLUB3090_SELF_UPDATE_BRANCH__}"
+CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE="${CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE:-__CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE__}"
+CLUB3090_SELF_UPDATE_METADATA_URL_TEMPLATE="${CLUB3090_SELF_UPDATE_METADATA_URL_TEMPLATE:-__CLUB3090_SELF_UPDATE_METADATA_URL_TEMPLATE__}"
 GPUTEMPS_VENDOR_PAYLOAD_BASE64="" # Injected by build.py for shipped outputs.
-if [[ "${CLUB3090_SELF_UPDATE_REPO_URL}" != "https://github.com/VykosX/club-3090-server.git" ]]; then
-  CLUB3090_SELF_UPDATE_REPO_URL="https://github.com/VykosX/club-3090-server.git"
+if [[ "${CLUB3090_SELF_UPDATE_REPO_URL}" != https://github.com/*/*.git ]]; then
+  CLUB3090_SELF_UPDATE_REPO_URL="__CLUB3090_SELF_UPDATE_REPO_URL__"
 fi
-if [[ "${CLUB3090_SELF_UPDATE_REF}" != "refs/heads/master" ]]; then
-  CLUB3090_SELF_UPDATE_REF="refs/heads/master"
+if [[ -z "${CLUB3090_SELF_UPDATE_REF}" ]]; then
+  CLUB3090_SELF_UPDATE_REF="__CLUB3090_SELF_UPDATE_REF__"
 fi
-if [[ "${CLUB3090_SELF_UPDATE_BRANCH}" != "master" ]]; then
-  CLUB3090_SELF_UPDATE_BRANCH="master"
+if [[ -z "${CLUB3090_SELF_UPDATE_BRANCH}" ]]; then
+  CLUB3090_SELF_UPDATE_BRANCH="__CLUB3090_SELF_UPDATE_BRANCH__"
 fi
-if [[ "${CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE}" != *"{sha}"* ]] || [[ "${CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE}" != https://raw.githubusercontent.com/VykosX/club-3090-server/*/install-club3090-server.sh ]]; then
-  CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE="https://raw.githubusercontent.com/VykosX/club-3090-server/{sha}/install-club3090-server.sh"
+if [[ "${CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE}" != *"{sha}"* ]] || [[ "${CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE}" != https://raw.githubusercontent.com/*/*/*/install-club3090-server.sh ]]; then
+  CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE="__CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE__"
 fi
-if [[ "${CLUB3090_SELF_UPDATE_METADATA_URL_TEMPLATE}" != *"{sha}"* ]] || [[ "${CLUB3090_SELF_UPDATE_METADATA_URL_TEMPLATE}" != https://raw.githubusercontent.com/VykosX/club-3090-server/*/metadata.json ]]; then
-  CLUB3090_SELF_UPDATE_METADATA_URL_TEMPLATE="https://raw.githubusercontent.com/VykosX/club-3090-server/{sha}/metadata.json"
+if [[ "${CLUB3090_SELF_UPDATE_METADATA_URL_TEMPLATE}" != *"{sha}"* ]] || [[ "${CLUB3090_SELF_UPDATE_METADATA_URL_TEMPLATE}" != https://raw.githubusercontent.com/*/*/*/metadata.json ]]; then
+  CLUB3090_SELF_UPDATE_METADATA_URL_TEMPLATE="__CLUB3090_SELF_UPDATE_METADATA_URL_TEMPLATE__"
 fi
 
 printf 'Club-3090 Server Installer %s\n' "${SCRIPT_VERSION}"

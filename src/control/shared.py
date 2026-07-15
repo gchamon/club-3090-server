@@ -476,17 +476,17 @@ SELF_UPDATE_SECRET_FILE = os.path.join(CONTROL_DIR, "self-update-secret")
 LOCAL_INSTALLER_SCRIPT_FILE = os.path.join(CONTROL_DIR, "install-club3090-server.sh")
 REMOTE_UPDATE_REPO_URL = os.environ.get(
     "CLUB3090_SELF_UPDATE_REPO_URL",
-    "https://github.com/VykosX/club-3090-server.git",
+    "__CLUB3090_SELF_UPDATE_REPO_URL__",
 )
-REMOTE_UPDATE_REF = os.environ.get("CLUB3090_SELF_UPDATE_REF", "refs/heads/master")
-REMOTE_UPDATE_BRANCH = os.environ.get("CLUB3090_SELF_UPDATE_BRANCH", "master")
+REMOTE_UPDATE_REF = os.environ.get("CLUB3090_SELF_UPDATE_REF", "__CLUB3090_SELF_UPDATE_REF__")
+REMOTE_UPDATE_BRANCH = os.environ.get("CLUB3090_SELF_UPDATE_BRANCH", "__CLUB3090_SELF_UPDATE_BRANCH__")
 REMOTE_UPDATE_RAW_URL_TEMPLATE = os.environ.get(
     "CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE",
-    "https://raw.githubusercontent.com/VykosX/club-3090-server/{sha}/install-club3090-server.sh",
+    "__CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE__",
 )
 REMOTE_UPDATE_METADATA_URL_TEMPLATE = os.environ.get(
     "CLUB3090_SELF_UPDATE_METADATA_URL_TEMPLATE",
-    "https://raw.githubusercontent.com/VykosX/club-3090-server/{sha}/metadata.json",
+    "__CLUB3090_SELF_UPDATE_METADATA_URL_TEMPLATE__",
 )
 REMOTE_UPDATE_METADATA_CACHE_TTL_SECONDS = 300
 REMOTE_UPDATE_METADATA_CACHE = {}
