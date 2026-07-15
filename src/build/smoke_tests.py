@@ -1903,8 +1903,28 @@ process.on("uncaughtException", (error) => {{
     model_update_error: "metadata unavailable",
   }};
   const warningSummaryCardHtml = String(vm.runInContext("renderSummaryVariantCard(__warningUpdateVariant, 'qwen3.6-27b')", context) || "");
-  if (!warningSummaryCardHtml.includes("update check warning") || !warningSummaryCardHtml.includes("metadata unavailable")) {{
+  if (!warningSummaryCardHtml.includes("update check warning") || !warningSummaryCardHtml.includes('title="metadata unavailable"') || !warningSummaryCardHtml.includes("Model update:</strong> metadata unavailable")) {{
     throw new Error("Summary preset cards should show model update warning details");
+  }}
+  context.__resourceWarningUpdateVariant = {{
+    ...presetStatus.variants[0],
+    variant_id: "resource-warning-update-test",
+    model_update_state: "check_error",
+    model_update_error: "",
+    model_update_resources: [
+      {{ path: "qwen3.6-27b-gguf/anbeeld-dflash-iq4xs/Qwen3.6-27B-DFlash-IQ4_XS.gguf", filename: "Qwen3.6-27B-DFlash-IQ4_XS.gguf", repo_id: "Anbeeld/Qwen3.6-27B-DFlash-GGUF", status: "error", error: "HF metadata did not include this file" }},
+    ],
+  }};
+  const resourceWarningSummaryCardHtml = String(vm.runInContext("renderSummaryVariantCard(__resourceWarningUpdateVariant, 'qwen3.6-27b')", context) || "");
+  if (!resourceWarningSummaryCardHtml.includes('title="Qwen3.6-27B-DFlash-IQ4_XS.gguf from Anbeeld/Qwen3.6-27B-DFlash-GGUF: HF metadata did not include this file"')) {{
+    throw new Error("Summary preset warning tooltips should fall back to per-resource update errors");
+  }}
+  if (resourceWarningSummaryCardHtml.includes("Update resource:") || resourceWarningSummaryCardHtml.includes("qwen3.6-27b-gguf/anbeeld-dflash-iq4xs")) {{
+    throw new Error("Summary preset cards should keep update resource details out of the compact summary view");
+  }}
+  const resourceWarningPresetCardHtml = String(vm.runInContext("renderVariantCard(__resourceWarningUpdateVariant)", context) || "");
+  if (!resourceWarningPresetCardHtml.includes("Update resource:") || !resourceWarningPresetCardHtml.includes("qwen3.6-27b-gguf/anbeeld-dflash-iq4xs/Qwen3.6-27B-DFlash-IQ4_XS.gguf")) {{
+    throw new Error("Preset cards should expose the local update resource path for metadata warnings");
   }}
   const familyPendingBadge = String(vm.runInContext("modelFamilyUpdateBadgeHtml([lastStatus.variants[0], __pendingUpdateVariant])", context) || "");
   const familyWarningBadge = String(vm.runInContext("modelFamilyUpdateBadgeHtml([lastStatus.variants[0], __warningUpdateVariant])", context) || "");

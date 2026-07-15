@@ -6582,14 +6582,30 @@ function variantModelUpdateBadgeHtml(variant) {
   const checking = !!(lastStatus?.model_updates?.checking || runtimeInventory()?.model_updates?.checking);
   if (checking && state !== "pending_update" && state !== "check_error") return '<span class="status-badge status-warning" title="The server is checking Hugging Face update metadata.">checking updates</span>';
   if (state === "pending_update") return '<span class="status-badge status-warning" title="A newer Hugging Face file revision is available for this preset.">update available</span>';
-  if (state === "check_error") return '<span class="status-badge status-caveats" title="The server could not verify Hugging Face update metadata for this preset.">update check warning</span>';
+  if (state === "check_error") return `<span class="status-badge status-caveats" title="${escapeHtml(variantModelUpdateMessage(variant))}">update check warning</span>`;
   if (state === "current") return '<span class="status-badge status-production" title="The last Hugging Face metadata check found this model current.">model current</span>';
   return "";
 }
 function variantModelUpdateMessage(variant) {
   const state = variantModelUpdateState(variant);
   if (state === "pending_update") return "A newer Hugging Face file revision is available.";
-  if (state === "check_error") return variant?.model_update_error || "The last update check could not verify this model.";
+  if (state === "check_error") {
+    const directError = String(variant?.model_update_error || "").trim();
+    if (directError) return directError;
+    const resourceErrors = (variant?.model_update_resources || [])
+      .filter((resource) => String(resource?.status || "") === "error")
+      .map((resource) => {
+        const parts = [
+          String(resource?.filename || "").trim(),
+          String(resource?.repo_id || "").trim(),
+        ].filter(Boolean);
+        const prefix = parts.length ? `${parts.join(" from ")}: ` : "";
+        return `${prefix}${String(resource?.error || "").trim()}`.trim();
+      })
+      .filter(Boolean);
+    if (resourceErrors.length) return resourceErrors.slice(0, 2).join("; ");
+    return "The last update check could not verify this model.";
+  }
   if (state === "current") return "The installed model file matches the last checked Hugging Face revision.";
   return "";
 }
@@ -6597,6 +6613,27 @@ function variantModelUpdateNoteHtml(variant) {
   const updateMessage = variantModelUpdateMessage(variant);
   if (!updateMessage) return "";
   return `<div class="variant-install-note${variantModelUpdateState(variant) === "check_error" ? " error-note" : ""}"><strong>Model update:</strong> ${escapeHtml(updateMessage)}</div>`;
+}
+function variantModelUpdateResourceDetailsHtml(variant) {
+  if (variantModelUpdateState(variant) !== "check_error") return "";
+  const rows = (variant?.model_update_resources || [])
+    .filter((resource) => String(resource?.status || "") === "error")
+    .map((resource) => {
+      const path = String(resource?.path || "").trim();
+      const filename = String(resource?.filename || "").trim();
+      const repoId = String(resource?.repo_id || "").trim();
+      const error = String(resource?.error || "").trim();
+      const pathLabel = path || filename;
+      if (!pathLabel && !repoId && !error) return "";
+      const bits = [];
+      if (pathLabel) bits.push(`<code>${escapeHtml(pathLabel)}</code>`);
+      if (repoId) bits.push(`from ${escapeHtml(repoId)}`);
+      if (error) bits.push(escapeHtml(error));
+      return bits.join(" · ");
+    })
+    .filter(Boolean);
+  if (!rows.length) return "";
+  return `<div class="variant-install-note error-note"><strong>Update resource:</strong> ${rows.slice(0, 2).join("<br>")}</div>`;
 }
 function variantModelUpdateButtonHtml(variant) {
   return variantModelUpdateState(variant) === "pending_update"
@@ -10993,6 +11030,7 @@ function renderVariantCard(variant) {
     ? `<div class="variant-install-note error-note"><strong>Blocked on this rig:</strong> ${escapeHtml(rigBlockedReason)}</div>`
     : "";
   const updateNote = variantModelUpdateNoteHtml(variant);
+  const updateResourceDetails = variantModelUpdateResourceDetailsHtml(variant);
   const statusBadge = variantStatusBadgeHtml(variant, stateLabel, {
     failed,
     rigBlockedReason,
@@ -11039,7 +11077,7 @@ function renderVariantCard(variant) {
   const actionDisabled = !!rigBlockedReason || launchLocked || sharedInstalling || (ready && !target);
   const sideControls = settingsCluster;
   const updateButton = variantModelUpdateButtonHtml(variant);
-  return `<div class="variant-card${active ? " active-variant" : ""}" data-preset-selector="${escapeHtml(selector)}"><div class="variant-card-head"><div class="variant-card-title">${renderPresetQueueTitleTag(selector)}<span>${escapeHtml(variantDisplayLabel(variant))}</span></div><div class="badge-row"><span class="state-badge ${stateClass}"${stateAttrs}>${escapeHtml(stateLabel)}</span>${statusBadge}${variantCapabilityBadges(variant)}${renderVariantLineageStar(variant)}</div></div><div class="variant-card-body"><div class="variant-card-main"><div class="variant-meta"><strong>Best for:</strong> ${escapeHtml(variant.best_for || "No summary yet.")}</div><div class="variant-meta"><strong>Max ctx:</strong> ${escapeHtml(variantMaxCtx(variant))} <strong>Engine:</strong> ${escapeHtml(prettyEngineName(variant.engine_display || variant.engine))} <strong>Drafter:</strong> ${escapeHtml(variant.drafter || "none")} <strong>KV:</strong> ${escapeHtml(variant.kv_format || "n/a")}</div>${provenanceNote}${gateNote}${hardwareNote}${rigBlockedNote}${caveat}${installNote}${updateNote}${failureNote}<div class="variant-actions variant-card-main-actions"><button class="btn ${buttonClass}" title="${escapeHtml(buttonTitle)}" ${actionDisabled ? "disabled" : ""} onclick="${action}">${escapeHtml(buttonLabel)}</button>${updateButton}${metricsGroup}</div>${footer}</div><aside class="variant-card-side">${renderPresetScoreLabel(selector, variant)}${sideControls}</aside></div></div>`;
+  return `<div class="variant-card${active ? " active-variant" : ""}" data-preset-selector="${escapeHtml(selector)}"><div class="variant-card-head"><div class="variant-card-title">${renderPresetQueueTitleTag(selector)}<span>${escapeHtml(variantDisplayLabel(variant))}</span></div><div class="badge-row"><span class="state-badge ${stateClass}"${stateAttrs}>${escapeHtml(stateLabel)}</span>${statusBadge}${variantCapabilityBadges(variant)}${renderVariantLineageStar(variant)}</div></div><div class="variant-card-body"><div class="variant-card-main"><div class="variant-meta"><strong>Best for:</strong> ${escapeHtml(variant.best_for || "No summary yet.")}</div><div class="variant-meta"><strong>Max ctx:</strong> ${escapeHtml(variantMaxCtx(variant))} <strong>Engine:</strong> ${escapeHtml(prettyEngineName(variant.engine_display || variant.engine))} <strong>Drafter:</strong> ${escapeHtml(variant.drafter || "none")} <strong>KV:</strong> ${escapeHtml(variant.kv_format || "n/a")}</div>${provenanceNote}${gateNote}${hardwareNote}${rigBlockedNote}${caveat}${installNote}${updateNote}${updateResourceDetails}${failureNote}<div class="variant-actions variant-card-main-actions"><button class="btn ${buttonClass}" title="${escapeHtml(buttonTitle)}" ${actionDisabled ? "disabled" : ""} onclick="${action}">${escapeHtml(buttonLabel)}</button>${updateButton}${metricsGroup}</div>${footer}</div><aside class="variant-card-side">${renderPresetScoreLabel(selector, variant)}${sideControls}</aside></div></div>`;
 }
 function renderVariantGroup(title, rows, options = {}) {
   const items =
