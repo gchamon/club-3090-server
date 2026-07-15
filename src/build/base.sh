@@ -1721,6 +1721,8 @@ for mode in modes:
     variant = lookup.get(str(mode))
     if not variant:
         continue
+    if str(variant.get("install_state") or "").strip() == "ready":
+        continue
     command = str(variant.get("setup_command") or variant.get("install_command") or "").strip()
     if command and command not in seen:
         seen.add(command)
@@ -2174,17 +2176,21 @@ unpack_gputemps_vendor_sources() {
     echo "WARNING: Vendored gputemps payload is missing from the installer; extra GPU temperature telemetry will be unavailable." >&2
     return 1
   fi
+  local tmp_dir payload_file
+  tmp_dir="$(mktemp -d)"
+  payload_file="${tmp_dir}/gputemps-vendor.b64"
+  trap 'rm -rf "${tmp_dir}"' RETURN
   "${SUDO[@]}" mkdir -p "${target_dir}"
-  "${SUDO[@]}" env GPUTEMPS_VENDOR_PAYLOAD_BASE64="${GPUTEMPS_VENDOR_PAYLOAD_BASE64}" "${PYTHON_BIN}" - "${target_dir}" <<'PY'
+  printf '%s' "${GPUTEMPS_VENDOR_PAYLOAD_BASE64}" >"${payload_file}"
+  if ! "${PYTHON_BIN}" - "${tmp_dir}" "${payload_file}" <<'PY'
 import base64
 import gzip
 import json
-import os
 import pathlib
 import sys
 
-payload = os.environ.get("GPUTEMPS_VENDOR_PAYLOAD_BASE64", "")
 target = pathlib.Path(sys.argv[1])
+payload = pathlib.Path(sys.argv[2]).read_text(encoding="ascii")
 data = json.loads(gzip.decompress(base64.b64decode(payload.encode("ascii"))).decode("utf-8"))
 for name in ("gputemps.c", "nvml.h"):
     text = data.get(name)
@@ -2192,6 +2198,13 @@ for name in ("gputemps.c", "nvml.h"):
         raise SystemExit(f"missing vendored {name}")
     (target / name).write_text(text, encoding="utf-8")
 PY
+  then
+    return 1
+  fi
+  "${SUDO[@]}" install -m 0644 "${tmp_dir}/gputemps.c" "${target_dir}/gputemps.c"
+  "${SUDO[@]}" install -m 0644 "${tmp_dir}/nvml.h" "${target_dir}/nvml.h"
+  rm -rf "${tmp_dir}"
+  trap - RETURN
 }
 
 ensure_gputemps_helper_available() {

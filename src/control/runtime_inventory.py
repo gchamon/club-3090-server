@@ -4119,14 +4119,20 @@ def _profile_guided_install_state_for_variant(variant, model_dir_root, model_pro
             direct_repo = next((item for item in compose_hints.get("generic") or [] if item not in set(compose_hints.get("target") or [])), "")
 
         direct_command = ""
-        if (
-            direct_repo
-            and rel_file
-            and os.path.basename(rel_file)
-            and role in {"model", "draft", "mmproj"}
-            and rel_file.lower().endswith((".gguf", ".safetensors", ".bin"))
-        ):
-            direct_command = _known_hf_file_download_command(model_dir_root, direct_repo, rel_file)
+        if role == "draft":
+            # Draft assets can sit in a different repo than the target model.
+            # Prefer the profile recipe so DFlash drafters do not inherit the
+            # first generic compose hint from target-model quick-start comments.
+            direct_command = _recipe_download_command(model_dir_root, recipe)
+        if not direct_command:
+            if (
+                direct_repo
+                and rel_file
+                and os.path.basename(rel_file)
+                and role in {"model", "draft", "mmproj"}
+                and rel_file.lower().endswith((".gguf", ".safetensors", ".bin"))
+            ):
+                direct_command = _known_hf_file_download_command(model_dir_root, direct_repo, rel_file)
         if not direct_command:
             direct_command = _recipe_download_command(model_dir_root, recipe)
         if not direct_command:

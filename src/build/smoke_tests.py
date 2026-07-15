@@ -12391,6 +12391,73 @@ try:
         'hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q5_K_S.gguf --local-dir "/models/target"'
     )
     assert len(direct_plan) == 1, direct_plan
+    beellama_compose_hint = temp_root / "beellama-dflash-compose.yml"
+    beellama_compose_hint.write_text(
+        "# target + DFlash draft\\n"
+        "# hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q5_K_S.gguf --local-dir /models/target\\n"
+        "# hf download Anbeeld/Qwen3.6-27B-DFlash-GGUF Qwen3.6-27B-DFlash-IQ4_XS.gguf --local-dir /models/draft\\n",
+        encoding="utf-8",
+    )
+    model_profile = type("ProfileModel", (), {
+        "weights": {
+            "beellama-q5ks-dflash": {
+                "hf_repos": ["unsloth/Qwen3.6-27B-GGUF"],
+                "format": "gguf",
+            }
+        },
+        "default_weight_variant": "",
+    })()
+    drafter_profile = type("DrafterProfile", (), {
+        "local_model_path": "qwen3.6-27b-gguf/anbeeld-dflash-iq4xs",
+        "download": {"hf_repo": "Anbeeld/Qwen3.6-27B-DFlash-GGUF"},
+    })()
+    beellama_profiles = type("Profiles", (), {
+        "models": {"qwen3.6-27b": model_profile},
+        "drafters": {"anbeeld-qwen-dflash": drafter_profile},
+    })()
+    old_recipe_from_subpath = module._weight_recipe_from_subpath
+    old_recipe_from_variant = module._weight_recipe_from_model_variant
+    try:
+        def beellama_recipe_from_subpath(subpath):
+            text = str(subpath or "")
+            if "anbeeld-dflash-iq4xs" in text:
+                return {
+                    "WEIGHT_REPO": "Anbeeld/Qwen3.6-27B-DFlash-GGUF",
+                    "WEIGHT_FILES": "Qwen3.6-27B-DFlash-IQ4_XS.gguf",
+                    "WEIGHT_SUBDIR": "qwen3.6-27b-gguf/anbeeld-dflash-iq4xs",
+                    "WEIGHT_KIND": "draft",
+                    "WEIGHT_VERIFY_GLOB": "*.gguf",
+                }
+            if "unsloth-q5ks" in text:
+                return {
+                    "WEIGHT_REPO": "unsloth/Qwen3.6-27B-GGUF",
+                    "WEIGHT_FILES": "Qwen3.6-27B-Q5_K_S.gguf",
+                    "WEIGHT_SUBDIR": "qwen3.6-27b-gguf/unsloth-q5ks",
+                    "WEIGHT_KIND": "gguf",
+                    "WEIGHT_VERIFY_GLOB": "*.gguf",
+                }
+            return {}
+        module._weight_recipe_from_subpath = beellama_recipe_from_subpath
+        module._weight_recipe_from_model_variant = lambda model_id, weights_variant: {}
+        beellama_state = module._profile_guided_install_state_for_variant(
+            {
+                "model_id": "qwen3.6-27b",
+                "weights_variant": "beellama-q5ks-dflash",
+                "model_path": "/models/qwen3.6-27b-gguf/unsloth-q5ks/Qwen3.6-27B-Q5_K_S.gguf",
+                "draft_model_path": "/models/qwen3.6-27b-gguf/anbeeld-dflash-iq4xs/Qwen3.6-27B-DFlash-IQ4_XS.gguf",
+                "profile_drafter_id": "anbeeld-qwen-dflash",
+                "derived_compose_path": str(beellama_compose_hint),
+            },
+            str(temp_root / "models-cache"),
+            beellama_profiles,
+        )
+    finally:
+        module._weight_recipe_from_subpath = old_recipe_from_subpath
+        module._weight_recipe_from_model_variant = old_recipe_from_variant
+    beellama_command = str(beellama_state.get("install_command") or "")
+    assert "unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q5_K_S.gguf" in beellama_command, beellama_command
+    assert "Anbeeld/Qwen3.6-27B-DFlash-GGUF Qwen3.6-27B-DFlash-IQ4_XS.gguf" in beellama_command, beellama_command
+    assert "unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-DFlash-IQ4_XS.gguf" not in beellama_command, beellama_command
     direct_gemma_plan = module._monitor_plan_from_variant_install(
         {
             "model_id": "gemma-4-12b",
