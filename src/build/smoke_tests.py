@@ -8077,6 +8077,21 @@ omni_settings_compose.write_text(
 omni_runtime_meta = module._read_compose_runtime_metadata(str(omni_settings_compose))
 assert omni_runtime_meta["model_path"] == "/models/qwen3-omni-30b-a3b-instruct-int4-autoround", omni_runtime_meta
 assert omni_runtime_meta["served_model_name"] == "/models/qwen3-omni-30b-a3b-instruct-int4-autoround", omni_runtime_meta
+assigned_path_compose = temp_root / "repo" / "models" / "qwen3.8-27b" / "sglang" / "compose" / "dual" / "fp8" / "dflash2.yml"
+assigned_path_compose.parent.mkdir(parents=True, exist_ok=True)
+assigned_path_compose.write_text(
+    "services:\\n"
+    "  sglang:\\n"
+    "    command:\\n"
+    "      - |\\n"
+    "        M=/models/qwen3.8-27b-fp8\\n"
+    "        D=${DRAFTER_DIR:-/models/qwen3.8-27b-dflash2-zlab-bf16}\\n"
+    "        exec python3 -m sglang.launch_server --model-path \\\"$$M\\\" --speculative-draft-model-path \\\"$$D\\\"\\n",
+    encoding="utf-8",
+)
+assigned_path_meta = module._read_compose_runtime_metadata(str(assigned_path_compose))
+assert assigned_path_meta["model_path"] == "/models/qwen3.8-27b-fp8", assigned_path_meta
+assert assigned_path_meta["draft_model_path"] == "/models/qwen3.8-27b-dflash2-zlab-bf16", assigned_path_meta
 assert module._selector_engine_display(
     "variant-models-qwen3-omni-30b-a3b-vllm-omni-compose-dual-autoround-int4-omni",
     "models/qwen3-omni-30b-a3b/vllm-omni/compose/dual/autoround-int4/omni.yml",
@@ -12716,6 +12731,9 @@ try:
     assert enriched["model_updates"]["pending"] == 1, enriched
     download_plan_source = inspect.getsource(module._run_hf_download_step)
     assert "--force-download" in download_plan_source, download_plan_source
+    assert 'env.setdefault("HF_XET_HIGH_PERFORMANCE", "1")' in download_plan_source, download_plan_source
+    assert "HF_HUB_ENABLE_HF_TRANSFER" not in download_plan_source, download_plan_source
+    assert "HF_HUB_DISABLE_XET" not in download_plan_source, download_plan_source
     start_source = inspect.getsource(module.start_model_update_job)
     assert "_start_model_download_job" in start_source and "update_mode=True" in start_source, start_source
     print("model install progress smoke ok")
@@ -12763,6 +12781,7 @@ try:
     module.USERS_FILE = str(temp_root / "users.json")
     module.GROUPS_FILE = str(temp_root / "groups.json")
     module.RUNTIME_INVENTORY_FILE = str(temp_root / "runtime_inventory.json")
+    module.PRESET_TPS_STATS_FILE = str(temp_root / "preset_tps_stats.json")
     module.GENERATED_COMPOSE_OVERRIDES_DIR = str(temp_root / "compose-overrides")
     module.ACTIVE_MODE_FILE = str(temp_root / "active_mode")
     module.LAST_GOOD_MODE_FILE = str(temp_root / "last_good_mode")
@@ -13728,6 +13747,8 @@ try:
     module.CHAT_CONVERSATIONS_DIR = str(temp_root / "conversations")
     module.CHAT_STATE_FILE = str(temp_root / "conversations" / "state.json")
     module.CHAT_ATTACHMENTS_DIR = str(temp_root / "conversations" / "attachments")
+    module.CHAT_STATE_BACKUP_DIR = str(temp_root / "conversations" / "backups")
+    module.CHAT_STREAM_STATE_DIR = str(temp_root / "conversations" / "stream-state")
     os.makedirs(module.CHAT_ATTACHMENTS_DIR, exist_ok=True)
 
     pathlib.Path(module._chat_attachment_blob_path("used")).write_bytes(b"used")
@@ -13978,6 +13999,7 @@ temp_root = pathlib.Path(tempfile.mkdtemp(prefix="club3090-audit-filter-"))
 try:
     audit_path = temp_root / "audit.log"
     debug_path = temp_root / "debug.log"
+    module.CONTROL_DIR = str(temp_root)
     module.AUDIT_LOG_FILE = str(audit_path)
     module.DEBUG_LOG_FILE = str(debug_path)
     module.audit_rate_limit_state.clear()
@@ -14178,6 +14200,8 @@ spec.loader.exec_module(module)
 temp_root = pathlib.Path(tempfile.mkdtemp(prefix="club3090-logrotate-"))
 try:
     target = temp_root / "club3090-docker-containers"
+    module.CONTROL_DIR = str(temp_root)
+    module.CONTROL_LOG_FILE = str(temp_root / "control.log")
     module.DOCKER_LOGROTATE_FILE = str(target)
     module.managed_docker_log_paths = lambda: ["/var/lib/docker/containers/a/a-json.log", "/var/lib/docker/containers/b/b-json.log"]
     ok = module.refresh_docker_logrotate_config()
@@ -14219,6 +14243,7 @@ spec.loader.exec_module(module)
 
 temp_root = pathlib.Path(tempfile.mkdtemp(prefix="club3090-storage-browser-"))
 try:
+    module.os.geteuid = lambda: 0
     module._storage_browser_known_roots = lambda: {str(temp_root.resolve())}
     target = temp_root / "large.bin"
     target.write_bytes(bytes((index % 251 for index in range(module.STORAGE_BROWSER_CHUNK_BYTES + 4096))))

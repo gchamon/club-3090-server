@@ -3273,6 +3273,22 @@ def _read_compose_runtime_metadata(path):
                         continue
     except Exception:
         return {}
+    command_assignments = {}
+    for item in command_items:
+        assignment = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=(.+)", str(item or "").strip())
+        if assignment:
+            command_assignments[assignment.group(1)] = _resolve_shell_value_with_env(
+                assignment.group(2),
+                command_assignments,
+            )
+
+    def resolve_command_value(raw):
+        value = _extract_shell_default_value(raw)
+        variable = re.fullmatch(r"\${1,2}(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))", value)
+        if variable:
+            return str(command_assignments.get(variable.group(1) or variable.group(2)) or value).strip()
+        return value
+
     for idx, item in enumerate(command_items):
         if (
             item == "serve"
@@ -3281,19 +3297,19 @@ def _read_compose_runtime_metadata(path):
             and idx + 1 < len(command_items)
             and not str(command_items[idx + 1] or "").strip().startswith("-")
         ):
-            model_path = _extract_shell_default_value(command_items[idx + 1])
+            model_path = resolve_command_value(command_items[idx + 1])
         if item == "--model" and idx + 1 < len(command_items):
-            model_path = _extract_shell_default_value(command_items[idx + 1])
+            model_path = resolve_command_value(command_items[idx + 1])
         elif item.startswith("--model="):
-            model_path = _extract_shell_default_value(item.split("=", 1)[1])
+            model_path = resolve_command_value(item.split("=", 1)[1])
         if item == "--model-path" and idx + 1 < len(command_items):
-            model_path = _extract_shell_default_value(command_items[idx + 1])
+            model_path = resolve_command_value(command_items[idx + 1])
         elif item.startswith("--model-path="):
-            model_path = _extract_shell_default_value(item.split("=", 1)[1])
+            model_path = resolve_command_value(item.split("=", 1)[1])
         if item == "-m" and idx + 1 < len(command_items):
-            model_path = _extract_shell_default_value(command_items[idx + 1])
+            model_path = resolve_command_value(command_items[idx + 1])
         elif item.startswith("-m="):
-            model_path = _extract_shell_default_value(item.split("=", 1)[1])
+            model_path = resolve_command_value(item.split("=", 1)[1])
         if item == "--served-model-name" and idx + 1 < len(command_items):
             served_model_name = _extract_shell_default_value(command_items[idx + 1])
         elif item.startswith("--served-model-name="):
@@ -3311,17 +3327,17 @@ def _read_compose_runtime_metadata(path):
         elif item.startswith("-c=") and max_model_len is None:
             max_model_len = _extract_default_number(item.split("=", 1)[1], minimum_digits=4)
         if item == "--mmproj" and idx + 1 < len(command_items):
-            mmproj_path = _extract_shell_default_value(command_items[idx + 1])
+            mmproj_path = resolve_command_value(command_items[idx + 1])
         elif item.startswith("--mmproj="):
-            mmproj_path = _extract_shell_default_value(item.split("=", 1)[1])
+            mmproj_path = resolve_command_value(item.split("=", 1)[1])
         if item in {"--spec-draft-model", "--draft-model"} and idx + 1 < len(command_items):
-            draft_model_path = _extract_shell_default_value(command_items[idx + 1])
+            draft_model_path = resolve_command_value(command_items[idx + 1])
         elif item.startswith("--spec-draft-model=") or item.startswith("--draft-model="):
-            draft_model_path = _extract_shell_default_value(item.split("=", 1)[1])
+            draft_model_path = resolve_command_value(item.split("=", 1)[1])
         if item == "--speculative-draft-model-path" and idx + 1 < len(command_items):
-            draft_model_path = _extract_shell_default_value(command_items[idx + 1])
+            draft_model_path = resolve_command_value(command_items[idx + 1])
         elif item.startswith("--speculative-draft-model-path="):
-            draft_model_path = _extract_shell_default_value(item.split("=", 1)[1])
+            draft_model_path = resolve_command_value(item.split("=", 1)[1])
         if item == "--speculative-config" and idx + 1 < len(command_items):
             speculative_json = command_items[idx + 1]
         elif item.startswith("--speculative-config="):

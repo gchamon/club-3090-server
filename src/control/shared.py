@@ -5816,8 +5816,7 @@ def _run_hf_download_step(job_id, prefix, step, env_map, progress_plan=None, for
     os.makedirs(local_dir, exist_ok=True)
     hf_cli = _resolve_hf_cli_binary()
     env = dict(env_map or {})
-    env.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
-    env.setdefault("HF_HUB_DISABLE_XET", "1")
+    env.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
     last_error = ""
     for repo_id in repo_ids:
         attempts = 2
