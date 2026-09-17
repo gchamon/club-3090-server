@@ -137,6 +137,13 @@ def validate_model_score_description_source(js_text: str) -> list[str]:
     installer_text = read_text(SCRIPT_SOURCE_PATH)
     updater_text = read_text(UPDATER_SOURCE_PATH)
     archived_custom_compose_dir = CONTROL_SOURCE_DIR / "custom-models"
+    if (
+        'INSTALLER_ENV_FILE="${CLUB3090_INSTALLER_ENV_FILE:-${PWD}/.env}"' not in installer_text
+        or 'read_repo_env_value "${INSTALLER_ENV_FILE}" "CLUB3090_DIR"' not in installer_text
+        or 'CLUB3090_DIR="${CLUB3090_DIR:-${INSTALLER_ENV_CLUB3090_DIR:-/opt/ai/club-3090}}"' not in installer_text
+        or 'REPO_ENV_FILE="${CLUB3090_DIR}/.env"' not in installer_text
+    ):
+        issues.append("installer must resolve CLUB3090_DIR from a safe bootstrap .env before reading the selected checkout's repository .env")
     if archived_custom_compose_dir.exists():
         direct_upstream_archives = []
         for path in sorted(archived_custom_compose_dir.rglob("*")):
@@ -7240,22 +7247,38 @@ module.subprocess.check_output = _utf8_subprocess_check_output
 
 module.CONTROL_DIR = str(temp_root)
 module.UI_CONFIG_FILE = str(temp_root / "ui_config.json")
+module.CONTROL_LOG_FILE = str(temp_root / "control.log")
+module.AUDIT_LOG_FILE = str(temp_root / "audit.log")
+module.DEBUG_LOG_FILE = str(temp_root / "debug.log")
+module.UPDATE_LOG_FILE = str(temp_root / "self-update.log")
+module.UPDATE_STATE_FILE = str(temp_root / "self-update-state.json")
+module.PRESET_TPS_STATS_FILE = str(temp_root / "preset_tps_stats.json")
+module.SYSTEM_METRIC_PEAKS_FILE = str(temp_root / "system_metric_peaks.json")
+module.GPU_LAST_SEEN_FILE = str(temp_root / "gpu_last_seen.json")
+module.METRICS_HISTORY_FILE = str(temp_root / "metrics_history.json")
 module.CUSTOM_PRESETS_FILE = str(temp_root / "custom_presets.json")
 module.CUSTOM_MODELS_FILE = str(temp_root / "custom_models.json")
 module.CUSTOM_MODELS_DIR = str(temp_root / "custom-models")
+module.INSTANCES_DIR = str(temp_root / "instances")
+module.INSTANCE_RUNTIME_CACHE_HOST_ROOT = str(temp_root / "runtime-cache" / "instances")
 module.INSTANCES_CONFIG_FILE = str(temp_root / "instances.json")
 module.SERVER_CONFIG_FILE = str(temp_root / "server_config.json")
 module.CONFIG_TOML_FILE = str(temp_root / "config.toml")
 module.USERS_FILE = str(temp_root / "users.json")
 module.GROUPS_FILE = str(temp_root / "groups.json")
 module.RUNTIME_INVENTORY_FILE = str(temp_root / "runtime_inventory.json")
+module.MODEL_UPDATE_STATE_FILE = str(temp_root / "model_update_state.json")
+module.SWITCH_FAILURE_FILE = str(temp_root / "switch_failure.json")
 module.GENERATED_COMPOSE_OVERRIDES_DIR = str(temp_root / "compose-overrides")
+module.ACTIVE_MODE_FILE = str(temp_root / "active_mode")
+module.LAST_GOOD_MODE_FILE = str(temp_root / "last_good_mode")
 module.BENCHMARKS_DIR = str(temp_root / "benchmarks")
 module.BENCHMARKS_PRESETS_DIR = str(temp_root / "benchmarks" / "presets")
 module.BENCHMARKS_STATE_FILE = str(temp_root / "benchmarks" / "state.json")
 module.BENCHMARKS_INVENTORY_STATE_FILE = str(temp_root / "benchmarks" / "inventory-state.json")
 module.BENCHMARKS_COMPARISONS_FILE = str(temp_root / "benchmarks" / "comparisons.json")
 module.BENCHMARKS_LOG_FILE = str(temp_root / "benchmarks" / "benchmarks.log")
+module.BENCHMARK_ARCHIVE_DIR = str(temp_root / "benchmark-archive")
 module.SCRIPT_RUNS_DIR = str(temp_root / "script-runs")
 module.SCRIPT_STATE_FILE = str(temp_root / "script-runs" / "state.json")
 module.CLUB3090_DIR = str(temp_root / "club-3090")

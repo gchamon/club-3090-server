@@ -359,7 +359,14 @@ choose_loopback_port() {
   return 1
 }
 
-CLUB3090_DIR="${CLUB3090_DIR:-/opt/ai/club-3090}"
+INSTALLER_ENV_FILE="${CLUB3090_INSTALLER_ENV_FILE:-${PWD}/.env}"
+INSTALLER_ENV_CLUB3090_DIR="$(read_repo_env_value "${INSTALLER_ENV_FILE}" "CLUB3090_DIR" || true)"
+CLUB3090_DIR="${CLUB3090_DIR:-${INSTALLER_ENV_CLUB3090_DIR:-/opt/ai/club-3090}}"
+if [[ "${CLUB3090_DIR}" == "~" ]]; then
+  CLUB3090_DIR="${HOME}"
+elif [[ "${CLUB3090_DIR}" == "~/"* ]]; then
+  CLUB3090_DIR="${HOME}/${CLUB3090_DIR#\~/}"
+fi
 DEFAULT_MODE="${DEFAULT_MODE:-}"
 CONTROL_PY="${CONTROL_DIR}/control.py"
 UPDATER_PY="${CONTROL_DIR}/updater.py"
@@ -600,6 +607,12 @@ log_resolved_pre_sudo_config() {
   fi
   printf '\n[%s] resolved configuration before sudo\n' "$(date +%H:%M:%S)"
   printf '  action: %s\n' "${ACTION}"
+  printf '  installer env file: %s\n' "${INSTALLER_ENV_FILE}"
+  if [[ -r "${INSTALLER_ENV_FILE}" ]]; then
+    printf '  installer env status: loaded\n'
+  else
+    printf '  installer env status: not found/readable\n'
+  fi
   printf '  club-3090 dir: %s\n' "${CLUB3090_DIR}"
   printf '  repo env file: %s\n' "${REPO_ENV_FILE}"
   if [[ -r "${REPO_ENV_FILE}" ]]; then

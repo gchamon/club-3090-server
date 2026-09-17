@@ -414,6 +414,14 @@ Running a local copy:
 bash install-club3090-server.sh
 ```
 
+The installer reads `CLUB3090_DIR` from a `.env` file in the current working directory before falling back to `/opt/ai/club-3090`. Use an absolute path:
+
+```dotenv
+CLUB3090_DIR=/home/gchamon/services/club-3090
+```
+
+An exported `CLUB3090_DIR` takes precedence over this bootstrap file. Set `CLUB3090_INSTALLER_ENV_FILE` to read the bootstrap value from another file. After resolving the checkout, the installer separately reads `${CLUB3090_DIR}/.env` for repository settings such as `MODEL_DIR`, Hugging Face cache paths, and `HF_TOKEN`.
+
 Custom admin and proxy ports:
 
 ```bash

@@ -6,3 +6,4 @@ node_modules/
 club-3090/
 artifacts/
 backups/
+.env
