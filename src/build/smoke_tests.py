@@ -136,6 +136,8 @@ def validate_model_score_description_source(js_text: str) -> list[str]:
     users_layout_text = read_text(WEB_SOURCE_DIR / "layout_users.js")
     installer_text = read_text(SCRIPT_SOURCE_PATH)
     updater_text = read_text(UPDATER_SOURCE_PATH)
+    if 'CLUB3090_ASSUME_YES=1 bash "${TMP_SCRIPT}"' not in updater_text:
+        issues.append("systemd self-updates must pass the installer confirmation override")
     archived_custom_compose_dir = CONTROL_SOURCE_DIR / "custom-models"
     if (
         'INSTALLER_ENV_FILE="${CLUB3090_INSTALLER_ENV_FILE:-${PWD}/.env}"' not in installer_text
