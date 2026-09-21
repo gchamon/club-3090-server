@@ -4,12 +4,14 @@ from urllib.parse import parse_qs, quote, urlsplit
 import mimetypes
 import base64
 import calendar
+import csv
 import codecs
 import collections
 import fnmatch
 import glob
 import gzip
 import hashlib
+import io
 import ipaddress
 import json
 import math
@@ -41,6 +43,7 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
+from xml.sax.saxutils import escape as xml_escape
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 try:

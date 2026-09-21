@@ -1710,7 +1710,7 @@ process.on("uncaughtException", (error) => {{
   if (!systemConfigHtml.includes("System") && (!systemConfigHtml.includes("Power Profile") || !systemConfigHtml.includes("Balanced (280W)") || !systemConfigHtml.includes("Power Optimizations") || !systemConfigHtml.includes("Cooling"))) {{
     throw new Error("System Configuration should render current power, optimization, and cooling settings");
   }}
-  vm.runInContext("setSystemConfigDraft('profile', 'fast');", context);
+   vm.runInContext("setSystemConfigDraft('gpu_profile', 'fast');", context);
   const dirtySystemConfigHtml = String(getElement("systemConfigGrid").innerHTML || "");
   if (!dirtySystemConfigHtml.includes("system-config-row-dirty") || !dirtySystemConfigHtml.includes("changed")) {{
     throw new Error("System Configuration should mark changed dropdown values as unsaved");
@@ -5900,8 +5900,7 @@ def generate_test_html_artifact() -> tuple[str, str]:
     ):
         raise ValueError("AI Studio must be represented as a first-class status runtime with container, request, GPU, and queue activity")
     if (
-        'current in {"fast", "turbo"}' not in system_source
-        or '"preserved": True' not in system_source
+        'current = str(current_gpu_profile or current_profile or "").strip().lower()' not in system_source
         or "def image_studio_power_watchdog():" not in system_source
         or "checker(max_age=0)" not in system_source
         or "time.sleep(0.1)" not in system_source

@@ -44,7 +44,7 @@ class CommonMixin:
                 "image/svg+xml",
             }
         )
-    def send_bytes(self, payload, content_type="application/octet-stream", code=200):
+    def send_bytes(self, payload, content_type="application/octet-stream", code=200, download_name=""):
         self.close_connection = True
         body = bytes(payload or b"")
         gzip_response = False
@@ -58,6 +58,8 @@ class CommonMixin:
                 gzip_response = False
         self.send_response(code)
         self.send_header("Content-Type", content_type)
+        if download_name:
+            self.send_header("Content-Disposition", f'attachment; filename="{os.path.basename(download_name)}"')
         if gzip_response:
             self.send_header("Content-Encoding", "gzip")
             self.send_header("Vary", "Accept-Encoding")
@@ -339,6 +341,18 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             self.send_bytes(admin_service_worker_script().encode("utf-8"), "application/javascript; charset=utf-8")
             return
         if not self.require_auth():
+            return
+        if path == "/admin/metrics-export":
+            params = parse_admin_query_params(parsed)
+            try:
+                export_payload = export_metrics_history(params.get("format") or "json")
+                self.send_bytes(
+                    export_payload["payload"],
+                    export_payload["content_type"],
+                    download_name=export_payload["download_name"],
+                )
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 400)
             return
         if path == "/admin/update-signal":
             update_state = read_self_update_state()

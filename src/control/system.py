@@ -533,6 +533,161 @@ def clear_recorded_metrics_history():
     }
 
 
+def _metrics_export_timestamp(value):
+    try:
+        timestamp = int(float(value or 0))
+    except Exception:
+        timestamp = 0
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(timestamp)) if timestamp > 0 else ""
+
+
+def _metrics_export_points():
+    ensure_metrics_history_loaded()
+    with metrics_lock:
+        return prune_metrics_history_points(list(series_points))
+
+
+def _metrics_export_csv(rows, headers):
+    output = io.StringIO(newline="")
+    writer = csv.writer(output, lineterminator="\n")
+    writer.writerow(headers)
+    writer.writerows(rows)
+    return output.getvalue().encode("utf-8")
+
+
+def _metrics_export_csv_payload(points):
+    system_headers = ["timestamp_iso", *METRICS_HISTORY_POINT_KEYS[1:]]
+    system_rows = []
+    gpu_headers = ["timestamp_iso", *METRICS_HISTORY_GPU_KEYS]
+    gpu_rows = []
+    for point in points:
+        timestamp = _metrics_export_timestamp(point.get("t"))
+        system_rows.append([timestamp, *[point.get(key, "") for key in METRICS_HISTORY_POINT_KEYS[1:]]])
+        for gpu in point.get("gpus") or []:
+            gpu_rows.append([timestamp, *[gpu.get(key, "") for key in METRICS_HISTORY_GPU_KEYS]])
+    return {
+        "system": _metrics_export_csv(system_rows, system_headers),
+        "gpu": _metrics_export_csv(gpu_rows, gpu_headers),
+    }
+
+
+def _ods_cell(value):
+    if value is None or value == "":
+        return "<table:table-cell/>"
+    if isinstance(value, bool):
+        return f'<table:table-cell office:value-type="boolean" office:boolean-value="{"true" if value else "false"}><text:p>{"TRUE" if value else "FALSE"}</text:p></table:table-cell>'
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f'<table:table-cell office:value-type="float" office:value="{value}"><text:p>{value}</text:p></table:table-cell>'
+    text = xml_escape(str(value))
+    return f'<table:table-cell office:value-type="string"><text:p>{text}</text:p></table:table-cell>'
+
+
+def _ods_sheet(name, rows):
+    body = "".join(
+        "<table:table-row>" + "".join(_ods_cell(value) for value in row) + "</table:table-row>"
+        for row in rows
+    )
+    return f'<table:table table:name="{xml_escape(name)}">{body}</table:table>'
+
+
+def _metrics_export_ods_payload(points):
+    csv_payload = _metrics_export_csv_payload(points)
+    system_headers = ["timestamp_iso", *METRICS_HISTORY_POINT_KEYS[1:]]
+    system_rows = [system_headers]
+    gpu_headers = ["timestamp_iso", *METRICS_HISTORY_GPU_KEYS]
+    gpu_rows = [gpu_headers]
+    for point in points:
+        timestamp = _metrics_export_timestamp(point.get("t"))
+        system_rows.append([timestamp, *[point.get(key, "") for key in METRICS_HISTORY_POINT_KEYS[1:]]])
+        for gpu in point.get("gpus") or []:
+            gpu_rows.append([timestamp, *[gpu.get(key, "") for key in METRICS_HISTORY_GPU_KEYS]])
+    metadata_rows = [
+        ["field", "value"],
+        ["exported_at", _metrics_export_timestamp(time.time())],
+        ["point_count", len(points)],
+        ["system_csv_bytes", len(csv_payload["system"])],
+        ["gpu_csv_bytes", len(csv_payload["gpu"])],
+        ["units", "See column names: *_pct are percentages, *_gib are GiB, *_s are seconds, *_mbps are Mbps."],
+    ]
+    content = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
+        'xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" '
+        'xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" '
+        'xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" office:version="1.2">'
+        '<office:automatic-styles/><office:body><office:spreadsheet>'
+        + _ods_sheet("System Metrics", system_rows)
+        + _ods_sheet("GPU Metrics", gpu_rows)
+        + _ods_sheet("Metadata", metadata_rows)
+        + "</office:spreadsheet></office:body></office:document-content>"
+    ).encode("utf-8")
+    styles = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<office:document-styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
+        'xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" '
+        'xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" office:version="1.2">'
+        "<office:styles/></office:document-styles>"
+    ).encode("utf-8")
+    manifest = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.2">'
+        '<manifest:file-entry manifest:full-path="/" manifest:media-type="application/vnd.oasis.opendocument.spreadsheet"/>'
+        '<manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/>'
+        '<manifest:file-entry manifest:full-path="styles.xml" manifest:media-type="text/xml"/>'
+        '<manifest:file-entry manifest:full-path="meta.xml" manifest:media-type="text/xml"/>'
+        '<manifest:file-entry manifest:full-path="settings.xml" manifest:media-type="text/xml"/>'
+        "</manifest:manifest>"
+    ).encode("utf-8")
+    metadata = b'<?xml version="1.0" encoding="UTF-8"?><office:document-meta xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" office:version="1.2"><office:meta/></office:document-meta>'
+    settings = b'<?xml version="1.0" encoding="UTF-8"?><office:document-settings xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" office:version="1.2"><office:settings/></office:document-settings>'
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", allowZip64=True) as archive:
+        archive.writestr("mimetype", "application/vnd.oasis.opendocument.spreadsheet", compress_type=zipfile.ZIP_STORED)
+        archive.writestr("content.xml", content, compress_type=zipfile.ZIP_DEFLATED)
+        archive.writestr("styles.xml", styles, compress_type=zipfile.ZIP_DEFLATED)
+        archive.writestr("meta.xml", metadata, compress_type=zipfile.ZIP_DEFLATED)
+        archive.writestr("settings.xml", settings, compress_type=zipfile.ZIP_DEFLATED)
+        archive.writestr("META-INF/manifest.xml", manifest, compress_type=zipfile.ZIP_DEFLATED)
+    return output.getvalue()
+
+
+def export_metrics_history(format_name):
+    format_name = str(format_name or "").strip().lower().replace("-", "")
+    points = _metrics_export_points()
+    payload = {
+        "schema_version": 1,
+        "exported_at": int(time.time()),
+        "retention_seconds": int(METRICS_HISTORY_RETENTION_SECONDS),
+        "point_count": len(points),
+        "series": points,
+    }
+    if format_name == "json":
+        return {
+            "payload": json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"),
+            "content_type": "application/json",
+            "download_name": f"club3090-metrics-{time.strftime('%Y%m%d-%H%M%S')}.json",
+        }
+    if format_name in {"csv", "csvzip", "zip"}:
+        csv_payload = _metrics_export_csv_payload(points)
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
+            archive.writestr("system-metrics.csv", csv_payload["system"])
+            archive.writestr("gpu-metrics.csv", csv_payload["gpu"])
+            archive.writestr("README.txt", "Club-3090 metrics export\n\nSystem metrics are one row per timestamp. GPU metrics are one row per timestamp per GPU.\nPercentages are numeric percentages, *_gib are GiB, *_s are seconds, and *_mbps are Mbps.\n")
+        return {
+            "payload": output.getvalue(),
+            "content_type": "application/zip",
+            "download_name": f"club3090-metrics-{time.strftime('%Y%m%d-%H%M%S')}.zip",
+        }
+    if format_name in {"ods", "sheet", "spreadsheet"}:
+        return {
+            "payload": _metrics_export_ods_payload(points),
+            "content_type": "application/vnd.oasis.opendocument.spreadsheet",
+            "download_name": f"club3090-metrics-{time.strftime('%Y%m%d-%H%M%S')}.ods",
+        }
+    raise ValueError("Unsupported metrics export format")
+
+
 def parse_runtime_log_metrics(text):
     metrics_out = {
         "prompt_tps": None,
