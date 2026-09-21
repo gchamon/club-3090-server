@@ -1475,16 +1475,27 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                 data = self.read_json_body()
                 ensure_benchmark_idle("Power profile")
                 profile_name = data.get("profile")
+                gpu_profile = data.get("gpu_profile")
+                cpu_profile = data.get("cpu_profile")
                 instance_id = str(data.get("instance_id") or "").strip().upper()
-                log_control(f"PROFILE request received name={profile_name} instance={instance_id or 'GLOBAL'}")
-                out = apply_performance_profile(profile_name)
+                log_control(f"PROFILE request received name={profile_name or '-'} gpu={gpu_profile or '-'} cpu={cpu_profile or '-'} instance={instance_id or 'GLOBAL'}")
+                if gpu_profile is None and cpu_profile is None:
+                    out = apply_performance_profile(profile_name)
+                else:
+                    out = {}
+                    if gpu_profile is not None:
+                        out.update(apply_gpu_power_profile(gpu_profile))
+                    if cpu_profile is not None:
+                        out.update(apply_cpu_power_profile(cpu_profile))
                 log_audit(
                     "admin_profile",
                     profile=profile_name,
+                    gpu_profile=gpu_profile,
+                    cpu_profile=cpu_profile,
                     instance=instance_id or "GLOBAL",
                     result_summary=summarize_audit_result(out),
                 )
-                self.send_json({"ok": True, "profile": profile_name, "result": out, "power": power_status(), "focus_log_source": "audit"})
+                self.send_json({"ok": True, "profile": profile_name, "gpu_profile": gpu_profile, "cpu_profile": cpu_profile, "result": out, "power": power_status(), "focus_log_source": "audit"})
             except Exception as e:
                 self.send_json({"ok": False, "error": str(e)}, 500)
             return
@@ -2115,16 +2126,27 @@ class LocalApiHandler(CommonMixin, BaseHTTPRequestHandler):
             if path == "/profile":
                 ensure_benchmark_idle("Local API power profile")
                 profile_name = data.get("profile")
+                gpu_profile = data.get("gpu_profile")
+                cpu_profile = data.get("cpu_profile")
                 instance_id = str(data.get("instance_id") or "").strip().upper()
-                log_control(f"LOCAL PROFILE request received name={profile_name} instance={instance_id or 'GLOBAL'}")
-                out = apply_performance_profile(profile_name)
+                log_control(f"LOCAL PROFILE request received name={profile_name or '-'} gpu={gpu_profile or '-'} cpu={cpu_profile or '-'} instance={instance_id or 'GLOBAL'}")
+                if gpu_profile is None and cpu_profile is None:
+                    out = apply_performance_profile(profile_name)
+                else:
+                    out = {}
+                    if gpu_profile is not None:
+                        out.update(apply_gpu_power_profile(gpu_profile))
+                    if cpu_profile is not None:
+                        out.update(apply_cpu_power_profile(cpu_profile))
                 log_audit(
                     "local_api_profile",
                     profile=profile_name,
+                    gpu_profile=gpu_profile,
+                    cpu_profile=cpu_profile,
                     instance=instance_id or "GLOBAL",
                     result_summary=summarize_audit_result(out),
                 )
-                self.send_json({"ok": True, "profile": profile_name, "result": out, "power": power_status()})
+                self.send_json({"ok": True, "profile": profile_name, "gpu_profile": gpu_profile, "cpu_profile": cpu_profile, "result": out, "power": power_status()})
                 return
             if path in {"/benchmarks", "/benchmarks/start", "/benchmarks/speed", "/benchmarks/category", "/benchmarks/queue", "/benchmarks/rerun"}:
                 default_action = "speed" if path.endswith("/speed") else ("start" if path.endswith("/start") else "")

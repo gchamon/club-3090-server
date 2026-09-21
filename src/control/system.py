@@ -3265,16 +3265,35 @@ def apply_performance_profile(name):
     return result
 
 
+def apply_gpu_power_profile(name):
+    profile_name = _apply_gpu_profile_globals(name)
+    log_control(f"GPU PROFILE requested name={name}")
+    write_server_config({"active_gpu_power_profile": profile_name})
+    clear_gpu_session_peaks()
+    result = {"gpu": apply_gpu_active_power(force=True), "gpu_profile": profile_name}
+    log_control(f"GPU PROFILE applied name={profile_name} gpu={result.get('gpu')}")
+    return result
+
+
+def apply_cpu_power_profile(name):
+    profile_name = _apply_cpu_profile_globals(name)
+    log_control(f"CPU PROFILE requested name={name}")
+    write_server_config({"active_cpu_power_profile": profile_name})
+    result = {"cpu": apply_cpu_active_power(), "cpu_profile": profile_name}
+    log_control(f"CPU PROFILE applied name={profile_name} cpu={result.get('cpu')}")
+    return result
+
+
 def restore_persisted_performance_profile(apply_now=False):
     cfg = read_server_config()
-    profile_name = str(cfg.get("active_power_profile") or current_profile or "balanced").strip().lower()
-    if profile_name not in PERFORMANCE_PROFILES:
-        profile_name = "balanced"
-    _apply_profile_globals(profile_name)
+    gpu_profile = str(cfg.get("active_gpu_power_profile") or cfg.get("active_power_profile") or current_profile or "balanced").strip().lower()
+    cpu_profile = str(cfg.get("active_cpu_power_profile") or "performance").strip().lower()
+    _apply_gpu_profile_globals(gpu_profile)
+    _apply_cpu_profile_globals(cpu_profile)
     if apply_now:
         clear_gpu_session_peaks()
-        return {"cpu": apply_cpu_active_power(), "gpu": apply_gpu_active_power(force=True), "profile": profile_name}
-    return {"profile": profile_name}
+        return {"cpu": apply_cpu_active_power(), "gpu": apply_gpu_active_power(force=True), "gpu_profile": current_gpu_profile, "cpu_profile": current_cpu_profile, "profile": current_profile}
+    return {"gpu_profile": current_gpu_profile, "cpu_profile": current_cpu_profile, "profile": current_profile}
 
 
 def persist_fan_manual_override_state():
@@ -3336,41 +3355,23 @@ def benchmark_power_actions_owned():
 def ensure_default_runtime_power(reason="runtime_activity", force=False):
     global runtime_default_power_last
     if benchmark_power_actions_owned():
-        return {"skipped": True, "profile": current_profile, "reason": "benchmark_active"}
+        return {"skipped": True, "profile": current_profile, "gpu_profile": current_gpu_profile, "cpu_profile": current_cpu_profile, "reason": "benchmark_active"}
     now = time.time()
-    current = str(current_profile or "").strip().lower()
+    current = str(current_gpu_profile or current_profile or "").strip().lower()
     with metrics_lock:
         gpu_state = str(power_state.get("gpu") or "").strip().lower()
-    if current in {"fast", "turbo"}:
-        if not force and gpu_state == "active" and now - runtime_default_power_last < 10:
-            return {"skipped": True, "profile": current, "reason": reason}
-        out = {
-            "cpu": apply_cpu_active_power(),
-            "gpu": apply_gpu_active_power(skip_fans=True),
-            "profile": current,
-            "reason": str(reason or ""),
-            "preserved": True,
-        }
-        runtime_default_power_last = now
-        log_control(
-            f"PROFILE runtime wake reason={reason} profile={current} preserved=true"
-        )
-        return out
-    if not force and current == "balanced" and gpu_state == "active" and now - runtime_default_power_last < 10:
-        return {"skipped": True, "profile": "balanced", "reason": reason}
-    reset_peaks = force or current != "balanced" or gpu_state != "active"
-    _apply_profile_globals("balanced")
-    write_server_config({"active_power_profile": "balanced"})
-    if reset_peaks:
-        clear_gpu_session_peaks()
+    if not force and gpu_state == "active" and now - runtime_default_power_last < 10:
+        return {"skipped": True, "profile": current, "gpu_profile": current_gpu_profile, "cpu_profile": current_cpu_profile, "reason": reason}
     out = {
         "cpu": apply_cpu_active_power(),
         "gpu": apply_gpu_active_power(skip_fans=True),
-        "profile": "balanced",
+        "profile": current,
+        "gpu_profile": current_gpu_profile,
+        "cpu_profile": current_cpu_profile,
         "reason": str(reason or ""),
     }
     runtime_default_power_last = now
-    log_control(f"PROFILE runtime wake reason={reason} profile=balanced")
+    log_control(f"PROFILE runtime wake reason={reason} profile={current}")
     return out
 
 
@@ -4099,7 +4100,7 @@ def power_status():
         booting = switch_job_active()
         idle_for = 0 if active > 0 or benchmark_active or booting or studio_active else int(max(0.0, time.time() - last_request_finished_at))
         fan_curve_text = ", ".join([f"<{temp}C={speed}%" for temp, speed in FAN_CURVE]) + ", >=65C=100%"
-        status = {**power_state, "profile": current_profile, "idle_for_seconds": idle_for, "benchmark_active": benchmark_active, "ai_studio_active": studio_active, "idle_power_after_seconds": POWER_IDLE_AFTER_SECONDS, "container_stop_after_seconds": 0, "container_auto_stop_enabled": CONTAINER_AUTO_STOP_ENABLED, "gpu_active_power_limit_w": GPU_ACTIVE_POWER_LIMIT_W, "gpu_idle_power_limit_w": GPU_IDLE_POWER_LIMIT_W, "gpu_idle_lock_clocks": GPU_IDLE_LOCK_CLOCKS, "cpu_active_governor": CPU_ACTIVE_GOVERNOR, "cpu_idle_governor": CPU_IDLE_GOVERNOR, "optimizations_enabled": power_optimizations_enabled, "fan_manual_override": fan_manual_override, "fan_curve": fan_curve_text, "fan_min_safe_speed": FAN_MIN_SAFE_SPEED, "wol_default_mac": str(WOL_MAC or "").replace("-", ":").strip().upper()}
+        status = {**power_state, "profile": current_profile, "gpu_profile": current_gpu_profile, "cpu_profile": current_cpu_profile, "idle_for_seconds": idle_for, "benchmark_active": benchmark_active, "ai_studio_active": studio_active, "idle_power_after_seconds": POWER_IDLE_AFTER_SECONDS, "container_stop_after_seconds": 0, "container_auto_stop_enabled": CONTAINER_AUTO_STOP_ENABLED, "gpu_active_power_limit_w": GPU_ACTIVE_POWER_LIMIT_W, "gpu_idle_power_limit_w": GPU_IDLE_POWER_LIMIT_W, "gpu_idle_lock_clocks": GPU_IDLE_LOCK_CLOCKS, "cpu_active_governor": CPU_ACTIVE_GOVERNOR, "cpu_idle_governor": CPU_IDLE_GOVERNOR, "optimizations_enabled": power_optimizations_enabled, "fan_manual_override": fan_manual_override, "fan_curve": fan_curve_text, "fan_min_safe_speed": FAN_MIN_SAFE_SPEED, "wol_default_mac": str(WOL_MAC or "").replace("-", ":").strip().upper()}
     if benchmark_active:
         status.update(benchmark_power_status_overlay_from_state_file())
     return status

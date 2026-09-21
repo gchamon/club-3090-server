@@ -7700,9 +7700,17 @@ profile_after_repeat = module.read_server_config()
 assert profile_after_repeat["active_power_profile"] == "fast", profile_after_repeat
 legacy_profile = module.write_server_config({"active_power_profile": "default"})
 assert legacy_profile["active_power_profile"] == "fast", legacy_profile
+pathlib.Path(module.SERVER_CONFIG_FILE).write_text('{"active_power_profile":"turbo"}', encoding="utf-8")
+split_migrated = module.read_server_config()
+assert split_migrated["active_gpu_power_profile"] == "turbo", split_migrated
+assert split_migrated["active_cpu_power_profile"] == "performance", split_migrated
 pathlib.Path(module.SERVER_CONFIG_FILE).write_text('{"active_power_profile":"default"}', encoding="utf-8")
 assert module.read_server_config()["active_power_profile"] == "balanced"
 module.write_server_config({"active_power_profile": "balanced", "selected_preset_model": "fixture-model", "fan_manual_override": False})
+split_profile = module.write_server_config({"active_gpu_power_profile": "eco", "active_cpu_power_profile": "adaptive"})
+assert split_profile["active_gpu_power_profile"] == "eco", split_profile
+assert split_profile["active_cpu_power_profile"] == "adaptive", split_profile
+assert split_profile["active_power_profile"] == "eco", split_profile
 assert pathlib.Path(module.SERVER_CONFIG_FILE).exists()
 
 custom = {"sample": {"description": "fixture", "params": {"temperature": 0.7}}}

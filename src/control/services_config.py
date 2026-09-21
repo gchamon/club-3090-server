@@ -188,6 +188,8 @@ def default_server_config():
         "selected_preset_model": "",
         "hidden_preset_selectors": [],
         "active_power_profile": current_profile,
+        "active_gpu_power_profile": current_gpu_profile,
+        "active_cpu_power_profile": current_cpu_profile,
         "fan_manual_override": False,
         "fan_override_instance_id": "GLOBAL",
         "preset_launch_overrides": {},
@@ -303,6 +305,14 @@ def read_server_config():
     merged["active_power_profile"] = str(data.get("active_power_profile") or current_profile or "balanced").strip().lower()
     if merged["active_power_profile"] not in PERFORMANCE_PROFILES:
         merged["active_power_profile"] = "balanced"
+    legacy_profile = merged["active_power_profile"]
+    legacy_cpu_profile = "performance" if str((PERFORMANCE_PROFILES.get(legacy_profile) or {}).get("cpu_active") or "").strip().lower() == "performance" else "adaptive"
+    merged["active_gpu_power_profile"] = str(data.get("active_gpu_power_profile") or legacy_profile).strip().lower().replace("_", "-")
+    if merged["active_gpu_power_profile"] not in PERFORMANCE_PROFILES:
+        merged["active_gpu_power_profile"] = "balanced"
+    merged["active_cpu_power_profile"] = str(data.get("active_cpu_power_profile") or legacy_cpu_profile).strip().lower().replace("_", "-")
+    if merged["active_cpu_power_profile"] not in CPU_POWER_PROFILES:
+        merged["active_cpu_power_profile"] = "performance"
     merged["fan_manual_override"] = bool(data.get("fan_manual_override", False))
     merged["fan_override_instance_id"] = str(data.get("fan_override_instance_id") or "GLOBAL").strip().upper() or "GLOBAL"
     merged["preset_launch_overrides"] = sanitize_preset_launch_overrides(data.get("preset_launch_overrides") or {})
@@ -332,6 +342,18 @@ def write_server_config(data):
         next_profile = str(data.get("active_power_profile") or "").strip().lower()
         if next_profile in PERFORMANCE_PROFILES:
             current["active_power_profile"] = next_profile
+            current["active_gpu_power_profile"] = next_profile
+            legacy_cpu_profile = "performance" if str((PERFORMANCE_PROFILES.get(next_profile) or {}).get("cpu_active") or "").strip().lower() == "performance" else "adaptive"
+            current["active_cpu_power_profile"] = legacy_cpu_profile
+    if "active_gpu_power_profile" in data:
+        next_profile = str(data.get("active_gpu_power_profile") or "").strip().lower().replace("_", "-")
+        if next_profile in PERFORMANCE_PROFILES:
+            current["active_gpu_power_profile"] = next_profile
+            current["active_power_profile"] = next_profile
+    if "active_cpu_power_profile" in data:
+        next_profile = str(data.get("active_cpu_power_profile") or "").strip().lower().replace("_", "-")
+        if next_profile in CPU_POWER_PROFILES:
+            current["active_cpu_power_profile"] = next_profile
     if "fan_manual_override" in data:
         current["fan_manual_override"] = bool(data.get("fan_manual_override", False))
     if "fan_override_instance_id" in data:
