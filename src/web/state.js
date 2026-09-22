@@ -5,6 +5,7 @@ let logReconnectTimer = null;
 let logCacheRefreshTimer = null;
 let logCacheRefreshNonce = 0;
 let statusPollTimer = null;
+let statusRenderSignatures = Object.create(null);
 let statusOutageStartedAt = 0;
 let statusDisconnectedActive = false;
 let initialMetricsSeriesRequested = false;
@@ -1616,12 +1617,6 @@ function beginPendingUpdateUi(scope) {
       ? "Starting Club-3090 migration. The orange update log will remain selected while the control plane restarts."
       : "Starting admin script update. The orange update log will remain selected while the control plane restarts.",
   );
-}
-function mirrorAuthToggles(allowAnonymous, allowDummy) {
-  if ($("auditAllowAnonymousProxy"))
-    $("auditAllowAnonymousProxy").checked = !!allowAnonymous;
-  if ($("auditAllowDummyProxyKey"))
-    $("auditAllowDummyProxyKey").checked = !!allowDummy;
 }
 let selectedGroupName = "";
 function setGroupsMsg(t) {

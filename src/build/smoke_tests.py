@@ -6274,12 +6274,14 @@ process.on("uncaughtException", (error) => {{
   }}
   const policyFixture = {{
     admin_port: 8008,
+    metrics: {{}},
+    system: {{}},
     server_config: {{
       admin_path: "/admin",
       online_enabled: false,
       local_api_enabled: false,
       allow_proxy_without_api_key: false,
-      allow_proxy_with_invalid_api_key: true,
+      allow_proxy_with_invalid_api_key: false,
     }},
   }};
   window.renderAudit(policyFixture.server_config);
@@ -6289,21 +6291,31 @@ process.on("uncaughtException", (error) => {{
   if (!anonymousProxyToggle || !dummyProxyToggle || !policyText) {{
     throw new Error("access policy controls or summary are missing");
   }}
-  if (anonymousProxyToggle.checked || !dummyProxyToggle.checked) {{
-    throw new Error("access policy controls did not hydrate independently from server config");
+  if (anonymousProxyToggle.checked || dummyProxyToggle.checked) {{
+    throw new Error("access policy controls did not hydrate persisted-off state");
   }}
-  if (!/without an API key.*rejected/i.test(policyText.textContent || "") || !/unrecognized API keys.*allowed/i.test(policyText.textContent || "")) {{
-    throw new Error("access policy summary did not report missing-key and dummy-key modes independently");
+  const originalDummyProxyToggle = dummyProxyToggle;
+  dummyProxyToggle.checked = true;
+  dummyProxyToggle.dispatchEvent(new window.Event("change", {{ bubbles: true }}));
+  if (typeof dummyProxyToggle.onchange === "function") dummyProxyToggle.onchange();
+  window.setAccessPolicyDraft(false, true);
+  window.renderStatusUi({{ ...policyFixture, server_config: {{ ...policyFixture.server_config }} }});
+  window.renderStatusUi({{ ...policyFixture, metrics: {{ active_requests: 1 }}, server_config: {{ ...policyFixture.server_config }} }});
+  if (window.document.getElementById("auditAllowDummyProxyKey") !== originalDummyProxyToggle ||
+      !originalDummyProxyToggle.checked || anonymousProxyToggle.checked ||
+      !/Unsaved changes/i.test(policyText.textContent || "")) {{
+    throw new Error("stale heartbeat did not preserve the Access Policy draft and controls");
   }}
   const policyFetch = window.fetch;
   let policySaveBody = null;
   window.fetch = async (url, options = {{}}) => {{
     if (url === "/admin/users") {{
       policySaveBody = JSON.parse(String(options.body || "{{}}"));
+      policyFixture.server_config.allow_proxy_with_invalid_api_key = true;
       return {{
         ok: true,
         status: 200,
-        async json() {{ return {{ ok: true, server_config: policyFixture.server_config }}; }},
+        async json() {{ return {{ ok: true, server_config: {{ ...policyFixture.server_config }} }}; }},
       }};
     }}
     return policyFetch(url, options);
@@ -6315,6 +6327,11 @@ process.on("uncaughtException", (error) => {{
       policySaveBody.allow_proxy_with_invalid_api_key !== true) {{
     throw new Error(`access policy save payload did not include both booleans: ${{JSON.stringify(policySaveBody)}}`);
   }}
+  window.renderStatusUi({{ ...policyFixture, metrics: {{ active_requests: 2 }} }});
+  if (!window.document.getElementById("auditAllowDummyProxyKey").checked ||
+      /Unsaved changes/i.test(policyText.textContent || "")) {{
+    throw new Error("saved access policy did not survive the next heartbeat as persisted state");
+  }}
   const fixtureSelect = window.document.getElementById("club3090FixtureSelect");
   const fixtureEditor = window.document.getElementById("club3090FixtureEditor");
   if (!fixtureSelect || !fixtureEditor) throw new Error("test lab controls are missing");
@@ -6323,6 +6340,25 @@ process.on("uncaughtException", (error) => {{
   fixtureSelect.value = preferredOption.value;
   fixtureSelect.dispatchEvent(new window.Event("change", {{ bubbles: true }}));
   await new Promise((resolve) => setTimeout(resolve, 40));
+  window.activateTab("presets");
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  window.renderPresetHeaderActions();
+  const presetMenu = window.document.getElementById("presetActionsMenuList");
+  const presetMenuButton = window.document.getElementById("presetActionsMenuButton");
+  if (!presetMenu || !presetMenuButton) throw new Error("preset actions menu did not render");
+  presetMenu.classList.remove("hidden");
+  presetMenuButton.setAttribute("aria-expanded", "true");
+  const stablePresetMenu = presetMenu;
+  window.renderStatusUi({{ metrics: {{ active_requests: 1 }}, presets: policyFixture.presets || {{}} }});
+  if (window.document.getElementById("presetActionsMenuList") !== stablePresetMenu ||
+      stablePresetMenu.classList.contains("hidden") ||
+      presetMenuButton.getAttribute("aria-expanded") !== "true") {{
+    throw new Error("metrics-only heartbeat reconstructed the open preset actions menu");
+  }}
+  window.renderStatusUi({{ metrics: {{ active_requests: 1 }}, presets: {{ changed: true }} }});
+  if (window.document.getElementById("presetActionsMenuList") === stablePresetMenu) {{
+    throw new Error("preset catalog change did not permit a structural menu refresh");
+  }}
   const tabs = Array.from(window.document.querySelectorAll(".tab"));
   if (tabs.length < 3) throw new Error("top-level tabs did not render");
   const logsButton = tabs.find((button) => /logs/i.test(button.textContent || ""));
@@ -7281,11 +7317,28 @@ process.on("uncaughtException", (error) => {{
   assertTooltipSide(40, true, "40% pointer should switch tooltip right-pinned");
   assertTooltipSide(45, true, "45% pointer should retain right-pinned hysteresis state");
   assertTooltipSide(50, false, "50% pointer should switch tooltip left-pinned");
-  window.metricsChartPointerLeave({{}}, chartRecord);
-  const resetTooltip = chartShell.querySelector(".metric-hover-tooltip");
-  if (!resetTooltip || resetTooltip.classList.contains(tooltipSideClass)) {{
-    throw new Error("pointer leave should clear right-pinned tooltip state");
+  chartCanvas.id = "smokeMetricsCanvas";
+  chartRecord.id = "smokeMetricsCanvas";
+  chartRecord.options = {{}};
+  const chartState = window.metricsChartState(window.document);
+  chartState.charts.set(chartRecord.id, chartRecord);
+  chartState.hoverIndex = 0;
+  chartState.active = true;
+  chartState.lastPointer = {{ clientX: 75 }};
+  window.metricsChartRedraw(window.document);
+  const stableTooltip = chartShell.querySelector(".metric-hover-tooltip");
+  const stableTimestamp = stableTooltip?.textContent || "";
+  window.metricsChartRedraw(window.document);
+  if (chartShell.querySelector(".metric-hover-tooltip") !== stableTooltip ||
+      chartShell.querySelector(".metric-hover-tooltip")?.textContent !== stableTimestamp) {{
+    throw new Error("unchanged metrics redraw replaced the active timestamp tooltip");
   }}
+  chartRecord.points = [];
+  window.metricsChartRedraw(window.document);
+  if (stableTooltip.classList.contains("visible")) {{
+    throw new Error("metrics redraw left a stale tooltip after removing its selected point");
+  }}
+  window.metricsChartPointerLeave({{}}, chartRecord);
   window.close();
   console.log("test html smoke ok");
 }})().catch((error) => {{

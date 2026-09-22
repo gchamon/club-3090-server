@@ -2379,7 +2379,12 @@ function handleStorageEditorHexPaste(event) {
 const metricsChartRegistryByDocument = new WeakMap();
 function metricsChartState(doc) {
   if (!metricsChartRegistryByDocument.has(doc)) {
-    metricsChartRegistryByDocument.set(doc, { charts: new Map(), hoverIndex: -1, active: false });
+    metricsChartRegistryByDocument.set(doc, {
+      charts: new Map(),
+      hoverIndex: -1,
+      active: false,
+      lastPointer: null,
+    });
   }
   return metricsChartRegistryByDocument.get(doc);
 }
@@ -2388,7 +2393,10 @@ function metricPointCopyText(point) {
 }
 function metricPointTooltip(doc, record, index, event) {
   const point = record.points?.[index];
-  if (!point) return;
+  if (!point) {
+    record.canvas.parentElement?.querySelector?.(".metric-hover-tooltip")?.classList.remove("visible", "metric-hover-tooltip-right");
+    return;
+  }
   let tooltip = record.canvas.parentElement?.querySelector?.(".metric-hover-tooltip");
   if (!tooltip) {
     tooltip = doc.createElement("div");
@@ -2414,9 +2422,19 @@ function metricPointTooltip(doc, record, index, event) {
   tooltip.classList.add("visible");
 }
 function metricsChartRedraw(doc) {
-  metricsChartState(doc).charts.forEach((record) => {
+  const state = metricsChartState(doc);
+  state.charts.forEach((record) => {
     draw(record.id, record.data, record.key, record.label, record.color, record.options);
   });
+  if (!state.active || state.hoverIndex < 0) return;
+  const record = [...state.charts.values()].find((item) => item.points?.[state.hoverIndex]);
+  if (record && state.lastPointer) {
+    metricPointTooltip(doc, record, state.hoverIndex, state.lastPointer);
+  } else {
+    doc.querySelectorAll(".metric-hover-tooltip").forEach((node) => {
+      node.classList.remove("visible", "metric-hover-tooltip-right");
+    });
+  }
 }
 function metricsChartPointerMove(event, record) {
   if (!record) return;
@@ -2426,14 +2444,15 @@ function metricsChartPointerMove(event, record) {
   const count = record.points?.length || record.data?.length || 0;
   if (!count || !rect.width) return;
   state.hoverIndex = Math.max(0, Math.min(count - 1, Math.round(((event.clientX - rect.left) / rect.width) * (count - 1))));
+  state.lastPointer = event;
   state.active = true;
   metricsChartRedraw(doc);
-  metricPointTooltip(doc, record, state.hoverIndex, event);
 }
 function metricsChartPointerLeave(event, record) {
   if (!record) return;
   const state = metricsChartState(record.canvas.ownerDocument);
   state.active = false;
+  state.lastPointer = null;
   record.canvas.ownerDocument.querySelectorAll(".metric-hover-tooltip").forEach((node) => {
     node.classList.remove("visible", "metric-hover-tooltip-right");
   });

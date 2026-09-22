@@ -107,14 +107,14 @@
               ><input
                 type="checkbox"
                 id="auditAllowAnonymousProxy"
-                onchange="mirrorAuthToggles(this.checked, document.getElementById('auditAllowDummyProxyKey').checked)"
+                onchange="setAccessPolicyDraft(this.checked, document.getElementById('auditAllowDummyProxyKey').checked)"
               />
               allow requests without an API key</label
             ><label class="label"
               ><input
                 type="checkbox"
                 id="auditAllowDummyProxyKey"
-                onchange="mirrorAuthToggles(document.getElementById('auditAllowAnonymousProxy').checked, this.checked)"
+                onchange="setAccessPolicyDraft(document.getElementById('auditAllowAnonymousProxy').checked, this.checked)"
               />
               allow requests with unrecognized API keys (dummy keys)</label
             ><button class="btn blue" onclick="saveAuthSettings()">
