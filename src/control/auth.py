@@ -678,6 +678,8 @@ def authorize_proxy_request(headers, instance_id, upstream_path, request_usage=N
     raw_key = extract_api_key(headers)
     user = get_user_by_api_key(raw_key) if raw_key else None
     if raw_key and user is None:
+        if cfg.get("allow_proxy_with_invalid_api_key", False):
+            return True, {"mode": "anonymous", "user_name": None, "target_id": target_id, "count_request": False, "permissions": normalize_permissions({})}
         log_audit("proxy_auth_denied", reason="invalid_api_key", target=target_id, path=upstream_path)
         return False, 401, {"error": "Invalid API key"}
     if user is not None:
@@ -690,10 +692,10 @@ def authorize_proxy_request(headers, instance_id, upstream_path, request_usage=N
             return False, 429, {"error": err, "user": user["name"]}
         permissions = effective_permissions(user)
         return True, {"mode": "user", "user_name": user["name"], "target_id": target_id, "count_request": count_request, "permissions": permissions}
-    if cfg.get("allow_proxy_without_api_key", True):
+    if cfg.get("allow_proxy_without_api_key", False):
         return True, {"mode": "anonymous", "user_name": None, "target_id": target_id, "count_request": False, "permissions": normalize_permissions({})}
-    log_audit("proxy_auth_denied", reason="missing_or_invalid_api_key", target=target_id, path=upstream_path)
-    return False, 401, {"error": "Missing or invalid API key"}
+    log_audit("proxy_auth_denied", reason="missing_api_key", target=target_id, path=upstream_path)
+    return False, 401, {"error": "Missing API key"}
 
 
 def extract_response_usage(payload):

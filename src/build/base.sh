@@ -3216,7 +3216,8 @@ https_key_file = sys.argv[7]
 proxy_swap_mode = sys.argv[8]
 path = os.path.join(control_dir, "server_config.json")
 current = {
-    "allow_proxy_without_api_key": True,
+    "allow_proxy_without_api_key": False,
+    "allow_proxy_with_invalid_api_key": False,
     "proxy_swap_enabled": True,
     "online_enabled": False,
     "upnp_enabled": False,

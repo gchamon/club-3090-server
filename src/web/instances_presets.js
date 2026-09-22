@@ -7,6 +7,7 @@ renderAudit = function (cfg) {
   const adminPath = cfg.admin_path || "/admin";
   const online = !!cfg.online_enabled;
   const authOptional = !!cfg.allow_proxy_without_api_key;
+  const dummyKeyAllowed = !!cfg.allow_proxy_with_invalid_api_key;
   const localEnabled = !!cfg.local_api_enabled;
   const localPort = cfg.local_api_port || 10881;
   if ($("auditAdminEndpoint"))
@@ -29,22 +30,26 @@ renderAudit = function (cfg) {
   if ($("auditPolicyText"))
     setHtmlIfChanged(
       $("auditPolicyText"),
-      `Proxy API keys are currently <b>${authOptional ? "optional" : "required"}</b>. Admin UI remains under <code>:${adminPort}${adminPath}</code>.`,
+      `Requests without an API key are <b>${authOptional ? "allowed" : "rejected"}</b>; requests with unrecognized API keys (dummy keys) are <b>${dummyKeyAllowed ? "allowed" : "rejected"}</b>. Admin UI remains under <code>:${adminPort}${adminPath}</code>.`,
     );
-  mirrorAuthToggles(authOptional);
+  mirrorAuthToggles(authOptional, dummyKeyAllowed);
 };
 saveAuthSettings = async function () {
-  const allow = !!(
+  const allowAnonymous = !!(
     $("auditAllowAnonymousProxy") && $("auditAllowAnonymousProxy").checked
   );
-  mirrorAuthToggles(allow);
+  const allowDummy = !!(
+    $("auditAllowDummyProxyKey") && $("auditAllowDummyProxyKey").checked
+  );
+  mirrorAuthToggles(allowAnonymous, allowDummy);
   try {
     const r = await fetch("/admin/users", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         action: "save_server_config",
-        allow_proxy_without_api_key: allow,
+        allow_proxy_without_api_key: allowAnonymous,
+        allow_proxy_with_invalid_api_key: allowDummy,
       }),
     });
     const j = await r.json();

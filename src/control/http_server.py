@@ -1722,7 +1722,9 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                     before_cfg = read_server_config()
                     cfg_data = {}
                     if "allow_proxy_without_api_key" in data:
-                        cfg_data["allow_proxy_without_api_key"] = bool(data.get("allow_proxy_without_api_key", True))
+                        cfg_data["allow_proxy_without_api_key"] = bool(data.get("allow_proxy_without_api_key", False))
+                    if "allow_proxy_with_invalid_api_key" in data:
+                        cfg_data["allow_proxy_with_invalid_api_key"] = bool(data.get("allow_proxy_with_invalid_api_key", False))
                     if "selected_preset_model" in data:
                         cfg_data["selected_preset_model"] = str(data.get("selected_preset_model") or "").strip()
                     if "hidden_preset_selectors" in data:
@@ -1734,7 +1736,8 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                     if cfg != before_cfg:
                         log_audit(
                             "admin_server_config",
-                            allow_proxy_without_api_key=cfg.get("allow_proxy_without_api_key", True),
+                            allow_proxy_without_api_key=cfg.get("allow_proxy_without_api_key", False),
+                            allow_proxy_with_invalid_api_key=cfg.get("allow_proxy_with_invalid_api_key", False),
                             selected_preset_model=cfg.get("selected_preset_model") or "",
                             hidden_preset_selectors=len(cfg.get("hidden_preset_selectors") or []),
                             preset_launch_overrides=len((cfg.get("preset_launch_overrides") or {}).keys()),

@@ -1617,9 +1617,11 @@ function beginPendingUpdateUi(scope) {
       : "Starting admin script update. The orange update log will remain selected while the control plane restarts.",
   );
 }
-function mirrorAuthToggles(v) {
+function mirrorAuthToggles(allowAnonymous, allowDummy) {
   if ($("auditAllowAnonymousProxy"))
-    $("auditAllowAnonymousProxy").checked = !!v;
+    $("auditAllowAnonymousProxy").checked = !!allowAnonymous;
+  if ($("auditAllowDummyProxyKey"))
+    $("auditAllowDummyProxyKey").checked = !!allowDummy;
 }
 let selectedGroupName = "";
 function setGroupsMsg(t) {

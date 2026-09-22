@@ -175,7 +175,8 @@ def default_dual_mode_selector():
 
 def default_server_config():
     return {
-        "allow_proxy_without_api_key": True,
+        "allow_proxy_without_api_key": False,
+        "allow_proxy_with_invalid_api_key": False,
         "proxy_swap_enabled": True,
         "online_enabled": False,
         "upnp_enabled": False,
@@ -287,7 +288,8 @@ def read_server_config():
     for key in merged:
         if key in data:
             merged[key] = data[key]
-    merged["allow_proxy_without_api_key"] = bool(merged.get("allow_proxy_without_api_key", True))
+    merged["allow_proxy_without_api_key"] = bool(merged.get("allow_proxy_without_api_key", False))
+    merged["allow_proxy_with_invalid_api_key"] = bool(merged.get("allow_proxy_with_invalid_api_key", False))
     merged["proxy_swap_enabled"] = bool(merged.get("proxy_swap_enabled", True))
     merged["online_enabled"] = bool(merged.get("online_enabled", False))
     merged["upnp_enabled"] = bool(merged.get("upnp_enabled", False))
@@ -323,7 +325,7 @@ def read_server_config():
 def write_server_config(data):
     current = read_server_config()
     original = dict(current)
-    for key in ("allow_proxy_without_api_key", "proxy_swap_enabled", "online_enabled", "upnp_enabled", "https_enabled", "local_api_enabled"):
+    for key in ("allow_proxy_without_api_key", "allow_proxy_with_invalid_api_key", "proxy_swap_enabled", "online_enabled", "upnp_enabled", "https_enabled", "local_api_enabled"):
         if key in data:
             current[key] = bool(data[key])
     if "local_api_port" in data:
