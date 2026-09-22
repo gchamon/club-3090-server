@@ -1953,6 +1953,21 @@ function popupWindowNameForMetricsSignature(signature) {
     .replace(/^-+|-+$/g, "");
   return `club3090-metrics-${token || "viewer"}`;
 }
+async function downloadMetricsExport(format = "") {
+  const doc = metricsRenderDocument || document;
+  const selected = String(format || doc.getElementById("metricsExportFormat")?.value || "csvzip").trim().toLowerCase();
+  const response = await fetch(`/admin/metrics-export?format=${encodeURIComponent(selected)}`, { credentials: "same-origin" });
+  if (!response.ok) throw new Error(`Metrics export failed (${response.status})`);
+  const blob = await response.blob();
+  const disposition = response.headers.get("Content-Disposition") || "";
+  const match = disposition.match(/filename="?([^";]+)"?/i);
+  const filename = match?.[1] || `club3090-metrics.${selected === "json" ? "json" : selected === "ods" ? "ods" : "zip"}`;
+  const link = doc.createElement("a");
+  link.href = (doc.defaultView || window).URL.createObjectURL(blob);
+  link.download = filename;
+  link.click();
+  (doc.defaultView || window).setTimeout(() => (doc.defaultView || window).URL.revokeObjectURL(link.href), 1000);
+}
 function detachedMetricsPopupHtml(state) {
   const sharedCss = String(document.querySelector("style")?.textContent || "");
   return `<!doctype html>
@@ -1992,6 +2007,12 @@ function detachedMetricsPopupHtml(state) {
           </div>
         </div>
         <div class="popup-actions">
+          <select id="popupMetricsExportFormat" class="metrics-export-format" aria-label="Metrics export format">
+            <option value="csvzip">CSV ZIP</option>
+            <option value="json">JSON</option>
+            <option value="ods">ODS</option>
+          </select>
+          <button class="popup-btn" type="button" id="popupMetricsExportBtn" title="Export metrics" aria-label="Export metrics">↓</button>
           <button class="iconbtn popup-metrics-reset-btn" type="button" id="popupMetricsResetBtn" title="Clear recorded metrics" aria-label="Clear recorded metrics">
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path d="M5 7h14M9 7V5h6v2m-7 3v7m4-7v7m4-7v7M7 7l1 12h8l1-12" />
@@ -2083,8 +2104,17 @@ function detachedMetricsPopupHtml(state) {
           "openStorageBrowserForVolume",
           "closeClubAlertModal",
           "resolveClubDecisionModal",
+          "downloadMetricsExport",
         ].forEach((name) => {
           window[name] = (...args) => invoke(name, ...args);
+        });
+        document.getElementById("popupMetricsExportBtn")?.addEventListener("click", async () => {
+          notify();
+          try {
+            await invoke("downloadMetricsExport", document.getElementById("popupMetricsExportFormat")?.value || "csvzip");
+          } catch (e) {
+            window.alert(e && e.message ? e.message : String(e || ""));
+          }
         });
         document.getElementById("popupMetricsResetBtn")?.addEventListener("click", async () => {
           notify();
@@ -2346,9 +2376,135 @@ function handleStorageEditorHexPaste(event) {
   event.preventDefault();
   applyStorageEditorHexPaste(event.clipboardData?.getData("text") || "", event.target);
 }
+const metricsChartRegistryByDocument = new WeakMap();
+function metricsChartState(doc) {
+  if (!metricsChartRegistryByDocument.has(doc)) {
+    metricsChartRegistryByDocument.set(doc, { charts: new Map(), hoverIndex: -1, active: false });
+  }
+  return metricsChartRegistryByDocument.get(doc);
+}
+function metricPointCopyText(point) {
+  return JSON.stringify(point || {}, null, 2);
+}
+function metricPointTooltip(doc, record, index, event) {
+  const point = record.points?.[index];
+  if (!point) return;
+  let tooltip = record.canvas.parentElement?.querySelector?.(".metric-hover-tooltip");
+  if (!tooltip) {
+    tooltip = doc.createElement("div");
+    tooltip.className = "metric-hover-tooltip";
+    record.canvas.parentElement?.appendChild(tooltip);
+  }
+  const timestamp = Number(point.t || 0);
+  const stamp = timestamp ? new Date(timestamp * 1000).toLocaleString() : "Point";
+  const value = record.data?.[index]?.[record.key];
+  const formattedValue = record.tooltipValueFormatter
+    ? record.tooltipValueFormatter(value)
+    : formatChartValue(value);
+  tooltip.innerHTML = `<table class="metric-hover-tooltip-table"><tbody><tr><th scope="row">Timestamp</th><td>${escapeHtml(stamp)}</td></tr><tr><th scope="row">${escapeHtml(record.label)}</th><td>${escapeHtml(formattedValue)}</td></tr></tbody></table><span>Click the point to copy all values</span>`;
+  const rect = record.canvas.getBoundingClientRect();
+  const width = Number(rect.width) || 0;
+  const localX = Math.max(0, Math.min(width, event.clientX - rect.left));
+  const fraction = width ? localX / width : 0;
+  if (fraction <= 0.4) {
+    tooltip.classList.add("metric-hover-tooltip-right");
+  } else if (fraction >= 0.5) {
+    tooltip.classList.remove("metric-hover-tooltip-right");
+  }
+  tooltip.classList.add("visible");
+}
+function metricsChartRedraw(doc) {
+  metricsChartState(doc).charts.forEach((record) => {
+    draw(record.id, record.data, record.key, record.label, record.color, record.options);
+  });
+}
+function metricsChartPointerMove(event, record) {
+  if (!record) return;
+  const doc = record.canvas.ownerDocument;
+  const state = metricsChartState(doc);
+  const rect = record.canvas.getBoundingClientRect();
+  const count = record.points?.length || record.data?.length || 0;
+  if (!count || !rect.width) return;
+  state.hoverIndex = Math.max(0, Math.min(count - 1, Math.round(((event.clientX - rect.left) / rect.width) * (count - 1))));
+  state.active = true;
+  metricsChartRedraw(doc);
+  metricPointTooltip(doc, record, state.hoverIndex, event);
+}
+function metricsChartPointerLeave(event, record) {
+  if (!record) return;
+  const state = metricsChartState(record.canvas.ownerDocument);
+  state.active = false;
+  record.canvas.ownerDocument.querySelectorAll(".metric-hover-tooltip").forEach((node) => {
+    node.classList.remove("visible", "metric-hover-tooltip-right");
+  });
+  metricsChartRedraw(record.canvas.ownerDocument);
+}
+function metricsChartCopyPoint(event, record) {
+  if (!record) return;
+  const doc = record.canvas.ownerDocument;
+  const point = record.points?.[metricsChartState(doc).hoverIndex];
+  if (!point) return;
+  const text = metricPointCopyText(point);
+  const copied = navigator.clipboard?.writeText
+    ? navigator.clipboard.writeText(text)
+    : Promise.resolve().then(() => {
+        const area = doc.createElement("textarea");
+        area.value = text;
+        area.style.position = "fixed";
+        area.style.opacity = "0";
+        doc.body.appendChild(area);
+        area.select();
+        doc.execCommand("copy");
+        area.remove();
+      });
+  Promise.resolve(copied).then(() => {
+    const tooltip = record.canvas.parentElement?.querySelector?.(".metric-hover-tooltip span");
+    if (tooltip) tooltip.textContent = "Copied all point values";
+  }).catch(() => {});
+}
+function drawMetricHoverOverlay(ctx, values, state, dpr, w, h, maxValue, chartHeight, chartBottomPad) {
+  if (!state.active || state.hoverIndex < 0 || !values.length) return;
+  const index = Math.min(state.hoverIndex, values.length - 1);
+  const x = (index / (values.length - 1 || 1)) * (w - 2 * dpr);
+  const y = h - (Number(values[index] || 0) / maxValue) * chartHeight - chartBottomPad;
+  ctx.save();
+  ctx.strokeStyle = "rgba(232,238,247,.55)";
+  ctx.lineWidth = dpr;
+  ctx.setLineDash([3 * dpr, 3 * dpr]);
+  ctx.beginPath();
+  ctx.moveTo(x, 22 * dpr);
+  ctx.lineTo(x, h - chartBottomPad);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = "#f5f8ff";
+  ctx.beginPath();
+  ctx.arc(x, y, 3.5 * dpr, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
 function draw(id, data, key, label, color, options = {}) {
   const c = metricsElement(id);
   if (!c) return;
+  const doc = c.ownerDocument;
+  const state = metricsChartState(doc);
+  const record = {
+    id,
+    canvas: c,
+    data,
+    key,
+    label,
+    color,
+    options,
+    tooltipValueFormatter: options.tooltipValueFormatter,
+    points: options.metricPoints || data,
+  };
+  state.charts.set(id, record);
+  if (!c.dataset.metricHoverBound) {
+    c.dataset.metricHoverBound = "1";
+    c.addEventListener("pointermove", (event) => metricsChartPointerMove(event, state.charts.get(id)));
+    c.addEventListener("pointerleave", (event) => metricsChartPointerLeave(event, state.charts.get(id)));
+    c.addEventListener("click", (event) => metricsChartCopyPoint(event, state.charts.get(id)));
+  }
   const ctx = c.getContext("2d"),
     dpr = devicePixelRatio || 1,
     w = (c.width = c.clientWidth * dpr),
@@ -2429,6 +2585,7 @@ function draw(id, data, key, label, color, options = {}) {
       true,
     );
   drawSeries(values, color, 2.2, 1);
+  drawMetricHoverOverlay(ctx, values, state, dpr, w, h, maxValue, chartHeight, chartBottomPad);
 }
 function drawGpuSeries(id, series, index, key, label, color, options = {}) {
   draw(
@@ -2440,7 +2597,7 @@ function drawGpuSeries(id, series, index, key, label, color, options = {}) {
     key,
     label,
     color,
-    options,
+    { ...options, metricPoints: series },
   );
 }
 function isBenchmarkMetricSample(metrics = {}) {
@@ -2547,12 +2704,14 @@ function renderMetrics(j, options = {}) {
     showPeakValue: true,
     peakColor: "#b7c0cc",
     persistentPeakValue: persistentMetricPeakValue(j, "gpu_util"),
+    tooltipValueFormatter: (value) => `${formatChartValue(value)}%`,
   });
   draw("cMem", s, "mem_pct", "VRAM % / GB", "#2fc46b", {
     showPeakLine: true,
     showPeakValue: true,
     peakColor: "#b7c0cc",
     persistentPeakValue: persistentMetricPeakValue(j, "mem_pct"),
+    tooltipValueFormatter: (value) => `${formatChartValue(value)}%`,
     valueFormatter: (current, peak) =>
       `${formatChartValue(current)}% · ${formatChartValue(currentVramUsedGib, 2)} GB (${UI_ARROW_UP} ${formatChartValue(safeVramPeakGib, 2)} GB)`,
   });
@@ -2561,12 +2720,14 @@ function renderMetrics(j, options = {}) {
     showPeakValue: true,
     peakColor: "#b7c0cc",
     persistentPeakValue: persistentMetricPeakValue(j, "latency_s"),
+    tooltipValueFormatter: (value) => `${formatChartValue(value)}s`,
   });
   draw("cTps", s, "tps", "TPS est", "#ff5b6c", {
     showPeakValue: true,
     showPeakLine: true,
     peakColor: "#b7c0cc",
     persistentPeakValue: persistentMetricPeakValue(j, "tps"),
+    tooltipValueFormatter: (value) => formatChartValue(value, 2),
     valueFormatter: (current, peak) =>
       `${formatChartValue(current, 2)} (↑ ${formatChartValue(peak, 2)})`,
   });
@@ -2575,6 +2736,7 @@ function renderMetrics(j, options = {}) {
     showPeakValue: true,
     peakColor: "#b7c0cc",
     persistentPeakValue: persistentMetricPeakValue(j, "ram_pct"),
+    tooltipValueFormatter: (value) => `${formatChartValue(value)}%`,
     valueFormatter: (current, peak) =>
       `${formatChartValue(current)}% · ${formatChartValue(currentRamUsedGib, 2)} GB (${UI_ARROW_UP} ${formatChartValue(safeRamPeakGib, 2)} GB)`,
   });
@@ -2583,18 +2745,21 @@ function renderMetrics(j, options = {}) {
     showPeakValue: true,
     peakColor: "#b7c0cc",
     persistentPeakValue: persistentMetricPeakValue(j, "cpu_pct"),
+    tooltipValueFormatter: (value) => `${formatChartValue(value)}%`,
   });
   draw("cSystemUtil", s, "system_util_pct", "System utilization %", "#a78bfa", {
     showPeakLine: true,
     showPeakValue: true,
     peakColor: "#b7c0cc",
     persistentPeakValue: persistentMetricPeakValue(j, "system_util_pct"),
+    tooltipValueFormatter: (value) => `${formatChartValue(value)}%`,
   });
   draw("cNetDown", s, "net_rx_mbps", "Download Mbps", "#2fc46b", {
     showPeakLine: true,
     showPeakValue: true,
     peakColor: "#b7c0cc",
     persistentPeakValue: persistentMetricPeakValue(j, "net_rx_mbps"),
+    tooltipValueFormatter: (value) => `${formatChartValue(value, 2)} Mbps`,
     valueFormatter: (current, peak) =>
       `${formatChartValue(current, 2)} (${UI_ARROW_UP} ${formatChartValue(peak, 2)})`,
   });
@@ -2603,6 +2768,7 @@ function renderMetrics(j, options = {}) {
     showPeakValue: true,
     peakColor: "#b7c0cc",
     persistentPeakValue: persistentMetricPeakValue(j, "net_tx_mbps"),
+    tooltipValueFormatter: (value) => `${formatChartValue(value, 2)} Mbps`,
     valueFormatter: (current, peak) =>
       `${formatChartValue(current, 2)} (${UI_ARROW_UP} ${formatChartValue(peak, 2)})`,
   });
@@ -2741,6 +2907,7 @@ function renderMetrics(j, options = {}) {
         showPeakLine: true,
         peakColor: "#b7c0cc",
         showPeakValue: true,
+        tooltipValueFormatter: (value) => `${formatChartValue(value)}%`,
       },
       {
         key: "mem_pct",
@@ -2750,6 +2917,7 @@ function renderMetrics(j, options = {}) {
         showPeakLine: true,
         peakColor: "#b7c0cc",
         showPeakValue: true,
+        tooltipValueFormatter: (value) => `${formatChartValue(value)}%`,
       },
       {
         key: "temp",
@@ -2759,6 +2927,7 @@ function renderMetrics(j, options = {}) {
         showPeakLine: true,
         peakColor: "#b7c0cc",
         showPeakValue: true,
+        tooltipValueFormatter: (value) => `${formatChartValue(value, 1)}°C`,
         valueColor: (current) => tempColorForValue(current, "core"),
         valueFormatterParts: (current, peak) => [
           { text: `${formatChartValue(current, 1)}°C`, color: tempColorForValue(current, "core") },
@@ -2777,6 +2946,7 @@ function renderMetrics(j, options = {}) {
               peakColor: "#b7c0cc",
               showPeakValue: true,
               valueColor: (current) => tempColorForValue(current, "junction"),
+              tooltipValueFormatter: (value) => `${formatChartValue(value, 1)}°C`,
               valueFormatterParts: (current, peak) => [
                 { text: `${formatChartValue(current, 1)}°C`, color: tempColorForValue(current, "junction") },
                 { text: " " },
@@ -2796,6 +2966,7 @@ function renderMetrics(j, options = {}) {
               peakColor: "#b7c0cc",
               showPeakValue: true,
               valueColor: (current) => tempColorForValue(current, "vram"),
+              tooltipValueFormatter: (value) => `${formatChartValue(value, 1)}°C`,
               valueFormatterParts: (current, peak) => [
                 { text: `${formatChartValue(current, 1)}°C`, color: tempColorForValue(current, "vram") },
                 { text: " " },
@@ -2812,6 +2983,7 @@ function renderMetrics(j, options = {}) {
         showPeakLine: true,
         peakColor: "#b7c0cc",
         showPeakValue: true,
+        tooltipValueFormatter: (value) => `${formatChartValue(value)} W`,
       },
     ];
     holder.innerHTML = cats

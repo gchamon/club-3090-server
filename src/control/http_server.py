@@ -44,7 +44,7 @@ class CommonMixin:
                 "image/svg+xml",
             }
         )
-    def send_bytes(self, payload, content_type="application/octet-stream", code=200):
+    def send_bytes(self, payload, content_type="application/octet-stream", code=200, download_name=""):
         self.close_connection = True
         body = bytes(payload or b"")
         gzip_response = False
@@ -58,6 +58,8 @@ class CommonMixin:
                 gzip_response = False
         self.send_response(code)
         self.send_header("Content-Type", content_type)
+        if download_name:
+            self.send_header("Content-Disposition", f'attachment; filename="{os.path.basename(download_name)}"')
         if gzip_response:
             self.send_header("Content-Encoding", "gzip")
             self.send_header("Vary", "Accept-Encoding")
@@ -339,6 +341,18 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             self.send_bytes(admin_service_worker_script().encode("utf-8"), "application/javascript; charset=utf-8")
             return
         if not self.require_auth():
+            return
+        if path == "/admin/metrics-export":
+            params = parse_admin_query_params(parsed)
+            try:
+                export_payload = export_metrics_history(params.get("format") or "json")
+                self.send_bytes(
+                    export_payload["payload"],
+                    export_payload["content_type"],
+                    download_name=export_payload["download_name"],
+                )
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 400)
             return
         if path == "/admin/update-signal":
             update_state = read_self_update_state()
@@ -1475,16 +1489,27 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                 data = self.read_json_body()
                 ensure_benchmark_idle("Power profile")
                 profile_name = data.get("profile")
+                gpu_profile = data.get("gpu_profile")
+                cpu_profile = data.get("cpu_profile")
                 instance_id = str(data.get("instance_id") or "").strip().upper()
-                log_control(f"PROFILE request received name={profile_name} instance={instance_id or 'GLOBAL'}")
-                out = apply_performance_profile(profile_name)
+                log_control(f"PROFILE request received name={profile_name or '-'} gpu={gpu_profile or '-'} cpu={cpu_profile or '-'} instance={instance_id or 'GLOBAL'}")
+                if gpu_profile is None and cpu_profile is None:
+                    out = apply_performance_profile(profile_name)
+                else:
+                    out = {}
+                    if gpu_profile is not None:
+                        out.update(apply_gpu_power_profile(gpu_profile))
+                    if cpu_profile is not None:
+                        out.update(apply_cpu_power_profile(cpu_profile))
                 log_audit(
                     "admin_profile",
                     profile=profile_name,
+                    gpu_profile=gpu_profile,
+                    cpu_profile=cpu_profile,
                     instance=instance_id or "GLOBAL",
                     result_summary=summarize_audit_result(out),
                 )
-                self.send_json({"ok": True, "profile": profile_name, "result": out, "power": power_status(), "focus_log_source": "audit"})
+                self.send_json({"ok": True, "profile": profile_name, "gpu_profile": gpu_profile, "cpu_profile": cpu_profile, "result": out, "power": power_status(), "focus_log_source": "audit"})
             except Exception as e:
                 self.send_json({"ok": False, "error": str(e)}, 500)
             return
@@ -2115,16 +2140,27 @@ class LocalApiHandler(CommonMixin, BaseHTTPRequestHandler):
             if path == "/profile":
                 ensure_benchmark_idle("Local API power profile")
                 profile_name = data.get("profile")
+                gpu_profile = data.get("gpu_profile")
+                cpu_profile = data.get("cpu_profile")
                 instance_id = str(data.get("instance_id") or "").strip().upper()
-                log_control(f"LOCAL PROFILE request received name={profile_name} instance={instance_id or 'GLOBAL'}")
-                out = apply_performance_profile(profile_name)
+                log_control(f"LOCAL PROFILE request received name={profile_name or '-'} gpu={gpu_profile or '-'} cpu={cpu_profile or '-'} instance={instance_id or 'GLOBAL'}")
+                if gpu_profile is None and cpu_profile is None:
+                    out = apply_performance_profile(profile_name)
+                else:
+                    out = {}
+                    if gpu_profile is not None:
+                        out.update(apply_gpu_power_profile(gpu_profile))
+                    if cpu_profile is not None:
+                        out.update(apply_cpu_power_profile(cpu_profile))
                 log_audit(
                     "local_api_profile",
                     profile=profile_name,
+                    gpu_profile=gpu_profile,
+                    cpu_profile=cpu_profile,
                     instance=instance_id or "GLOBAL",
                     result_summary=summarize_audit_result(out),
                 )
-                self.send_json({"ok": True, "profile": profile_name, "result": out, "power": power_status()})
+                self.send_json({"ok": True, "profile": profile_name, "gpu_profile": gpu_profile, "cpu_profile": cpu_profile, "result": out, "power": power_status()})
                 return
             if path in {"/benchmarks", "/benchmarks/start", "/benchmarks/speed", "/benchmarks/category", "/benchmarks/queue", "/benchmarks/rerun"}:
                 default_action = "speed" if path.endswith("/speed") else ("start" if path.endswith("/start") else "")

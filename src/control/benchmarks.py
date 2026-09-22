@@ -4516,6 +4516,8 @@ def benchmark_capture_restore_state():
             "optimizations_enabled": bool(power.get("optimizations_enabled", True)),
             "fan_manual_override": bool(power.get("fan_manual_override", False)),
             "profile": str(power.get("profile") or current_profile or "balanced").strip().lower(),
+            "gpu_profile": str(power.get("gpu_profile") or power.get("profile") or current_profile or "balanced").strip().lower(),
+            "cpu_profile": str(power.get("cpu_profile") or "performance").strip().lower(),
         },
     }
 
@@ -4557,7 +4559,11 @@ def benchmark_restore_runtime_locks(state):
         append_benchmark_log(f"[restore] fan restore warning: {exc}")
     previous_profile = str(power.get("profile") or "balanced").strip().lower()
     try:
-        apply_performance_profile(previous_profile)
+        if power.get("gpu_profile") or power.get("cpu_profile"):
+            apply_gpu_power_profile(power.get("gpu_profile") or previous_profile)
+            apply_cpu_power_profile(power.get("cpu_profile") or "performance")
+        else:
+            apply_performance_profile(previous_profile)
     except Exception as exc:
         append_benchmark_log(f"[restore] power profile restore warning for {previous_profile}: {exc}")
 

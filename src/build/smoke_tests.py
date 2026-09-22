@@ -136,6 +136,8 @@ def validate_model_score_description_source(js_text: str) -> list[str]:
     users_layout_text = read_text(WEB_SOURCE_DIR / "layout_users.js")
     installer_text = read_text(SCRIPT_SOURCE_PATH)
     updater_text = read_text(UPDATER_SOURCE_PATH)
+    if 'CLUB3090_ASSUME_YES=1 bash "${TMP_SCRIPT}"' not in updater_text:
+        issues.append("systemd self-updates must pass the installer confirmation override")
     archived_custom_compose_dir = CONTROL_SOURCE_DIR / "custom-models"
     if (
         'INSTALLER_ENV_FILE="${CLUB3090_INSTALLER_ENV_FILE:-${PWD}/.env}"' not in installer_text
@@ -1708,7 +1710,7 @@ process.on("uncaughtException", (error) => {{
   if (!systemConfigHtml.includes("System") && (!systemConfigHtml.includes("Power Profile") || !systemConfigHtml.includes("Balanced (280W)") || !systemConfigHtml.includes("Power Optimizations") || !systemConfigHtml.includes("Cooling"))) {{
     throw new Error("System Configuration should render current power, optimization, and cooling settings");
   }}
-  vm.runInContext("setSystemConfigDraft('profile', 'fast');", context);
+   vm.runInContext("setSystemConfigDraft('gpu_profile', 'fast');", context);
   const dirtySystemConfigHtml = String(getElement("systemConfigGrid").innerHTML || "");
   if (!dirtySystemConfigHtml.includes("system-config-row-dirty") || !dirtySystemConfigHtml.includes("changed")) {{
     throw new Error("System Configuration should mark changed dropdown values as unsaved");
@@ -5898,8 +5900,7 @@ def generate_test_html_artifact() -> tuple[str, str]:
     ):
         raise ValueError("AI Studio must be represented as a first-class status runtime with container, request, GPU, and queue activity")
     if (
-        'current in {"fast", "turbo"}' not in system_source
-        or '"preserved": True' not in system_source
+        'current = str(current_gpu_profile or current_profile or "").strip().lower()' not in system_source
         or "def image_studio_power_watchdog():" not in system_source
         or "checker(max_age=0)" not in system_source
         or "time.sleep(0.1)" not in system_source
@@ -7188,6 +7189,48 @@ process.on("uncaughtException", (error) => {{
   if (!brand || /__SCRIPT_VERSION__/.test(brand.textContent || "")) {{
     throw new Error("script version placeholder was not replaced");
   }}
+  const chartShell = window.document.createElement("div");
+  const chartCanvas = window.document.createElement("canvas");
+  chartShell.appendChild(chartCanvas);
+  window.document.body.appendChild(chartShell);
+  chartCanvas.getBoundingClientRect = () => ({{ left: 0, width: 100 }});
+  Object.defineProperty(chartShell, "clientWidth", {{ configurable: true, value: 100 }});
+  const chartRecord = {{
+    canvas: chartCanvas,
+    data: [{{ metric: 12.34 }}],
+    key: "metric",
+    label: "Percent",
+    points: [{{ t: 1700000000, value: 1, unrelated: "hidden" }}],
+    tooltipValueFormatter: (value) => `${{Number(value).toFixed(1)}}%`,
+  }};
+  const tooltipSideClass = "metric-hover-tooltip-right";
+  const assertTooltipSide = (clientX, expectedRight, message) => {{
+    window.metricPointTooltip(window.document, chartRecord, 0, {{ clientX }});
+    const tooltip = chartShell.querySelector(".metric-hover-tooltip");
+    if (!tooltip || tooltip.classList.contains(tooltipSideClass) !== expectedRight) {{
+      throw new Error(message);
+    }}
+  }};
+  assertTooltipSide(75, false, "75% pointer should keep tooltip left-pinned");
+  const tooltip = chartShell.querySelector(".metric-hover-tooltip");
+  const tooltipRows = tooltip ? tooltip.querySelectorAll(".metric-hover-tooltip-table tbody tr") : [];
+  const expectedStamp = new Date(1700000000 * 1000).toLocaleString();
+  if (!tooltip || tooltipRows.length !== 2 ||
+      !tooltipRows[0].textContent.includes("Timestamp") ||
+      !tooltipRows[0].textContent.includes(expectedStamp) ||
+      !tooltipRows[1].textContent.includes("Percent") ||
+      !tooltipRows[1].textContent.includes("12.3%") ||
+      tooltip.querySelector("pre")) {{
+    throw new Error("metric tooltip table content failed validation");
+  }}
+  assertTooltipSide(40, true, "40% pointer should switch tooltip right-pinned");
+  assertTooltipSide(45, true, "45% pointer should retain right-pinned hysteresis state");
+  assertTooltipSide(50, false, "50% pointer should switch tooltip left-pinned");
+  window.metricsChartPointerLeave({{}}, chartRecord);
+  const resetTooltip = chartShell.querySelector(".metric-hover-tooltip");
+  if (!resetTooltip || resetTooltip.classList.contains(tooltipSideClass)) {{
+    throw new Error("pointer leave should clear right-pinned tooltip state");
+  }}
   window.close();
   console.log("test html smoke ok");
 }})().catch((error) => {{
@@ -7700,9 +7743,17 @@ profile_after_repeat = module.read_server_config()
 assert profile_after_repeat["active_power_profile"] == "fast", profile_after_repeat
 legacy_profile = module.write_server_config({"active_power_profile": "default"})
 assert legacy_profile["active_power_profile"] == "fast", legacy_profile
+pathlib.Path(module.SERVER_CONFIG_FILE).write_text('{"active_power_profile":"turbo"}', encoding="utf-8")
+split_migrated = module.read_server_config()
+assert split_migrated["active_gpu_power_profile"] == "turbo", split_migrated
+assert split_migrated["active_cpu_power_profile"] == "performance", split_migrated
 pathlib.Path(module.SERVER_CONFIG_FILE).write_text('{"active_power_profile":"default"}', encoding="utf-8")
 assert module.read_server_config()["active_power_profile"] == "balanced"
 module.write_server_config({"active_power_profile": "balanced", "selected_preset_model": "fixture-model", "fan_manual_override": False})
+split_profile = module.write_server_config({"active_gpu_power_profile": "eco", "active_cpu_power_profile": "adaptive"})
+assert split_profile["active_gpu_power_profile"] == "eco", split_profile
+assert split_profile["active_cpu_power_profile"] == "adaptive", split_profile
+assert split_profile["active_power_profile"] == "eco", split_profile
 assert pathlib.Path(module.SERVER_CONFIG_FILE).exists()
 
 custom = {"sample": {"description": "fixture", "params": {"temperature": 0.7}}}
@@ -14677,7 +14728,6 @@ def scan_potential_dead_code(js_source: str, html_source: str, css_source: str) 
     if "systemUtilityRow" in js_source:
         warnings.append("Legacy systemUtilityRow layout shim still appears in the composed UI source")
     return warnings
-
 
 def run_ui_smoke_test(js_text: str, cwd: Path, filename: str) -> tuple[bool, str]:
     script_path = cwd / filename

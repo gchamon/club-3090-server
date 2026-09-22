@@ -965,8 +965,8 @@ function renderOverviewStatus(j) {
   const containers = Array.isArray(j?.containers) ? j.containers.filter(Boolean) : [];
   const modes = Array.isArray(j?.active_modes) ? j.active_modes.filter(Boolean) : [];
   const baseSummary = runtime
-      ? `${runtime.id || runtime.instance_id} | ${runtime.mode || j.active_mode} | ${runtime.container || "no container"} | ${power.profile || "balanced"} | GPUs ${j.gpu_count | 0}`
-      : `${modes[0] || j.active_mode || "-"} | ${containers[0] || j.container || "no container"} | ${power.profile || "balanced"} | GPUs ${j.gpu_count | 0}`;
+      ? `${runtime.id || runtime.instance_id} | ${runtime.mode || j.active_mode} | ${runtime.container || "no container"} | GPU ${power.gpu_profile || power.profile || "balanced"} / CPU ${power.cpu_profile || "performance"} | GPUs ${j.gpu_count | 0}`
+      : `${modes[0] || j.active_mode || "-"} | ${containers[0] || j.container || "no container"} | GPU ${power.gpu_profile || power.profile || "balanced"} / CPU ${power.cpu_profile || "performance"} | GPUs ${j.gpu_count | 0}`;
   const cacheMeta = j?.__status_cache || {};
   const cachePrefix = cacheMeta.disconnected
     ? `Disconnected | cached ${typeof statusCacheSavedLabel === "function" ? statusCacheSavedLabel(cacheMeta.saved_at) : "snapshot"}`
@@ -991,7 +991,7 @@ function renderOverviewStatus(j) {
   }
   if ($("powerbox"))
     $("powerbox").textContent =
-      `profile=${power.profile || "-"}, GPU=${power.gpu || "-"}, CPU=${power.cpu || "-"}, fans=${power.fans || "-"}, container=${benchmarkPowerText}, ${benchmarkPowerActive ? "benchmark active" : `idle=${fmtUptime(power.idle_for_seconds)}`}`;
+      `gpu_profile=${power.gpu_profile || power.profile || "-"}, cpu_profile=${power.cpu_profile || "-"}, GPU=${power.gpu || "-"}, CPU=${power.cpu || "-"}, fans=${power.fans || "-"}, container=${benchmarkPowerText}, ${benchmarkPowerActive ? "benchmark active" : `idle=${fmtUptime(power.idle_for_seconds)}`}`;
   renderGenerationStats(j);
   renderOverviewTracker();
 }

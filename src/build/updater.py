@@ -253,7 +253,7 @@ def build_update_command(scope_name, target_commit=""):
         "trap 'rm -f \"${TMP_SCRIPT}\"' EXIT; "
         "curl -fsSL -H \"Cache-Control: no-cache\" -H \"Pragma: no-cache\" -o \"${TMP_SCRIPT}\" \"${SCRIPT_URL}\"; "
         f"install -m 0755 \"${{TMP_SCRIPT}}\" {cached_script_quoted}; "
-        f"bash \"${{TMP_SCRIPT}}\" {mode_flag}{extra}"
+        'CLUB3090_ASSUME_YES=1 bash "${TMP_SCRIPT}" ' + mode_flag + extra
     )
     source = "remote"
     return normalized, label, command, source, target_commit

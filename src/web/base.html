@@ -769,6 +769,18 @@
               <h2>Metrics</h2>
             </div>
             <div class="preset-actions">
+              <select id="metricsExportFormat" class="metrics-export-format" aria-label="Metrics export format">
+                <option value="csvzip">CSV ZIP</option>
+                <option value="json">JSON</option>
+                <option value="ods">ODS</option>
+              </select>
+              <button
+                class="btn"
+                id="metricsExportBtn"
+                type="button"
+                title="Export metrics"
+                onclick="downloadMetricsExport()"
+              >Export</button>
               <button
                 class="iconbtn"
                 id="metricsResetBtn"

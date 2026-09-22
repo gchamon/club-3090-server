@@ -4,12 +4,14 @@ from urllib.parse import parse_qs, quote, urlsplit
 import mimetypes
 import base64
 import calendar
+import csv
 import codecs
 import collections
 import fnmatch
 import glob
 import gzip
 import hashlib
+import io
 import ipaddress
 import json
 import math
@@ -41,6 +43,7 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
+from xml.sax.saxutils import escape as xml_escape
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 try:
@@ -756,7 +759,14 @@ PERFORMANCE_PROFILES = {
     "benchmark-safe": {"gpu_active": config_int("profiles.benchmark_safe", "gpu_active", 200), "gpu_idle": config_int("profiles.benchmark_safe", "gpu_idle", 120), "idle_clocks": config_str("profiles.benchmark_safe", "idle_clocks", ""), "cpu_active": config_str("profiles.benchmark_safe", "cpu_active", "schedutil"), "cpu_idle": config_str("profiles.benchmark_safe", "cpu_idle", "powersave"), "idle_after": config_int("profiles.benchmark_safe", "idle_after", 1800), "stop_after": config_int("profiles.benchmark_safe", "stop_after", 7200)},
     "turbo": {"gpu_active": config_int("profiles.turbo", "gpu_active", 350), "gpu_idle": config_int("profiles.turbo", "gpu_idle", 160), "idle_clocks": config_str("profiles.turbo", "idle_clocks", ""), "cpu_active": config_str("profiles.turbo", "cpu_active", "performance"), "cpu_idle": config_str("profiles.turbo", "cpu_idle", "schedutil"), "idle_after": config_int("profiles.turbo", "idle_after", 1800), "stop_after": config_int("profiles.turbo", "stop_after", 7200)},
 }
-current_profile = "balanced"
+CPU_POWER_PROFILES = {
+    "adaptive": {"active": "schedutil", "idle": "powersave"},
+    "performance": {"active": "performance", "idle": "powersave"},
+}
+current_gpu_profile = "balanced"
+current_cpu_profile = "performance"
+# Legacy alias retained for benchmark and API callers that still use one profile.
+current_profile = current_gpu_profile
 last_inference_time = time.time()
 last_request_finished_at = time.time()
 power_optimizations_enabled = True
@@ -802,6 +812,7 @@ def _sanitize_chat_stream_state_payload(state):
 
 
 def refresh_power_config_globals():
+    global current_profile, current_gpu_profile, current_cpu_profile
     global POWER_IDLE_AFTER_SECONDS, CONTAINER_STOP_AFTER_SECONDS
     global GPU_ACTIVE_POWER_LIMIT_W, GPU_IDLE_POWER_LIMIT_W, GPU_IDLE_LOCK_CLOCKS, GPU_ACTIVE_LOCK_CLOCKS
     global CPU_ACTIVE_GOVERNOR, CPU_IDLE_GOVERNOR, FAN_MAX_SPEED, FAN_MIN_SAFE_SPEED, PERFORMANCE_PROFILES
@@ -823,13 +834,20 @@ def refresh_power_config_globals():
         "benchmark-safe": {"gpu_active": config_int("profiles.benchmark_safe", "gpu_active", 200), "gpu_idle": config_int("profiles.benchmark_safe", "gpu_idle", 120), "idle_clocks": config_str("profiles.benchmark_safe", "idle_clocks", ""), "cpu_active": config_str("profiles.benchmark_safe", "cpu_active", "schedutil"), "cpu_idle": config_str("profiles.benchmark_safe", "cpu_idle", "powersave"), "idle_after": config_int("profiles.benchmark_safe", "idle_after", 1800), "stop_after": config_int("profiles.benchmark_safe", "stop_after", 7200)},
         "turbo": {"gpu_active": config_int("profiles.turbo", "gpu_active", 350), "gpu_idle": config_int("profiles.turbo", "gpu_idle", 160), "idle_clocks": config_str("profiles.turbo", "idle_clocks", ""), "cpu_active": config_str("profiles.turbo", "cpu_active", "performance"), "cpu_idle": config_str("profiles.turbo", "cpu_idle", "schedutil"), "idle_after": config_int("profiles.turbo", "idle_after", 1800), "stop_after": config_int("profiles.turbo", "stop_after", 7200)},
     }
-    active_profile = PERFORMANCE_PROFILES.get(str(current_profile or "").strip().lower())
+    selected_gpu_profile = str(current_profile or "").strip().lower() if current_profile != current_gpu_profile else str(current_gpu_profile or "").strip().lower()
+    active_profile = PERFORMANCE_PROFILES.get(selected_gpu_profile)
     if active_profile:
+        if current_profile != current_gpu_profile:
+            current_gpu_profile = selected_gpu_profile
+            current_cpu_profile = "performance" if str(active_profile["cpu_active"]).strip().lower() == "performance" else "adaptive"
+            current_profile = selected_gpu_profile
         GPU_ACTIVE_POWER_LIMIT_W = int(active_profile["gpu_active"])
         GPU_IDLE_POWER_LIMIT_W = int(active_profile["gpu_idle"])
         GPU_IDLE_LOCK_CLOCKS = str(active_profile["idle_clocks"])
-        CPU_ACTIVE_GOVERNOR = str(active_profile["cpu_active"])
-        CPU_IDLE_GOVERNOR = str(active_profile["cpu_idle"])
+        cpu_profile = CPU_POWER_PROFILES.get(str(current_cpu_profile or "").strip().lower())
+        if cpu_profile:
+            CPU_ACTIVE_GOVERNOR = str(cpu_profile["active"])
+            CPU_IDLE_GOVERNOR = str(cpu_profile["idle"])
         POWER_IDLE_AFTER_SECONDS = int(active_profile["idle_after"])
         CONTAINER_STOP_AFTER_SECONDS = int(active_profile["stop_after"])
     return PERFORMANCE_PROFILES
@@ -954,7 +972,8 @@ def clear_admin_chat_stream_control(conversation_id):
 
 
 def _apply_profile_globals(profile_name):
-    global current_profile, GPU_ACTIVE_POWER_LIMIT_W, GPU_IDLE_POWER_LIMIT_W
+    global current_profile, current_gpu_profile, current_cpu_profile
+    global GPU_ACTIVE_POWER_LIMIT_W, GPU_IDLE_POWER_LIMIT_W
     global GPU_IDLE_LOCK_CLOCKS, CPU_ACTIVE_GOVERNOR, CPU_IDLE_GOVERNOR
     global POWER_IDLE_AFTER_SECONDS, CONTAINER_STOP_AFTER_SECONDS
     refresh_power_config_globals()
@@ -967,11 +986,53 @@ def _apply_profile_globals(profile_name):
     GPU_ACTIVE_POWER_LIMIT_W = int(cfg["gpu_active"])
     GPU_IDLE_POWER_LIMIT_W = int(cfg["gpu_idle"])
     GPU_IDLE_LOCK_CLOCKS = str(cfg["idle_clocks"])
-    CPU_ACTIVE_GOVERNOR = str(cfg["cpu_active"])
-    CPU_IDLE_GOVERNOR = str(cfg["cpu_idle"])
+    current_gpu_profile = name
+    legacy_cpu_profile = "performance" if str(cfg["cpu_active"]).strip().lower() == "performance" else "adaptive"
+    current_cpu_profile = legacy_cpu_profile
+    cpu_cfg = CPU_POWER_PROFILES[legacy_cpu_profile]
+    CPU_ACTIVE_GOVERNOR = str(cpu_cfg["active"])
+    CPU_IDLE_GOVERNOR = str(cpu_cfg["idle"])
     POWER_IDLE_AFTER_SECONDS = int(cfg["idle_after"])
     CONTAINER_STOP_AFTER_SECONDS = int(cfg["stop_after"])
     current_profile = name
+    return name
+
+
+def _apply_gpu_profile_globals(profile_name):
+    global current_profile, current_gpu_profile
+    global GPU_ACTIVE_POWER_LIMIT_W, GPU_IDLE_POWER_LIMIT_W, GPU_IDLE_LOCK_CLOCKS
+    global POWER_IDLE_AFTER_SECONDS, CONTAINER_STOP_AFTER_SECONDS
+    refresh_power_config_globals()
+    name = str(profile_name or "").strip().lower().replace("_", "-")
+    if name in {"standard", "default"}:
+        name = "balanced"
+    if name not in PERFORMANCE_PROFILES:
+        raise ValueError("Invalid GPU power profile")
+    cfg = PERFORMANCE_PROFILES[name]
+    GPU_ACTIVE_POWER_LIMIT_W = int(cfg["gpu_active"])
+    GPU_IDLE_POWER_LIMIT_W = int(cfg["gpu_idle"])
+    GPU_IDLE_LOCK_CLOCKS = str(cfg["idle_clocks"])
+    POWER_IDLE_AFTER_SECONDS = int(cfg["idle_after"])
+    CONTAINER_STOP_AFTER_SECONDS = int(cfg["stop_after"])
+    current_gpu_profile = name
+    current_profile = name
+    return name
+
+
+def _apply_cpu_profile_globals(profile_name):
+    global current_cpu_profile, CPU_ACTIVE_GOVERNOR, CPU_IDLE_GOVERNOR
+    refresh_power_config_globals()
+    name = str(profile_name or "").strip().lower().replace("_", "-")
+    if name in {"adaptive", "schedutil", "balanced", "eco", "fast"}:
+        name = "adaptive"
+    elif name in {"performance", "turbo"}:
+        name = "performance"
+    if name not in CPU_POWER_PROFILES:
+        raise ValueError("Invalid CPU power profile")
+    cfg = CPU_POWER_PROFILES[name]
+    CPU_ACTIVE_GOVERNOR = str(cfg["active"])
+    CPU_IDLE_GOVERNOR = str(cfg["idle"])
+    current_cpu_profile = name
     return name
 
 

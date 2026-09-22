@@ -677,6 +677,7 @@ body.resize-active * {
   gap: 10px;
 }
 .chart {
+  position: relative;
   height: 145px;
   background: #081018;
   border: 1px solid #213044;
@@ -689,6 +690,64 @@ body.resize-active * {
 canvas {
   width: 100%;
   height: 100%;
+  cursor: crosshair;
+}
+.metrics-export-format {
+  min-height: 30px;
+  background: var(--field);
+  color: var(--text);
+  border: 1px solid #2c3a4f;
+  border-radius: 7px;
+  padding: 0 7px;
+  font-size: 11px;
+}
+.metric-hover-tooltip {
+  display: none;
+  position: absolute;
+  z-index: 5;
+  left: 4px;
+  top: 8px;
+  max-width: min(360px, calc(100% - 8px));
+  padding: 8px 10px;
+  background: rgba(8, 16, 24, .97);
+  border: 1px solid #3a506b;
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .35);
+  color: var(--text);
+  pointer-events: none;
+  font-size: 11px;
+}
+.metric-hover-tooltip.metric-hover-tooltip-right {
+  left: auto;
+  right: 4px;
+}
+.metric-hover-tooltip.visible {
+  display: block;
+}
+.metric-hover-tooltip-table {
+  border-collapse: collapse;
+  margin: 0;
+  width: 100%;
+}
+.metric-hover-tooltip-table th,
+.metric-hover-tooltip-table td {
+  padding: 2px 0;
+  vertical-align: top;
+}
+.metric-hover-tooltip-table th {
+  color: var(--muted);
+  font-weight: 600;
+  padding-right: 12px;
+  text-align: left;
+}
+.metric-hover-tooltip-table td {
+  text-align: right;
+  white-space: nowrap;
+}
+.metric-hover-tooltip span {
+  display: block;
+  color: var(--muted);
+  margin-top: 5px;
 }
 .msg {
   color: var(--amber);

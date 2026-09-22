@@ -486,12 +486,18 @@ const SYSTEM_POWER_PROFILE_OPTIONS = [
   ["fast", "Fast (300W)"],
   ["turbo", "Turbo (350W)"],
 ];
+const SYSTEM_GPU_PROFILE_OPTIONS = SYSTEM_POWER_PROFILE_OPTIONS;
+const SYSTEM_CPU_PROFILE_OPTIONS = [
+  ["adaptive", "Adaptive (schedutil)"],
+  ["performance", "Performance"],
+];
 let systemConfigDraft = {};
 function systemConfigCurrent(status = lastStatus) {
   const power = status?.power || {};
   const cfg = status?.server_config || {};
   return {
-    profile: String(power.profile || cfg.active_power_profile || "balanced").trim().toLowerCase(),
+    gpu_profile: String(power.gpu_profile || cfg.active_gpu_power_profile || power.profile || cfg.active_power_profile || "balanced").trim().toLowerCase(),
+    cpu_profile: String(power.cpu_profile || cfg.active_cpu_power_profile || "performance").trim().toLowerCase(),
     optimizations: power.optimizations_enabled === false ? "disabled" : "enabled",
     fan_mode: power.fan_manual_override ? "manual_max" : "auto",
     fan_scope: String(cfg.fan_override_instance_id || currentScope() || "GLOBAL").trim().toUpperCase() || "GLOBAL",
@@ -526,7 +532,8 @@ function systemConfigSelectOptions(options, currentValue) {
 }
 function systemConfigPrettyValue(key, value) {
   const raw = String(value || "");
-  if (key === "profile") return (SYSTEM_POWER_PROFILE_OPTIONS.find(([id]) => id === raw) || [raw, raw])[1] || raw;
+  if (key === "gpu_profile") return (SYSTEM_GPU_PROFILE_OPTIONS.find(([id]) => id === raw) || [raw, raw])[1] || raw;
+  if (key === "cpu_profile") return (SYSTEM_CPU_PROFILE_OPTIONS.find(([id]) => id === raw) || [raw, raw])[1] || raw;
   if (key === "optimizations") return raw === "enabled" ? "Enabled" : "Disabled";
   if (key === "fan_mode") return raw === "manual_max" ? "Fans Max" : "Automatic Fans";
   if (key === "fan_scope") {
@@ -546,23 +553,32 @@ function renderSystemConfiguration(status = lastStatus) {
   const grid = $("systemConfigGrid");
   if (!grid) return;
   const current = systemConfigCurrent(status);
-  const profileValue = systemConfigValue("profile", current);
+  const gpuProfileValue = systemConfigValue("gpu_profile", current);
+  const cpuProfileValue = systemConfigValue("cpu_profile", current);
   const optimizationsValue = systemConfigValue("optimizations", current);
   const fanModeValue = systemConfigValue("fan_mode", current);
   const fanScopeValue = systemConfigValue("fan_scope", current);
-  const dirtyKeys = ["profile", "optimizations", "fan_mode", "fan_scope"].filter((key) => systemConfigValue(key, current) !== String(current[key] || ""));
+  const dirtyKeys = ["gpu_profile", "cpu_profile", "optimizations", "fan_mode", "fan_scope"].filter((key) => systemConfigValue(key, current) !== String(current[key] || ""));
   if ($("systemConfigCurrentBadge")) {
     $("systemConfigCurrentBadge").textContent = dirtyKeys.length ? `${dirtyKeys.length} unsaved` : "current";
     $("systemConfigCurrentBadge").className = `status-badge ${dirtyKeys.length ? "status-warning" : "status-production"}`;
   }
   grid.innerHTML = [
     systemConfigRowHtml({
-      key: "profile",
-      title: "Power Profile",
-      detail: "Sets GPU power limits, CPU governors, idle clocks, and idle timers.",
+      key: "gpu_profile",
+      title: "GPU Power Profile",
+      detail: "Sets active and idle GPU power limits, idle clocks, and idle timers.",
       current,
-      controlHtml: `<select class="system-config-select" id="systemConfigProfile" onchange="setSystemConfigDraft('profile', this.value)">${systemConfigSelectOptions(SYSTEM_POWER_PROFILE_OPTIONS, profileValue)}</select>`,
-      applyAction: "applySystemConfigProfile()",
+      controlHtml: `<select class="system-config-select" id="systemConfigGpuProfile" onchange="setSystemConfigDraft('gpu_profile', this.value)">${systemConfigSelectOptions(SYSTEM_GPU_PROFILE_OPTIONS, gpuProfileValue)}</select>`,
+      applyAction: "applySystemConfigGpuProfile()",
+    }),
+    systemConfigRowHtml({
+      key: "cpu_profile",
+      title: "CPU Power Profile",
+      detail: "Selects the active CPU governor. Idle operation uses powersave in both modes.",
+      current,
+      controlHtml: `<select class="system-config-select" id="systemConfigCpuProfile" onchange="setSystemConfigDraft('cpu_profile', this.value)">${systemConfigSelectOptions(SYSTEM_CPU_PROFILE_OPTIONS, cpuProfileValue)}</select>`,
+      applyAction: "applySystemConfigCpuProfile()",
     }),
     systemConfigRowHtml({
       key: "optimizations",
@@ -580,18 +596,32 @@ function setSystemConfigDraft(key, value) {
   systemConfigDraft[String(key || "")] = String(value || "");
   renderSystemConfiguration(lastStatus);
 }
-async function applySystemConfigProfile() {
+async function applySystemConfigGpuProfile() {
   const current = systemConfigCurrent(lastStatus);
-  const next = systemConfigValue("profile", current);
-  if (!next || next === current.profile) return;
+  const next = systemConfigValue("gpu_profile", current);
+  if (!next || next === current.gpu_profile) return;
   try {
-    await withPowerCoolingBusy("Applying power profile...", async () => {
-      await post("/admin/profile", { profile: next, instance_id: currentScope() || "GLOBAL" }, `/admin/profile ${next}`);
+    await withPowerCoolingBusy("Applying GPU power profile...", async () => {
+      await post("/admin/profile", { gpu_profile: next, instance_id: currentScope() || "GLOBAL" }, `/admin/profile gpu=${next}`);
     });
-    delete systemConfigDraft.profile;
+    delete systemConfigDraft.gpu_profile;
     await refreshStatus({ force: true });
   } catch (e) {
-    setMsg(`Power profile failed: ${messageText(e)}`);
+    setMsg(`GPU power profile failed: ${messageText(e)}`);
+  }
+}
+async function applySystemConfigCpuProfile() {
+  const current = systemConfigCurrent(lastStatus);
+  const next = systemConfigValue("cpu_profile", current);
+  if (!next || next === current.cpu_profile) return;
+  try {
+    await withPowerCoolingBusy("Applying CPU power profile...", async () => {
+      await post("/admin/profile", { cpu_profile: next, instance_id: currentScope() || "GLOBAL" }, `/admin/profile cpu=${next}`);
+    });
+    delete systemConfigDraft.cpu_profile;
+    await refreshStatus({ force: true });
+  } catch (e) {
+    setMsg(`CPU power profile failed: ${messageText(e)}`);
   }
 }
 async function applySystemConfigOptimizations() {
