@@ -724,21 +724,30 @@ canvas {
 .metric-hover-tooltip.visible {
   display: block;
 }
-.metric-hover-tooltip strong,
+.metric-hover-tooltip-table {
+  border-collapse: collapse;
+  margin: 0;
+  width: 100%;
+}
+.metric-hover-tooltip-table th,
+.metric-hover-tooltip-table td {
+  padding: 2px 0;
+  vertical-align: top;
+}
+.metric-hover-tooltip-table th {
+  color: var(--muted);
+  font-weight: 600;
+  padding-right: 12px;
+  text-align: left;
+}
+.metric-hover-tooltip-table td {
+  text-align: right;
+  white-space: nowrap;
+}
 .metric-hover-tooltip span {
   display: block;
-}
-.metric-hover-tooltip span {
   color: var(--muted);
   margin-top: 5px;
-}
-.metric-hover-tooltip pre {
-  max-height: 180px;
-  overflow: auto;
-  margin: 5px 0 0;
-  white-space: pre-wrap;
-  word-break: break-word;
-  color: #cbd8e8;
 }
 .msg {
   color: var(--amber);

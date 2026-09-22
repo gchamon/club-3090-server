@@ -7195,7 +7195,14 @@ process.on("uncaughtException", (error) => {{
   window.document.body.appendChild(chartShell);
   chartCanvas.getBoundingClientRect = () => ({{ left: 0, width: 100 }});
   Object.defineProperty(chartShell, "clientWidth", {{ configurable: true, value: 100 }});
-  const chartRecord = {{ canvas: chartCanvas, points: [{{ t: 0, value: 1 }}] }};
+  const chartRecord = {{
+    canvas: chartCanvas,
+    data: [{{ metric: 12.34 }}],
+    key: "metric",
+    label: "Percent",
+    points: [{{ t: 1700000000, value: 1, unrelated: "hidden" }}],
+    tooltipValueFormatter: (value) => `${{Number(value).toFixed(1)}}%`,
+  }};
   const tooltipSideClass = "metric-hover-tooltip-right";
   const assertTooltipSide = (clientX, expectedRight, message) => {{
     window.metricPointTooltip(window.document, chartRecord, 0, {{ clientX }});
@@ -7205,6 +7212,17 @@ process.on("uncaughtException", (error) => {{
     }}
   }};
   assertTooltipSide(75, false, "75% pointer should keep tooltip left-pinned");
+  const tooltip = chartShell.querySelector(".metric-hover-tooltip");
+  const tooltipRows = tooltip ? tooltip.querySelectorAll(".metric-hover-tooltip-table tbody tr") : [];
+  const expectedStamp = new Date(1700000000 * 1000).toLocaleString();
+  if (!tooltip || tooltipRows.length !== 2 ||
+      !tooltipRows[0].textContent.includes("Timestamp") ||
+      !tooltipRows[0].textContent.includes(expectedStamp) ||
+      !tooltipRows[1].textContent.includes("Percent") ||
+      !tooltipRows[1].textContent.includes("12.3%") ||
+      tooltip.querySelector("pre")) {{
+    throw new Error("metric tooltip table content failed validation");
+  }}
   assertTooltipSide(40, true, "40% pointer should switch tooltip right-pinned");
   assertTooltipSide(45, true, "45% pointer should retain right-pinned hysteresis state");
   assertTooltipSide(50, false, "50% pointer should switch tooltip left-pinned");

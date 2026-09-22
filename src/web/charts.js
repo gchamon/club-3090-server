@@ -2397,7 +2397,11 @@ function metricPointTooltip(doc, record, index, event) {
   }
   const timestamp = Number(point.t || 0);
   const stamp = timestamp ? new Date(timestamp * 1000).toLocaleString() : "Point";
-  tooltip.innerHTML = `<strong>${escapeHtml(stamp)}</strong><pre>${escapeHtml(metricPointCopyText(point))}</pre><span>Click the point to copy all values</span>`;
+  const value = record.data?.[index]?.[record.key];
+  const formattedValue = record.tooltipValueFormatter
+    ? record.tooltipValueFormatter(value)
+    : formatChartValue(value);
+  tooltip.innerHTML = `<table class="metric-hover-tooltip-table"><tbody><tr><th scope="row">Timestamp</th><td>${escapeHtml(stamp)}</td></tr><tr><th scope="row">${escapeHtml(record.label)}</th><td>${escapeHtml(formattedValue)}</td></tr></tbody></table><span>Click the point to copy all values</span>`;
   const rect = record.canvas.getBoundingClientRect();
   const width = Number(rect.width) || 0;
   const localX = Math.max(0, Math.min(width, event.clientX - rect.left));
@@ -2483,7 +2487,17 @@ function draw(id, data, key, label, color, options = {}) {
   if (!c) return;
   const doc = c.ownerDocument;
   const state = metricsChartState(doc);
-  const record = { id, canvas: c, data, key, label, color, options, points: options.metricPoints || data };
+  const record = {
+    id,
+    canvas: c,
+    data,
+    key,
+    label,
+    color,
+    options,
+    tooltipValueFormatter: options.tooltipValueFormatter,
+    points: options.metricPoints || data,
+  };
   state.charts.set(id, record);
   if (!c.dataset.metricHoverBound) {
     c.dataset.metricHoverBound = "1";
@@ -2690,12 +2704,14 @@ function renderMetrics(j, options = {}) {
     showPeakValue: true,
     peakColor: "#b7c0cc",
     persistentPeakValue: persistentMetricPeakValue(j, "gpu_util"),
+    tooltipValueFormatter: (value) => `${formatChartValue(value)}%`,
   });
   draw("cMem", s, "mem_pct", "VRAM % / GB", "#2fc46b", {
     showPeakLine: true,
     showPeakValue: true,
     peakColor: "#b7c0cc",
     persistentPeakValue: persistentMetricPeakValue(j, "mem_pct"),
+    tooltipValueFormatter: (value) => `${formatChartValue(value)}%`,
     valueFormatter: (current, peak) =>
       `${formatChartValue(current)}% · ${formatChartValue(currentVramUsedGib, 2)} GB (${UI_ARROW_UP} ${formatChartValue(safeVramPeakGib, 2)} GB)`,
   });
@@ -2704,12 +2720,14 @@ function renderMetrics(j, options = {}) {
     showPeakValue: true,
     peakColor: "#b7c0cc",
     persistentPeakValue: persistentMetricPeakValue(j, "latency_s"),
+    tooltipValueFormatter: (value) => `${formatChartValue(value)}s`,
   });
   draw("cTps", s, "tps", "TPS est", "#ff5b6c", {
     showPeakValue: true,
     showPeakLine: true,
     peakColor: "#b7c0cc",
     persistentPeakValue: persistentMetricPeakValue(j, "tps"),
+    tooltipValueFormatter: (value) => formatChartValue(value, 2),
     valueFormatter: (current, peak) =>
       `${formatChartValue(current, 2)} (↑ ${formatChartValue(peak, 2)})`,
   });
@@ -2718,6 +2736,7 @@ function renderMetrics(j, options = {}) {
     showPeakValue: true,
     peakColor: "#b7c0cc",
     persistentPeakValue: persistentMetricPeakValue(j, "ram_pct"),
+    tooltipValueFormatter: (value) => `${formatChartValue(value)}%`,
     valueFormatter: (current, peak) =>
       `${formatChartValue(current)}% · ${formatChartValue(currentRamUsedGib, 2)} GB (${UI_ARROW_UP} ${formatChartValue(safeRamPeakGib, 2)} GB)`,
   });
@@ -2726,18 +2745,21 @@ function renderMetrics(j, options = {}) {
     showPeakValue: true,
     peakColor: "#b7c0cc",
     persistentPeakValue: persistentMetricPeakValue(j, "cpu_pct"),
+    tooltipValueFormatter: (value) => `${formatChartValue(value)}%`,
   });
   draw("cSystemUtil", s, "system_util_pct", "System utilization %", "#a78bfa", {
     showPeakLine: true,
     showPeakValue: true,
     peakColor: "#b7c0cc",
     persistentPeakValue: persistentMetricPeakValue(j, "system_util_pct"),
+    tooltipValueFormatter: (value) => `${formatChartValue(value)}%`,
   });
   draw("cNetDown", s, "net_rx_mbps", "Download Mbps", "#2fc46b", {
     showPeakLine: true,
     showPeakValue: true,
     peakColor: "#b7c0cc",
     persistentPeakValue: persistentMetricPeakValue(j, "net_rx_mbps"),
+    tooltipValueFormatter: (value) => `${formatChartValue(value, 2)} Mbps`,
     valueFormatter: (current, peak) =>
       `${formatChartValue(current, 2)} (${UI_ARROW_UP} ${formatChartValue(peak, 2)})`,
   });
@@ -2746,6 +2768,7 @@ function renderMetrics(j, options = {}) {
     showPeakValue: true,
     peakColor: "#b7c0cc",
     persistentPeakValue: persistentMetricPeakValue(j, "net_tx_mbps"),
+    tooltipValueFormatter: (value) => `${formatChartValue(value, 2)} Mbps`,
     valueFormatter: (current, peak) =>
       `${formatChartValue(current, 2)} (${UI_ARROW_UP} ${formatChartValue(peak, 2)})`,
   });
@@ -2884,6 +2907,7 @@ function renderMetrics(j, options = {}) {
         showPeakLine: true,
         peakColor: "#b7c0cc",
         showPeakValue: true,
+        tooltipValueFormatter: (value) => `${formatChartValue(value)}%`,
       },
       {
         key: "mem_pct",
@@ -2893,6 +2917,7 @@ function renderMetrics(j, options = {}) {
         showPeakLine: true,
         peakColor: "#b7c0cc",
         showPeakValue: true,
+        tooltipValueFormatter: (value) => `${formatChartValue(value)}%`,
       },
       {
         key: "temp",
@@ -2902,6 +2927,7 @@ function renderMetrics(j, options = {}) {
         showPeakLine: true,
         peakColor: "#b7c0cc",
         showPeakValue: true,
+        tooltipValueFormatter: (value) => `${formatChartValue(value, 1)}°C`,
         valueColor: (current) => tempColorForValue(current, "core"),
         valueFormatterParts: (current, peak) => [
           { text: `${formatChartValue(current, 1)}°C`, color: tempColorForValue(current, "core") },
@@ -2920,6 +2946,7 @@ function renderMetrics(j, options = {}) {
               peakColor: "#b7c0cc",
               showPeakValue: true,
               valueColor: (current) => tempColorForValue(current, "junction"),
+              tooltipValueFormatter: (value) => `${formatChartValue(value, 1)}°C`,
               valueFormatterParts: (current, peak) => [
                 { text: `${formatChartValue(current, 1)}°C`, color: tempColorForValue(current, "junction") },
                 { text: " " },
@@ -2939,6 +2966,7 @@ function renderMetrics(j, options = {}) {
               peakColor: "#b7c0cc",
               showPeakValue: true,
               valueColor: (current) => tempColorForValue(current, "vram"),
+              tooltipValueFormatter: (value) => `${formatChartValue(value, 1)}°C`,
               valueFormatterParts: (current, peak) => [
                 { text: `${formatChartValue(current, 1)}°C`, color: tempColorForValue(current, "vram") },
                 { text: " " },
@@ -2955,6 +2983,7 @@ function renderMetrics(j, options = {}) {
         showPeakLine: true,
         peakColor: "#b7c0cc",
         showPeakValue: true,
+        tooltipValueFormatter: (value) => `${formatChartValue(value)} W`,
       },
     ];
     holder.innerHTML = cats
