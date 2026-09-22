@@ -705,6 +705,8 @@ canvas {
   display: none;
   position: absolute;
   z-index: 5;
+  left: 4px;
+  top: 8px;
   max-width: min(360px, calc(100% - 8px));
   padding: 8px 10px;
   background: rgba(8, 16, 24, .97);
@@ -714,6 +716,10 @@ canvas {
   color: var(--text);
   pointer-events: none;
   font-size: 11px;
+}
+.metric-hover-tooltip.metric-hover-tooltip-right {
+  left: auto;
+  right: 4px;
 }
 .metric-hover-tooltip.visible {
   display: block;

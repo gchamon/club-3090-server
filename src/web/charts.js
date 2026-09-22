@@ -2399,9 +2399,14 @@ function metricPointTooltip(doc, record, index, event) {
   const stamp = timestamp ? new Date(timestamp * 1000).toLocaleString() : "Point";
   tooltip.innerHTML = `<strong>${escapeHtml(stamp)}</strong><pre>${escapeHtml(metricPointCopyText(point))}</pre><span>Click the point to copy all values</span>`;
   const rect = record.canvas.getBoundingClientRect();
-  const localX = Math.max(0, Math.min(rect.width, event.clientX - rect.left));
-  tooltip.style.left = `${Math.max(4, Math.min(record.canvas.parentElement.clientWidth - tooltip.offsetWidth - 4, localX + 10))}px`;
-  tooltip.style.top = "8px";
+  const width = Number(rect.width) || 0;
+  const localX = Math.max(0, Math.min(width, event.clientX - rect.left));
+  const fraction = width ? localX / width : 0;
+  if (fraction <= 0.4) {
+    tooltip.classList.add("metric-hover-tooltip-right");
+  } else if (fraction >= 0.5) {
+    tooltip.classList.remove("metric-hover-tooltip-right");
+  }
   tooltip.classList.add("visible");
 }
 function metricsChartRedraw(doc) {
@@ -2425,7 +2430,9 @@ function metricsChartPointerLeave(event, record) {
   if (!record) return;
   const state = metricsChartState(record.canvas.ownerDocument);
   state.active = false;
-  record.canvas.ownerDocument.querySelectorAll(".metric-hover-tooltip").forEach((node) => node.classList.remove("visible"));
+  record.canvas.ownerDocument.querySelectorAll(".metric-hover-tooltip").forEach((node) => {
+    node.classList.remove("visible", "metric-hover-tooltip-right");
+  });
   metricsChartRedraw(record.canvas.ownerDocument);
 }
 function metricsChartCopyPoint(event, record) {
