@@ -766,7 +766,7 @@ ensureAccessPolicyCard = function () {
   if (!card) return;
   if (card.dataset.v414Policy !== "1") {
     card.dataset.v414Policy = "1";
-    card.innerHTML = `<h2>Access Policy</h2><div class="actions" id="accessPolicyRow"><label class="label"><input type="checkbox" id="auditAllowAnonymousProxy" onchange="mirrorAuthToggles(this.checked)"> allow requests without per-user API keys</label><button class="btn blue" onclick="saveAuthSettings()">Save Policy</button></div><div class="value smallgap" style="margin-top:10px" id="auditPolicyText">-</div>`;
+    card.innerHTML = `<h2>Access Policy</h2><div class="actions" id="accessPolicyRow"><label class="label"><input type="checkbox" id="auditAllowAnonymousProxy" onchange="setAccessPolicyDraft(this.checked, document.getElementById('auditAllowDummyProxyKey').checked)"> allow requests without an API key</label><label class="label"><input type="checkbox" id="auditAllowDummyProxyKey" onchange="setAccessPolicyDraft(document.getElementById('auditAllowAnonymousProxy').checked, this.checked)"> allow requests with unrecognized API keys (dummy keys)</label><button class="btn blue" onclick="saveAuthSettings()">Save Policy</button></div><div class="value smallgap" style="margin-top:10px" id="auditPolicyText">-</div>`;
   }
 };
 function ensureAuditOverviewCard() {

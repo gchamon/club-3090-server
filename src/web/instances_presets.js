@@ -1,12 +1,83 @@
 // Audit, instances, preset scopes, and host actions
+let accessPolicyDraft = {};
+let accessPolicyPersistedConfig = {};
+const ACCESS_POLICY_KEYS = [
+  "allow_proxy_without_api_key",
+  "allow_proxy_with_invalid_api_key",
+];
+
+function accessPolicyPersistedValues(cfg = {}) {
+  return ACCESS_POLICY_KEYS.reduce((values, key) => {
+    values[key] = !!cfg[key];
+    return values;
+  }, {});
+}
+
+function accessPolicyResolvedValue(key, persisted) {
+  return Object.prototype.hasOwnProperty.call(accessPolicyDraft, key)
+    ? accessPolicyDraft[key]
+    : !!persisted[key];
+}
+
+function accessPolicyHasDraft() {
+  return ACCESS_POLICY_KEYS.some((key) =>
+    Object.prototype.hasOwnProperty.call(accessPolicyDraft, key),
+  );
+}
+
+function renderAccessPolicy(persisted) {
+  const allowAnonymous = accessPolicyResolvedValue(
+    "allow_proxy_without_api_key",
+    persisted,
+  );
+  const allowDummy = accessPolicyResolvedValue(
+    "allow_proxy_with_invalid_api_key",
+    persisted,
+  );
+  const dirty = accessPolicyHasDraft();
+  if ($("auditAllowAnonymousProxy"))
+    $("auditAllowAnonymousProxy").checked = allowAnonymous;
+  if ($("auditAllowDummyProxyKey"))
+    $("auditAllowDummyProxyKey").checked = allowDummy;
+  if ($("auditPolicyText")) {
+    const persistedAnonymous = persisted.allow_proxy_without_api_key;
+    const persistedDummy = persisted.allow_proxy_with_invalid_api_key;
+    const persistedText = `Requests without an API key are <b>${persistedAnonymous ? "allowed" : "rejected"}</b>; requests with unrecognized API keys (dummy keys) are <b>${persistedDummy ? "allowed" : "rejected"}</b>.`;
+    const draftText = dirty
+      ? ` Unsaved changes: requests without an API key are <b>${allowAnonymous ? "allowed" : "rejected"}</b>; requests with unrecognized API keys (dummy keys) are <b>${allowDummy ? "allowed" : "rejected"}</b>.`
+      : "";
+    setHtmlIfChanged(
+      $("auditPolicyText"),
+      `${dirty ? "Persisted policy: " : ""}${persistedText}${draftText} Admin UI remains under <code>:${(lastStatus && lastStatus.admin_port) || 8008}${(persisted.admin_path || "/admin")}</code>.`,
+    );
+  }
+}
+
+function setAccessPolicyDraft(allowAnonymous, allowDummy) {
+  const values = {
+    allow_proxy_without_api_key: !!allowAnonymous,
+    allow_proxy_with_invalid_api_key: !!allowDummy,
+  };
+  const persisted = accessPolicyPersistedValues(accessPolicyPersistedConfig);
+  ACCESS_POLICY_KEYS.forEach((key) => {
+    if (values[key] === persisted[key]) delete accessPolicyDraft[key];
+    else accessPolicyDraft[key] = values[key];
+  });
+  renderAccessPolicy(persisted);
+}
+
 renderAudit = function (cfg) {
   cfg = cfg || {};
+  accessPolicyPersistedConfig = {
+    ...accessPolicyPersistedConfig,
+    ...cfg,
+  };
+  const persisted = accessPolicyPersistedValues(accessPolicyPersistedConfig);
   ensureV414Layout();
   const adminPort = (lastStatus && lastStatus.admin_port) || 8008;
   const proxyPort = (lastStatus && lastStatus.proxy_port) || 8009;
   const adminPath = cfg.admin_path || "/admin";
   const online = !!cfg.online_enabled;
-  const authOptional = !!cfg.allow_proxy_without_api_key;
   const localEnabled = !!cfg.local_api_enabled;
   const localPort = cfg.local_api_port || 10881;
   if ($("auditAdminEndpoint"))
@@ -26,30 +97,32 @@ renderAudit = function (cfg) {
       $("auditSummary"),
       "Audit entries capture admin actions, proxy authentication outcomes, quota denials, API usage, group changes, and user-management events. Use the shared log viewer below to inspect either Docker runtime logs or the audit log stream.",
     );
-  if ($("auditPolicyText"))
-    setHtmlIfChanged(
-      $("auditPolicyText"),
-      `Proxy API keys are currently <b>${authOptional ? "optional" : "required"}</b>. Admin UI remains under <code>:${adminPort}${adminPath}</code>.`,
-    );
-  mirrorAuthToggles(authOptional);
+  renderAccessPolicy(persisted);
 };
 saveAuthSettings = async function () {
-  const allow = !!(
+  const allowAnonymous = !!(
     $("auditAllowAnonymousProxy") && $("auditAllowAnonymousProxy").checked
   );
-  mirrorAuthToggles(allow);
+  const allowDummy = !!(
+    $("auditAllowDummyProxyKey") && $("auditAllowDummyProxyKey").checked
+  );
   try {
     const r = await fetch("/admin/users", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         action: "save_server_config",
-        allow_proxy_without_api_key: allow,
+        allow_proxy_without_api_key: allowAnonymous,
+        allow_proxy_with_invalid_api_key: allowDummy,
       }),
     });
     const j = await r.json();
     if (!r.ok || !j.ok) throw new Error(j.error || "config failed");
-    if (j.server_config) renderAudit(j.server_config);
+    accessPolicyDraft = {};
+    if (j.server_config) {
+      accessPolicyPersistedConfig = { ...j.server_config };
+      renderAudit(j.server_config);
+    }
     setAuditMsg("Saved access policy");
     await refreshStatus();
   } catch (e) {

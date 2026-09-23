@@ -673,7 +673,12 @@ def validate_model_score_description_source(js_text: str) -> list[str]:
     if (
         "proxy_swap_lock = threading.Lock()" not in shared_text
         or '"proxy_swap_enabled": True' not in services_text
-        or "merged[\"proxy_swap_enabled\"] = bool" not in services_text
+        or '"allow_proxy_without_api_key": False' not in services_text
+        or '"allow_proxy_with_invalid_api_key": False' not in services_text
+        or '"allow_proxy_without_api_key": False' not in installer_text
+        or '"allow_proxy_with_invalid_api_key": False' not in installer_text
+        or 'merged["allow_proxy_without_api_key"] = bool' not in services_text
+        or 'merged["allow_proxy_with_invalid_api_key"] = bool' not in services_text
         or "--disable-swap" not in installer_text
         or 'proxy_swap_mode == "disable"' not in installer_text
         or "def proxy_requested_selector" not in proxy_text
@@ -685,7 +690,11 @@ def validate_model_score_description_source(js_text: str) -> list[str]:
         or '"permissions": permissions' not in auth_text
         or '"permissions": normalize_permissions({})' not in auth_text
         or 'if raw_key and user is None:' not in auth_text
+        or 'allow_proxy_with_invalid_api_key' not in auth_text
         or 'reason="invalid_api_key"' not in auth_text
+        or 'reason="missing_api_key"' not in auth_text
+        or '{"error": "Invalid API key"}' not in auth_text
+        or '{"error": "Missing API key"}' not in auth_text
         or 'auth_context.get("permissions")' not in http_text
         or "proxy_swap_denied" not in http_text
         or "API key is not allowed to auto-load inactive presets" not in http_text
@@ -698,7 +707,7 @@ def validate_model_score_description_source(js_text: str) -> list[str]:
         or "ensure_proxy_swap_target(requested_selector" not in http_text
         or "proxy_rewrite_body_model_for_selector(body, requested_selector)" not in http_text
     ):
-        issues.append("proxy requests must support queued preset swapping, selector URL parsing, invalid-key rejection, and the --disable-swap installer kill switch")
+        issues.append("proxy requests must support queued preset swapping, selector URL parsing, independent missing/invalid API-key opt-ins, and the --disable-swap installer kill switch")
     if (
         "if primary and instance_running(primary):" not in instances_text
         or '"port": mode_default_port(selected, PROXY_PORT)' not in proxy_text
@@ -6260,6 +6269,69 @@ process.on("uncaughtException", (error) => {{
   if (asyncFailure) throw asyncFailure;
   const {{ window }} = dom;
   if (!window.__club3090TestLab) throw new Error("test lab bootstrap did not initialize");
+  if (typeof window.renderAudit !== "function" || typeof window.saveAuthSettings !== "function") {{
+    throw new Error("access policy render/save functions are missing");
+  }}
+  const policyFixture = {{
+    admin_port: 8008,
+    metrics: {{}},
+    system: {{}},
+    server_config: {{
+      admin_path: "/admin",
+      online_enabled: false,
+      local_api_enabled: false,
+      allow_proxy_without_api_key: false,
+      allow_proxy_with_invalid_api_key: false,
+    }},
+  }};
+  window.renderAudit(policyFixture.server_config);
+  const anonymousProxyToggle = window.document.getElementById("auditAllowAnonymousProxy");
+  const dummyProxyToggle = window.document.getElementById("auditAllowDummyProxyKey");
+  const policyText = window.document.getElementById("auditPolicyText");
+  if (!anonymousProxyToggle || !dummyProxyToggle || !policyText) {{
+    throw new Error("access policy controls or summary are missing");
+  }}
+  if (anonymousProxyToggle.checked || dummyProxyToggle.checked) {{
+    throw new Error("access policy controls did not hydrate persisted-off state");
+  }}
+  const originalDummyProxyToggle = dummyProxyToggle;
+  dummyProxyToggle.checked = true;
+  dummyProxyToggle.dispatchEvent(new window.Event("change", {{ bubbles: true }}));
+  if (typeof dummyProxyToggle.onchange === "function") dummyProxyToggle.onchange();
+  window.setAccessPolicyDraft(false, true);
+  window.renderStatusUi({{ ...policyFixture, server_config: {{ ...policyFixture.server_config }} }});
+  window.renderStatusUi({{ ...policyFixture, metrics: {{ active_requests: 1 }}, server_config: {{ ...policyFixture.server_config }} }});
+  if (window.document.getElementById("auditAllowDummyProxyKey") !== originalDummyProxyToggle ||
+      !originalDummyProxyToggle.checked || anonymousProxyToggle.checked ||
+      !/Unsaved changes/i.test(policyText.textContent || "")) {{
+    throw new Error("stale heartbeat did not preserve the Access Policy draft and controls");
+  }}
+  const policyFetch = window.fetch;
+  let policySaveBody = null;
+  window.fetch = async (url, options = {{}}) => {{
+    if (url === "/admin/users") {{
+      policySaveBody = JSON.parse(String(options.body || "{{}}"));
+      policyFixture.server_config.allow_proxy_with_invalid_api_key = true;
+      return {{
+        ok: true,
+        status: 200,
+        async json() {{ return {{ ok: true, server_config: {{ ...policyFixture.server_config }} }}; }},
+      }};
+    }}
+    return policyFetch(url, options);
+  }};
+  await window.saveAuthSettings();
+  window.fetch = policyFetch;
+  if (!policySaveBody || policySaveBody.action !== "save_server_config" ||
+      policySaveBody.allow_proxy_without_api_key !== false ||
+      policySaveBody.allow_proxy_with_invalid_api_key !== true) {{
+    throw new Error(`access policy save payload did not include both booleans: ${{JSON.stringify(policySaveBody)}}`);
+  }}
+  window.renderStatusUi({{ ...policyFixture, metrics: {{ active_requests: 2 }} }});
+  if (!window.document.getElementById("auditAllowDummyProxyKey").checked ||
+      /Unsaved changes/i.test(policyText.textContent || "")) {{
+    throw new Error("saved access policy did not survive the next heartbeat as persisted state");
+  }}
   const fixtureSelect = window.document.getElementById("club3090FixtureSelect");
   const fixtureEditor = window.document.getElementById("club3090FixtureEditor");
   if (!fixtureSelect || !fixtureEditor) throw new Error("test lab controls are missing");
@@ -6268,6 +6340,25 @@ process.on("uncaughtException", (error) => {{
   fixtureSelect.value = preferredOption.value;
   fixtureSelect.dispatchEvent(new window.Event("change", {{ bubbles: true }}));
   await new Promise((resolve) => setTimeout(resolve, 40));
+  window.activateTab("presets");
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  window.renderPresetHeaderActions();
+  const presetMenu = window.document.getElementById("presetActionsMenuList");
+  const presetMenuButton = window.document.getElementById("presetActionsMenuButton");
+  if (!presetMenu || !presetMenuButton) throw new Error("preset actions menu did not render");
+  presetMenu.classList.remove("hidden");
+  presetMenuButton.setAttribute("aria-expanded", "true");
+  const stablePresetMenu = presetMenu;
+  window.renderStatusUi({{ metrics: {{ active_requests: 1 }}, presets: policyFixture.presets || {{}} }});
+  if (window.document.getElementById("presetActionsMenuList") !== stablePresetMenu ||
+      stablePresetMenu.classList.contains("hidden") ||
+      presetMenuButton.getAttribute("aria-expanded") !== "true") {{
+    throw new Error("metrics-only heartbeat reconstructed the open preset actions menu");
+  }}
+  window.renderStatusUi({{ metrics: {{ active_requests: 1 }}, presets: {{ changed: true }} }});
+  if (window.document.getElementById("presetActionsMenuList") === stablePresetMenu) {{
+    throw new Error("preset catalog change did not permit a structural menu refresh");
+  }}
   const tabs = Array.from(window.document.querySelectorAll(".tab"));
   if (tabs.length < 3) throw new Error("top-level tabs did not render");
   const logsButton = tabs.find((button) => /logs/i.test(button.textContent || ""));
@@ -7226,11 +7317,28 @@ process.on("uncaughtException", (error) => {{
   assertTooltipSide(40, true, "40% pointer should switch tooltip right-pinned");
   assertTooltipSide(45, true, "45% pointer should retain right-pinned hysteresis state");
   assertTooltipSide(50, false, "50% pointer should switch tooltip left-pinned");
-  window.metricsChartPointerLeave({{}}, chartRecord);
-  const resetTooltip = chartShell.querySelector(".metric-hover-tooltip");
-  if (!resetTooltip || resetTooltip.classList.contains(tooltipSideClass)) {{
-    throw new Error("pointer leave should clear right-pinned tooltip state");
+  chartCanvas.id = "smokeMetricsCanvas";
+  chartRecord.id = "smokeMetricsCanvas";
+  chartRecord.options = {{}};
+  const chartState = window.metricsChartState(window.document);
+  chartState.charts.set(chartRecord.id, chartRecord);
+  chartState.hoverIndex = 0;
+  chartState.active = true;
+  chartState.lastPointer = {{ clientX: 75 }};
+  window.metricsChartRedraw(window.document);
+  const stableTooltip = chartShell.querySelector(".metric-hover-tooltip");
+  const stableTimestamp = stableTooltip?.textContent || "";
+  window.metricsChartRedraw(window.document);
+  if (chartShell.querySelector(".metric-hover-tooltip") !== stableTooltip ||
+      chartShell.querySelector(".metric-hover-tooltip")?.textContent !== stableTimestamp) {{
+    throw new Error("unchanged metrics redraw replaced the active timestamp tooltip");
   }}
+  chartRecord.points = [];
+  window.metricsChartRedraw(window.document);
+  if (stableTooltip.classList.contains("visible")) {{
+    throw new Error("metrics redraw left a stale tooltip after removing its selected point");
+  }}
+  window.metricsChartPointerLeave({{}}, chartRecord);
   window.close();
   console.log("test html smoke ok");
 }})().catch((error) => {{
@@ -7729,6 +7837,53 @@ cfg2, changed2 = module.write_ui_config({"active_tab": "logs", "show_global_logs
 assert changed2 is False and cfg2 == cfg
 
 server_before = module.read_server_config()
+assert server_before["allow_proxy_without_api_key"] is False
+assert server_before["allow_proxy_with_invalid_api_key"] is False
+server_policy_defaults = module.write_server_config({
+    "allow_proxy_without_api_key": False,
+    "allow_proxy_with_invalid_api_key": False,
+})
+assert server_policy_defaults["allow_proxy_without_api_key"] is False
+assert server_policy_defaults["allow_proxy_with_invalid_api_key"] is False
+server_policy_reloaded = module.read_server_config()
+assert server_policy_reloaded["allow_proxy_without_api_key"] is False
+assert server_policy_reloaded["allow_proxy_with_invalid_api_key"] is False
+original_auth_read_server_config = module.read_server_config
+original_auth_get_user_by_api_key = module.get_user_by_api_key
+original_auth_log_audit = module.log_audit
+original_auth_user_can_access_target = module.user_can_access_target
+original_auth_user_limit_error = module.user_limit_error
+original_auth_effective_permissions = module.effective_permissions
+try:
+    auth_flags = {"allow_proxy_without_api_key": False, "allow_proxy_with_invalid_api_key": False}
+    module.read_server_config = lambda: dict(auth_flags)
+    module.get_user_by_api_key = lambda key: {"name": "fixture-user", "enabled": True} if key == "fixture-valid-key" else None
+    module.log_audit = lambda *_args, **_kwargs: None
+    module.user_can_access_target = lambda *_args, **_kwargs: True
+    module.user_limit_error = lambda *_args, **_kwargs: None
+    module.effective_permissions = lambda *_args, **_kwargs: {"proxy_swap": True}
+    missing_denied = module.authorize_proxy_request({}, "GPU0", "/v1/chat/completions")
+    invalid_denied = module.authorize_proxy_request({"Authorization": "Bearer fixture-invalid-key"}, "GPU0", "/v1/chat/completions")
+    assert missing_denied == (False, 401, {"error": "Missing API key"}), missing_denied
+    assert invalid_denied == (False, 401, {"error": "Invalid API key"}), invalid_denied
+    auth_flags["allow_proxy_without_api_key"] = True
+    missing_allowed = module.authorize_proxy_request({}, "GPU0", "/v1/chat/completions")
+    assert missing_allowed[0] is True and missing_allowed[1]["mode"] == "anonymous", missing_allowed
+    assert missing_allowed[1]["count_request"] is False and missing_allowed[1]["permissions"] == module.normalize_permissions({}), missing_allowed
+    auth_flags["allow_proxy_without_api_key"] = False
+    auth_flags["allow_proxy_with_invalid_api_key"] = True
+    invalid_allowed = module.authorize_proxy_request({"Authorization": "Bearer fixture-invalid-key"}, "GPU0", "/v1/chat/completions")
+    assert invalid_allowed[0] is True and invalid_allowed[1]["mode"] == "anonymous", invalid_allowed
+    assert invalid_allowed[1]["count_request"] is False and invalid_allowed[1]["permissions"] == module.normalize_permissions({}), invalid_allowed
+    valid_user = module.authorize_proxy_request({"Authorization": "Bearer fixture-valid-key"}, "GPU0", "/v1/chat/completions")
+    assert valid_user[0] is True and valid_user[1]["mode"] == "user" and valid_user[1]["user_name"] == "fixture-user", valid_user
+finally:
+    module.read_server_config = original_auth_read_server_config
+    module.get_user_by_api_key = original_auth_get_user_by_api_key
+    module.log_audit = original_auth_log_audit
+    module.user_can_access_target = original_auth_user_can_access_target
+    module.user_limit_error = original_auth_user_limit_error
+    module.effective_permissions = original_auth_effective_permissions
 server_after = module.write_server_config({"selected_preset_model": "fixture-model"})
 server_after_repeat = module.write_server_config({"selected_preset_model": "fixture-model"})
 assert server_after["selected_preset_model"] == "fixture-model"

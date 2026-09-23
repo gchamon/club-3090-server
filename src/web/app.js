@@ -5304,15 +5304,23 @@ function statusPollDelayMs() {
 }
 function scheduleStatusPoll(delayMs = null) {
   statusPollNonce += 1;
-  if (statusPollTimer) clearInterval(statusPollTimer);
+  clearTimeout(statusPollTimer);
+  statusPollTimer = null;
+  if (delayMs === 0) {
+    refreshStatus().catch(() => {});
+    return;
+  }
   const pollDelay = Math.max(
     STATUS_POLL_FOREGROUND_FAST_MS,
     delayMs === null ? statusPollDelayMs() : Number(delayMs || statusPollDelayMs()),
   );
-  statusPollTimer = setInterval(() => {
+  const nonce = statusPollNonce;
+  statusPollTimer = setTimeout(() => {
+    statusPollTimer = null;
+    if (nonce !== statusPollNonce) return;
     refreshStatus().catch(() => {});
   }, pollDelay);
-  if (delayMs === 0) refreshStatus().catch(() => {});
+  statusPollTimer?.unref?.();
 }
 function statusCacheSavedLabel(savedAt = 0) {
   const stamp = Number(savedAt || 0);
@@ -5378,6 +5386,7 @@ function clearStatusConnectionState() {
   return wasDisconnected;
 }
 function markStatusDisconnected(reason = "") {
+  statusRenderSignatures = Object.create(null);
   const payload = readCachedStatusPayload(0);
   const cached = payload?.status && typeof payload.status === "object"
     ? payload.status
@@ -5534,6 +5543,15 @@ function writeStatusCacheFromStatus(status = {}) {
     );
   } catch (e) {}
 }
+function renderStatusSurface(label, projection, render, errors) {
+  const signature = JSON.stringify(projection);
+  if (Object.prototype.hasOwnProperty.call(statusRenderSignatures, label) &&
+      statusRenderSignatures[label] === signature) return;
+  safeRenderStep(label, () => {
+    render();
+    statusRenderSignatures[label] = signature;
+  }, errors);
+}
 function renderStatusUi(j, previousStatus = null, options = {}) {
   const metrics = j?.metrics || {};
   const power = j?.power || {};
@@ -5543,34 +5561,59 @@ function renderStatusUi(j, previousStatus = null, options = {}) {
     $("showGlobalLogs").checked = effectiveShowGlobalLogs();
     $("showGlobalLogs").disabled = currentLogSourceDetached();
   }
-  safeRenderStep("connection", () => renderStatusConnectionBanner(j), renderErrors);
-  safeRenderStep("overview", () => renderOverviewStatus(j), renderErrors);
-  safeRenderStep("gpu", () => renderGpuCards(j.gpus), renderErrors);
-  safeRenderStep("services", () => renderSystemServices(j), renderErrors);
-  safeRenderStep("system configuration", () => {
+  renderStatusSurface("connection", j.__status_cache, () => renderStatusConnectionBanner(j), renderErrors);
+  renderStatusSurface("overview", [
+    j.metrics, j.power, j.system, j.system_metric_peaks, j.uptime_seconds,
+    j.machine_uptime_seconds, j.instances, j.benchmarks?.job,
+  ], () => renderOverviewStatus(j), renderErrors);
+  renderStatusSurface("gpu", j.gpus, () => renderGpuCards(j.gpus), renderErrors);
+  renderStatusSurface("services", [
+    j.system, j.upstream_services, j.instances, j.switch_job, j.power,
+  ], () => renderSystemServices(j), renderErrors);
+  renderStatusSurface("system configuration", [
+    j.server_config, j.instances, j.power, j.benchmarks?.job, currentScope(),
+  ], () => {
     if (typeof renderSystemConfiguration === "function") renderSystemConfiguration(j);
     if (typeof syncPowerCoolingBusyState === "function") syncPowerCoolingBusyState();
   }, renderErrors);
-  safeRenderStep(
-    "metrics",
-    () => {
-      if (activeTabName === "metrics" || popupMetricsWindowOpen()) renderMetrics(j);
-    },
-    renderErrors,
-  );
-  safeRenderStep("presets", () => renderPresetCatalog(j.presets), renderErrors);
-  safeRenderStep("users", () => renderUsers(j.users || []), renderErrors);
-  safeRenderStep("groups", () => renderGroups(j.groups || []), renderErrors);
-  safeRenderStep("audit", () => renderAudit(j.server_config || {}), renderErrors);
-  safeRenderStep("update notices", () => renderUpdateNotices(j), renderErrors);
-  safeRenderStep("update button", () => renderUpdateButton(j), renderErrors);
-  safeRenderStep("instances", () => renderInstances(j.instances || []), renderErrors);
-  safeRenderStep("preset scopes", () => renderPresetScopeTabs(), renderErrors);
-  safeRenderStep("scoped cards", () => updateScopedCards(), renderErrors);
-  safeRenderStep("model install status", () => renderModelInstallStatus(), renderErrors);
-  safeRenderStep("dynamic preset models", () => renderDynamicPresetModels(), renderErrors);
-  safeRenderStep("benchmark surfaces", () => renderBenchmarkSurfaces(), renderErrors);
-  safeRenderStep("chat", () => renderChatUi({ preserveTranscript: true }), renderErrors);
+  if (activeTabName === "metrics" || popupMetricsWindowOpen()) {
+    renderStatusSurface("metrics", [j.metrics, j.system, j.series], () => renderMetrics(j), renderErrors);
+  }
+  renderStatusSurface("presets", j.presets, () => renderPresetCatalog(j.presets), renderErrors);
+  renderStatusSurface("users", j.users, () => renderUsers(j.users || []), renderErrors);
+  renderStatusSurface("groups", j.groups, () => renderGroups(j.groups || []), renderErrors);
+  renderStatusSurface("audit", j.server_config, () => renderAudit(j.server_config || {}), renderErrors);
+  renderStatusSurface("update notices", [
+    j.remote_update, j.script_version, CLUB3090_SCRIPT_VERSION,
+  ], () => renderUpdateNotices(j), renderErrors);
+  renderStatusSurface("update button", [
+    j.remote_update, j.script_version, CLUB3090_SCRIPT_VERSION,
+  ], () => renderUpdateButton(j), renderErrors);
+  const instanceProjection = [
+    j.instances, j.running_runtimes, j.instance_runtime_metrics, currentScope(),
+  ];
+  renderStatusSurface("instances", instanceProjection, () => renderInstances(j.instances || []), renderErrors);
+  renderStatusSurface("preset scopes", instanceProjection, () => renderPresetScopeTabs(), renderErrors);
+  renderStatusSurface("scoped cards", [
+    j.server_config, j.instances, j.power, j.benchmarks?.job, currentScope(),
+  ], () => updateScopedCards(), renderErrors);
+  renderStatusSurface("model install status", [
+    j.model_install_job, j.model_install_jobs, j.custom_model_job, j.model_updates,
+  ], () => renderModelInstallStatus(), renderErrors);
+  const dynamicSignature = dynamicPresetModelsRenderSignature();
+  if (statusRenderSignatures["dynamic preset models"] !== dynamicSignature) {
+    safeRenderStep("dynamic preset models", () => {
+      renderDynamicPresetModels();
+      statusRenderSignatures["dynamic preset models"] = dynamicSignature;
+    }, renderErrors);
+  }
+  renderStatusSurface("benchmark surfaces", [j.benchmarks, j.instances], () => renderBenchmarkSurfaces(), renderErrors);
+  if (activeTabName === "chat") {
+    renderStatusSurface("chat", [
+      j.instances, j.running_runtimes, j.instance_runtime_metrics, j.presets,
+      j.ai_studio, j.benchmarks?.job, j.metrics,
+    ], () => renderChatUi({ preserveTranscript: true }), renderErrors);
+  }
   safeRenderStep("tab sync", () => syncActiveTabDisplay(), renderErrors);
   reconcileUpdateUiFromStatus(j);
   if (activeTabName === "logs" || effectiveShowGlobalLogs()) connectLogs(false);
@@ -5685,7 +5728,6 @@ refreshStatus = async function (opts = {}) {
       ensureChatHydrationForActiveTab();
       hydrateSelectedPresetModel();
       const renderErrors = renderStatusUi(j, previousStatus);
-      scheduleStatusPoll();
       const statusWarnings = [];
       if (wasDisconnected) statusWarnings.push("Reconnected to the remote server.");
       if (j.access_hint?.message) statusWarnings.push(String(j.access_hint.message));
@@ -5718,6 +5760,7 @@ refreshStatus = async function (opts = {}) {
           inventoryDetail: nextInventoryDetail,
         }).catch(() => {});
       }
+      else scheduleStatusPoll();
     }
   })();
   return statusRefreshPromise;
@@ -5725,10 +5768,13 @@ refreshStatus = async function (opts = {}) {
 function clearLegacyPollers() {
   const marker = window.setInterval(() => {}, 60000);
   window.clearInterval(marker);
-  for (let id = 1; id < marker; id += 1) window.clearInterval(id);
+  for (let id = 1; id < marker; id += 1) {
+    window.clearInterval(id);
+    window.clearTimeout(id);
+  }
 }
 async function bootAdminUi() {
-  clearLegacyPollers();
+  statusRenderSignatures = Object.create(null);
   ensureV414Layout();
   registerAdminServiceWorker();
   ensureResizableSurfaces();
@@ -5774,7 +5820,6 @@ async function bootAdminUi() {
     initialMetricsSeriesRequested = true;
   }
   refreshStatus({ force: true, includeSeries: bootNeedsMetricSeries, boot: true }).catch(() => {});
-  scheduleStatusPoll();
   scheduleLogCacheRefresh();
   if (detachedLogPopupClosedPollTimer) clearInterval(detachedLogPopupClosedPollTimer);
   detachedLogPopupClosedPollTimer = setInterval(
@@ -6279,7 +6324,10 @@ function openPresetFilterModal() {
 function renderPresetHeaderActions() {
   const host = $("presetHeadActions");
   if (!host) return;
-  host.innerHTML = `<button type="button" class="preset-menu-button preset-filter-button${presetFilterIsActive() ? " active" : ""}" title="Filter presets" aria-label="Filter presets" onclick="openPresetFilterModal()">${svgIcon("filter")}</button>${renderPresetActionsMenu()}`;
+  setHtmlIfChanged(
+    host,
+    `<button type="button" class="preset-menu-button preset-filter-button${presetFilterIsActive() ? " active" : ""}" title="Filter presets" aria-label="Filter presets" onclick="openPresetFilterModal()">${svgIcon("filter")}</button>${renderPresetActionsMenu()}`,
+  );
 }
 function renderPresetHeadActionsHtml() {
   return `<div class="preset-head-actions" id="presetHeadActions"><button type="button" class="preset-menu-button preset-filter-button${presetFilterIsActive() ? " active" : ""}" title="Filter presets" aria-label="Filter presets" onclick="openPresetFilterModal()">${svgIcon("filter")}</button>${renderPresetActionsMenu()}</div>`;
@@ -11245,11 +11293,12 @@ function dynamicPresetModelsRenderSignature() {
 function renderDynamicPresetModels(options = {}) {
   ensureDynamicPresetLayout();
   hydrateSelectedPresetModel();
-  renderPresetModelSelector();
   const host = $("modelPresetGrid");
   if (!host) return;
   const nextSignature = dynamicPresetModelsRenderSignature();
   if (!options.force && dynamicPresetRenderSignature === nextSignature && host.childElementCount) return;
+  renderPresetModelSelector();
+  renderPresetHeaderActions();
   const variants = inventoryVariants();
   const models = inventoryModels();
   if (!models.length) {
