@@ -73,7 +73,6 @@ renderAudit = function (cfg) {
     ...cfg,
   };
   const persisted = accessPolicyPersistedValues(accessPolicyPersistedConfig);
-  ensureV414Layout();
   const adminPort = (lastStatus && lastStatus.admin_port) || 8008;
   const proxyPort = (lastStatus && lastStatus.proxy_port) || 8009;
   const adminPath = cfg.admin_path || "/admin";
@@ -118,13 +117,11 @@ saveAuthSettings = async function () {
     });
     const j = await r.json();
     if (!r.ok || !j.ok) throw new Error(j.error || "config failed");
+    accessPolicyPersistedConfig = { ...j.server_config };
     accessPolicyDraft = {};
-    if (j.server_config) {
-      accessPolicyPersistedConfig = { ...j.server_config };
-      renderAudit(j.server_config);
-    }
+    renderAudit(j.server_config);
     setAuditMsg("Saved access policy");
-    await refreshStatus();
+    await refreshStatus({ force: true });
   } catch (e) {
     alert("Access policy failed: " + e);
   }
@@ -636,38 +633,78 @@ function renderSystemConfiguration(status = lastStatus) {
     $("systemConfigCurrentBadge").textContent = dirtyKeys.length ? `${dirtyKeys.length} unsaved` : "current";
     $("systemConfigCurrentBadge").className = `status-badge ${dirtyKeys.length ? "status-warning" : "status-production"}`;
   }
-  grid.innerHTML = [
-    systemConfigRowHtml({
-      key: "gpu_profile",
-      title: "GPU Power Profile",
-      detail: "Sets active and idle GPU power limits, idle clocks, and idle timers.",
-      current,
-      controlHtml: `<select class="system-config-select" id="systemConfigGpuProfile" onchange="setSystemConfigDraft('gpu_profile', this.value)">${systemConfigSelectOptions(SYSTEM_GPU_PROFILE_OPTIONS, gpuProfileValue)}</select>`,
-      applyAction: "applySystemConfigGpuProfile()",
-    }),
-    systemConfigRowHtml({
-      key: "cpu_profile",
-      title: "CPU Power Profile",
-      detail: "Selects the active CPU governor. Idle operation uses powersave in both modes.",
-      current,
-      controlHtml: `<select class="system-config-select" id="systemConfigCpuProfile" onchange="setSystemConfigDraft('cpu_profile', this.value)">${systemConfigSelectOptions(SYSTEM_CPU_PROFILE_OPTIONS, cpuProfileValue)}</select>`,
-      applyAction: "applySystemConfigCpuProfile()",
-    }),
-    systemConfigRowHtml({
-      key: "optimizations",
-      title: "Power Optimizations",
-      detail: "Controls active power management and idle power behavior for the selected scope.",
-      current,
-      controlHtml: `<select class="system-config-select" id="systemConfigOptimizations" onchange="setSystemConfigDraft('optimizations', this.value)">${systemConfigSelectOptions([["enabled", "Enabled"], ["disabled", "Disabled"]], optimizationsValue)}</select>`,
-      applyAction: "applySystemConfigOptimizations()",
-    }),
-    `<div class="system-config-row${fanModeValue !== current.fan_mode || fanScopeValue !== current.fan_scope ? " system-config-row-dirty" : ""}" data-system-config-key="cooling"><div class="system-config-copy"><div class="system-config-title-row"><span class="system-config-title">Cooling</span>${fanModeValue !== current.fan_mode || fanScopeValue !== current.fan_scope ? '<span class="status-badge status-warning">changed</span>' : '<span class="status-badge status-production">saved</span>'}</div><div class="system-config-current">Current: <strong>${escapeHtml(systemConfigPrettyValue("fan_mode", current.fan_mode))}</strong> · <strong>${escapeHtml(systemConfigPrettyValue("fan_scope", current.fan_scope))}</strong></div><div class="preset-help">Sets fans to automatic control or manual max for the selected GPU scope.</div></div><div class="system-config-control system-config-control-pair"><select class="system-config-select" id="systemConfigFanMode" onchange="setSystemConfigDraft('fan_mode', this.value)">${systemConfigSelectOptions([["auto", "Automatic Fans"], ["manual_max", "Fans Max"]], fanModeValue)}</select><select class="system-config-select" id="systemConfigFanScope" onchange="setSystemConfigDraft('fan_scope', this.value)">${systemConfigScopeOptions(fanScopeValue)}</select></div><button class="btn green system-config-apply-btn" ${fanModeValue !== current.fan_mode || fanScopeValue !== current.fan_scope ? "" : "disabled"} onclick="applySystemConfigCooling()">Apply</button></div>`,
-  ].join("");
+  if (!["gpu_profile", "cpu_profile", "optimizations", "cooling"].every((key) => grid.querySelector(`[data-system-config-key="${key}"]`))) {
+    grid.innerHTML = [
+      systemConfigRowHtml({
+        key: "gpu_profile",
+        title: "GPU Power Profile",
+        detail: "Sets active and idle GPU power limits, idle clocks, and idle timers.",
+        current,
+        controlHtml: `<select class="system-config-select" id="systemConfigGpuProfile" onchange="setSystemConfigDraft('gpu_profile', this.value)">${systemConfigSelectOptions(SYSTEM_GPU_PROFILE_OPTIONS, gpuProfileValue)}</select>`,
+        applyAction: "applySystemConfigGpuProfile()",
+      }),
+      systemConfigRowHtml({
+        key: "cpu_profile",
+        title: "CPU Power Profile",
+        detail: "Selects the active CPU governor. Idle operation uses powersave in both modes.",
+        current,
+        controlHtml: `<select class="system-config-select" id="systemConfigCpuProfile" onchange="setSystemConfigDraft('cpu_profile', this.value)">${systemConfigSelectOptions(SYSTEM_CPU_PROFILE_OPTIONS, cpuProfileValue)}</select>`,
+        applyAction: "applySystemConfigCpuProfile()",
+      }),
+      systemConfigRowHtml({
+        key: "optimizations",
+        title: "Power Optimizations",
+        detail: "Controls active power management and idle power behavior for the selected scope.",
+        current,
+        controlHtml: `<select class="system-config-select" id="systemConfigOptimizations" onchange="setSystemConfigDraft('optimizations', this.value)">${systemConfigSelectOptions([["enabled", "Enabled"], ["disabled", "Disabled"]], optimizationsValue)}</select>`,
+        applyAction: "applySystemConfigOptimizations()",
+      }),
+      `<div class="system-config-row" data-system-config-key="cooling"><div class="system-config-copy"><div class="system-config-title-row"><span class="system-config-title">Cooling</span><span class="status-badge status-production">saved</span></div><div class="system-config-current">Current: <strong></strong> · <strong></strong></div><div class="preset-help">Sets fans to automatic control or manual max for the selected GPU scope.</div></div><div class="system-config-control system-config-control-pair"><select class="system-config-select" id="systemConfigFanMode" onchange="setSystemConfigDraft('fan_mode', this.value)"></select><select class="system-config-select" id="systemConfigFanScope" onchange="setSystemConfigDraft('fan_scope', this.value)"></select></div><button class="btn green system-config-apply-btn" disabled onclick="applySystemConfigCooling()">Apply</button></div>`,
+    ].join("");
+  }
+  const rows = {
+    gpu_profile: grid.querySelector('[data-system-config-key="gpu_profile"]'),
+    cpu_profile: grid.querySelector('[data-system-config-key="cpu_profile"]'),
+    optimizations: grid.querySelector('[data-system-config-key="optimizations"]'),
+    cooling: grid.querySelector('[data-system-config-key="cooling"]'),
+  };
+  const selectSpecs = [
+    [rows.gpu_profile, "systemConfigGpuProfile", "gpu_profile", SYSTEM_GPU_PROFILE_OPTIONS],
+    [rows.cpu_profile, "systemConfigCpuProfile", "cpu_profile", SYSTEM_CPU_PROFILE_OPTIONS],
+    [rows.optimizations, "systemConfigOptimizations", "optimizations", [["enabled", "Enabled"], ["disabled", "Disabled"]]],
+    [rows.cooling, "systemConfigFanMode", "fan_mode", [["auto", "Automatic Fans"], ["manual_max", "Fans Max"]]],
+    [rows.cooling, "systemConfigFanScope", "fan_scope", null],
+  ];
+  selectSpecs.forEach(([row, id, key, options]) => {
+    const select = $(id);
+    if (!select || !row) return;
+    const value = systemConfigValue(key, current);
+    const html = options ? systemConfigSelectOptions(options, value) : systemConfigScopeOptions(value);
+    if (select.innerHTML !== html) select.innerHTML = html;
+    if (select.value !== value) select.value = value;
+  });
+  const locked = typeof benchmarkJobActive === "function" && benchmarkJobActive();
+  Object.entries(rows).forEach(([key, row]) => {
+    if (!row) return;
+    const dirty = key === "cooling"
+      ? fanModeValue !== current.fan_mode || fanScopeValue !== current.fan_scope
+      : systemConfigValue(key, current) !== String(current[key] || "");
+    row.classList.toggle("system-config-row-dirty", dirty);
+    const badge = row.querySelector(".status-badge");
+    if (badge) {
+      badge.textContent = dirty ? "changed" : "saved";
+      badge.className = `status-badge ${dirty ? "status-warning" : "status-production"}`;
+    }
+    const currentLabel = row.querySelector(".system-config-current");
+    if (currentLabel) {
+      currentLabel.innerHTML = key === "cooling"
+        ? `Current: <strong>${escapeHtml(systemConfigPrettyValue("fan_mode", current.fan_mode))}</strong> · <strong>${escapeHtml(systemConfigPrettyValue("fan_scope", current.fan_scope))}</strong>`
+        : `Current: <strong>${escapeHtml(systemConfigPrettyValue(key, current[key]))}</strong>`;
+    }
+    const apply = row.querySelector(".system-config-apply-btn");
+    if (apply) apply.disabled = !dirty || locked;
+  });
   syncPowerCoolingBusyState();
-}
-function setSystemConfigDraft(key, value) {
-  systemConfigDraft[String(key || "")] = String(value || "");
-  renderSystemConfiguration(lastStatus);
 }
 async function applySystemConfigGpuProfile() {
   const current = systemConfigCurrent(lastStatus);

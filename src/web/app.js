@@ -5667,7 +5667,12 @@ refreshStatus = async function (opts = {}) {
   }
   statusRefreshPromise = (async () => {
     try {
-      ensureV414Layout();
+      const layoutNeedsRepair =
+        !$("systemConfigGrid") ||
+        !$("auditAllowAnonymousProxy") ||
+        !$("auditAllowDummyProxyKey") ||
+        !$("auditPolicyText");
+      if (layoutNeedsRepair) ensureV414Layout();
       const profileOptions = {
         includeSeries,
         includeInventory,

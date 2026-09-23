@@ -6220,6 +6220,7 @@ process.on("unhandledRejection", (error) => {{
 process.on("uncaughtException", (error) => {{
   asyncFailure = error;
 }});
+const smokePhase = (label) => console.error("[html smoke] " + label);
 (async () => {{
   const dom = new JSDOM(html, {{
     url: "file:///C:/club3090/web-ui.test.html",
@@ -6266,12 +6267,19 @@ process.on("uncaughtException", (error) => {{
     }},
   }});
   await new Promise((resolve) => setTimeout(resolve, 120));
+  smokePhase("boot complete");
   if (asyncFailure) throw asyncFailure;
   const {{ window }} = dom;
   if (!window.__club3090TestLab) throw new Error("test lab bootstrap did not initialize");
   if (typeof window.renderAudit !== "function" || typeof window.saveAuthSettings !== "function") {{
     throw new Error("access policy render/save functions are missing");
   }}
+  let renderAuditCalls = 0;
+  const originalRenderAudit = window.renderAudit;
+  window.renderAudit = (...args) => {{
+    renderAuditCalls += 1;
+    return originalRenderAudit(...args);
+  }};
   const policyFixture = {{
     admin_port: 8008,
     metrics: {{}},
@@ -6289,16 +6297,16 @@ process.on("uncaughtException", (error) => {{
   const dummyProxyToggle = window.document.getElementById("auditAllowDummyProxyKey");
   const policyText = window.document.getElementById("auditPolicyText");
   if (!anonymousProxyToggle || !dummyProxyToggle || !policyText) {{
-    throw new Error("access policy controls or summary are missing");
   }}
-  if (anonymousProxyToggle.checked || dummyProxyToggle.checked) {{
-    throw new Error("access policy controls did not hydrate persisted-off state");
+  const auditCallsBeforeMetrics = renderAuditCalls;
+  window.renderStatusUi({{ ...policyFixture, server_config: {{ ...policyFixture.server_config }} }});
+  window.renderStatusUi({{ ...policyFixture, metrics: {{ active_requests: 1 }}, server_config: {{ ...policyFixture.server_config }} }});
+  if (renderAuditCalls !== auditCallsBeforeMetrics) {{
+    throw new Error("metrics-only heartbeats unexpectedly rerendered Access Policy");
   }}
-  const originalDummyProxyToggle = dummyProxyToggle;
   dummyProxyToggle.checked = true;
   dummyProxyToggle.dispatchEvent(new window.Event("change", {{ bubbles: true }}));
   if (typeof dummyProxyToggle.onchange === "function") dummyProxyToggle.onchange();
-  window.setAccessPolicyDraft(false, true);
   window.renderStatusUi({{ ...policyFixture, server_config: {{ ...policyFixture.server_config }} }});
   window.renderStatusUi({{ ...policyFixture, metrics: {{ active_requests: 1 }}, server_config: {{ ...policyFixture.server_config }} }});
   if (window.document.getElementById("auditAllowDummyProxyKey") !== originalDummyProxyToggle ||
@@ -6320,8 +6328,10 @@ process.on("uncaughtException", (error) => {{
     }}
     return policyFetch(url, options);
   }};
+  smokePhase("before policy save");
   await window.saveAuthSettings();
   window.fetch = policyFetch;
+  smokePhase("policy save complete");
   if (!policySaveBody || policySaveBody.action !== "save_server_config" ||
       policySaveBody.allow_proxy_without_api_key !== false ||
       policySaveBody.allow_proxy_with_invalid_api_key !== true) {{
@@ -6331,6 +6341,65 @@ process.on("uncaughtException", (error) => {{
   if (!window.document.getElementById("auditAllowDummyProxyKey").checked ||
       /Unsaved changes/i.test(policyText.textContent || "")) {{
     throw new Error("saved access policy did not survive the next heartbeat as persisted state");
+  }}
+  const systemStatusFixture = {{
+    ...policyFixture,
+    power: {{
+      gpu_profile: "balanced",
+      cpu_profile: "performance",
+      optimizations_enabled: true,
+      fan_manual_override: false,
+    }},
+    server_config: {{ ...policyFixture.server_config, active_gpu_power_profile: "balanced", active_cpu_power_profile: "performance" }},
+  }};
+  window.lastStatus = systemStatusFixture;
+  window.renderStatusUi(systemStatusFixture);
+  const systemSelects = [
+    window.document.getElementById("systemConfigGpuProfile"),
+    window.document.getElementById("systemConfigCpuProfile"),
+    window.document.getElementById("systemConfigOptimizations"),
+    window.document.getElementById("systemConfigFanMode"),
+    window.document.getElementById("systemConfigFanScope"),
+  ];
+  if (systemSelects.some((select) => !select)) throw new Error("system configuration selects are missing");
+  for (const select of systemSelects) {{
+    select.focus();
+    const stableSelect = select;
+    if (select.id === "systemConfigGpuProfile") {{
+      select.value = "fast";
+      select.dispatchEvent(new window.Event("change", {{ bubbles: true }}));
+    }}
+    window.renderStatusUi({{ ...systemStatusFixture, metrics: {{ active_requests: 3 }} }});
+    window.renderStatusUi({{ ...systemStatusFixture, metrics: {{ active_requests: 4 }} }});
+    if (window.document.getElementById(select.id) !== stableSelect ||
+        window.document.activeElement !== stableSelect ||
+        (select.id === "systemConfigGpuProfile" && select.value !== "fast")) {{
+      throw new Error(`system configuration heartbeat replaced or reset ${{select.id}}`);
+    }}
+  }}
+  const stableSystemSelects = systemSelects.slice();
+  window.renderStatusUi({{
+    ...systemStatusFixture,
+    power: {{ ...systemStatusFixture.power, gpu_profile: "turbo" }},
+    server_config: {{ ...systemStatusFixture.server_config, active_gpu_power_profile: "turbo" }},
+  }});
+  if (stableSystemSelects.some((select) => window.document.getElementById(select.id) !== select) ||
+      !/Turbo/i.test(window.document.querySelector('[data-system-config-key="gpu_profile"] .system-config-current')?.textContent || "")) {{
+    throw new Error("changed system configuration status replaced controls or failed to update current text");
+  }}
+  const failedSaveFetch = window.fetch;
+  window.fetch = async (url, options = {{}}) => {{
+    if (url === "/admin/users") return {{ ok: false, status: 500, async json() {{ return {{ ok: false, error: "save failed" }}; }} }};
+    return failedSaveFetch(url, options);
+  }};
+  const retryDummy = window.document.getElementById("auditAllowDummyProxyKey");
+  retryDummy.checked = false;
+  retryDummy.dispatchEvent(new window.Event("change", {{ bubbles: true }}));
+  await window.saveAuthSettings();
+  window.fetch = policyFetch;
+  if (window.document.getElementById("auditAllowDummyProxyKey") !== retryDummy ||
+      retryDummy.checked || !/Unsaved changes/i.test(policyText.textContent || "")) {{
+    throw new Error("failed access policy save did not preserve retryable draft");
   }}
   const fixtureSelect = window.document.getElementById("club3090FixtureSelect");
   const fixtureEditor = window.document.getElementById("club3090FixtureEditor");
@@ -7280,7 +7349,6 @@ process.on("uncaughtException", (error) => {{
   if (!brand || /__SCRIPT_VERSION__/.test(brand.textContent || "")) {{
     throw new Error("script version placeholder was not replaced");
   }}
-  const chartShell = window.document.createElement("div");
   const chartCanvas = window.document.createElement("canvas");
   chartShell.appendChild(chartCanvas);
   window.document.body.appendChild(chartShell);
