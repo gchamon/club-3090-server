@@ -171,7 +171,7 @@
             ><button
               class="btn run-script-trigger hidden"
               id="instanceRunScriptBtn"
-              onclick="openRunScriptModal()"
+              onclick="focusScriptLogs()"
             >
               <svg viewBox="0 0 24 24" aria-hidden="true">
                 <path d="m5 7 4.5 5L5 17M11 17h8" fill="none" />
@@ -928,8 +928,10 @@
             >
           </div>
         </div>
+        <div id="scriptControlsWrap" class="script-controls-wrap hidden"></div>
         <div class="resizable-surface resizable-surface-log" id="logSurface">
-          <textarea id="log" class="log" readonly wrap="soft">
+          <div id="logRender" class="log log-render" tabindex="0">Connecting...</div>
+          <textarea id="log" class="log log-plain-mirror hidden" readonly wrap="soft">
 Connecting...</textarea
           >
           <button

@@ -69,6 +69,8 @@ function gotoMatch(i) {
   const lineHeight = 16;
   const before = log.value.slice(0, start).split("\n").length - 1;
   log.scrollTop = Math.max(0, before * lineHeight - log.clientHeight / 2);
+  const render = $("logRender");
+  if (render) render.scrollTop = log.scrollTop;
   updateSearchUI(false);
 }
 function nextMatch() {

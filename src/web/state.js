@@ -1507,8 +1507,10 @@ async function startCompatibleMigration() {
 }
 function updateLogVisualMode() {
   const box = $("log");
-  if (!box) return;
-  box.classList.toggle("log-update", currentLogSource === "update");
+  const renderBox = $("logRender");
+  const isUpdate = currentLogSource === "update";
+  if (box) box.classList.toggle("log-update", isUpdate);
+  if (renderBox) renderBox.classList.toggle("log-update", isUpdate);
 }
 function endUpdateMonitor() {
   updateMonitor.active = false;

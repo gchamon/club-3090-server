@@ -21,7 +21,7 @@ let showGlobalLogs = true;
 let showGlobalLogSources =
   window.showGlobalLogSources || (window.showGlobalLogSources = Object.create(null));
 let currentLogSource = "docker";
-const knownLogSources = new Set(["docker", "audit", "debug", "benchmarks"]);
+const knownLogSources = new Set(["docker", "audit", "debug", "benchmarks", "script"]);
 window.logPopupStates = window.logPopupStates || Object.create(null);
 var LOG_POPUP_WIDTH = 980;
 var LOG_POPUP_HEIGHT = 720;
@@ -120,6 +120,125 @@ function popupLogWindowActive(signature = "") {
 function effectiveShowGlobalLogs() {
   return currentLogGlobalEnabled() && !currentLogSourceDetached();
 }
+function escapeHtml(value) {
+  return String(value || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+function stripAnsiCodes(text) {
+  if (!text) return "";
+  return String(text)
+    .replace(/(?:\x1b\[|\u001b\[)[0-9;?]*[a-zA-Z]/g, "")
+    .replace(/\[([0-9;]+)m/g, "");
+}
+function renderAnsiHtml(text) {
+  if (!text) return "";
+  const raw = String(text);
+  const tokenRegex = /(?:\x1b\[|\u001b\[|\[)([0-9;]+)m/g;
+  let result = "";
+  let lastIndex = 0;
+  const activeClasses = new Set();
+  let activeStyles = {};
+  const fgMap = {
+    "30": "ansi-black", "31": "ansi-red", "32": "ansi-green", "33": "ansi-yellow",
+    "34": "ansi-blue", "35": "ansi-magenta", "36": "ansi-cyan", "37": "ansi-white",
+    "90": "ansi-bright-black", "91": "ansi-bright-red", "92": "ansi-bright-green", "93": "ansi-bright-yellow",
+    "94": "ansi-bright-blue", "95": "ansi-bright-magenta", "96": "ansi-bright-cyan", "97": "ansi-bright-white"
+  };
+  const bgMap = {
+    "40": "ansi-bg-black", "41": "ansi-bg-red", "42": "ansi-bg-green", "43": "ansi-bg-yellow",
+    "44": "ansi-bg-blue", "45": "ansi-bg-magenta", "46": "ansi-bg-cyan", "47": "ansi-bg-white",
+    "100": "ansi-bg-bright-black", "101": "ansi-bg-bright-red", "102": "ansi-bg-bright-green", "103": "ansi-bg-bright-yellow",
+    "104": "ansi-bg-bright-blue", "105": "ansi-bg-bright-magenta", "106": "ansi-bg-bright-cyan", "107": "ansi-bg-bright-white"
+  };
+  let openSpan = false;
+  function closeSpan() {
+    if (openSpan) {
+      result += "</span>";
+      openSpan = false;
+    }
+  }
+  function startSpan() {
+    closeSpan();
+    if (activeClasses.size > 0 || Object.keys(activeStyles).length > 0) {
+      const cls = Array.from(activeClasses).join(" ");
+      const styleStr = Object.entries(activeStyles).map(([k, v]) => `${k}:${v}`).join(";");
+      const attrCls = cls ? ` class="${cls}"` : "";
+      const attrStyle = styleStr ? ` style="${styleStr}"` : "";
+      result += `<span${attrCls}${attrStyle}>`;
+      openSpan = true;
+    }
+  }
+  let match;
+  while ((match = tokenRegex.exec(raw)) !== null) {
+    const textChunk = raw.slice(lastIndex, match.index);
+    if (textChunk) {
+      result += escapeHtml(textChunk);
+    }
+    lastIndex = tokenRegex.lastIndex;
+    const codes = match[1].split(";");
+    for (let i = 0; i < codes.length; i++) {
+      const code = codes[i];
+      if (code === "" || code === "0") {
+        activeClasses.clear();
+        activeStyles = {};
+      } else if (code === "1") {
+        activeClasses.add("ansi-bold");
+      } else if (code === "2") {
+        activeClasses.add("ansi-dim");
+      } else if (code === "3") {
+        activeClasses.add("ansi-italic");
+      } else if (code === "4") {
+        activeClasses.add("ansi-underline");
+      } else if (code === "22") {
+        activeClasses.delete("ansi-bold");
+        activeClasses.delete("ansi-dim");
+      } else if (code === "23") {
+        activeClasses.delete("ansi-italic");
+      } else if (code === "24") {
+        activeClasses.delete("ansi-underline");
+      } else if (code === "39") {
+        for (const c of Object.values(fgMap)) activeClasses.delete(c);
+        delete activeStyles["color"];
+      } else if (code === "49") {
+        for (const c of Object.values(bgMap)) activeClasses.delete(c);
+        delete activeStyles["background-color"];
+      } else if (fgMap[code]) {
+        for (const c of Object.values(fgMap)) activeClasses.delete(c);
+        delete activeStyles["color"];
+        activeClasses.add(fgMap[code]);
+      } else if (bgMap[code]) {
+        for (const c of Object.values(bgMap)) activeClasses.delete(c);
+        delete activeStyles["background-color"];
+        activeClasses.add(bgMap[code]);
+      } else if (code === "38" && codes[i + 1] === "5" && codes[i + 2]) {
+        const colorIdx = parseInt(codes[i + 2], 10);
+        for (const c of Object.values(fgMap)) activeClasses.delete(c);
+        activeStyles["color"] = `var(--ansi-256-${colorIdx}, inherit)`;
+        i += 2;
+      } else if (code === "38" && codes[i + 1] === "2" && codes[i + 4]) {
+        const r = parseInt(codes[i + 2], 10), g = parseInt(codes[i + 3], 10), b = parseInt(codes[i + 4], 10);
+        for (const c of Object.values(fgMap)) activeClasses.delete(c);
+        activeStyles["color"] = `rgb(${r},${g},${b})`;
+        i += 4;
+      }
+    }
+    startSpan();
+  }
+  const remaining = raw.slice(lastIndex);
+  if (remaining) {
+    result += escapeHtml(remaining);
+  }
+  closeSpan();
+  return result;
+}
+window.renderAnsiHtml = renderAnsiHtml;
+window.stripAnsiCodes = stripAnsiCodes;
+window.escapeHtml = escapeHtml;
+
 function $(id) {
   return currentUiDocument().getElementById(id);
 }
@@ -447,7 +566,6 @@ function minimizeSurfacesForUpdateMode() {
   [
     "presetScoresModal",
     "storageBrowserModal",
-    "runScriptModal",
     "presetActionModal",
     "actionChoiceModal",
     "presetLaunchSettingsModal",

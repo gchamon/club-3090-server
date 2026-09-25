@@ -3152,7 +3152,7 @@ function renderBenchmarkModalLogCard(ctx = benchmarkRunningLogContext(), current
     : "";
   const scriptTabs = effectiveMode === "staged" && hasStaged ? `<div class="subtabs score-log-tabs score-log-tabs-bottom">${ctx.scriptTabs}</div>` : "";
   const heightStyle = benchmarkModalLogHeight ? ` style="height:${Math.round(benchmarkModalLogHeight)}px"` : "";
-  const body = `<div class="benchmark-log-mode-row"><div class="subtabs"><button class="subtab ${effectiveMode === "staged" ? "active" : ""}" ${hasStaged ? "" : "disabled"} onclick="setBenchmarkModalLogMode('staged')">Staged</button><button class="subtab ${effectiveMode === "full" ? "active" : ""}" onclick="setBenchmarkModalLogMode('full')">Full</button></div>${renderActiveLogPathLabel(logPath)}<span class="preset-help">${escapeHtml(active ? "Live benchmark output" : "Last benchmark output")}</span></div><pre id="benchmarkModalLogTail" class="benchmark-log-tail ${effectiveMode === "full" ? "full" : "staged"}" data-log-mode="${escapeHtml(effectiveMode)}" tabindex="0"${heightStyle} onscroll="rememberBenchmarkModalLogScroll()" onmouseup="rememberBenchmarkModalLogHeight()" onpointerup="rememberBenchmarkModalLogHeight()" onblur="rememberBenchmarkModalLogHeight()">${escapeHtml(text)}</pre>${scriptTabs}`;
+  const body = `<div class="benchmark-log-mode-row"><div class="subtabs"><button class="subtab ${effectiveMode === "staged" ? "active" : ""}" ${hasStaged ? "" : "disabled"} onclick="setBenchmarkModalLogMode('staged')">Staged</button><button class="subtab ${effectiveMode === "full" ? "active" : ""}" onclick="setBenchmarkModalLogMode('full')">Full</button></div>${renderActiveLogPathLabel(logPath)}<span class="preset-help">${escapeHtml(active ? "Live benchmark output" : "Last benchmark output")}</span></div><pre id="benchmarkModalLogTail" class="benchmark-log-tail ${effectiveMode === "full" ? "full" : "staged"}" data-log-mode="${escapeHtml(effectiveMode)}" tabindex="0"${heightStyle} onscroll="rememberBenchmarkModalLogScroll()" onmouseup="rememberBenchmarkModalLogHeight()" onpointerup="rememberBenchmarkModalLogHeight()" onblur="rememberBenchmarkModalLogHeight()">${renderAnsiHtml(text)}</pre>${scriptTabs}`;
   return renderBenchmarkSection("logs", "benchmark-section-card benchmark-log-section", "Benchmark Logs", escapeHtml(activeLabel), body, true);
 }
 function benchmarkStepShortLabel(row = {}) {
@@ -4114,7 +4114,7 @@ function renderPresetScoreLogViewer(result = {}) {
   const liveLine = live ? `<div class="preset-help score-log-live-line">Live benchmark output for ${escapeHtml(live.display_name || live.selector || "this preset")} · ${escapeHtml(live.step_label || liveCtx?.stepLine || "current step")}</div>` : "";
   const emptyText = live ? "No staged output captured for this script yet." : "No output captured for this script.";
   const activeLogId = String(active.id || "");
-  return `<div class="score-log-shell">${liveLine}<pre class="score-log-viewer" data-score-log-id="${escapeHtml(activeLogId)}" onscroll="rememberPresetScoreLogScroll()">${escapeHtml(formatBenchmarkArtifactLogText(active, active.text || emptyText))}</pre><div class="subtabs score-log-tabs score-log-tabs-bottom">${tabs}</div></div>`;
+  return `<div class="score-log-shell">${liveLine}<pre class="score-log-viewer" data-score-log-id="${escapeHtml(activeLogId)}" onscroll="rememberPresetScoreLogScroll()">${renderAnsiHtml(formatBenchmarkArtifactLogText(active, active.text || emptyText))}</pre><div class="subtabs score-log-tabs score-log-tabs-bottom">${tabs}</div></div>`;
 }
 function scoreSummaryUsefulFailureText(value = "") {
   const text = String(value || "").trim();
@@ -4767,14 +4767,10 @@ function ensureRunScriptModal() {
   document.body.appendChild(modal);
 }
 function openRunScriptModal() {
-  ensureRunScriptModal();
-  $("runScriptModal").classList.remove("hidden");
-  renderRunScriptModal();
-  loadRunScripts().catch(() => {});
+  focusScriptLogs();
 }
 function closeRunScriptModal() {
-  ensureRunScriptModal();
-  $("runScriptModal").classList.add("hidden");
+  if ($("runScriptModal")) $("runScriptModal").classList.add("hidden");
 }
 async function loadRunScripts() {
   scriptModalState.loading = true;
@@ -4846,8 +4842,12 @@ async function startDiscoveredScript(scriptId) {
     if (payload.script_job) lastStatus = { ...(lastStatus || {}), script_job: payload.script_job };
     const queue = Array.isArray(payload?.script_job?.queue) ? payload.script_job.queue : [];
     const added = queue[queue.length - 1];
-    if (added?.job_id) scriptModalState.selectedJobId = String(added.job_id);
-    renderRunScriptModal();
+    if (added?.job_id) {
+      scriptModalState.selectedJobId = String(added.job_id);
+      scriptModalState.view = "logs";
+      loadRunScriptLog(scriptModalState.selectedJobId, true).catch(() => {});
+    }
+    renderScriptRunnerUi();
   } catch (error) {
     setElementMsg("runScriptMsg", messageText(error), "error");
   }
@@ -4858,9 +4858,8 @@ async function startImageStudioSetup() {
     return;
   }
   try {
-    ensureRunScriptModal();
-    $("runScriptModal").classList.remove("hidden");
     scriptModalState.view = "logs";
+    focusScriptLogs();
     const payload = await post(
       "/admin/ai-studio/setup",
       {},
@@ -4873,7 +4872,7 @@ async function startImageStudioSetup() {
       scriptModalState.selectedJobId = String(added.job_id);
       loadRunScriptLog(scriptModalState.selectedJobId, true).catch(() => {});
     }
-    renderRunScriptModal();
+    renderScriptRunnerUi();
     setElementMsg("runScriptMsg", "AI Studio setup queued. Output is streaming to the Script Queue and Audit Logs.", "success");
   } catch (error) {
     setElementMsg("runScriptMsg", messageText(error), "error");
@@ -4885,9 +4884,8 @@ async function removeImageStudio() {
     return;
   }
   try {
-    ensureRunScriptModal();
-    $("runScriptModal").classList.remove("hidden");
     scriptModalState.view = "logs";
+    focusScriptLogs();
     const payload = await post(
       "/admin/ai-studio/remove",
       {},
@@ -4900,7 +4898,7 @@ async function removeImageStudio() {
       scriptModalState.selectedJobId = String(added.job_id);
       loadRunScriptLog(scriptModalState.selectedJobId, true).catch(() => {});
     }
-    renderRunScriptModal();
+    renderScriptRunnerUi();
     setElementMsg("runScriptMsg", "AI Studio removal queued. Downloaded models are left in place for Model Manager cleanup.", "success");
   } catch (error) {
     setElementMsg("runScriptMsg", messageText(error), "error");
@@ -4936,8 +4934,8 @@ function imageStudioActionButtonHtml(className = "btn run-script-trigger") {
 }
 async function setImageStudioRuntime(start) {
   try {
-    $("runScriptModal").classList.remove("hidden");
     scriptModalState.view = "logs";
+    focusScriptLogs();
     const route = start ? "/admin/ai-studio/start" : "/admin/ai-studio/stop";
     const payload = await post(route, {}, route);
     if (payload.script_job) lastStatus = { ...(lastStatus || {}), script_job: payload.script_job };
@@ -4947,7 +4945,7 @@ async function setImageStudioRuntime(start) {
       scriptModalState.selectedJobId = String(added.job_id);
       loadRunScriptLog(scriptModalState.selectedJobId, true).catch(() => {});
     }
-    renderRunScriptModal();
+    renderScriptRunnerUi();
     setElementMsg("runScriptMsg", `AI Studio ${start ? "start" : "stop"} queued.`, "success");
   } catch (error) {
     setElementMsg("runScriptMsg", messageText(error), "error");
@@ -4996,10 +4994,10 @@ async function loadRunScriptLog(jobId, force = false) {
     const payload = await response.json();
     if (!response.ok || payload?.ok === false) throw new Error(payload?.error || "Script log request failed.");
     scriptModalState.logByJob[id] = String(payload?.text || "");
-    scriptModalState.logLoadedAtByJob[id] = Date.now();
   } catch (error) {
     scriptModalState.error = messageText(error);
   } finally {
+    scriptModalState.logLoadedAtByJob[id] = Date.now();
     if (scriptModalState.logLoadingJob === id) scriptModalState.logLoadingJob = "";
     renderRunScriptModal();
   }
@@ -5007,7 +5005,8 @@ async function loadRunScriptLog(jobId, force = false) {
 function showQueuedScriptLog(jobId) {
   scriptModalState.selectedJobId = String(jobId || "");
   scriptModalState.view = "logs";
-  renderRunScriptModal();
+  focusScriptLogs();
+  renderScriptRunnerUi();
   loadRunScriptLog(scriptModalState.selectedJobId, true).catch(() => {});
 }
 async function removeQueuedScript(jobId) {
@@ -5075,11 +5074,16 @@ async function copyLatestRigReport() {
     setElementMsg("runScriptMsg", messageText(err), "error");
   }
 }
-function renderRunScriptModal() {
-  ensureRunScriptModal();
-  const body = $("runScriptBody");
-  if (!body) return;
-  const previousLogViewer = body.querySelector(".run-script-log-viewer");
+function renderScriptRunnerUi() {
+  const isScriptTab = currentLogSource === "script";
+  if ($("scriptControlsWrap")) {
+    $("scriptControlsWrap").classList.toggle("hidden", !isScriptTab);
+  }
+  const targets = [];
+  if (isScriptTab && $("scriptControlsWrap")) targets.push($("scriptControlsWrap"));
+  if ($("runScriptBody")) targets.push($("runScriptBody"));
+  if (!targets.length) return;
+  const previousLogViewer = targets[0].querySelector(".run-script-log-viewer");
   const shouldFollowScriptLog =
     !!$("autoscroll")?.checked &&
     (!previousLogViewer ||
@@ -5092,7 +5096,7 @@ function renderRunScriptModal() {
   const userScripts = scripts.filter((row) => !row?.internal && row?.category !== "validation");
   const internalScripts = scripts.filter((row) => row?.internal && row?.category !== "validation");
   const validationCards = validationScripts.length
-    ? `<section class="run-script-validation-card resource-manager-card"><div class="resource-manager-card-head"><div><h3>Benchmarking & Validation</h3><div class="preset-help">One-click upstream PR, issue evidence, and rig validation suites (runs under active GPU power).</div></div></div><div class="run-script-grid resource-manager-grid">${validationScripts.map((row) => renderScriptCard(row)).join("")}</div></section>`
+    ? `<section class="run-script-validation-card resource-manager-card"><div class="resource-manager-card-head"><div><h3>Benchmarking &amp; Validation</h3><div class="preset-help">One-click upstream PR, issue evidence, and rig validation suites (runs under active GPU power).</div></div></div><div class="run-script-grid resource-manager-grid">${validationScripts.map((row) => renderScriptCard(row)).join("")}</div></section>`
     : "";
   const cards = scriptModalState.loading
     ? '<div class="empty-variant-note">Discovering upstream scripts...</div>'
@@ -5117,16 +5121,31 @@ function renderRunScriptModal() {
   const reportActionsHtml = isReportJob
     ? `<div class="run-script-report-actions"><a class="btn primary-btn run-script-report-btn" href="/admin/scripts/report?download=1" target="_blank" rel="noopener">${svgIcon("download")} Download my-rig.md</a><button type="button" class="btn secondary-btn run-script-report-btn" onclick="copyLatestRigReport()">${svgIcon("copy")} Copy Report</button></div>`
     : "";
-  const logsView = `<div class="run-script-selected-log"><div class="resource-manager-card-head"><div class="run-script-log-title-row"><h3>${escapeHtml(selectedJob?.label || selectedJob?.script_id || "Script Log")}</h3>${reportActionsHtml}</div><span class="run-script-status-label">${escapeHtml(selectedJob?.status || "idle")}</span></div><pre class="benchmark-log-tail run-script-log-viewer" tabindex="0">${escapeHtml(selectedLog || (scriptModalState.logLoadingJob === selectedJobId ? "Loading script log..." : "No script log entries yet."))}</pre></div>`;
+  const logsView = `<div class="run-script-selected-log"><div class="resource-manager-card-head"><div class="run-script-log-title-row"><h3>${escapeHtml(selectedJob?.label || selectedJob?.script_id || "Script Log")}</h3>${reportActionsHtml}</div><span class="run-script-status-label">${escapeHtml(selectedJob?.status || "idle")}</span></div><pre class="benchmark-log-tail run-script-log-viewer" tabindex="0">${renderAnsiHtml(selectedLog || (scriptModalState.logLoadingJob === selectedJobId ? "Loading script log..." : "No script log entries yet."))}</pre></div>`;
   const queueCard = `<section class="run-script-queue-card resource-manager-card"><div class="resource-manager-card-head"><div><h3>Script Queue</h3><div class="preset-help">${escapeHtml(queueSummary)}</div></div><span class="benchmark-ready-controls run-script-ready-controls">${logToggle}</span></div><div class="run-script-queue">${queueRows}</div></section>`;
-  body.innerHTML = `${queueCard}<div class="preset-help">${locked ? "Scripts cannot be run during a Model Scores benchmark, but discovery and logs remain available." : "Scripts run sequentially against the selected scope when a runtime is available."}</div>${scriptControls}${scriptModalState.view === "logs" ? logsView : scriptsView}`;
-  const nextLogViewer = body.querySelector(".run-script-log-viewer");
-  if (nextLogViewer && shouldFollowScriptLog) nextLogViewer.scrollTop = nextLogViewer.scrollHeight;
-  if (scriptModalState.view === "logs" && selectedJobId && (String(selectedJob?.status || "") === "running" || !scriptModalState.logByJob[selectedJobId])) {
+  const htmlContent = `<div class="msg" id="runScriptMsg"></div>${queueCard}<div class="preset-help">${locked ? "Scripts cannot be run during a Model Scores benchmark, but discovery and logs remain available." : "Scripts run sequentially against the selected scope when a runtime is available."}</div>${scriptControls}${scriptModalState.view === "logs" ? logsView : scriptsView}`;
+  for (const target of targets) {
+    target.innerHTML = htmlContent;
+    const nextLogViewer = target.querySelector(".run-script-log-viewer");
+    if (nextLogViewer && shouldFollowScriptLog) nextLogViewer.scrollTop = nextLogViewer.scrollHeight;
+  }
+  const loadedAt = Number(scriptModalState.logLoadedAtByJob[selectedJobId] || 0);
+  if (
+    scriptModalState.view === "logs" &&
+    selectedJobId &&
+    scriptModalState.logLoadingJob !== selectedJobId &&
+    Date.now() - loadedAt >= 1200 &&
+    (String(selectedJob?.status || "") === "running" || !scriptModalState.logByJob[selectedJobId])
+  ) {
     loadRunScriptLog(selectedJobId).catch(() => {});
   }
   if (scriptModalState.error) setElementMsg("runScriptMsg", scriptModalState.error, "error");
 }
+window.renderScriptRunnerUi = renderScriptRunnerUi;
+function renderRunScriptModal() {
+  renderScriptRunnerUi();
+}
+window.renderRunScriptModal = renderRunScriptModal;
 function renderBenchmarkSurfaces() {
   hydrateBenchmarkFloatingState();
   if (benchmarkModalOpenPersisted && !benchmarkModalCollapsed) {
@@ -5152,7 +5171,7 @@ function renderBenchmarkSurfaces() {
     renderPresetScoresModal();
     refreshPresetScoresModalDetailFromStatus().catch(() => {});
   }
-  if ($("runScriptModal") && !$("runScriptModal").classList.contains("hidden")) renderRunScriptModal();
+  if (currentLogSource === "script" || ($("runScriptModal") && !$("runScriptModal").classList.contains("hidden"))) renderScriptRunnerUi();
 }
 function handleBenchmarkJobTransition(previousStatus = {}, nextStatus = {}) {
   const previousJob = previousStatus?.benchmarks?.job || {};
@@ -5323,6 +5342,7 @@ function statusPollDelayMs() {
   }
   return STATUS_POLL_FOREGROUND_SLOW_MS;
 }
+let statusPollingRunning = false;
 function scheduleStatusPoll(delayMs = null) {
   statusPollNonce += 1;
   clearTimeout(statusPollTimer);
@@ -5339,7 +5359,13 @@ function scheduleStatusPoll(delayMs = null) {
   statusPollTimer = setTimeout(() => {
     statusPollTimer = null;
     if (nonce !== statusPollNonce) return;
-    refreshStatus().catch(() => {});
+    if (statusPollingRunning) return;
+    statusPollingRunning = true;
+    refreshStatus()
+      .catch(() => {})
+      .finally(() => {
+        statusPollingRunning = false;
+      });
   }, pollDelay);
   statusPollTimer?.unref?.();
 }

@@ -15,7 +15,7 @@ function renderLogSourcePanel() {
       { id: "debug", label: "Debug" },
       ...modelSources,
       { id: "benchmarks", label: "Benchmarks" },
-      ...(scriptActive ? [{ id: "script", label: "Script" }] : []),
+      { id: "script", label: "Script" },
       ...(updateActive || currentLogSource === "update"
         ? [{ id: "update", label: "Update" }]
         : []),
@@ -32,6 +32,7 @@ function renderLogSourcePanel() {
       .join("")}</div><div class="value smallgap" id="logsSourceSummary">-</div>`;
   }
   renderDebugLogCommandUi();
+  if (currentLogSource === "script" && typeof renderScriptRunnerUi === "function") renderScriptRunnerUi();
   if (!$("logsSourceSummary")) return;
   if (currentLogSource === "update") {
     $("logsSourceSummary").innerHTML =
@@ -64,7 +65,8 @@ function renderLogSourcePanel() {
   if (currentLogSource === "script") {
     const job = lastStatus?.script_job || {};
     $("logsSourceSummary").innerHTML =
-      `Script selected. ${escapeHtml(job.summary || "The live viewer follows the active upstream script output.")}${job.label ? ` <code>${escapeHtml(job.label)}</code>` : ""}`;
+      `Script runner selected. Execute validation suites, AI Studio setup, and diagnostic scripts with live terminal output.${job.label ? ` Active: <code>${escapeHtml(job.label)}</code>` : ""}`;
+    if (typeof renderScriptRunnerUi === "function") renderScriptRunnerUi();
     return;
   }
   if (String(currentLogSource || "").startsWith("model:")) {
@@ -896,13 +898,15 @@ function currentLogSourceDetached() {
 function logViewerVisible() {
   return !currentLogSourceDetached() && (activeTabName === "logs" || effectiveShowGlobalLogs());
 }
-function logIsNearBottom(box = $("log")) {
+function logIsNearBottom(box = $("logRender") || $("log")) {
   if (!box) return true;
   return box.scrollHeight - (box.scrollTop + box.clientHeight) <= 28;
 }
-function scrollLogToBottom(box = $("log")) {
+function scrollLogToBottom(box = $("logRender") || $("log")) {
   if (!box) return;
   box.scrollTop = box.scrollHeight;
+  const other = box.id === "logRender" ? $("log") : $("logRender");
+  if (other) other.scrollTop = box.scrollTop;
 }
 function logCacheEntry(signature) {
   if (!logCache[signature]) logCache[signature] = { text: "", loaded: false };
@@ -910,15 +914,20 @@ function logCacheEntry(signature) {
 }
 function renderCurrentLog(signature, options = {}) {
   const box = $("log");
+  const renderBox = $("logRender");
   const entry = logCacheEntry(signature);
   const nextValue = entry.loaded ? collapseRepeatedLogText(entry.text) : "Connecting...\n";
-  const changed = !!box && box.value !== nextValue;
-  if (box) {
-    if (changed) box.value = nextValue;
+  const changed = (!!box && box.value !== nextValue) || (!!renderBox && renderBox.dataset.renderedSig !== `${signature}:${nextValue.length}`);
+  if (box && changed) box.value = nextValue;
+  if (renderBox && changed) {
+    renderBox.innerHTML = renderAnsiHtml(nextValue);
+    renderBox.dataset.renderedSig = `${signature}:${nextValue.length}`;
+  }
+  if (changed) {
     if (searchState.active) {
-      if (changed) recalculateMatches(true);
-    } else if (changed && options.follow && $("autoscroll") && $("autoscroll").checked) {
-      scrollLogToBottom(box);
+      recalculateMatches(true);
+    } else if (options.follow && $("autoscroll") && $("autoscroll").checked) {
+      scrollLogToBottom(renderBox || box);
     }
   }
   flushPendingLogJump();
@@ -1751,8 +1760,15 @@ function focusBenchmarkLogs() {
   activateTab("logs", true);
 }
 function focusScriptLogs() {
+  if (typeof closeRunScriptModal === "function") closeRunScriptModal();
   if (currentLogSource !== "script") setCurrentLogSource("script");
   activateTab("logs", true);
+  if (typeof loadRunScripts === "function") loadRunScripts().catch(() => {});
+  if (typeof renderScriptRunnerUi === "function") renderScriptRunnerUi();
+  setTimeout(() => {
+    const wrap = $("scriptControlsWrap") || $("logCard");
+    if (wrap) wrap.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, 50);
 }
 function clearActiveLogJump() {
   pendingLogJump = null;

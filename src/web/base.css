@@ -594,6 +594,58 @@ body.resize-active * {
   border-color: #8a652b;
   box-shadow: inset 0 0 0 1px rgba(255, 179, 71, 0.14);
 }
+/* Terminal ANSI styling */
+.ansi-bold { font-weight: 700; }
+.ansi-dim { opacity: 0.72; }
+.ansi-italic { font-style: italic; }
+.ansi-underline { text-decoration: underline; }
+.ansi-black { color: #495057; }
+.ansi-red { color: #ff6b6b; }
+.ansi-green { color: #51cf66; }
+.ansi-yellow { color: #ffd43b; }
+.ansi-blue { color: #339af0; }
+.ansi-magenta { color: #cc5de8; }
+.ansi-cyan { color: #22b8cf; }
+.ansi-white { color: #f8f9fa; }
+.ansi-bright-black { color: #868e96; }
+.ansi-bright-red { color: #ff8787; }
+.ansi-bright-green { color: #69db7c; }
+.ansi-bright-yellow { color: #ffe066; }
+.ansi-bright-blue { color: #4dabf7; }
+.ansi-bright-magenta { color: #da77f2; }
+.ansi-bright-cyan { color: #3bc9db; }
+.ansi-bright-white { color: #ffffff; }
+.ansi-bg-black { background-color: #212529; }
+.ansi-bg-red { background-color: #c92a2a; }
+.ansi-bg-green { background-color: #2b8a3e; }
+.ansi-bg-yellow { background-color: #e67700; }
+.ansi-bg-blue { background-color: #1864ab; }
+.ansi-bg-magenta { background-color: #862e9c; }
+.ansi-bg-cyan { background-color: #0b7285; }
+.ansi-bg-white { background-color: #ced4da; color: #111; }
+.ansi-bg-bright-black { background-color: #343a40; }
+.ansi-bg-bright-red { background-color: #e03131; }
+.ansi-bg-bright-green { background-color: #2f9e44; }
+.ansi-bg-bright-yellow { background-color: #f08c00; }
+.ansi-bg-bright-blue { background-color: #1971c2; }
+.ansi-bg-bright-magenta { background-color: #9c36b5; }
+.ansi-bg-bright-cyan { background-color: #0c8599; }
+.ansi-bg-bright-white { background-color: #f1f3f5; color: #111; }
+.log-render {
+  overflow-y: auto;
+  user-select: text;
+  box-sizing: border-box;
+}
+.log-render mark.search-match {
+  background: #fcc419;
+  color: #111;
+  border-radius: 2px;
+}
+.log-render mark.search-match-current {
+  background: #ff922b;
+  color: #111;
+  font-weight: 700;
+}
 .log-card-hidden {
   display: none !important;
 }
@@ -3596,6 +3648,20 @@ details[open] > summary .score-collapse-cue::before {
   align-items: center;
   gap: 12px;
   flex-wrap: wrap;
+}
+.script-controls-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.script-controls-wrap.hidden {
+  display: none !important;
+}
+.script-controls-wrap .run-script-queue-card,
+.script-controls-wrap .run-script-validation-card,
+.script-controls-wrap .run-script-internal-card {
+  margin-bottom: 0;
 }
 .run-script-report-actions {
   display: inline-flex;
