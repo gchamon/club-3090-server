@@ -419,7 +419,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
         if path == "/admin/scripts":
             params = parse_admin_query_params(parsed)
             include_internal = str(params.get("include_internal") or "").strip().lower() in {"1", "true", "yes", "on"}
-            self.send_json({"ok": True, "scripts": discover_upstream_scripts(include_internal=include_internal), "include_internal": include_internal, "job": script_job_snapshot()})
+            self.send_json({"ok": True, "scripts": discover_upstream_scripts(include_internal=include_internal, include_validation=True), "include_internal": include_internal, "job": script_job_snapshot()})
             return
         if path == "/admin/scripts/jobs":
             self.send_json({"ok": True, "job": script_job_snapshot()})
@@ -427,6 +427,24 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
         if path == "/admin/scripts/log":
             params = parse_admin_query_params(parsed)
             self.send_json({"ok": True, **script_log_snapshot(job_id=params.get("job_id") or "", tail_lines=parse_tail_lines_param(params, 500))})
+            return
+        if path == "/admin/scripts/report":
+            params = parse_admin_query_params(parsed)
+            markdown, report_path = latest_rig_report_content()
+            download = str(params.get("download") or "").strip().lower() in {"1", "true", "yes", "on"}
+            if download:
+                if not markdown:
+                    self.send_bytes(b"No rig report generated yet. Run the Full Rig Report validation preset first.\n", content_type="text/plain; charset=utf-8", code=404)
+                    return
+                self.send_bytes(markdown.encode("utf-8"), content_type="text/markdown; charset=utf-8", code=200, download_name="my-rig.md")
+                return
+            self.send_json({
+                "ok": True,
+                "has_report": bool(markdown),
+                "markdown": markdown,
+                "path": report_path,
+                "filename": "my-rig.md",
+            })
             return
         if path == "/admin/benchmarks/detail":
             params = parse_admin_query_params(parsed)

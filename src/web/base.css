@@ -3583,6 +3583,38 @@ details[open] > summary .score-collapse-cue::before {
   align-items: center;
   justify-content: space-between;
 }
+.run-script-validation-card {
+  margin: 10px 0;
+  border: 1px solid rgba(77, 215, 199, 0.4);
+  background: rgba(13, 24, 38, 0.7);
+}
+.run-script-validation-card .resource-manager-card-head h3 {
+  color: #4dd7c7;
+}
+.run-script-log-title-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.run-script-report-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.run-script-report-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+  border-radius: 6px;
+  text-decoration: none;
+}
+.run-script-report-btn svg {
+  width: 14px;
+  height: 14px;
+}
 .run-script-card h3 {
   margin: 0;
   color: #eef7ff;

@@ -3506,6 +3506,16 @@ def benchmark_power_actions_owned():
         pass
     return False
 
+def script_power_actions_owned():
+    checker = globals().get("script_job_active")
+    try:
+        if callable(checker) and checker():
+            return True
+    except Exception:
+        pass
+    return False
+
+
 
 def ensure_default_runtime_power(reason="runtime_activity", force=False):
     global runtime_default_power_last
@@ -3996,6 +4006,8 @@ def set_cpu_governor(governor):
 def apply_gpu_idle_power(skip_fans=False):
     if benchmark_power_actions_owned():
         return ["benchmark active; gpu idle power deferred"]
+    if script_power_actions_owned():
+        return ["script job active; gpu idle power deferred"]
     if not power_optimizations_enabled:
         return ["power optimizations disabled"]
     results = []
@@ -4039,6 +4051,8 @@ def apply_gpu_active_power(skip_fans=False, force=False):
 def apply_cpu_idle_power():
     if benchmark_power_actions_owned():
         return ["benchmark active; cpu idle power deferred"]
+    if script_power_actions_owned():
+        return ["script job active; cpu idle power deferred"]
     results = set_cpu_governor(CPU_IDLE_GOVERNOR)
     with metrics_lock:
         power_state["cpu"] = "idle"
@@ -4107,6 +4121,11 @@ def idle_watchdog():
     while True:
         try:
             if benchmark_power_actions_owned():
+                idle_power_applied = False
+                time.sleep(15)
+                continue
+            if script_power_actions_owned():
+                ensure_default_runtime_power("script_job")
                 idle_power_applied = False
                 time.sleep(15)
                 continue

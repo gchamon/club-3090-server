@@ -5048,7 +5048,7 @@ function renderScriptCard(row) {
   const docsHtml = docs.length
     ? `<button class="script-help-btn script-info-btn" title="More Info" aria-label="More Info" onclick="openScriptDoc('${escapeJs(docs[0].root_path || "")}','${escapeJs(docs[0].relative_path || "")}')">i</button>`
     : "";
-  const internalBadge = row?.internal ? '<span class="status-badge status-warning">internal</span>' : "";
+  const internalBadge = row?.internal ? '<span class="status-badge status-warning">internal</span>' : (row?.category === "validation" ? '<span class="status-badge status-success">validation</span>' : "");
   return `<div class="run-script-card resource-manager-card"><div class="resource-manager-card-head"><div class="resource-manager-card-subrow"><div><h3>${escapeHtml(row?.label || row?.name || id)}</h3><div class="preset-help"><code>${escapeHtml(id)}</code></div></div><div class="script-card-controls">${internalBadge}${docsHtml}<button class="script-help-btn" title="Options" aria-label="Show script options" onclick="toggleScriptOptions('${escapeJs(id)}')">?</button></div></div><div class="preset-help">${escapeHtml(row?.description || "Upstream script.")}</div></div><label class="script-args-row">Arguments<input value="${escapeHtml(args)}" placeholder="optional switches or values" oninput="setScriptArgs('${escapeJs(id)}', this.value)" /></label><div class="resource-manager-card-actions"><button class="btn green" ${locked ? "disabled" : ""} onclick="startDiscoveredScript('${escapeJs(id)}')">${queueBusy ? "Enqueue" : "Run"}</button></div>${optionsHtml}</div>`;
 }
 function renderScriptQueueRow(row, index) {
@@ -5061,6 +5061,19 @@ function renderScriptQueueRow(row, index) {
   const logButton = renderIconButton({ title: `View ${label} Logs`, action: `showQueuedScriptLog('${escapeJs(jobId)}')`, icon: "terminal", className: "run-script-queue-log" });
   const removeButton = renderIconButton({ title: status === "running" ? `Terminate and Remove ${label}` : `Remove ${label}`, action: `removeQueuedScript('${escapeJs(jobId)}')`, icon: "close", className: "run-script-queue-remove" });
   return `<div class="run-script-queue-row ${escapeHtml(status)}${selected ? " focused" : ""}" data-script-job-id="${escapeHtml(jobId)}"><span class="status-badge status-${status === "success" ? "success" : status === "failed" || status === "cancelled" ? "danger" : status === "running" ? "warning" : "info"}">${escapeHtml(status)}</span><div class="run-script-queue-main"><strong>${escapeHtml(label)}</strong><code>${escapeHtml(row?.script_id || "")}</code>${args ? `<span>${escapeHtml(args)}</span>` : ""}<div class="run-script-queue-progress"><i style="width:${progress}%"></i><span>Progress ${progress}%</span></div></div><div class="run-script-queue-actions">${logButton}${removeButton}</div></div>`;
+}
+async function copyLatestRigReport() {
+  try {
+    const res = await fetchJsonWithTimeout(`/admin/scripts/report?_=${Date.now()}`, { cache: "no-store" }, 10000);
+    const data = await res.json();
+    if (!res.ok || !data?.ok || !data?.markdown) {
+      throw new Error(data?.error || "No clean report available to copy yet.");
+    }
+    const ok = await copyTextValue(data.markdown);
+    setElementMsg("runScriptMsg", ok ? "Copied my-rig.md to clipboard!" : "Copy failed on this browser.", ok ? "success" : "error");
+  } catch (err) {
+    setElementMsg("runScriptMsg", messageText(err), "error");
+  }
 }
 function renderRunScriptModal() {
   ensureRunScriptModal();
@@ -5075,8 +5088,12 @@ function renderRunScriptModal() {
   const queue = scriptQueueRows();
   const locked = benchmarkJobActive();
   const scripts = Array.isArray(scriptModalState.scripts) ? scriptModalState.scripts : [];
-  const userScripts = scripts.filter((row) => !row?.internal);
-  const internalScripts = scripts.filter((row) => row?.internal);
+  const validationScripts = scripts.filter((row) => row?.category === "validation");
+  const userScripts = scripts.filter((row) => !row?.internal && row?.category !== "validation");
+  const internalScripts = scripts.filter((row) => row?.internal && row?.category !== "validation");
+  const validationCards = validationScripts.length
+    ? `<section class="run-script-validation-card resource-manager-card"><div class="resource-manager-card-head"><div><h3>Benchmarking & Validation</h3><div class="preset-help">One-click upstream PR, issue evidence, and rig validation suites (runs under active GPU power).</div></div></div><div class="run-script-grid resource-manager-grid">${validationScripts.map((row) => renderScriptCard(row)).join("")}</div></section>`
+    : "";
   const cards = scriptModalState.loading
     ? '<div class="empty-variant-note">Discovering upstream scripts...</div>'
     : userScripts.length
@@ -5095,8 +5112,12 @@ function renderRunScriptModal() {
   const selectedLog = String(scriptModalState.logByJob[selectedJobId] || (selectedJobId === String(job.job_id || "") && Array.isArray(job.log_tail) ? job.log_tail.slice(-500).join("\n") : ""));
   const logToggle = renderIconButton({ title: scriptModalState.view === "logs" ? "Show Scripts" : "View Logs", action: "toggleRunScriptLogView()", icon: scriptModalState.view === "logs" ? "chevron-left" : "terminal", className: "benchmark-run-toggle run-script-log-toggle" });
   const scriptControls = `<div class="benchmark-actions"><label class="script-internal-toggle"><input type="checkbox" ${scriptModalState.showInternal ? "checked" : ""} onchange="setRunScriptsInternalVisible(this.checked)" />Display internal backend scripts</label></div>`;
-  const scriptsView = `<div class="run-script-grid resource-manager-grid">${cards}</div>${internalSection}`;
-  const logsView = `<div class="run-script-selected-log"><div class="resource-manager-card-head"><h3>${escapeHtml(selectedJob?.label || selectedJob?.script_id || "Script Log")}</h3><span class="run-script-status-label">${escapeHtml(selectedJob?.status || "idle")}</span></div><pre class="benchmark-log-tail run-script-log-viewer" tabindex="0">${escapeHtml(selectedLog || (scriptModalState.logLoadingJob === selectedJobId ? "Loading script log..." : "No script log entries yet."))}</pre></div>`;
+  const scriptsView = `${validationCards}<div class="run-script-grid resource-manager-grid">${cards}</div>${internalSection}`;
+  const isReportJob = String(selectedJob?.script_id || "").includes("report") || String(selectedJob?.command || "").includes("report.sh");
+  const reportActionsHtml = isReportJob
+    ? `<div class="run-script-report-actions"><a class="btn primary-btn run-script-report-btn" href="/admin/scripts/report?download=1" target="_blank" rel="noopener">${svgIcon("download")} Download my-rig.md</a><button type="button" class="btn secondary-btn run-script-report-btn" onclick="copyLatestRigReport()">${svgIcon("copy")} Copy Report</button></div>`
+    : "";
+  const logsView = `<div class="run-script-selected-log"><div class="resource-manager-card-head"><div class="run-script-log-title-row"><h3>${escapeHtml(selectedJob?.label || selectedJob?.script_id || "Script Log")}</h3>${reportActionsHtml}</div><span class="run-script-status-label">${escapeHtml(selectedJob?.status || "idle")}</span></div><pre class="benchmark-log-tail run-script-log-viewer" tabindex="0">${escapeHtml(selectedLog || (scriptModalState.logLoadingJob === selectedJobId ? "Loading script log..." : "No script log entries yet."))}</pre></div>`;
   const queueCard = `<section class="run-script-queue-card resource-manager-card"><div class="resource-manager-card-head"><div><h3>Script Queue</h3><div class="preset-help">${escapeHtml(queueSummary)}</div></div><span class="benchmark-ready-controls run-script-ready-controls">${logToggle}</span></div><div class="run-script-queue">${queueRows}</div></section>`;
   body.innerHTML = `${queueCard}<div class="preset-help">${locked ? "Scripts cannot be run during a Model Scores benchmark, but discovery and logs remain available." : "Scripts run sequentially against the selected scope when a runtime is available."}</div>${scriptControls}${scriptModalState.view === "logs" ? logsView : scriptsView}`;
   const nextLogViewer = body.querySelector(".run-script-log-viewer");

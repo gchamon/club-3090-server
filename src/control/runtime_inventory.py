@@ -2576,6 +2576,7 @@ def _repo_subprocess_env():
             env[str(key)] = str(value)
     if str(os.environ.get("CLUB3090_RESTART") or "").strip():
         env["CLUB3090_RESTART"] = str(os.environ.get("CLUB3090_RESTART") or "").strip()
+    env["PYTHONUNBUFFERED"] = "1"
     return env
 
 

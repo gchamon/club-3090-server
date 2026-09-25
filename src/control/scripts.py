@@ -4,6 +4,71 @@ SCRIPT_RUNS_DIR = os.path.join(CONTROL_DIR, "script-runs")
 SCRIPT_STATE_FILE = os.path.join(SCRIPT_RUNS_DIR, "state.json")
 SCRIPT_LOG_TAIL_LINES = 500
 AI_STUDIO_EXTENSION_PAYLOAD_GZIP_BASE64 = ""  # Injected by build.py for shipped outputs.
+RIG_REPORT_OUTPUT_PATHS = [
+    os.path.join(CLUB3090_DIR, "results", "my-rig.md"),
+    os.path.join(CONTROL_DIR, "artifacts", "my-rig.md"),
+    os.path.join(SCRIPT_RUNS_DIR, "my-rig.md"),
+]
+
+
+def clean_rig_report_markdown(raw_text):
+    lines = str(raw_text or "").splitlines()
+    start_idx = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith("# club-3090 rig report"):
+            start_idx = i
+            break
+    if start_idx is None:
+        return ""
+    report_lines = []
+    for line in lines[start_idx:]:
+        if line.strip().startswith("[script] finished rc="):
+            break
+        report_lines.append(line)
+    return "\n".join(report_lines).strip() + "\n"
+
+
+def save_clean_rig_report(content):
+    clean = clean_rig_report_markdown(content)
+    if not clean:
+        return ""
+    for path in RIG_REPORT_OUTPUT_PATHS:
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(clean)
+        except Exception:
+            pass
+    return clean
+
+
+def latest_rig_report_content():
+    for path in RIG_REPORT_OUTPUT_PATHS:
+        try:
+            if os.path.isfile(path) and os.path.getsize(path) > 100:
+                with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                    text = handle.read()
+                    if "# club-3090 rig report" in text:
+                        return text, path
+        except Exception:
+            pass
+    state = read_script_job_state()
+    for row in reversed(state.get("queue") or []):
+        cmd = str(row.get("command") or "")
+        sid = str(row.get("script_id") or "")
+        if "report.sh" in cmd or "validation-rig-report" in sid:
+            log_file = str(row.get("log_file") or "")
+            if log_file and os.path.isfile(log_file):
+                try:
+                    with open(log_file, "r", encoding="utf-8", errors="replace") as handle:
+                        clean = clean_rig_report_markdown(handle.read())
+                        if clean:
+                            return clean, log_file
+                except Exception:
+                    pass
+    return "", ""
+
+
 
 script_job_lock = threading.RLock()
 script_worker_thread = None
@@ -59,6 +124,19 @@ def write_script_job_state(state):
     payload.update(dict(state or {}))
     write_json_file(SCRIPT_STATE_FILE, payload)
     return payload
+
+def script_job_active():
+    with script_job_lock:
+        if script_process is not None:
+            return True
+        state = read_script_job_state()
+        if bool(state.get("active")):
+            return True
+        for row in state.get("queue") or []:
+            if str((row or {}).get("status") or "").lower() == "running":
+                return True
+        return False
+
 
 
 def script_job_snapshot():
@@ -320,41 +398,117 @@ def script_discovery_row(root, path, internal=False):
         "internal": bool(internal),
     }
 
+def validation_preset_definitions():
+    report_script = os.path.join(CLUB3090_DIR, "scripts", "report.sh")
+    quality_script = os.path.join(CLUB3090_DIR, "scripts", "quality-test.sh")
+    sandbox_script = os.path.join(CLUB3090_DIR, "benchlocal-cli", "tools", "build-sandboxes.sh")
+    return [
+        {
+            "id": "validation-rig-report",
+            "name": "report.sh",
+            "label": "Full Rig Report (my-rig.md)",
+            "path": report_script,
+            "relative_path": "scripts/report.sh",
+            "description": "Captures hardware, OS, GPU, PCIe topology, P2P verdicts, and runs all validation stages to generate a paste-ready my-rig.md report for GitHub issues.",
+            "command_template": "bash scripts/report.sh --full",
+            "options": [
+                {"name": "--full", "description": "Run all validation stages (verify + stress + soak + bench + agentic)."},
+                {"name": "--verify", "description": "Run fast operational verification smoke only (~2 min)."},
+                {"name": "--stress", "description": "Run boundary and stress tests incl. needle recall (~10-20 min)."},
+            ],
+            "docs": script_doc_candidates(report_script),
+            "kind": "shell",
+            "category": "validation",
+            "internal": False,
+        },
+        {
+            "id": "validation-benchlocal-setup",
+            "name": "build-sandboxes.sh",
+            "label": "Setup / Update benchlocal-cli & Sandboxes",
+            "path": sandbox_script,
+            "relative_path": "benchlocal-cli/tools/build-sandboxes.sh",
+            "description": "Clones or updates benchlocal-cli, installs it into Python, and builds Docker sandboxes for quality pack evaluation.",
+            "command_template": "if [ -d benchlocal-cli ]; then git -C benchlocal-cli pull; else git clone https://github.com/noonghunna/benchlocal-cli.git; fi && pip install -e ./benchlocal-cli && bash benchlocal-cli/tools/build-sandboxes.sh",
+            "options": [],
+            "docs": [],
+            "kind": "shell",
+            "category": "validation",
+            "internal": False,
+        },
+        {
+            "id": "validation-quality-8pack-thinking",
+            "name": "quality-test.sh",
+            "label": "Quality 8-pack (Leg B · Thinking ON / Shipped)",
+            "path": quality_script,
+            "relative_path": "scripts/quality-test.sh",
+            "description": "Runs the complete 8-pack behavioral quality evaluation with thinking/reasoning enabled (shipped configuration for reasoning models).",
+            "command_template": "bash scripts/quality-test.sh --full --enable-thinking",
+            "options": [
+                {"name": "--full", "description": "Run all 8 behavioral quality packs (requires Docker sandboxes)."},
+                {"name": "--enable-thinking", "description": "Enable thinking / reasoning mode during evaluation."},
+            ],
+            "docs": script_doc_candidates(quality_script),
+            "kind": "shell",
+            "category": "validation",
+            "internal": False,
+        },
+        {
+            "id": "validation-quality-8pack-no-thinking",
+            "name": "quality-test.sh",
+            "label": "Quality 8-pack (Leg A · Thinking OFF / Baseline)",
+            "path": quality_script,
+            "relative_path": "scripts/quality-test.sh",
+            "description": "Runs the complete 8-pack behavioral quality evaluation with thinking disabled (baseline comparison for reasoning models).",
+            "command_template": "bash scripts/quality-test.sh --full --no-thinking",
+            "options": [
+                {"name": "--full", "description": "Run all 8 behavioral quality packs (requires Docker sandboxes)."},
+                {"name": "--no-thinking", "description": "Disable thinking / reasoning mode during evaluation."},
+            ],
+            "docs": script_doc_candidates(quality_script),
+            "kind": "shell",
+            "category": "validation",
+            "internal": False,
+        },
+    ]
 
-def discover_upstream_scripts(include_internal=False):
+
+
+def discover_upstream_scripts(include_internal=False, include_validation=False):
     root = script_discovery_root()
     rows = []
-    if not os.path.isdir(root):
-        return rows
-    seen = set()
-    for name in sorted(os.listdir(root)):
-        if name.startswith(".") or not name.lower().endswith(".sh"):
-            continue
-        path = os.path.join(root, name)
-        if not os.path.isfile(path):
-            continue
-        rows.append(script_discovery_row(root, path, internal=False))
-        seen.add(os.path.normpath(path))
-    if include_internal:
-        for dirpath, dirs, files in os.walk(root):
-            dirs[:] = [name for name in dirs if not name.startswith(".") and name not in {"__pycache__", "node_modules"}]
-            for name in sorted(files):
-                lower = name.lower()
-                if not lower.endswith((".sh", ".py")):
-                    continue
-                path = os.path.normpath(os.path.join(dirpath, name))
-                if path in seen:
-                    continue
-                rows.append(script_discovery_row(root, path, internal=True))
-                seen.add(path)
-    rows.sort(key=lambda row: (1 if row.get("internal") else 0, str(row.get("label") or row.get("name") or row.get("relative_path") or "").lower(), str(row.get("relative_path") or "").lower()))
-    return rows
-
+    if os.path.isdir(root):
+        seen = set()
+        for name in sorted(os.listdir(root)):
+            if name.startswith(".") or not name.lower().endswith(".sh"):
+                continue
+            path = os.path.join(root, name)
+            if not os.path.isfile(path):
+                continue
+            rows.append(script_discovery_row(root, path, internal=False))
+            seen.add(os.path.normpath(path))
+        if include_internal:
+            for dirpath, dirs, files in os.walk(root):
+                dirs[:] = [name for name in dirs if not name.startswith(".") and name not in {"__pycache__", "node_modules"}]
+                for name in sorted(files):
+                    lower = name.lower()
+                    if not lower.endswith((".sh", ".py")):
+                        continue
+                    path = os.path.normpath(os.path.join(dirpath, name))
+                    if path in seen:
+                        continue
+                    rows.append(script_discovery_row(root, path, internal=True))
+                    seen.add(path)
+        rows.sort(key=lambda row: (1 if row.get("internal") else 0, str(row.get("label") or row.get("name") or row.get("relative_path") or "").lower(), str(row.get("relative_path") or "").lower()))
+    presets = [dict(r) for r in validation_preset_definitions()] if include_validation else []
+    return presets + rows
 
 def resolve_upstream_script(script_id):
     wanted = str(script_id or "").strip().replace("\\", "/")
     if not wanted:
         raise ValueError("script_id is required")
+    for row in validation_preset_definitions():
+        if row.get("id") == wanted:
+            return dict(row)
     for row in discover_upstream_scripts(include_internal=True):
         if row.get("id") == wanted:
             return row
@@ -378,15 +532,21 @@ def script_runtime_context(instance_id=""):
 
 
 def script_command_for(row, args):
+    template = str(row.get("command_template") or "").strip()
+    norm_args = normalize_script_args(args)
+    if template:
+        if norm_args:
+            suffix = " ".join(shlex.quote(str(arg)) for arg in norm_args)
+            return f"{template} {suffix}".strip()
+        return template
     path = str(row.get("path") or "")
     quoted_path = shlex.quote(path)
-    suffix = " ".join(shlex.quote(str(arg)) for arg in normalize_script_args(args))
+    suffix = " ".join(shlex.quote(str(arg)) for arg in norm_args)
     if row.get("kind") == "python":
         base = f"python3 {quoted_path}"
     else:
         base = f"bash {quoted_path}"
     return f"{base} {suffix}".strip()
-
 
 def image_studio_extension_install_snippet():
     payload = str(AI_STUDIO_EXTENSION_PAYLOAD_GZIP_BASE64 or "")
@@ -1523,6 +1683,13 @@ def execute_script_job(job):
         env["MODEL"] = str(context.get("served_model_name") or "")
     if context.get("engine"):
         env["ENGINE_KIND"] = str(context.get("engine") or "")
+    env["PYTHONUNBUFFERED"] = "1"
+    try:
+        wake_fn = globals().get("ensure_default_runtime_power")
+        if callable(wake_fn):
+            wake_fn("script_job", force=True)
+    except Exception:
+        pass
     rc = 999
     try:
         with open(log_file, "a", encoding="utf-8", newline="\n") as handle:
@@ -1559,11 +1726,17 @@ def execute_script_job(job):
                         break
                 state["queue"] = queue
                 write_script_job_state(script_state_mirror_job(state, job))
+            captured_lines = []
+            is_report_run = "report.sh" in command or "validation-rig-report" in str(job.get("script_id") or "")
             for line in process.stdout:
                 handle.write(line)
                 handle.flush()
+                if is_report_run:
+                    captured_lines.append(line)
             rc = int(process.wait())
             handle.write(f"\n[script] finished rc={rc}\n")
+            if is_report_run and captured_lines:
+                save_clean_rig_report("".join(captured_lines))
     except Exception as exc:
         try:
             with open(log_file, "a", encoding="utf-8", newline="\n") as handle:

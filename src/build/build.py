@@ -34,6 +34,7 @@ SMOKE_TEST_REGISTRY = [
     (17, "debug_transfer_expansion_smoke", "Debug transfer expansion smoke"),
     (18, "storage_browser_chunk_smoke", "Storage browser chunk smoke"),
     (19, "docker_logrotate_refresh_smoke", "Docker logrotate refresh smoke"),
+    (20, "script_validation_suite_smoke", "Script validation suite and power management smoke"),
 ]
 SMOKE_TEST_ID_TO_NAME = {str(test_id): name for test_id, name, _label in SMOKE_TEST_REGISTRY}
 SMOKE_TEST_NAME_TO_ID = {name: test_id for test_id, name, _label in SMOKE_TEST_REGISTRY}
@@ -901,6 +902,20 @@ def build_release(
                 print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
                 return 1
             report.add_test("docker_logrotate_refresh_smoke", "passed", logrotate_detail or "Docker logrotate refresh smoke test passed")
+
+        if not smoke_test_selector.skip(report, "script_validation_suite_smoke"):
+            flush_build_report(report, "running script validation suite smoke test")
+            validation_suite_ok, validation_suite_detail = run_script_validation_suite_smoke_test(
+                temp_control,
+                temp_dir,
+                "control.script-validation-suite.py",
+            )
+            if not validation_suite_ok:
+                report.add_test("script_validation_suite_smoke", "failed", validation_suite_detail or "Script validation suite smoke test failed")
+                flush_build_report(report, "build failed: script validation suite smoke test")
+                print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
+                return 1
+            report.add_test("script_validation_suite_smoke", "passed", validation_suite_detail or "Script validation suite smoke test passed")
 
         script_embedded = extract_embedded_control(built_script)
         if script_embedded != built_control.rstrip("\n"):
