@@ -9739,6 +9739,11 @@ function aiStudioModelTypeCount(type) {
   }[type] || [];
   return aiStudioLaneCountLabel(lanes);
 }
+function aiStudioTextModelCount() {
+  const models = inventoryModels();
+  const installed = models.filter((model) => model?.installed_state === "ready").length;
+  return `${installed} / ${models.length}`;
+}
 function selectAIStudioModelType(type) {
   const nextType = String(type || "").trim().toLowerCase();
   if (!["image", "audio", "speech", "video", "text"].includes(nextType)) return;
@@ -9759,19 +9764,20 @@ function renderAIStudioTab() {
   const presets = $("presets");
   if (!typeHost || !contentHost || !presets) return;
   const counts = [
+    ["text", "Text Models"],
     ["image", "Image Models"],
     ["audio", "Audio Models"],
     ["speech", "Speech Models"],
     ["video", "Video Models"],
-    ["text", "Text Models"],
   ];
-  setHtmlIfChanged(typeHost, `<div class="ai-studio-summary-row">${counts.map(([key, label]) => `<button type="button" class="resource-manager-total-card ai-studio-model-type${aiStudioModelType === key ? " active" : ""}" aria-pressed="${aiStudioModelType === key ? "true" : "false"}" onclick="selectAIStudioModelType('${key}')"><span class="resource-manager-total-label">${label}</span><span class="resource-manager-total-value">${key === "text" ? inventoryModels().length : aiStudioModelTypeCount(key)}</span></button>`).join("")}</div>`);
+  setHtmlIfChanged(typeHost, `<div class="ai-studio-summary-row">${counts.map(([key, label]) => `<button type="button" class="resource-manager-total-card ai-studio-model-type${aiStudioModelType === key ? " active" : ""}" aria-pressed="${aiStudioModelType === key ? "true" : "false"}" onclick="selectAIStudioModelType('${key}')"><span class="resource-manager-total-label">${label}</span><span class="resource-manager-total-value">${key === "text" ? aiStudioTextModelCount() : aiStudioModelTypeCount(key)}</span></button>`).join("")}</div>`);
   const textMode = aiStudioModelType === "text";
   contentHost.classList.toggle("hidden", textMode);
   presets.classList.toggle("hidden", !textMode);
   if (!textMode) setHtmlIfChanged(contentHost, renderAIStudioView());
 }
 function renderAIStudioView() {
+  const rows = aiStudioResourceRows();
   const imageSummaryLanes = [
     { key: "hidream-o1", primaryMatch: ["hidream-o1", "hidream_o1", "hidream"] },
     { key: "ideogram-4", primaryMatch: ["ideogram4_fp8_scaled", "ideogram4_unconditional"] },

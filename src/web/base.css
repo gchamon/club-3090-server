@@ -5531,6 +5531,14 @@ details[open] > summary .score-collapse-cue::before {
   font: inherit;
   text-align: left;
 }
+.ai-studio-model-type {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.ai-studio-model-surface {
+  margin-top: 16px;
+}
 .ai-studio-model-type:hover,
 .ai-studio-model-type:focus-visible,
 .ai-studio-model-type.active {

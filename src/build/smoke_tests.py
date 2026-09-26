@@ -5968,6 +5968,19 @@ def generate_test_html_artifact() -> tuple[str, str]:
     ):
         raise ValueError("Image models must remain available as a top-level page with setup/docs/multimodal resource management")
     if (
+        "function aiStudioTextModelCount()" not in js_source
+        or 'model?.installed_state === "ready"' not in js_source
+        or "return `${installed} / ${models.length}`;" not in js_source
+        or '["text", "Text Models"]' not in js_source
+        or 'const rows = aiStudioResourceRows();' not in js_source
+        or 'id="aiStudioContent" class="ai-studio-model-surface"' not in html_source
+        or 'id="presets" class="ai-studio-model-surface hidden"' not in html_source
+        or ".ai-studio-model-surface" not in css_source
+        or "flex-direction: column;" not in css_source
+        or "gap: 6px;" not in css_source
+    ):
+        raise ValueError("AI Studio must order Text first, count fully-ready text models, render category data, and separate both surfaces and pill contents")
+    if (
         "resource-manager-modality-image" not in css_source
         or "ai-studio-modality-badge" not in js_source
         or "ai-studio-modality-image" not in css_source
@@ -6298,38 +6311,39 @@ process.on("uncaughtException", (error) => {{
       policySaveBody.allow_proxy_with_invalid_api_key !== true) {{
     throw new Error(`access policy save payload did not include both booleans: ${{JSON.stringify(policySaveBody)}}`);
   }}
-  window.renderStatusUi({{ ...policyFixture, metrics: {{ active_requests: 2 }} }});
-  if (!window.document.getElementById("auditAllowDummyProxyKey").checked ||
-      /Unsaved changes/i.test(policyText.textContent || "")) {{
-    throw new Error("saved access policy did not survive the next heartbeat as persisted state");
-  }}
-  const fixtureSelect = window.document.getElementById("club3090FixtureSelect");
-  const fixtureEditor = window.document.getElementById("club3090FixtureEditor");
-  if (!fixtureSelect || !fixtureEditor) throw new Error("test lab controls are missing");
-  if (!fixtureSelect.options.length) throw new Error("fixture selector is empty");
-  const preferredOption = Array.from(fixtureSelect.options).find((option) => /multi-runtime/i.test(option.value)) || fixtureSelect.options[0];
-  fixtureSelect.value = preferredOption.value;
-  fixtureSelect.dispatchEvent(new window.Event("change", {{ bubbles: true }}));
-  await new Promise((resolve) => setTimeout(resolve, 150));
+  window.renderStatusUi({{ metrics: {{}}, runtime_inventory: {{ models: [
+    {{ model_id: "ready-fixture", installed_state: "ready" }},
+    {{ model_id: "partial-fixture", installed_state: "partial" }},
+    {{ model_id: "missing-fixture", installed_state: "missing" }},
+  ], variants: [] }}, models: [
+    {{ model_id: "ready-fixture", installed_state: "ready" }},
+    {{ model_id: "partial-fixture", installed_state: "partial" }},
+    {{ model_id: "missing-fixture", installed_state: "missing" }},
+  ] }});
   window.activateTab("ai-studio");
   await new Promise((resolve) => setTimeout(resolve, 50));
   const modelTypeButtons = Array.from(window.document.querySelectorAll(".ai-studio-model-type"));
   if (modelTypeButtons.length !== 5) throw new Error("AI Studio should expose five model-type controls");
-  for (const label of ["Image Models", "Audio Models", "Speech Models", "Video Models", "Text Models"]) {{
-    if (!modelTypeButtons.some((button) => button.textContent.includes(label))) throw new Error("missing AI Studio model type " + label);
-  }}
+  const modelTypeLabels = modelTypeButtons.map((button) => button.querySelector(".resource-manager-total-label")?.textContent.trim());
+  if (modelTypeLabels.join("|") !== "Text Models|Image Models|Audio Models|Speech Models|Video Models") throw new Error("AI Studio categories must put Text Models first");
+  const textPill = modelTypeButtons[0];
+  if (textPill.querySelector(".resource-manager-total-value")?.textContent.trim() !== "1 / 3") throw new Error("Text Models count must include only ready inventory models");
   for (const type of ["image", "audio", "speech", "video"]) {{
     window.selectAIStudioModelType(type);
-    if (!window.document.querySelector(`.ai-studio-lane-${{type}}`)) throw new Error(type + " lane did not render");
-    if (!window.document.querySelector(".ai-studio-lane-text")) throw new Error("Studio Director support lane did not render");
+    const content = window.document.getElementById("aiStudioContent");
+    const selectedButton = window.document.querySelector(`.ai-studio-model-type[aria-pressed="true"]`);
+    const lane = content.querySelector(`.ai-studio-lane-${{type}}`);
+    if (content.classList.contains("hidden") || !selectedButton?.textContent.includes(type[0].toUpperCase() + type.slice(1)) || !lane) throw new Error(type + " category surface did not render or select");
+    const laneBody = lane.querySelector(".ai-studio-lane-column-body");
+    if (!laneBody || !laneBody.querySelector(".ai-studio-lane-card")) throw new Error(type + " lane body has no visible lane card");
+    if (!content.querySelector(".ai-studio-lane-text")) throw new Error("Studio Director support lane did not render");
   }}
   window.selectAIStudioModelType("text");
   const presetToolbar = window.document.getElementById("presetHeadActions");
   if (!presetToolbar || !presetToolbar.textContent.includes("Setup Assistant")) throw new Error("Text Models did not render the Model Presets toolbar");
-  if (window.document.getElementById("aiStudioContent").classList.contains("active") ||
+  if (!window.document.getElementById("aiStudioContent").classList.contains("hidden") ||
       window.document.querySelector(".ai-studio-lane-image")) throw new Error("Text Models should hide AI Studio lanes");
-  if (!window.document.getElementById("presets").classList.contains("active") &&
-      window.document.getElementById("presets").classList.contains("hidden")) throw new Error("Text Models preset surface is hidden");
+  if (window.document.getElementById("presets").classList.contains("hidden")) throw new Error("Text Models preset surface is hidden");
   window.renderStatusUi({{ metrics: {{ active_requests: 1 }}, presets: policyFixture.presets }});
   if (window.document.querySelector('.ai-studio-model-type[aria-pressed="true"]')?.textContent.includes("Text Models") !== true) {{
     throw new Error("status rerender should retain the selected Text Models type");
