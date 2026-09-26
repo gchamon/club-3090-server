@@ -435,8 +435,10 @@ def validate_model_score_description_source(js_text: str) -> list[str]:
         or "os.path.commonpath([resource_path, requested]) == resource_path" not in shared_text
         or 'errorTargetId: "presetResourceMsg"' not in js_text
         or "Deleting model resource and rebuilding inventory" not in js_text
+        or "Other presets may share them and will need to download them again" not in js_text
+        or "Generated gallery files and conversations are not deleted" not in js_text
     ):
-        issues.append("Model Manager resource deletes must report status and allow safe inactive resource cleanup during background benchmarks")
+        issues.append("Per-model resource deletion must report status, preserve safe cleanup behavior, and explain shared-file and generated-media effects")
     if (
         "state = { ...(cfg || {}), ...searchState, ...cached, ...hashState }" not in runtime_state_text
         or "function applyLocationUiStateOverride" not in runtime_state_text
@@ -507,7 +509,7 @@ def validate_model_score_description_source(js_text: str) -> list[str]:
     if not all(
         call in activate_tab_source
         for call in (
-            'if (activeTabName === "presets")',
+            'if (activeTabName === "ai-studio")',
             "renderPresetScopeTabs();",
             "renderModelInstallStatus();",
             "renderDynamicPresetModels();",
@@ -759,7 +761,7 @@ def validate_model_score_description_source(js_text: str) -> list[str]:
         or 'const left = [single, advanced].filter(Boolean).join("");' not in js_text
         or 'const right = [custom, dual, experimental].filter(Boolean).join("");' not in js_text
         or 'left && right ? "variant-groups-two-column" : "variant-groups-single-column"' not in js_text
-        or "variantIsCustom(variant) && !presetIsHidden(variant)" not in js_text
+        or "modelIsCustom(model)" not in js_text
         or "variantIsCustom(row) && !variantIsMigrated(row)" not in js_text
         or "const catalogRows = nonDeprecatedRows.filter((row) => !customRows.includes(row));" not in js_text
         or 'if (!items.length && options.hideEmpty !== false) return "";' not in js_text
@@ -801,35 +803,25 @@ def validate_model_score_description_source(js_text: str) -> list[str]:
     ):
         issues.append("preset cards must reuse unchanged rendered inventory instead of rebuilding on every status poll")
     if (
-        "model_cache_root_size_summary" not in shared_text
-        or "delete_model_cache_paths" not in shared_text
-        or '"/admin/model-cache/delete"' not in http_text
-        or "model_cache_size_bytes" not in js_text
+        "model_resource_inventory_entries" not in shared_text
+        or "delete_model_cache_paths" in shared_text
+        or '"/admin/model-cache/delete"' in http_text
+        or "start_model_update_check(" in shared_text
+        or 'path == "/admin/model-updates/check"' in http_text
+        or "model_cache_size_bytes" in shared_text
         or "model_cache_entries" not in js_text
-        or "model_resource_root_size_bytes" not in js_text
-        or "model_resource_root_entries" not in shared_text
+        or "model_resource_root_size_bytes" in shared_text
         or "model_resource_file_entries" not in shared_text
         or "model_resource_file_entries" not in js_text
         or '".onnx"' not in shared_text
         or "onnx|npy" not in js_text
         or 'enrich_runtime_inventory_cache_sizes(shaped.get("runtime_inventory"))' not in system_text
         or "inventory = enrich_runtime_inventory_cache_sizes(rebuild_runtime_inventory())" not in http_text
-        or "promptDeleteModelCachePaths" not in js_text
-        or "Total Downloaded Resource Disk Usage" not in js_text
-        or "Models + Cache" not in js_text
         or "_path_contains_model_payload" not in shared_text
-        or "Not currently attached to a discovered preset" not in js_text
     ):
-        issues.append("Model Manager must distinguish model resources from cache and expose safe cleanup only for cache entries")
-    if (
-        "openPresetCardFromResourceManager" not in js_text
-        or "data-preset-selector" not in js_text
-        or "preset-card-focus-pulse" not in css_text
-        or "resource-manager-usage-button" not in css_text
-        or "function resourceManagerPresetUsageMeta" not in js_text
-        or '"Preset usage"' in js_text
-    ):
-        issues.append("Model Manager preset usage rows must navigate to the exact preset card and show useful generated metadata")
+        issues.append("Image models resource inventory must classify downloaded model files and retain lane resource details")
+    if "openPresetCardFromResourceManager" in js_text or "renderModelResourceManagerView" in js_text:
+        issues.append("Removed Model Manager navigation and aggregate view must not return")
     if (
         "function openBenchmarkForPreset" not in js_text
         or "preselectBenchmarkPreset" not in js_text
@@ -1006,7 +998,7 @@ def validate_model_score_description_source(js_text: str) -> list[str]:
         issues.append("Benchmark rows must keep assigned GPUs reserved until terminal runtime cleanup and target VRAM settling finish")
     if (
         "benchmarkMiniWindow" not in js_text
-        or "collapseBenchmarkAllModal" not in js_text
+        or "minimizeBenchmarksPage" not in js_text
         or "startBenchmarkModalDrag" not in js_text
         or 'icon: "detach", className: "benchmark-mini-expand"' not in js_text
         or "benchmark-mini-runner-list" not in js_text
@@ -1356,7 +1348,7 @@ def validate_model_score_description_source(js_text: str) -> list[str]:
     render_queue_row_source = js_text.split("function renderBenchmarkQueueRow", 1)[-1].split("function renderBenchmarkFailedRow", 1)[0]
     render_stage_controls_source = js_text.split("function renderBenchmarkStageControls", 1)[-1].split("function ensureBenchmarkQueueSelection", 1)[0]
     lock_markup_source = js_text.split("function benchmarkLockActiveControlMarkup", 1)[-1].split("function applyBenchmarkModalActiveControlLock", 1)[0]
-    active_lock_source = js_text.split("function applyBenchmarkModalActiveControlLock", 1)[-1].split("function renderBenchmarkAllModal", 1)[0]
+    active_lock_source = js_text.split("function applyBenchmarkModalActiveControlLock", 1)[-1].split("function renderBenchmarksPage", 1)[0]
     if (
         '["success", "completed"].includes(status)' not in render_queue_row_source
         or 'status === "failed"' not in render_queue_row_source
@@ -1797,19 +1789,23 @@ process.on("uncaughtException", (error) => {{
     variants: [],
   }};
   context.__selectorStatus = selectorStatus;
-  vm.runInContext("lastStatus = __selectorStatus; ensureDynamicPresetLayout(); renderPresetModelSelector();", context);
+  vm.runInContext("localStorage.setItem('club3090_recent_model_family', 'custom-fixture'); lastStatus = __selectorStatus; ensureDynamicPresetLayout(); renderPresetModelSelector();", context);
   const selectorHtml = String(getElement("presetModelSelector").innerHTML || "");
   if (!selectorHtml.includes("Fixture Custom")) {{
     throw new Error("preset model selector should render custom model tabs");
   }}
-  if (selectorHtml.includes("custom-model-trigger") || selectorHtml.includes("Hidden Presets") || selectorHtml.includes("Model Manager") || selectorHtml.includes("Benchmarks")) {{
-    throw new Error("preset model selector should only render model tabs; actions belong in the header menu");
+  if (selectorHtml.includes("Model Manager") || selectorHtml.includes("Benchmarks")) {{
+    throw new Error("model selector should contain model families only");
   }}
-  const presetMenuHtml = String(getElement("presetActionsMenu").innerHTML || vm.runInContext("renderPresetActionsMenu()", context) || "");
-  for (const marker of ["preset-menu-button", "Setup Assistant", "Rebuild Model DB", "Hidden Presets", "Custom Model", "Model Manager", "Benchmarks", "preset-menu-rebuild", "preset-menu-benchmarks"]) {{
-    if (!presetMenuHtml.includes(marker)) {{
-      throw new Error("preset actions menu is missing " + marker);
-    }}
+  if (!selectorHtml.includes("Fixture Custom") || !selectorHtml.includes("Qwen3.6-27B")) {{
+    throw new Error("preset model selector should retain both fixture model families");
+  }}
+  const presetToolbarHtml = String(vm.runInContext("renderPresetHeadActionsHtml()", context) || "");
+  for (const marker of ["Setup Assistant", "Rebuild Model DB", "Add custom model", "Show hidden presets", "openPresetFilterModal()", "toggleHiddenPresetsVisibility()"] ) {{
+    if (!presetToolbarHtml.includes(marker)) throw new Error("Text models toolbar is missing " + marker);
+  }}
+  if (presetToolbarHtml.includes("Model Manager") || presetToolbarHtml.includes("presetActionsMenu")) {{
+    throw new Error("Text models toolbar must not recreate the removed preset actions menu or Model Manager");
   }}
   const presetStatus = {{
     ...statusPayload,
@@ -1981,8 +1977,7 @@ process.on("uncaughtException", (error) => {{
   }}
   const missingScoreHtml = String(vm.runInContext("lastStatus = {{ benchmarks: {{ scores: {{}}, running: {{}}, job: {{ active: false }} }} }}; renderPresetScoreLabel('never-scored', {{ upstream_tag: 'never-scored' }})", context) || "");
   const missingScoreBody = String(vm.runInContext("missingModelScoresModalBody()", context) || "");
-  if (!missingScoreHtml.includes("No Model Scores are Available on this Preset Yet. Run Benchmarks through the Presets menu to calculate scores") || !missingScoreHtml.includes("showMissingModelScoresInfo('never-scored')") || missingScoreHtml.includes("disabled") || !missingScoreBody.includes("<br><br>") || !String(vm.runInContext("showMissingModelScoresInfo.toString()", context) || "").includes("Run Benchmark")) {{
-    throw new Error("missing Model Scores cards should be clickable and open Benchmarks for that preset");
+  if (!missingScoreHtml.includes("No Model Scores are Available on this Preset Yet. Run Benchmarks to calculate scores") || !missingScoreHtml.includes("showMissingModelScoresInfo('never-scored')") || missingScoreHtml.includes("disabled") || !missingScoreBody.includes("<br><br>") || !String(vm.runInContext("showMissingModelScoresInfo.toString()", context) || "").includes("Run Benchmarks")) {{
   }}
   const failGlyphHtml = String(vm.runInContext("renderScoreValueWithGlyph('❌', 0)", context) || "");
   if (!failGlyphHtml.includes("❌") || failGlyphHtml.includes("<svg")) {{
@@ -2215,8 +2210,8 @@ process.on("uncaughtException", (error) => {{
   if (overlapSelectedStages.length !== 1 || overlapSelectedStages[0] !== "bench") {{
     throw new Error("Repairable benchmark rows must keep backend-selected repair stages when merged with already scored metadata");
   }}
-  vm.runInContext("lastStatus = __benchmarkCountsStatus; benchmarkAllModalMode = 'full'; ensureBenchmarkAllModal(); renderBenchmarkAllModal();", context);
-  const fullCountsHtml = String(getElement("benchmarkAllBody").innerHTML || "");
+  vm.runInContext("lastStatus = __benchmarkCountsStatus; benchmarkPageMode = 'full'; ensureBenchmarksPage(); renderBenchmarksPage();", context);
+  const fullCountsHtml = String(getElement("benchmarksPageBody").innerHTML || "");
   if (!fullCountsHtml.includes("1 eligible") || !fullCountsHtml.includes("<span>Eligible</span><span>1</span>") || !fullCountsHtml.includes("<span>Already Scored</span><span>1</span>") || !fullCountsHtml.includes("<span>Ineligible</span><span>1</span>") || !fullCountsHtml.includes("<span>Experimental</span><span>1</span>") || !fullCountsHtml.includes("<span>Deprecated</span><span>1</span>") || fullCountsHtml.includes("<span>Skipped</span>")) {{
     throw new Error("Benchmarks modal should render the currently selected Full eligibility counts");
   }}
@@ -2245,7 +2240,7 @@ process.on("uncaughtException", (error) => {{
   }}
   vm.runInContext("updateBenchmarkStageSelection('full', 'ik-llama/iq4ks-mtp', 'bench', true)", context);
   await Promise.resolve();
-  const stageSelectedHtml = String(getElement("benchmarkAllBody").innerHTML || "");
+  const stageSelectedHtml = String(getElement("benchmarksPageBody").innerHTML || "");
   const selectedStageIds = Array.from(vm.runInContext("[...benchmarkSelectedStages('full', 'ik-llama/iq4ks-mtp')]", context) || []);
   if (!stageSelectedHtml.includes("Verify full") || !selectedStageIds.includes("bench") || !selectedStageIds.includes("verify-full")) {{
     throw new Error("Manual per-preset benchmark stage choices should override missing-stage defaults before launch");
@@ -2268,19 +2263,19 @@ process.on("uncaughtException", (error) => {{
   }}
   vm.runInContext("setBenchmarkStatusSelection('full', 'experimental', true)", context);
   await Promise.resolve();
-  const experimentalSelectedHtml = String(getElement("benchmarkAllBody").innerHTML || "");
+  const experimentalSelectedHtml = String(getElement("benchmarksPageBody").innerHTML || "");
   if (!experimentalSelectedHtml.includes("<span>Eligible</span><span>1</span>") || !experimentalSelectedHtml.includes("<span>Experimental</span><span>1</span>") || !experimentalSelectedHtml.includes("Experimental Preset") || !experimentalSelectedHtml.includes("benchmark-inventory-preset-row selected")) {{
     throw new Error("Experimental bulk selection should keep experimental presets in their category while marking them selected for the run");
   }}
   vm.runInContext("setBenchmarkStatusSelection('full', 'deprecated', true)", context);
   await Promise.resolve();
-  const deprecatedSelectedHtml = String(getElement("benchmarkAllBody").innerHTML || "");
+  const deprecatedSelectedHtml = String(getElement("benchmarksPageBody").innerHTML || "");
   if (!deprecatedSelectedHtml.includes("<span>Eligible</span><span>1</span>") || !deprecatedSelectedHtml.includes("<span>Deprecated</span><span>1</span>") || !deprecatedSelectedHtml.includes("Deprecated Preset")) {{
     throw new Error("Deprecated bulk selection should keep deprecated presets in their category while marking them selected for the run");
   }}
   vm.runInContext("setBenchmarkCompletedSelection('full', true)", context);
   await Promise.resolve();
-  const completedSelectedHtml = String(getElement("benchmarkAllBody").innerHTML || "");
+  const completedSelectedHtml = String(getElement("benchmarksPageBody").innerHTML || "");
   if (!completedSelectedHtml.includes("<span>Eligible</span><span>1</span>") || !completedSelectedHtml.includes("<span>Already Scored</span><span>1</span>") || !completedSelectedHtml.includes("vllm/scored")) {{
     throw new Error("Selecting already scored presets should keep them in the Already Scored category while marking them selected for the run");
   }}
@@ -2320,16 +2315,16 @@ process.on("uncaughtException", (error) => {{
       }},
     }},
   }};
-  vm.runInContext("lastStatus = __resumableBenchmarkStatus; benchmarkAllModalMode = 'quick'; ensureBenchmarkAllModal(); renderBenchmarkAllModal();", context);
-  const resumableHtml = String(getElement("benchmarkAllBody").innerHTML || "");
+  vm.runInContext("lastStatus = __resumableBenchmarkStatus; benchmarkPageMode = 'quick'; ensureBenchmarksPage(); renderBenchmarksPage();", context);
+  const resumableHtml = String(getElement("benchmarksPageBody").innerHTML || "");
   if (!resumableHtml.includes("Benchmark cancelled; queued work can be resumed.") || !resumableHtml.includes("vllm/dual") || !resumableHtml.includes("1 queued preset can be resumed.")) {{
     throw new Error("Benchmarks modal should render preserved cancelled queue state for resumable jobs");
   }}
   if (!resumableHtml.includes("Resume Full Benchmark") || resumableHtml.includes("benchmark-start-toggle iconbtn-disabled") || resumableHtml.includes('benchmark-start-toggle" disabled') || resumableHtml.includes('benchmark-start-toggle" aria-disabled="true"')) {{
     throw new Error("Resumable benchmark queues should keep the Start/Resume button enabled");
   }}
-  vm.runInContext("benchmarkModalAwaitingFreshSnapshot = true; benchmarkModalControlsLocked = true; renderBenchmarkAllModal();", context);
-  const awaitingResumableHtml = String(getElement("benchmarkAllBody").innerHTML || "");
+  vm.runInContext("benchmarkModalAwaitingFreshSnapshot = true; benchmarkModalControlsLocked = true; renderBenchmarksPage();", context);
+  const awaitingResumableHtml = String(getElement("benchmarksPageBody").innerHTML || "");
   if (awaitingResumableHtml.includes("Refreshing benchmark inventory") || !awaitingResumableHtml.includes("Benchmark cancelled; queued work can be resumed.") || !awaitingResumableHtml.includes("1 queued preset can be resumed.")) {{
     throw new Error("Fresh-inventory refresh placeholder must not hide an already resumable benchmark queue");
   }}
@@ -2375,27 +2370,26 @@ process.on("uncaughtException", (error) => {{
       }},
     }},
   }};
-  vm.runInContext("localStorage.removeItem(BENCHMARK_FINISHED_REVIEW_KEY); lastStatus = __finishedBenchmarkReviewStatus; benchmarkAllModalMode = 'quick'; benchmarkModalAwaitingFreshSnapshot = false; benchmarkModalControlsLocked = false; ensureBenchmarkAllModal(); renderBenchmarkAllModal();", context);
-  const finishedReviewHtml = String(getElement("benchmarkAllBody").innerHTML || "");
+  vm.runInContext("localStorage.removeItem(BENCHMARK_FINISHED_REVIEW_KEY); lastStatus = __finishedBenchmarkReviewStatus; benchmarkPageMode = 'quick'; benchmarkModalAwaitingFreshSnapshot = false; benchmarkModalControlsLocked = false; ensureBenchmarksPage(); renderBenchmarksPage();", context);
+  const finishedReviewHtml = String(getElement("benchmarksPageBody").innerHTML || "");
   if (!finishedReviewHtml.includes("Benchmark job completed.") || !finishedReviewHtml.includes("Reset Finished Benchmark Review") || !finishedReviewHtml.includes("benchmark-finished-toggle") || !finishedReviewHtml.includes("Finished: 2/2 (1 skipped)") || !finishedReviewHtml.includes("<span>Finished</span><span>1</span>") || !finishedReviewHtml.includes("<span>Failed</span><span>1</span>") || !finishedReviewHtml.includes("vllm/done") || !finishedReviewHtml.includes("vllm/queue-fail")) {{
     throw new Error("Completed idle benchmark sessions should remain reviewable with finished and failed queue rows visible");
   }}
   if (!finishedReviewHtml.includes('disabled onclick="retryFailedBenchmarkPreset') || /<input type="checkbox"(?![^>]*disabled)[^>]*onchange="updateBenchmarkQueueSelection/.test(finishedReviewHtml)) {{
     throw new Error("Completed idle benchmark review rows should stay read-only until the user resets the session");
   }}
-  vm.runInContext("benchmarkModalCollapsed = true; benchmarkMiniHidden = false; benchmarkMiniPosition = {{ left: 50, top: 60 }}; renderBenchmarkMiniWindow();", context);
+  vm.runInContext("benchmarkMiniHidden = false; benchmarkMiniVisible = true; benchmarkMiniPosition = {{ left: 50, top: 60 }}; renderBenchmarkMiniWindow();", context);
   const finishedMini = getElement("benchmarkMiniWindow");
   const finishedMiniHtml = String(finishedMini?.innerHTML || "");
   if (!finishedMiniHtml.includes("Finished") || !finishedMiniHtml.includes("Reset Finished Benchmark Review") || !finishedMiniHtml.includes("benchmark-finished-toggle") || finishedMiniHtml.includes("Preparing next preset") || finishedMiniHtml.includes("Up next")) {{
     throw new Error("Collapsed Benchmarks mini window should switch to a finished review state when the job completes");
   }}
-  vm.runInContext("benchmarkModalCollapsed = false; benchmarkMiniHidden = false; benchmarkModalOpenPersisted = true; ensureBenchmarkAllModal(); $('benchmarkAllModal').classList.remove('hidden'); closeBenchmarkAllModal();", context);
-  const finishedCloseState = vm.runInContext("({{ collapsed: benchmarkModalCollapsed, hidden: benchmarkMiniHidden, open: benchmarkModalOpenPersisted }})", context);
-  if (!finishedCloseState.hidden || finishedCloseState.collapsed || finishedCloseState.open) {{
-    throw new Error("Closing a finished benchmark modal should hide it instead of reopening the collapsed mini window: " + JSON.stringify({{ state: finishedCloseState, active: vm.runInContext("benchmarkJobActive()", context), finished: vm.runInContext("benchmarkJobFinishedReviewable()", context) }}));
+  vm.runInContext("activeTabName = 'benchmarks'; renderBenchmarkMiniWindow();", context);
+  if (elements.has("benchmarkMiniWindow")) {{
+    throw new Error("The floating benchmark monitor should yield to the full Benchmarks page while it is active");
   }}
   vm.runInContext("resetBenchmarkFinishedReview();", context);
-  const resetFinishedHtml = String(getElement("benchmarkAllBody").innerHTML || "");
+  const resetFinishedHtml = String(getElement("benchmarksPageBody").innerHTML || "");
   if (vm.runInContext("benchmarkJobFinishedReviewable()", context) !== false || resetFinishedHtml.includes("benchmark-finished-toggle") || !resetFinishedHtml.includes("Start Full Benchmark") || !resetFinishedHtml.includes("Ready")) {{
     throw new Error("Finished benchmark review reset should return the modal to the normal new-session picker");
   }}
@@ -2535,10 +2529,10 @@ process.on("uncaughtException", (error) => {{
       ],
     }},
   }};
-  vm.runInContext("Object.assign(statusPayload, __activeBenchmarkStatus); lastStatus = {{ benchmarks: {{ job: {{ active: false }}, counts: {{ eligible: 0 }} }} }}; ensureBenchmarkAllModal(); openBenchmarkAllModal();", context);
+  vm.runInContext("Object.assign(statusPayload, __activeBenchmarkStatus); lastStatus = {{ benchmarks: {{ job: {{ active: false }}, counts: {{ eligible: 0 }} }} }}; ensureBenchmarksPage(); openBenchmarksPage();", context);
   await Promise.resolve();
   await new Promise((resolve) => setImmediate(resolve));
-  const activeBenchmarkHtml = String(getElement("benchmarkAllBody").innerHTML || "");
+  const activeBenchmarkHtml = String(getElement("benchmarksPageBody").innerHTML || "");
   if (!activeBenchmarkHtml.includes("Cancel Benchmark") || !activeBenchmarkHtml.includes("Full Model Scores benchmark queued.") || !activeBenchmarkHtml.includes("vllm/dual")) {{
     throw new Error("Benchmarks modal should refresh /admin/benchmarks and render the active running job");
   }}
@@ -2599,8 +2593,8 @@ process.on("uncaughtException", (error) => {{
       }},
     }},
   }};
-  vm.runInContext("lastStatus = __activeBenchmarkNoLogStatus; benchmarkRunningPresetTab = ''; benchmarkModalLogMode = 'staged'; renderBenchmarkAllModal();", context);
-  const noLogRunningHtml = String(getElement("benchmarkAllBody").innerHTML || "");
+  vm.runInContext("lastStatus = __activeBenchmarkNoLogStatus; benchmarkRunningPresetTab = ''; benchmarkModalLogMode = 'staged'; renderBenchmarksPage();", context);
+  const noLogRunningHtml = String(getElement("benchmarksPageBody").innerHTML || "");
   if (!noLogRunningHtml.includes("<span>Running Presets</span><span>2</span>") || !noLogRunningHtml.includes("vllm/dual") || !noLogRunningHtml.includes("vllm/second") || !noLogRunningHtml.includes("Detailed staged logs are loading from the benchmark worker.") || noLogRunningHtml.includes("Waiting for the scheduler to assign the next runnable preset.")) {{
     throw new Error("Benchmarks modal should fall back to running queue rows while detailed running logs are loading");
   }}
@@ -2691,8 +2685,8 @@ process.on("uncaughtException", (error) => {{
   if (resumableMerged.job.queue[0].selected_step_ids.join(",") !== "bench" || resumableMerged.job.queue[0].stage_statuses.bench !== "failed" || resumableMerged.job.queue[0].stage_statuses["verify-full"] !== "complete") {{
     throw new Error("Compact benchmark status rows must not discard detailed selected-stage evidence already loaded by the modal");
   }}
-  vm.runInContext("lastStatus = __resumableCompactBenchmarkStatus; benchmarkModalAwaitingFreshSnapshot = true; benchmarkModalControlsLocked = true; ensureBenchmarkAllModal(); renderBenchmarkAllModal();", context);
-  const compactResumableHtml = String(getElement("benchmarkAllBody").innerHTML || "");
+  vm.runInContext("lastStatus = __resumableCompactBenchmarkStatus; benchmarkModalAwaitingFreshSnapshot = true; benchmarkModalControlsLocked = true; ensureBenchmarksPage(); renderBenchmarksPage();", context);
+  const compactResumableHtml = String(getElement("benchmarksPageBody").innerHTML || "");
   if (!compactResumableHtml.includes("Refreshing benchmark inventory from the server") || compactResumableHtml.includes("benchmark-stage-selector") || compactResumableHtml.includes("Throughput bench")) {{
     throw new Error("Benchmarks modal must not render resumable stage controls from compact queue rows that have no stage_statuses");
   }}
@@ -2700,33 +2694,17 @@ process.on("uncaughtException", (error) => {{
   if (!activeBenchmarkHtml.includes('id="benchmarkPresetQueue"') || !activeBenchmarkHtml.includes("handleBenchmarkQueueSummaryClick") || !activeBenchmarkHtml.includes("data-benchmark-queue-row")) {{
     throw new Error("Benchmarks preset queue should render expandable rows with preserved scroll state hooks");
   }}
-  vm.runInContext("const __benchmarkStorage = {{}}; localStorage = {{ getItem(k) {{ return Object.prototype.hasOwnProperty.call(__benchmarkStorage, k) ? __benchmarkStorage[k] : null; }}, setItem(k, v) {{ __benchmarkStorage[k] = String(v); }}, removeItem(k) {{ delete __benchmarkStorage[k]; }} }}; window.localStorage = localStorage; window.innerWidth = 1024; window.innerHeight = 768; localStorage.setItem(BENCHMARK_FLOATING_STATE_KEY, JSON.stringify({{ collapsed: true, mini_position: {{ left: 123, top: 77 }} }})); benchmarkFloatingStateHydrated = false; benchmarkModalCollapsed = false; benchmarkMiniPosition = null; lastStatus = __activeBenchmarkStatus; renderBenchmarkMiniWindow();", context);
+  vm.runInContext("const __benchmarkStorage = {{}}; localStorage = {{ getItem(k) {{ return Object.prototype.hasOwnProperty.call(__benchmarkStorage, k) ? __benchmarkStorage[k] : null; }}, setItem(k, v) {{ __benchmarkStorage[k] = String(v); }}, removeItem(k) {{ delete __benchmarkStorage[k]; }} }}; window.localStorage = localStorage; window.innerWidth = 1024; window.innerHeight = 768; localStorage.setItem(BENCHMARK_FLOATING_STATE_KEY, JSON.stringify({{ mini_position: {{ left: 123, top: 77 }} }})); benchmarkFloatingStateHydrated = false; benchmarkMiniHidden = false; benchmarkMiniVisible = true; benchmarkMiniPosition = null; activeTabName = 'overview'; lastStatus = __activeBenchmarkStatus; renderBenchmarkMiniWindow();", context);
   const restoredMini = getElement("benchmarkMiniWindow");
   const restoredMiniHtml = String(restoredMini.innerHTML || "");
   if (restoredMiniHtml.includes("Total Progress") || restoredMiniHtml.includes('<section class="benchmark-mini-section"><hr class="benchmark-mini-separator" />') || !restoredMiniHtml.includes("vllm/dual") || String(restoredMini.style.left || "") !== "123px" || String(restoredMini.style.top || "") !== "77px") {{
-    throw new Error("Collapsed Benchmarks mini window should restore persisted collapsed state and position after refresh");
+    throw new Error("The active benchmark monitor should restore its saved position after refresh");
   }}
-  elements.delete("benchmarkAllModal");
   elements.delete("benchmarkMiniWindow");
-  elements.delete("#benchmarkAllModal .benchmark-modal-card");
-  vm.runInContext("const __oldBenchmarkModal = $('benchmarkAllModal'); if (__oldBenchmarkModal) __oldBenchmarkModal.remove(); const __oldBenchmarkMini = $('benchmarkMiniWindow'); if (__oldBenchmarkMini) __oldBenchmarkMini.remove(); window.innerWidth = 1600; window.innerHeight = 1000; localStorage.setItem(BENCHMARK_FLOATING_STATE_KEY, JSON.stringify({{ modal_open: true, collapsed: false, modal_position: {{ left: 222, top: 88 }} }})); benchmarkFloatingStateHydrated = false; benchmarkModalCollapsed = false; benchmarkModalOpenPersisted = false; benchmarkModalPosition = null; lastStatus = __activeBenchmarkStatus; renderBenchmarkSurfaces();", context);
-  const restoredModal = getElement("benchmarkAllModal");
-  const restoredModalCard = document.querySelector("#benchmarkAllModal .benchmark-modal-card");
-  const restoredModalHtml = String(getElement("benchmarkAllBody").innerHTML || "");
-  const restoredMiniAfterModalNode = elements.get("benchmarkMiniWindow") || null;
-  const restoredRenderedMiniAfterModal = !!(
-    restoredMiniAfterModalNode &&
-    (String(restoredMiniAfterModalNode.className || "").includes("benchmark-mini-window") ||
-      String(restoredMiniAfterModalNode.innerHTML || "").includes("benchmark-mini-"))
-  );
-  if (restoredModal.classList.contains("hidden") || !restoredModalHtml.includes("Cancel Benchmark") || !restoredModalHtml.includes("vllm/dual") || String(restoredModalCard.style.left || "") !== "222px" || String(restoredModalCard.style.top || "") !== "88px" || restoredRenderedMiniAfterModal) {{
-    throw new Error("Expanded Benchmarks modal should restore persisted open state and position after refresh without falling back to the collapsed mini window"
-      + " (hidden=" + restoredModal.classList.contains("hidden")
-      + " cancel=" + restoredModalHtml.includes("Cancel Benchmark")
-      + " selector=" + restoredModalHtml.includes("vllm/dual")
-      + " left=" + String(restoredModalCard.style.left || "")
-      + " top=" + String(restoredModalCard.style.top || "")
-      + " mini=" + restoredRenderedMiniAfterModal + ")");
+  vm.runInContext("window.innerWidth = 1600; window.innerHeight = 1000; lastStatus = __activeBenchmarkStatus; activeTabName = 'benchmarks'; renderBenchmarkSurfaces();", context);
+  const restoredBenchmarkPageHtml = String(getElement("benchmarksPageBody").innerHTML || "");
+  if (!restoredBenchmarkPageHtml.includes("Cancel Benchmark") || !restoredBenchmarkPageHtml.includes("vllm/dual") || elements.has("benchmarkMiniWindow") || document.querySelector("#benchmarkAllModal")) {{
+    throw new Error("Expanded benchmark controls should render inside the Benchmarks page without recreating a modal");
   }}
   if (!activeBenchmarkHtml.includes("active-queue-full-eligible") || !activeBenchmarkHtml.includes("<span>Running Queue</span><span>1</span>") || !activeBenchmarkHtml.includes("<span>Finished</span><span>1</span>") || !activeBenchmarkHtml.includes("<span>Failed</span><span>1</span>") || activeBenchmarkHtml.includes("active-queue-full-skipped") || activeBenchmarkHtml.includes("active-queue-full-ineligible") || !activeBenchmarkHtml.includes("active-queue-full-already-scored") || !activeBenchmarkHtml.includes("active-queue-full-experimental") || !activeBenchmarkHtml.includes("active-queue-full-deprecated") || activeBenchmarkHtml.includes("<span>Skipped</span>") || activeBenchmarkHtml.includes("<span>Ineligible</span>") || !activeBenchmarkHtml.includes("<span>Already Scored</span><span>1</span>") || !activeBenchmarkHtml.includes("<span>Experimental</span><span>1</span>") || !activeBenchmarkHtml.includes("<span>Deprecated</span><span>1</span>")) {{
     throw new Error("Active benchmark preset queues should group Running Queue, Finished, Failed, already-scored, experimental, and deprecated parent cards while hiding Ineligible during live runs");
@@ -2856,8 +2834,8 @@ process.on("uncaughtException", (error) => {{
   if (!benchmarkDownloadActionHtml.includes(">Download<") || benchmarkDownloadActionHtml.includes(">Locked<") || benchmarkDownloadActionHtml.includes("disabled")) {{
     throw new Error("Benchmark locks should block ready preset launches without disabling missing-resource downloads");
   }}
-  vm.runInContext("lastStatus = __activeBenchmarkStatus; benchmarkQueueOpenState['vllm/done'] = true; renderBenchmarkAllModal();", context);
-  const expandedQueueHtml = String(getElement("benchmarkAllBody").innerHTML || "");
+  vm.runInContext("lastStatus = __activeBenchmarkStatus; benchmarkQueueOpenState['vllm/done'] = true; renderBenchmarksPage();", context);
+  const expandedQueueHtml = String(getElement("benchmarksPageBody").innerHTML || "");
   if (!expandedQueueHtml.includes("benchmark-step-history-stats") || !expandedQueueHtml.includes("PASS 3/3") || !expandedQueueHtml.includes("FAIL 2/3")) {{
     throw new Error("Expanded queue entries should right-align per-stage pass/fail counts");
   }}
@@ -2867,29 +2845,29 @@ process.on("uncaughtException", (error) => {{
   if (!expandedQueueHtml.includes("benchmark-progress-copy") || !expandedQueueHtml.includes("benchmark-progress-count-inline")) {{
     throw new Error("Benchmarks modal should keep step/log lines left-aligned while the progress count is right-aligned");
   }}
-  vm.runInContext("benchmarkRunningPresetTab = 'vllm/done'; benchmarkModalLogMode = 'staged'; benchmarkFocusPendingSelector = 'vllm/done'; benchmarkFocusPendingUntil = Date.now() + 5000; renderBenchmarkAllModal();", context);
-  const focusedPausedHtml = String(getElement("benchmarkAllBody").innerHTML || "");
+  vm.runInContext("benchmarkRunningPresetTab = 'vllm/done'; benchmarkModalLogMode = 'staged'; benchmarkFocusPendingSelector = 'vllm/done'; benchmarkFocusPendingUntil = Date.now() + 5000; renderBenchmarksPage();", context);
+  const focusedPausedHtml = String(getElement("benchmarksPageBody").innerHTML || "");
   if (!focusedPausedHtml.includes("Loading logs for the selected preset") || !focusedPausedHtml.includes("vllm/done") || focusedPausedHtml.includes("dual live staged log")) {{
     throw new Error("Focusing a non-running queued preset should immediately show loading text without mixing active logs");
   }}
-  vm.runInContext("benchmarkRunningPresetTab = 'vllm/skipped'; benchmarkModalLogMode = 'staged'; benchmarkFocusPendingSelector = ''; benchmarkFocusPendingUntil = 0; renderBenchmarkAllModal();", context);
-  const focusedEmptyHtml = String(getElement("benchmarkAllBody").innerHTML || "");
+  vm.runInContext("benchmarkRunningPresetTab = 'vllm/skipped'; benchmarkModalLogMode = 'staged'; benchmarkFocusPendingSelector = ''; benchmarkFocusPendingUntil = 0; renderBenchmarksPage();", context);
+  const focusedEmptyHtml = String(getElement("benchmarksPageBody").innerHTML || "");
   if (!focusedEmptyHtml.includes("dual live staged log") || focusedEmptyHtml.includes("No completed benchmark steps recorded yet.") || focusedEmptyHtml.includes("Loading logs for the selected preset")) {{
     throw new Error("Expired non-running log focus should return Staged mode to the active preset");
   }}
-  vm.runInContext("benchmarkRunningPresetTab = 'vllm/dual'; benchmarkModalLogMode = 'staged'; renderBenchmarkAllModal();", context);
-  const focusedActiveHtml = String(getElement("benchmarkAllBody").innerHTML || "");
+  vm.runInContext("benchmarkRunningPresetTab = 'vllm/dual'; benchmarkModalLogMode = 'staged'; renderBenchmarksPage();", context);
+  const focusedActiveHtml = String(getElement("benchmarksPageBody").innerHTML || "");
   if (!focusedActiveHtml.includes("dual live staged log")) {{
     throw new Error("Focusing the active queued preset should show its staged logs");
   }}
-  vm.runInContext("lastStatus = {{ ...__activeBenchmarkStatus, benchmarks: {{ ...__activeBenchmarkStatus.benchmarks, current_log: {{ label: 'vllm/dual · Quality sandbox packs', active: true, progress: 0.5, text: 'fresh sandbox log' }}, running_logs: [{{ selector: 'vllm/dual', display_name: 'vllm/dual', step_id: 'quality-sandbox', step_index: 5, step_count: 8, step_label: 'Quality sandbox packs', step_progress: 0.5, logs: [{{ id: 'verify-stress', label: 'Verify stress', artifact: 'verify-stress.log', text: 'old verify stress log' }}, {{ id: 'quality-sandbox', label: 'Quality sandbox packs', artifact: 'quality-sandbox.log', text: 'fresh sandbox log' }}] }}] }} }}; benchmarkRunningPresetTab = 'vllm/dual'; benchmarkRunningScriptTabs['vllm/dual'] = 'verify-stress'; benchmarkRunningScriptTabSteps['vllm/dual'] = 'verify-stress'; benchmarkModalLogMode = 'staged'; renderBenchmarkAllModal();", context);
-  const stageChangedLogHtml = String(getElement("benchmarkAllBody").innerHTML || "");
+  vm.runInContext("lastStatus = {{ ...__activeBenchmarkStatus, benchmarks: {{ ...__activeBenchmarkStatus.benchmarks, current_log: {{ label: 'vllm/dual · Quality sandbox packs', active: true, progress: 0.5, text: 'fresh sandbox log' }}, running_logs: [{{ selector: 'vllm/dual', display_name: 'vllm/dual', step_id: 'quality-sandbox', step_index: 5, step_count: 8, step_label: 'Quality sandbox packs', step_progress: 0.5, logs: [{{ id: 'verify-stress', label: 'Verify stress', artifact: 'verify-stress.log', text: 'old verify stress log' }}, {{ id: 'quality-sandbox', label: 'Quality sandbox packs', artifact: 'quality-sandbox.log', text: 'fresh sandbox log' }}] }}] }} }}; benchmarkRunningPresetTab = 'vllm/dual'; benchmarkRunningScriptTabs['vllm/dual'] = 'verify-stress'; benchmarkRunningScriptTabSteps['vllm/dual'] = 'verify-stress'; benchmarkModalLogMode = 'staged'; renderBenchmarksPage();", context);
+  const stageChangedLogHtml = String(getElement("benchmarksPageBody").innerHTML || "");
   if (!stageChangedLogHtml.includes("fresh sandbox log") || !stageChangedLogHtml.includes("quality-sandbox.log") || stageChangedLogHtml.includes("old verify stress log") || vm.runInContext("benchmarkRunningScriptTabs['vllm/dual']", context) !== "quality-sandbox") {{
     throw new Error("Benchmark staged log tab should reset to the current worker step when the preset changes stages");
   }}
-  vm.runInContext("lastStatus = __activeBenchmarkStatus; benchmarkRunningPresetTab = 'vllm/dual'; benchmarkRunningScriptTabs['vllm/dual'] = ''; benchmarkRunningScriptTabSteps['vllm/dual'] = ''; benchmarkModalLogMode = 'staged'; renderBenchmarkAllModal();", context);
-  vm.runInContext("benchmarkModalLogMode = 'full'; renderBenchmarkAllModal();", context);
-  const cumulativeLogHtml = String(getElement("benchmarkAllBody").innerHTML || "");
+  vm.runInContext("lastStatus = __activeBenchmarkStatus; benchmarkRunningPresetTab = 'vllm/dual'; benchmarkRunningScriptTabs['vllm/dual'] = ''; benchmarkRunningScriptTabSteps['vllm/dual'] = ''; benchmarkModalLogMode = 'staged'; renderBenchmarksPage();", context);
+  vm.runInContext("benchmarkModalLogMode = 'full'; renderBenchmarksPage();", context);
+  const cumulativeLogHtml = String(getElement("benchmarksPageBody").innerHTML || "");
   if (!cumulativeLogHtml.includes("older cumulative stage") || !cumulativeLogHtml.includes("latest cumulative stage")) {{
     throw new Error("Full benchmark logs should preserve cumulative output across stage changes");
   }}
@@ -2919,15 +2897,15 @@ process.on("uncaughtException", (error) => {{
   if (!requestTpsHtml.includes("gen tk/s=55.85") || requestTpsHtml.includes("gen tk/s=33.33")) {{
     throw new Error("Generation Stats should prefer request/benchmark TPS over runtime log TPS fallback");
   }}
-  vm.runInContext("lastStatus = {{ benchmarks: {{ job: {{ active: false }}, counts: {{ eligible: 0 }} }} }}; renderBenchmarkAllModal();", context);
-  const staleBenchmarkHtml = String(getElement("benchmarkAllBody").innerHTML || "");
+  vm.runInContext("lastStatus = {{ benchmarks: {{ job: {{ active: false }}, counts: {{ eligible: 0 }} }} }}; renderBenchmarksPage();", context);
+  const staleBenchmarkHtml = String(getElement("benchmarksPageBody").innerHTML || "");
   if (!staleBenchmarkHtml.includes('id="benchmarkThermalCooldown" type="checkbox" checked disabled') || staleBenchmarkHtml.includes('onclick="startBenchmarkAll')) {{
     throw new Error("Benchmarks modal should preserve disabled controls through stale repaint frames");
   }}
-  vm.runInContext("Object.assign(statusPayload, __activeBenchmarkStatus); lastStatus = __activeBenchmarkStatus; renderBenchmarkAllModal();", context);
-  const firstBenchmarkRenderSignature = String(getElement("benchmarkAllBody").dataset.benchmarkRenderHtml || "");
-  vm.runInContext("lastStatus = __activeBenchmarkStatus; renderBenchmarkAllModal();", context);
-  if (String(getElement("benchmarkAllBody").dataset.benchmarkRenderHtml || "") !== firstBenchmarkRenderSignature) {{
+  vm.runInContext("Object.assign(statusPayload, __activeBenchmarkStatus); lastStatus = __activeBenchmarkStatus; renderBenchmarksPage();", context);
+  const firstBenchmarkRenderSignature = String(getElement("benchmarksPageBody").dataset.benchmarkRenderHtml || "");
+  vm.runInContext("lastStatus = __activeBenchmarkStatus; renderBenchmarksPage();", context);
+  if (String(getElement("benchmarksPageBody").dataset.benchmarkRenderHtml || "") !== firstBenchmarkRenderSignature) {{
     throw new Error("Benchmarks modal should preserve a stable render signature across unchanged refreshes");
   }}
   vm.runInContext("lastStatus = __presetStatus;", context);
@@ -3172,16 +3150,9 @@ process.on("uncaughtException", (error) => {{
   if (!migratedNvlinkBadgeHtml.includes("status-migrated") || !migratedNvlinkBadgeHtml.includes(">migrated<") || !migratedNvlinkBadgeHtml.includes("status-nvlink") || !migratedNvlinkBadgeHtml.includes(">NVLink<") || migratedNvlinkBadgeHtml.includes("NVLink-capable")) {{
     throw new Error("Migrated NVLink presets should render both migrated provenance and the light-green required NVLink badge");
   }}
-  const presetActionsMenuHtml = String(vm.runInContext("renderPresetActionsMenu()", context) || "");
-  if (!presetActionsMenuHtml.includes("preset-menu-button") || !presetActionsMenuHtml.includes("preset-menu-setup") || !presetActionsMenuHtml.includes("preset-menu-rebuild") || !presetActionsMenuHtml.includes("preset-menu-hidden") || !presetActionsMenuHtml.includes("preset-menu-custom") || !presetActionsMenuHtml.includes("preset-menu-manager") || !presetActionsMenuHtml.includes("preset-menu-benchmarks")) {{
-    throw new Error("Presets card should expose all model actions through one hamburger menu");
-  }}
-  if (!presetActionsMenuHtml.includes("promptRuntimeInventoryRebuild()") || !presetActionsMenuHtml.includes("openBenchmarkAllModal()") || !presetActionsMenuHtml.includes("selectPresetModel('__model_resources__')")) {{
-    throw new Error("Presets action menu should wire Rebuild Model DB, Benchmarks, and Model Manager actions");
-  }}
   const presetHeadActionsHtml = String(vm.runInContext("renderPresetHeadActionsHtml()", context) || "");
-  if (!presetHeadActionsHtml.includes("preset-filter-button") || !presetHeadActionsHtml.includes("openPresetFilterModal()") || !presetHeadActionsHtml.includes("presetActionsMenu")) {{
-    throw new Error("Presets card should render the funnel filter immediately before the hamburger menu");
+  if (!presetHeadActionsHtml.includes("Setup Assistant") || !presetHeadActionsHtml.includes("promptRuntimeInventoryRebuild()") || !presetHeadActionsHtml.includes("Add custom model") || !presetHeadActionsHtml.includes("toggleHiddenPresetsVisibility()") || !presetHeadActionsHtml.includes("preset-filter-button") || !presetHeadActionsHtml.includes("openPresetFilterModal()") || presetHeadActionsHtml.includes("presetActionsMenu")) {{
+    throw new Error("Text models should render the new inline toolbar and filter without the old preset actions menu");
   }}
   const categoryOrder = String(vm.runInContext(`[
     variantDisplayGroupKey({{ status_kind: 'deprecated', nvlink_mode: 'required', topology: 'dual' }}),
@@ -3269,7 +3240,7 @@ process.on("uncaughtException", (error) => {{
   }}
   const modalityIcons = String(vm.runInContext("['ideogram4_fp8_scaled.safetensors','ace-step-v1.safetensors','step-voice/model.safetensors','ltx-2.3-22b.gguf','qwen3.5-4b-gguf/hauhaucs-uncensored-q4km/mmproj-Qwen3.5.gguf'].map((path) => resourceManagerModalityIcon({{ path }})).join('|')", context) || "");
   if (!modalityIcons.includes("Image model") || !modalityIcons.includes("Audio model") || !modalityIcons.includes("Speech synthesis model") || !modalityIcons.includes("Video model") || !modalityIcons.includes("Studio support model")) {{
-    throw new Error("Model Manager resource rows should classify Studio image, audio, speech, video, and support assets with modality icons");
+    throw new Error("Image model lane resources should classify Studio image, audio, speech, video, and support assets with modality icons");
   }}
   if (!modalityIcons.includes("resource-manager-modality-image") || !modalityIcons.includes("<rect")) {{
     throw new Error("Image model badges should use the picture-frame icon and modality-specific badge class");
@@ -4996,10 +4967,9 @@ def generate_test_html_artifact() -> tuple[str, str]:
         or "max-width: 100%;" not in css_source
         or ".score-stale-badge" not in css_source
         or ".status-custom" not in css_source
-        or ".preset-actions-menu" not in css_source
-        or ".preset-menu-button" not in css_source
-        or ".preset-menu-benchmarks" not in css_source
-        or ".preset-menu-rebuild" not in css_source
+        or ".preset-toolbar-icon-button" not in css_source
+        or ".preset-toolbar" not in css_source
+        or ".hidden-preset-card" not in css_source
         or ".eco-profile" not in css_source
         or ".run-script-trigger" not in css_source
         or ".service-section-cue" not in css_source
@@ -5018,8 +4988,7 @@ def generate_test_html_artifact() -> tuple[str, str]:
         or "z-index: 1300;" not in css_source
         or "#storageEditorModal" not in css_source
         or "z-index: 1350;" not in css_source
-        or "#benchmarkAllModal" not in css_source
-        or "z-index: 1380;" not in css_source
+        or ".benchmark-page-panel" not in css_source
         or "#clubDecisionModal" not in css_source
         or "z-index: 1400;" not in css_source
         or ".storage-editor-tool.danger" not in css_source
@@ -5059,7 +5028,7 @@ def generate_test_html_artifact() -> tuple[str, str]:
     ):
         raise ValueError("Benchmark preset queue rows must expose chevron affordances for expandable stage details")
     boot_call_offset = js_source.find("bootAdminUi().catch")
-    for sentinel in ("RESOURCE_MANAGER_MODEL_ID", "HIDDEN_PRESETS_MODEL_ID"):
+    for sentinel in ("showHiddenPresets", "toggleHiddenPresetsVisibility"):
         declaration_offset = js_source.find(f'var {sentinel} =')
         if declaration_offset < 0 or boot_call_offset < 0 or declaration_offset > boot_call_offset:
             raise ValueError(f"{sentinel} must be initialized before the synchronous admin boot path")
@@ -5928,8 +5897,10 @@ def generate_test_html_artifact() -> tuple[str, str]:
         raise ValueError("Control uptime, machine uptime, and idle time must render as compact d/h/m/s durations, not raw seconds")
     if (
         "AI Studio" not in html_source
-        or "preset-menu-ai-studio" not in css_source
-        or "AI_STUDIO_MODEL_ID" not in js_source
+        or 'id="ai-studio" class="tabpane content-tab"' not in html_source
+        or 'data-tab="ai-studio"' not in html_source
+        or "function renderAIStudioTab" not in js_source
+        or "function selectAIStudioModelType" not in js_source
         or "renderAIStudioView" not in js_source
         or "aiStudioLaneBackendReady" not in js_source
         or "Download Missing" in js_source
@@ -5945,7 +5916,6 @@ def generate_test_html_artifact() -> tuple[str, str]:
         or '"ai-studio-models", "comfyui", "ComfyUI", "models"' not in image_studio_source
         or "/mnt/models/comfyui/models" not in image_studio_source
         or "openStorageBrowserFileReadOnly('/', 'opt/ai/club-3090/docs/ai-studio/README.md')" not in js_source
-        or "Open Model Manager" in js_source
         or "Plan and Interactive generation" not in js_source
         or "ACE-Step Music" not in js_source
         or "Stable Audio SFX" not in js_source
@@ -5995,7 +5965,7 @@ def generate_test_html_artifact() -> tuple[str, str]:
         or "const anyInstalledLane = flatLanes.some((lane) => aiStudioLanePrimaryInstalled(lane));" not in js_source
         or "rows.length || anyInstalledLane" not in js_source
     ):
-        raise ValueError("AI Studio must be available from the Presets menu with setup/docs/multimodal resource management")
+        raise ValueError("Image models must remain available as a top-level page with setup/docs/multimodal resource management")
     if (
         "resource-manager-modality-image" not in css_source
         or "ai-studio-modality-badge" not in js_source
@@ -6017,7 +5987,7 @@ def generate_test_html_artifact() -> tuple[str, str]:
         or 'svgIcon(icon)' not in js_source
         or 'entry.usages || []).some(({ resource }) => presetResourceMarkerKind(resource || {}) === "speculative"' not in js_source
     ):
-        raise ValueError("AI Studio lane cards and Model Manager resources must keep modality icons, pinned badges, Run Script-style docs help, and speculative diamond grouping")
+        raise ValueError("Image model lane cards must keep modality icons, pinned badges, Run Script-style docs help, and speculative diamond grouping")
     if (
         "extraContent = \"\"" not in js_source
         or "ai-studio-other-resources" not in js_source
@@ -6032,22 +6002,21 @@ def generate_test_html_artifact() -> tuple[str, str]:
     lane_section_source = js_source.split("function renderAIStudioLaneSection", 1)[-1].split("function renderAIStudioResourceCard", 1)[0]
     if "ai-studio-modality-badge" in lane_section_source or "resourceManagerModalityIcon" in lane_section_source:
         raise ValueError("AI Studio parent lane columns must stay collapsible without parent icons or modality badges")
-    if 'id="systemConfigPanel"' not in html_source or 'id="systemConfigGrid"' not in html_source or 'id="profileActionRow"' in html_source:
-        raise ValueError("System power controls must render through the staged System Configuration panel instead of the legacy profile button row")
-    if 'class="btn blue" onclick="openSetupAssistantModal()"' in html_source or "class=\"btn green\"\n                onclick=\"promptRuntimeInventoryRebuild()\"" in html_source:
-        raise ValueError("Model Presets header actions must be collapsed into the hamburger menu")
-    for preset_menu_marker in (
-        "presetActionsMenuButton",
-        "preset-menu-setup",
-        "preset-menu-rebuild",
-        "preset-menu-hidden",
-        "preset-menu-custom",
-        "preset-menu-manager",
-        "preset-menu-ai-studio",
-        "preset-menu-benchmarks",
+    for toolbar_marker in (
+        'data-tab="ai-studio" onclick="tab(event, \'ai-studio\')">AI Studio',
+        'id="aiStudioModelTypes"',
+        'id="aiStudioContent"',
+        'data-tab="benchmarks" id="benchmarksTabBtn"',
+        'onclick="openSetupAssistantModal()">Setup Assistant',
+        'onclick="promptRuntimeInventoryRebuild()">Rebuild Model DB',
+        'onclick="openCustomModelModal()">Add custom model',
+        'onclick="toggleHiddenPresetsVisibility()">Show hidden presets',
+        'id="benchmarks" class="tabpane content-tab"',
     ):
-        if preset_menu_marker not in html_source:
-            raise ValueError("Model Presets header menu is missing " + preset_menu_marker)
+        if toolbar_marker not in html_source:
+            raise ValueError("Model navigation or the Text models toolbar is missing " + toolbar_marker)
+    if "presetActionsMenu" in html_source or "preset-menu-manager" in html_source:
+        raise ValueError("The preset actions menu and Model Manager must be removed")
     power_profile_markers = [
         ("benchmark-ready", "Benchmark Ready (220W)"),
         ("eco", "Eco (240W)"),
@@ -6341,24 +6310,37 @@ process.on("uncaughtException", (error) => {{
   fixtureSelect.value = preferredOption.value;
   fixtureSelect.dispatchEvent(new window.Event("change", {{ bubbles: true }}));
   await new Promise((resolve) => setTimeout(resolve, 150));
-  window.activateTab("presets");
+  window.activateTab("ai-studio");
   await new Promise((resolve) => setTimeout(resolve, 50));
-  window.renderPresetHeaderActions();
-  const presetMenu = window.document.getElementById("presetActionsMenuList");
-  const presetMenuButton = window.document.getElementById("presetActionsMenuButton");
-  if (!presetMenu || !presetMenuButton) throw new Error("preset actions menu did not render");
-  presetMenu.classList.remove("hidden");
-  presetMenuButton.setAttribute("aria-expanded", "true");
-  const stablePresetMenu = presetMenu;
-  window.renderStatusUi({{ metrics: {{ active_requests: 1 }}, presets: policyFixture.presets }});
-  if (window.document.getElementById("presetActionsMenuList") !== stablePresetMenu ||
-      stablePresetMenu.classList.contains("hidden") ||
-      presetMenuButton.getAttribute("aria-expanded") !== "true") {{
-    throw new Error("metrics-only heartbeat reconstructed the open preset actions menu");
+  const modelTypeButtons = Array.from(window.document.querySelectorAll(".ai-studio-model-type"));
+  if (modelTypeButtons.length !== 5) throw new Error("AI Studio should expose five model-type controls");
+  for (const label of ["Image Models", "Audio Models", "Speech Models", "Video Models", "Text Models"]) {{
+    if (!modelTypeButtons.some((button) => button.textContent.includes(label))) throw new Error("missing AI Studio model type " + label);
   }}
-  window.renderStatusUi({{ metrics: {{ active_requests: 1 }}, presets: {{ changed: true }} }});
-  if (window.document.getElementById("presetActionsMenuList") === stablePresetMenu) {{
-    throw new Error("preset catalog change did not permit a structural menu refresh");
+  for (const type of ["image", "audio", "speech", "video"]) {{
+    window.selectAIStudioModelType(type);
+    if (!window.document.querySelector(`.ai-studio-lane-${{type}}`)) throw new Error(type + " lane did not render");
+    if (!window.document.querySelector(".ai-studio-lane-text")) throw new Error("Studio Director support lane did not render");
+  }}
+  window.selectAIStudioModelType("text");
+  const presetToolbar = window.document.getElementById("presetHeadActions");
+  if (!presetToolbar || !presetToolbar.textContent.includes("Setup Assistant")) throw new Error("Text Models did not render the Model Presets toolbar");
+  if (window.document.getElementById("aiStudioContent").classList.contains("active") ||
+      window.document.querySelector(".ai-studio-lane-image")) throw new Error("Text Models should hide AI Studio lanes");
+  if (!window.document.getElementById("presets").classList.contains("active") &&
+      window.document.getElementById("presets").classList.contains("hidden")) throw new Error("Text Models preset surface is hidden");
+  window.renderStatusUi({{ metrics: {{ active_requests: 1 }}, presets: policyFixture.presets }});
+  if (window.document.querySelector('.ai-studio-model-type[aria-pressed="true"]')?.textContent.includes("Text Models") !== true) {{
+    throw new Error("status rerender should retain the selected Text Models type");
+  }}
+  const aiStudioButton = window.document.querySelector('.tab[data-tab="ai-studio"]');
+  const benchmarksButton = window.document.querySelector('.tab[data-tab="benchmarks"]');
+  if (!aiStudioButton?.textContent.includes("AI Studio") || !benchmarksButton) {{
+    throw new Error("AI Studio and Benchmarks must be top-level tabs");
+  }}
+  benchmarksButton.click();
+  if (!window.document.getElementById("benchmarks").classList.contains("active")) {{
+    throw new Error("Benchmarks navigation should activate the full page tab");
   }}
   const tabs = Array.from(window.document.querySelectorAll(".tab"));
   if (tabs.length < 3) throw new Error("top-level tabs did not render");
@@ -7961,9 +7943,8 @@ assert "TRITON_CACHE_DIR" in override_text and "VLLM_CACHE_ROOT" in override_tex
 (pathlib.Path(cache_root) / "triton").mkdir(parents=True, exist_ok=True)
 (pathlib.Path(cache_root) / "triton" / "compiled.bin").write_bytes(b"x" * 64)
 module.CLUB3090_DIR = str(temp_root / "repo")
-cache_summary = module.model_cache_root_size_summary()
+cache_summary = module.model_resource_inventory_entries()
 assert any(pathlib.Path(row["path"]) == pathlib.Path(cache_root) for row in cache_summary["model_cache_entries"]), cache_summary
-assert module._model_cache_path_allowed(cache_root) is True
 studio_models_root = pathlib.Path(module.CLUB3090_DIR) / "ai-studio-models" / "comfyui" / "models"
 studio_models_root.mkdir(parents=True, exist_ok=True)
 studio_model_file = studio_models_root / "tts" / "kokoro" / "kokoro-v1.0.onnx"
@@ -7972,13 +7953,12 @@ studio_model_file.write_bytes(b"fixture-model")
 original_comfyui_models_dir = os.environ.get("COMFYUI_MODELS_DIR")
 try:
     os.environ["COMFYUI_MODELS_DIR"] = str(studio_models_root)
-    studio_summary = module.model_cache_root_size_summary()
+    studio_summary = module.model_resource_inventory_entries()
     studio_file_rows = [
         row for row in studio_summary["model_resource_file_entries"]
         if str(row.get("real_path") or "").endswith(os.path.join("tts", "kokoro", "kokoro-v1.0.onnx"))
     ]
     assert len(studio_file_rows) == 1, studio_summary
-    assert studio_summary["model_resource_root_size_bytes"] >= studio_model_file.stat().st_size, studio_summary
 finally:
     if original_comfyui_models_dir is None:
         os.environ.pop("COMFYUI_MODELS_DIR", None)
@@ -8713,7 +8693,6 @@ saved_enrich_runtime_inventory_cache_sizes = module.enrich_runtime_inventory_cac
 try:
     def fixture_enrich_runtime_inventory_cache_sizes(inventory):
         payload = dict(inventory or {})
-        payload["model_resource_root_size_bytes"] = 1234
         payload["model_resource_file_entries"] = [
             {"path": "/fixture/comfyui/models/diffusion_models/ideogram4_fp8_scaled.safetensors", "size_bytes": 1234}
         ]
@@ -8724,7 +8703,6 @@ try:
         {"include_inventory": True},
     )
     enriched_inventory = enriched_status.get("runtime_inventory") or {}
-    assert enriched_inventory.get("model_resource_root_size_bytes") == 1234, enriched_inventory
     assert enriched_inventory.get("model_resource_file_entries"), enriched_inventory
 finally:
     module.enrich_runtime_inventory_cache_sizes = saved_enrich_runtime_inventory_cache_sizes
@@ -14994,4 +14972,3 @@ def run_ui_smoke_test(js_text: str, cwd: Path, filename: str) -> tuple[bool, str
         pass
     detail = (result.stderr or result.stdout or "").strip()
     return result.returncode == 0, detail
-

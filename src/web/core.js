@@ -549,13 +549,10 @@ function recoverPendingUpdateMonitor(scope = "controller") {
 }
 function minimizeSurfacesForUpdateMode() {
   try {
-    if (typeof collapseBenchmarkAllModal === "function" && $("benchmarkAllModal") && !$("benchmarkAllModal").classList.contains("hidden")) {
-      collapseBenchmarkAllModal();
-    } else {
-      $("benchmarkAllModal")?.classList.add("hidden");
-    }
+    if (typeof minimizeBenchmarksPage === "function") minimizeBenchmarksPage();
+    else $("benchmarkMiniWindow")?.remove();
   } catch (e) {
-    $("benchmarkAllModal")?.classList.add("hidden");
+    $("benchmarkMiniWindow")?.remove();
   }
   try {
     if (typeof minimizeStorageEditorModal === "function") minimizeStorageEditorModal();

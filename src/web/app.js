@@ -1,9 +1,6 @@
 var MODEL_SCORE_COMPARISON_KEY = "club3090.model-score-comparisons.v1";
 var BENCHMARK_FLOATING_STATE_KEY = "club3090.benchmark-floating-state.v1";
 var BENCHMARK_FINISHED_REVIEW_KEY = "club3090.benchmark-finished-review-dismissed.v1";
-var RESOURCE_MANAGER_MODEL_ID = "__model_resources__";
-var HIDDEN_PRESETS_MODEL_ID = "__hidden_presets__";
-var AI_STUDIO_MODEL_ID = "__ai_studio__";
 var MODEL_SCORE_COMPARISON_COLORS = [
   "#6aa6ff",
   "#7bd88f",
@@ -118,7 +115,7 @@ var MODEL_SCORE_SUBCATEGORY_DESCRIPTIONS = {
   "average vram temperature": "Mean VRAM temperature across assigned cards during the benchmark. It matters because memory heat can limit long-context stability; the bar compares the reading with the configured VRAM pause limit and remains informational.",
   "max vram temperature": "Highest VRAM temperature seen on assigned cards during the benchmark. It matters because memory temperature spikes can explain cooldown waits or instability; the bar compares the peak with the configured VRAM pause limit and remains informational.",
 };
-var benchmarkAllModalMode = "quick";
+var benchmarkPageMode = "quick";
 var benchmarkForceStopPressTimer = null;
 var benchmarkForceStopArmed = false;
 var benchmarkForceStopConsumed = false;
@@ -146,10 +143,8 @@ var benchmarkModalLastStructuralSignature = "";
 var benchmarkModalLastFullRenderAt = 0;
 var benchmarkFocusPendingSelector = "";
 var benchmarkFocusPendingUntil = 0;
-var benchmarkModalCollapsed = false;
 var benchmarkMiniHidden = false;
-var benchmarkModalOpenPersisted = false;
-var benchmarkModalPosition = null;
+var benchmarkMiniVisible = false;
 var benchmarkMiniPosition = null;
 var benchmarkDragState = null;
 var benchmarkFloatingStateHydrated = false;
@@ -162,6 +157,7 @@ var modelScoreLogScrollTopByKey = {};
 var modelScoreActiveLogTabsByKey = {};
 var scriptModalState = { loading: false, error: "", scripts: [], expandedOptions: "", argsById: {}, showInternal: false, view: "scripts", selectedJobId: "", logByJob: {}, logLoadedAtByJob: {}, logLoadingJob: "" };
 var aiStudioGalleryState = { loading: false, loadedAt: 0, error: "", items: [], open: false };
+var aiStudioModelType = "image";
 
 function benchmarkSnapshot(status = lastStatus || {}) {
   const benchmarks = status?.benchmarks;
@@ -175,9 +171,8 @@ function benchmarkJobActive(status = lastStatus || {}) {
   return !!benchmarkJob(status).active;
 }
 function benchmarkSurfaceOpen() {
-  const modal = $("benchmarkAllModal");
   const mini = $("benchmarkMiniWindow");
-  return (!!modal && !modal.classList.contains("hidden")) || !!mini;
+  return activeTabName === "benchmarks" || !!mini;
 }
 function benchmarkCountsHaveInventoryDetails(counts = {}) {
   return !!(
@@ -208,7 +203,7 @@ function resetBenchmarkInventoryDefaultSelections(benchmarks = benchmarkSnapshot
     ? benchmarks.counts_by_mode
     : {};
   ["quick", "full"].forEach((mode) => {
-    const counts = countsByMode[mode] || (mode === benchmarkAllModalMode ? benchmarks?.counts : null) || {};
+    const counts = countsByMode[mode] || (mode === benchmarkPageMode ? benchmarks?.counts : null) || {};
     if (!counts || typeof counts !== "object" || !benchmarkSnapshotHasFullInventory({ counts })) return;
     const eligible = benchmarkInventorySelectorsForGroup(counts, "eligible");
     const allSelectors = benchmarkInventoryRows(counts).map((row) => String(row?.selector || "")).filter(Boolean);
@@ -245,9 +240,8 @@ async function refreshBenchmarkSnapshot(options = {}) {
   return benchmarkSnapshot();
 }
 function scheduleBenchmarkModalSnapshotRefresh(force = false) {
-  const modal = $("benchmarkAllModal");
   const mini = $("benchmarkMiniWindow");
-  if ((!modal || modal.classList.contains("hidden")) && !mini) return;
+  if (activeTabName !== "benchmarks" && !mini) return;
   if (!force && benchmarkModalAwaitingFreshSnapshot && !benchmarkJobActive()) return;
   const now = Date.now();
   const refreshFloorMs = benchmarkJobActive() ? 1000 : 2000;
@@ -260,7 +254,7 @@ function scheduleBenchmarkModalSnapshotRefresh(force = false) {
     .then(() => {
       benchmarkFocusPendingSelector = "";
       benchmarkFocusPendingUntil = 0;
-      renderBenchmarkAllModal();
+      renderBenchmarksPage();
       renderBenchmarkMiniWindow();
     })
     .catch(() => {})
@@ -636,9 +630,9 @@ function renderPresetScoreStack(labels = []) {
   if (visible.length === 1) return visible[0];
   return `<div class="preset-score-stack">${visible.join("")}</div>`;
 }
-const MISSING_MODEL_SCORES_MESSAGE = "No Model Scores are Available on this Preset Yet. Run Benchmarks through the Presets menu to calculate scores";
+const MISSING_MODEL_SCORES_MESSAGE = "No Model Scores are Available on this Preset Yet. Run Benchmarks to calculate scores";
 function missingModelScoresModalBody() {
-  return "No Model Scores are Available on this Preset Yet.<br><br>Run Benchmarks through the Presets menu to calculate scores";
+  return "No Model Scores are Available on this Preset Yet.<br><br>Run Benchmarks to calculate scores";
 }
 function showMissingModelScoresInfo(selector = "") {
   openPresetActionModal({
@@ -672,10 +666,10 @@ function renderQueuedPresetScoreLabel(selector, row = {}) {
   }
   if (status === "running") {
     const pct = Math.round(normalizeBenchmarkProgress(row.step_progress) * 100);
-    return `<button type="button" class="preset-score-label score-running" title="${escapeHtml(title)}" onclick="openBenchmarkAllModal()">⌛ ${pct}%${stepText}</button>`;
+    return `<button type="button" class="preset-score-label score-running" title="${escapeHtml(title)}" onclick="openBenchmarksPage()">⌛ ${pct}%${stepText}</button>`;
   }
   if (status === "queued") {
-    return `<button type="button" class="preset-score-label score-running" title="${escapeHtml(title)}" onclick="openBenchmarkAllModal()">⌛ queued${stepText}</button>`;
+    return `<button type="button" class="preset-score-label score-running" title="${escapeHtml(title)}" onclick="openBenchmarksPage()">⌛ queued${stepText}</button>`;
   }
   if (status === "skipped") {
     return `<button type="button" class="preset-score-label score-missing" title="${escapeHtml(title)}" disabled>⛔ n/a</button>`;
@@ -693,7 +687,7 @@ function renderPresetQueueTitleTag(selector) {
   const stepText = stepCount ? ` · ${stepIndex}/${stepCount}` : "";
   const label = status === "queued" ? "queued" : status;
   const title = `${queued?.display_name || key}: ${queued?.step_label || queued?.error || status}`;
-  return `<button type="button" class="preset-queue-title-tag" title="${escapeHtml(title)}" onclick="openBenchmarkAllModal()">⌛ ${escapeHtml(label)}${escapeHtml(stepText)}</button>`;
+  return `<button type="button" class="preset-queue-title-tag" title="${escapeHtml(title)}" onclick="openBenchmarksPage()">⌛ ${escapeHtml(label)}${escapeHtml(stepText)}</button>`;
 }
 function benchmarkRunningLogForSelector(selector) {
   const key = String(selector || "").trim();
@@ -1662,13 +1656,8 @@ function renderModelScoreBreakdown(result = {}, comparison = null) {
     })
     .join("");
 }
-function ensureBenchmarkAllModal() {
-  if ($("benchmarkAllModal")) return;
-  const modal = document.createElement("div");
-  modal.id = "benchmarkAllModal";
-  modal.className = "club-modal hidden";
-  modal.innerHTML = `<div class="club-modal-card benchmark-modal-card" role="dialog" aria-modal="true" aria-labelledby="benchmarkAllTitle"><div class="panel-head benchmark-modal-drag-handle" onpointerdown="startBenchmarkModalDrag(event,'modal')"><h2 id="benchmarkAllTitle">Benchmarks</h2><button class="plain-close-btn" title="Close" aria-label="Close" onclick="closeBenchmarkAllModal()">✕</button></div><div id="benchmarkAllBody"></div><div class="msg" id="benchmarkAllMsg"></div></div>`;
-  document.body.appendChild(modal);
+function ensureBenchmarksPage() {
+  return !!$("benchmarksPageBody");
 }
 function benchmarkFloatingPositionFromStorage(value) {
   if (!value || typeof value !== "object") return null;
@@ -1682,10 +1671,8 @@ function hydrateBenchmarkFloatingState() {
   try {
     const payload = JSON.parse(localStorage.getItem(BENCHMARK_FLOATING_STATE_KEY) || "{}");
     if (!payload || typeof payload !== "object") return;
-    benchmarkModalCollapsed = !!payload.collapsed;
     benchmarkMiniHidden = !!payload.mini_hidden;
-    benchmarkModalOpenPersisted = !!payload.modal_open && !benchmarkModalCollapsed;
-    benchmarkModalPosition = benchmarkFloatingPositionFromStorage(payload.modal_position);
+    benchmarkMiniVisible = !!(payload.mini_visible ?? payload.collapsed);
     benchmarkMiniPosition = benchmarkFloatingPositionFromStorage(payload.mini_position);
   } catch (error) {}
 }
@@ -1694,38 +1681,34 @@ function persistBenchmarkFloatingState() {
     localStorage.setItem(
       BENCHMARK_FLOATING_STATE_KEY,
       JSON.stringify({
-        collapsed: !!benchmarkModalCollapsed,
         mini_hidden: !!benchmarkMiniHidden,
-        modal_open: !!benchmarkModalOpenPersisted,
-        modal_position: benchmarkModalPosition || null,
+        mini_visible: !!benchmarkMiniVisible,
         mini_position: benchmarkMiniPosition || null,
       }),
     );
   } catch (error) {}
 }
-function openBenchmarkAllModal() {
-  ensureBenchmarkAllModal();
+function openBenchmarksPage() {
+  ensureBenchmarksPage();
   hydrateBenchmarkFloatingState();
-  benchmarkModalCollapsed = false;
   benchmarkMiniHidden = false;
-  benchmarkModalOpenPersisted = true;
+  benchmarkMiniVisible = false;
   benchmarkModalAwaitingFreshSnapshot = true;
   benchmarkModalControlsLocked = true;
   persistBenchmarkFloatingState();
-  $("benchmarkAllModal").classList.remove("hidden");
-  applyBenchmarkModalPosition();
+  activateTab("benchmarks", false);
   renderBenchmarkMiniWindow();
-  renderBenchmarkAllModal();
+  renderBenchmarksPage();
   refreshBenchmarkSnapshot({ live: benchmarkJobActive() })
     .then(() => {
-      renderBenchmarkAllModal();
+      renderBenchmarksPage();
       return refreshStatus({ force: true }).catch(() => {});
     })
-    .then(() => renderBenchmarkAllModal())
+    .then(() => renderBenchmarksPage())
     .catch(() => {
       benchmarkModalAwaitingFreshSnapshot = false;
       benchmarkModalControlsLocked = false;
-      renderBenchmarkAllModal();
+      renderBenchmarksPage();
     });
 }
 function benchmarkRowForSelectorInCounts(selector = "", counts = {}) {
@@ -1740,7 +1723,7 @@ function preselectBenchmarkPreset(selector = "", mode = "full") {
   const counts = benchmarkSnapshot().counts_by_mode?.[benchMode] || benchmarkSnapshot().counts || {};
   const row = benchmarkRowForSelectorInCounts(key, counts);
   const selectedStages = benchmarkSelectedStages(benchMode, key, row, counts);
-  benchmarkAllModalMode = benchMode;
+  benchmarkPageMode = benchMode;
   benchmarkQueueSelectionByMode[benchMode] = [key];
   benchmarkQueueOrderByMode[benchMode] = [
     key,
@@ -1752,64 +1735,36 @@ function preselectBenchmarkPreset(selector = "", mode = "full") {
 function openBenchmarkForPreset(selector = "", mode = "full") {
   const key = String(selector || "").trim();
   if (!key) {
-    openBenchmarkAllModal();
+    openBenchmarksPage();
     return;
   }
-  openBenchmarkAllModal();
+  openBenchmarksPage();
   refreshBenchmarkSnapshot({ live: benchmarkJobActive() })
     .then(() => {
       preselectBenchmarkPreset(key, mode);
-      renderBenchmarkAllModal();
+      renderBenchmarksPage();
     })
     .catch(() => {
       preselectBenchmarkPreset(key, mode);
-      renderBenchmarkAllModal();
+      renderBenchmarksPage();
     });
 }
-function closeBenchmarkAllModal() {
-  ensureBenchmarkAllModal();
+function restoreBenchmarksPageFromMini() {
   hydrateBenchmarkFloatingState();
-  if (benchmarkJobFinishedReviewable()) {
-    benchmarkModalCollapsed = false;
-    benchmarkMiniHidden = true;
-    benchmarkModalOpenPersisted = false;
-    persistBenchmarkFloatingState();
-    $("benchmarkAllModal").classList.add("hidden");
-    renderBenchmarkMiniWindow();
-    return;
-  }
-  if (benchmarkJobActive()) {
-    collapseBenchmarkAllModal();
-    return;
-  }
-  benchmarkModalCollapsed = false;
   benchmarkMiniHidden = false;
-  benchmarkModalOpenPersisted = false;
+  benchmarkMiniVisible = false;
   persistBenchmarkFloatingState();
-  $("benchmarkAllModal").classList.add("hidden");
-  renderBenchmarkMiniWindow();
+  openBenchmarksPage();
 }
-function collapseBenchmarkAllModal() {
-  ensureBenchmarkAllModal();
-  hydrateBenchmarkFloatingState();
-  benchmarkModalCollapsed = true;
-  benchmarkMiniHidden = false;
-  benchmarkModalOpenPersisted = false;
-  persistBenchmarkFloatingState();
-  $("benchmarkAllModal").classList.add("hidden");
+function minimizeBenchmarksPage() {
+  benchmarkMiniVisible = benchmarkJobActive() || benchmarkJobFinishedReviewable();
+  if (activeTabName === "benchmarks") activateTab("overview", false);
   renderBenchmarkMiniWindow();
-}
-function restoreBenchmarkAllModalFromMini() {
-  hydrateBenchmarkFloatingState();
-  benchmarkModalCollapsed = false;
-  benchmarkMiniHidden = false;
-  benchmarkModalOpenPersisted = true;
-  persistBenchmarkFloatingState();
-  openBenchmarkAllModal();
 }
 function closeBenchmarkMiniWindow() {
   hydrateBenchmarkFloatingState();
   benchmarkMiniHidden = true;
+  benchmarkMiniVisible = false;
   persistBenchmarkFloatingState();
   renderBenchmarkMiniWindow();
 }
@@ -1822,19 +1777,10 @@ function clampBenchmarkFloatingPosition(position = {}, width = 360, height = 220
     top: Math.min(Math.max(margin, Number(position.top || margin)), maxTop),
   };
 }
-function applyBenchmarkModalPosition() {
-  hydrateBenchmarkFloatingState();
-  const card = document.querySelector("#benchmarkAllModal .benchmark-modal-card");
-  if (!card || !benchmarkModalPosition) return;
-  const pos = clampBenchmarkFloatingPosition(benchmarkModalPosition, card.offsetWidth || 980, card.offsetHeight || 720);
-  benchmarkModalPosition = pos;
-  card.style.left = `${pos.left}px`;
-  card.style.top = `${pos.top}px`;
-}
-function startBenchmarkModalDrag(event, target = "modal") {
+function startBenchmarkModalDrag(event, target = "mini") {
   if (event?.button !== undefined && event.button !== 0) return;
   if (event?.target?.closest?.("button,input,select,textarea,a")) return;
-  const node = target === "mini" ? $("benchmarkMiniWindow") : document.querySelector("#benchmarkAllModal .benchmark-modal-card");
+  const node = $("benchmarkMiniWindow");
   if (!node) return;
   const rect = node.getBoundingClientRect();
   benchmarkDragState = {
@@ -1864,20 +1810,11 @@ function moveBenchmarkModalDrag(event) {
     benchmarkDragState.width,
     benchmarkDragState.height,
   );
-  if (benchmarkDragState.target === "mini") {
-    benchmarkMiniPosition = pos;
-    const mini = $("benchmarkMiniWindow");
-    if (mini) {
-      mini.style.left = `${pos.left}px`;
-      mini.style.top = `${pos.top}px`;
-    }
-  } else {
-    benchmarkModalPosition = pos;
-    const card = document.querySelector("#benchmarkAllModal .benchmark-modal-card");
-    if (card) {
-      card.style.left = `${pos.left}px`;
-      card.style.top = `${pos.top}px`;
-    }
+  benchmarkMiniPosition = pos;
+  const mini = $("benchmarkMiniWindow");
+  if (mini) {
+    mini.style.left = `${pos.left}px`;
+    mini.style.top = `${pos.top}px`;
   }
 }
 function stopBenchmarkModalDrag() {
@@ -1894,8 +1831,8 @@ function stopBenchmarkModalDrag() {
   persistBenchmarkFloatingState();
 }
 function setBenchmarkAllMode(mode) {
-  benchmarkAllModalMode = String(mode || "quick") === "full" ? "full" : "quick";
-  renderBenchmarkAllModal();
+  benchmarkPageMode = String(mode || "quick") === "full" ? "full" : "quick";
+  renderBenchmarksPage();
 }
 function benchmarkInventoryRows(counts = {}) {
   const groups = [
@@ -2055,7 +1992,7 @@ function benchmarkStageStatusForRow(row, stageId, selected = false) {
   const rowStatus = String(row?.status || "").toLowerCase();
   const currentStep = String(row?.step_id || "");
   if (mapped === "missing" && selected && jobActive && rowStatus === "running" && currentStep && currentStep !== id) {
-    const mode = String(row?.mode || benchmarkJob()?.mode || benchmarkAllModalMode || "quick") === "full" ? "full" : "quick";
+    const mode = String(row?.mode || benchmarkJob()?.mode || benchmarkPageMode || "quick") === "full" ? "full" : "quick";
     const stageOrder = benchmarkStageOptions(mode).map((stage) => String(stage?.id || "")).filter(Boolean);
     const stageIndex = stageOrder.indexOf(id);
     const currentIndex = stageOrder.indexOf(currentStep);
@@ -2093,7 +2030,7 @@ function benchmarkNextStageMarkerKeys(mode) {
   const job = benchmarkJob();
   const markers = new Set();
   if (!job?.active) return markers;
-  const key = String(mode || job.mode || benchmarkAllModalMode || "quick") === "full" ? "full" : "quick";
+  const key = String(mode || job.mode || benchmarkPageMode || "quick") === "full" ? "full" : "quick";
   const counts = benchmarkSnapshot().counts_by_mode?.[key] || benchmarkSnapshot().counts || {};
   const options = benchmarkStageOptions(key, counts);
   if (!options.length) return markers;
@@ -2202,7 +2139,7 @@ function benchmarkActiveQueueOrder(job = benchmarkJob()) {
   }
   const jobKey = [
     String(job.job_id || ""),
-    String(job.mode || benchmarkAllModalMode || ""),
+    String(job.mode || benchmarkPageMode || ""),
     [...selectors].sort().join("\u001f"),
   ].join("\u001e");
   const previous = benchmarkStableActiveQueueOrderState.key === jobKey
@@ -2278,7 +2215,7 @@ async function updateBenchmarkQueueSelection(mode, selector, checked) {
   const counts = benchmarkSnapshot().counts_by_mode?.[key] || benchmarkSnapshot().counts || {};
   const preset = String(selector || "");
   if (benchmarkInventorySelectorsForGroup(counts, "ineligible").includes(preset)) {
-    renderBenchmarkAllModal();
+    renderBenchmarksPage();
     return;
   }
   const job = benchmarkJob();
@@ -2287,7 +2224,7 @@ async function updateBenchmarkQueueSelection(mode, selector, checked) {
     if (!checked && String(row?.status || "") === "running") {
       const confirmed = await openClubConfirmModal("Remove the active preset after its current benchmark stage finishes?");
       if (!confirmed) {
-        renderBenchmarkAllModal();
+        renderBenchmarksPage();
         return;
       }
     }
@@ -2307,16 +2244,16 @@ async function updateBenchmarkQueueSelection(mode, selector, checked) {
       );
       await refreshStatus({ force: true });
     } catch (error) {
-      setElementMsg("benchmarkAllMsg", messageText(error), "error");
+      setElementMsg("benchmarksPageMsg", messageText(error), "error");
     }
-    renderBenchmarkAllModal();
+    renderBenchmarksPage();
     return;
   }
   const selected = ensureBenchmarkQueueSelection(key, counts);
   if (checked) selected.add(preset);
   else selected.delete(preset);
   benchmarkQueueSelectionByMode[key] = [...selected];
-  renderBenchmarkAllModal();
+  renderBenchmarksPage();
 }
 async function updateBenchmarkStageSelection(mode, selector, stageId, checked) {
   rememberBenchmarkQueueScroll();
@@ -2328,7 +2265,7 @@ async function updateBenchmarkStageSelection(mode, selector, stageId, checked) {
   const row = active ? benchmarkQueueRows(job).find((item) => String(item?.selector || "") === preset) : null;
   const counts = benchmarkSnapshot().counts_by_mode?.[key] || benchmarkSnapshot().counts || {};
   if (benchmarkInventorySelectorsForGroup(counts, "ineligible").includes(preset)) {
-    renderBenchmarkAllModal();
+    renderBenchmarksPage();
     return;
   }
   const selected = benchmarkSelectedStages(key, preset, row, counts);
@@ -2336,12 +2273,12 @@ async function updateBenchmarkStageSelection(mode, selector, stageId, checked) {
   else selected.delete(stage);
   if (!selected.size) {
     alert("Select at least one benchmark stage for each queued preset.");
-    renderBenchmarkAllModal();
+    renderBenchmarksPage();
     return;
   }
   if (!active) {
     benchmarkStageSelectionByMode[key][preset] = [...selected];
-    renderBenchmarkAllModal();
+    renderBenchmarksPage();
     return;
   }
   const activeSelectors = benchmarkActiveSelectedSelectors(job);
@@ -2355,9 +2292,9 @@ async function updateBenchmarkStageSelection(mode, selector, stageId, checked) {
     );
     await refreshStatus({ force: true });
   } catch (error) {
-    setElementMsg("benchmarkAllMsg", messageText(error), "error");
+    setElementMsg("benchmarksPageMsg", messageText(error), "error");
   }
-  renderBenchmarkAllModal();
+  renderBenchmarksPage();
 }
 async function setBenchmarkBulkSelection(mode, selectors, checked) {
   rememberBenchmarkQueueScroll();
@@ -2373,7 +2310,7 @@ async function setBenchmarkBulkSelection(mode, selectors, checked) {
     const action = checked ? "Queue" : "Move";
     const destination = checked ? "into" : "out of";
     if (!(await openClubConfirmModal(`${action} ${label} from this category ${destination} the active ${key === "full" ? "Full" : "Quick"} benchmark?`))) {
-      renderBenchmarkAllModal();
+      renderBenchmarksPage();
       return;
     }
   }
@@ -2398,13 +2335,13 @@ async function setBenchmarkBulkSelection(mode, selectors, checked) {
       );
       await refreshStatus({ force: true });
     } catch (error) {
-      setElementMsg("benchmarkAllMsg", messageText(error), "error");
+      setElementMsg("benchmarksPageMsg", messageText(error), "error");
     }
-    renderBenchmarkAllModal();
+    renderBenchmarksPage();
     return;
   }
   benchmarkQueueSelectionByMode[key] = [...selected];
-  renderBenchmarkAllModal();
+  renderBenchmarksPage();
 }
 function setBenchmarkEligibleSelection(mode, checked) {
   const key = String(mode || "quick") === "full" ? "full" : "quick";
@@ -2455,12 +2392,12 @@ async function moveBenchmarkQueuePreset(event, mode, selector, direction) {
       );
       await refreshStatus({ force: true });
     } catch (error) {
-      setElementMsg("benchmarkAllMsg", messageText(error), "error");
+      setElementMsg("benchmarksPageMsg", messageText(error), "error");
     }
   } else {
     benchmarkQueueOrderByMode[key] = order;
   }
-  renderBenchmarkAllModal();
+  renderBenchmarksPage();
 }
 function focusBenchmarkModalLogs() {
   const target = $("benchmarkModalLogTail");
@@ -2510,7 +2447,7 @@ function restoreBenchmarkModalLogScroll() {
 function setBenchmarkModalLogMode(mode) {
   rememberBenchmarkModalLogScroll();
   benchmarkModalLogMode = String(mode || "") === "full" ? "full" : "staged";
-  renderBenchmarkAllModal();
+  renderBenchmarksPage();
 }
 function resetBenchmarkFinishedReview() {
   const job = benchmarkJob();
@@ -2520,12 +2457,12 @@ function resetBenchmarkFinishedReview() {
       localStorage.setItem(BENCHMARK_FINISHED_REVIEW_KEY, key);
     } catch (error) {}
   }
-  const mode = String(job.mode || benchmarkAllModalMode || "quick") === "full" ? "full" : "quick";
-  benchmarkAllModalMode = mode;
+  const mode = String(job.mode || benchmarkPageMode || "quick") === "full" ? "full" : "quick";
+  benchmarkPageMode = mode;
   benchmarkRunningPresetTab = "";
   benchmarkModalControlsLocked = false;
   benchmarkModalAwaitingFreshSnapshot = false;
-  renderBenchmarkAllModal();
+  renderBenchmarksPage();
   scheduleBenchmarkModalSnapshotRefresh(true);
 }
 function benchmarkSectionOpen(sectionId, defaultOpen = true) {
@@ -2598,7 +2535,7 @@ function handleBenchmarkQueueSummaryClick(event, selector, key) {
   }
   rememberBenchmarkQueueScroll();
   scheduleBenchmarkModalSnapshotRefresh(true);
-  setTimeout(() => renderBenchmarkAllModal(), 0);
+  setTimeout(() => renderBenchmarksPage(), 0);
 }
 function handleBenchmarkInventorySummaryClick(event, key) {
   const details = event?.currentTarget?.closest?.("details");
@@ -2613,7 +2550,7 @@ function applyBenchmarkGroupCheckboxStates(root = document) {
 }
 function setBenchmarkRunningPresetTab(selector) {
   benchmarkRunningPresetTab = String(selector || "");
-  renderBenchmarkAllModal();
+  renderBenchmarksPage();
 }
 function setBenchmarkRunningScriptTab(selector, tabId) {
   const key = String(selector || "");
@@ -2622,7 +2559,7 @@ function setBenchmarkRunningScriptTab(selector, tabId) {
   const row = (Array.isArray(benchmarkSnapshot().running_logs) ? benchmarkSnapshot().running_logs : [])
     .find((item) => String(item?.selector || "") === key);
   benchmarkRunningScriptTabSteps[key] = String(row?.step_id || "");
-  renderBenchmarkAllModal();
+  renderBenchmarksPage();
 }
 function benchmarkRunningLogContext(snapshot = benchmarkSnapshot(), requestedSelectorOverride = undefined, options = {}) {
   const hasSelectorOverride = requestedSelectorOverride !== undefined;
@@ -3093,7 +3030,7 @@ function renderBenchmarkMiniWindow() {
   const job = benchmarkJob();
   const active = !!job.active;
   const finishedReview = benchmarkJobFinishedReviewable(job);
-  if (!benchmarkModalCollapsed || (!active && !finishedReview)) {
+  if (activeTabName === "benchmarks" || !benchmarkMiniVisible || (!active && !finishedReview)) {
     if (mini) mini.remove();
     return;
   }
@@ -3124,8 +3061,8 @@ function renderBenchmarkMiniWindow() {
   const eta = finishedReview ? "complete" : benchmarkEtaLabel(job) || "calculating";
   const next = finishedReview ? "" : benchmarkNextQueuedLabel(job);
   const closeButton = renderIconButton({ title: "Hide", action: "closeBenchmarkMiniWindow()", icon: "close", className: "benchmark-mini-close" });
-  const expandButton = renderIconButton({ title: "Expand", action: "restoreBenchmarkAllModalFromMini()", icon: "detach", className: "benchmark-mini-expand" });
-  mini.innerHTML = `<div class="benchmark-mini-head benchmark-modal-drag-handle" onpointerdown="startBenchmarkModalDrag(event,'mini')"><strong>Benchmarks</strong><span class="benchmark-mini-head-actions">${closeButton}${expandButton}</span></div><div class="benchmark-mini-body">${showTotal ? benchmarkMiniProgressCardHtml(finishedReview ? "Finished" : "Total Progress", finishedReview ? 100 : overall, elapsed, eta, runButton) : ""}<section class="benchmark-mini-section">${showTotal ? '<hr class="benchmark-mini-separator" />' : ""}<div class="benchmark-mini-runner-list">${runningList}</div></section>${benchmarkMiniGpuTelemetryHtml()}${next ? `<div class="benchmark-mini-next-line"><span class="benchmark-mini-card-title">Up next</span><b class="benchmark-mini-next">${escapeHtml(next)}</b></div>` : ""}</div>`;
+  const expandButton = renderIconButton({ title: "Open Benchmarks", action: "restoreBenchmarksPageFromMini()", icon: "detach", className: "benchmark-mini-expand" });
+  mini.innerHTML = `<div class="benchmark-mini-head benchmark-mini-drag-handle" onpointerdown="startBenchmarkModalDrag(event,'mini')"><strong>Benchmarks</strong><span class="benchmark-mini-head-actions">${closeButton}${expandButton}</span></div><div class="benchmark-mini-body">${showTotal ? benchmarkMiniProgressCardHtml(finishedReview ? "Finished" : "Total Progress", finishedReview ? 100 : overall, elapsed, eta, runButton) : ""}<section class="benchmark-mini-section">${showTotal ? '<hr class="benchmark-mini-separator" />' : ""}<div class="benchmark-mini-runner-list">${runningList}</div></section>${benchmarkMiniGpuTelemetryHtml()}${next ? `<div class="benchmark-mini-next-line"><span class="benchmark-mini-card-title">Up next</span><b class="benchmark-mini-next">${escapeHtml(next)}</b></div>` : ""}</div>`;
   const miniWidth = applyBenchmarkMiniLayout(mini);
   const measuredMiniWidth = mini.offsetWidth || miniWidth || 560;
   const pos = clampBenchmarkFloatingPosition(benchmarkMiniPosition || { left: (window.innerWidth || 640) - measuredMiniWidth - 20, top: 70 }, measuredMiniWidth, mini.offsetHeight || 210);
@@ -3279,7 +3216,7 @@ function renderBenchmarkFailedRow(row = {}, mode = "full", active = false) {
   return `<details class="benchmark-failed-card" open><summary><span>❌ ${escapeHtml(row.display_name || selector || "Preset")}</span><span>${escapeHtml(formatModelScoreValue(row.score))}</span></summary><div class="preset-help">${escapeHtml(row.step || "Failed benchmark gate")}</div><div class="preset-help">${escapeHtml(row.error || "No failure text captured.")}</div><ul class="benchmark-recommendations">${tips}</ul><div class="benchmark-actions"><button class="btn green" ${locked ? "disabled" : ""} onclick="retryFailedBenchmarkPreset('${escapeJs(selector)}','${escapeJs(retryMode)}')">Retry</button></div></details>`;
 }
 function benchmarkModalDomHasActiveText() {
-  const body = $("benchmarkAllBody");
+  const body = $("benchmarksPageBody");
   if (!body) return false;
   const text = String(body.innerText || body.textContent || "").trim().toLowerCase();
   return /model scores (running|waiting)|benchmark (running|queued)|running:|pausing to cool/.test(text);
@@ -3301,7 +3238,7 @@ function benchmarkLockActiveControlMarkup(html = "") {
 }
 function applyBenchmarkModalActiveControlLock(locked = false) {
   const lockNodes = () => {
-    const body = $("benchmarkAllBody");
+    const body = $("benchmarksPageBody");
     if (!body) return;
     body.querySelectorAll([
       ".benchmark-mode-row > button.subtab",
@@ -3337,7 +3274,7 @@ function applyBenchmarkModalActiveControlLock(locked = false) {
     return;
   }
   lockNodes();
-  const body = $("benchmarkAllBody");
+  const body = $("benchmarksPageBody");
   if (body && !benchmarkModalControlLockObserver && typeof MutationObserver === "function") {
     benchmarkModalControlLockObserver = new MutationObserver(() => {
       const job = benchmarkJob();
@@ -3366,16 +3303,11 @@ function applyBenchmarkModalActiveControlLock(locked = false) {
     }, 5);
   }
 }
-function renderBenchmarkAllModal() {
-  ensureBenchmarkAllModal();
-  const body = $("benchmarkAllBody");
+function renderBenchmarksPage() {
+  ensureBenchmarksPage();
+  const body = $("benchmarksPageBody");
   if (!body) return;
-  const modal = $("benchmarkAllModal");
-  if (modal && !modal.classList.contains("hidden")) {
-    benchmarkModalCollapsed = false;
-    benchmarkModalOpenPersisted = true;
-    renderBenchmarkMiniWindow();
-  }
+  renderBenchmarkMiniWindow();
   rememberBenchmarkQueueScroll();
   rememberBenchmarkModalLogScroll();
   rememberBenchmarkModalLogHeight();
@@ -3398,7 +3330,7 @@ function renderBenchmarkAllModal() {
   const finishedReview = refreshingIdleInventory ? false : rawFinishedReview;
   const sessionReview = active || resumable || finishedReview;
   const controlsLocked = benchmarkModalAwaitingFreshSnapshot || refreshingIdleInventory || active || syncBenchmarkModalControlLock(job, snapshot);
-  const mode = sessionReview ? String(job.mode || "quick") : benchmarkAllModalMode;
+  const mode = sessionReview ? String(job.mode || "quick") : benchmarkPageMode;
   const countsByMode = snapshot.counts_by_mode || {};
   const inventoryCounts = countsByMode[mode] || snapshot.counts || {};
   const idleSelected = sessionReview ? new Set() : ensureBenchmarkQueueSelection(mode, inventoryCounts);
@@ -3559,7 +3491,6 @@ function renderBenchmarkAllModal() {
   applyBenchmarkGroupCheckboxStates(body);
   applyBenchmarkModalActiveControlLock(controlsLocked);
   const restoreBenchmarkUiState = () => {
-    applyBenchmarkModalPosition();
     restoreBenchmarkQueueScroll();
     restoreBenchmarkModalLogHeight();
     restoreBenchmarkModalLogScroll();
@@ -3579,7 +3510,7 @@ async function startBenchmarkAll(mode = "quick") {
   const selectors = order.filter((selector) => selected.has(selector) && !ineligible.has(selector));
   const runnable = benchmarkRunnableStagePayload(key, selectors, resumable ? job : null);
   if (!runnable.selectors.length) {
-    setElementMsg("benchmarkAllMsg", "Select at least one missing, failed, or stale benchmark stage to run.", "error");
+    setElementMsg("benchmarksPageMsg", "Select at least one missing, failed, or stale benchmark stage to run.", "error");
     return;
   }
   const runnableSet = new Set(runnable.selectors);
@@ -3610,9 +3541,9 @@ async function startBenchmarkAll(mode = "quick") {
       `/admin/benchmarks/start ${mode}`,
     );
     await refreshStatus({ force: true });
-    renderBenchmarkAllModal();
+    renderBenchmarksPage();
   } catch (error) {
-    setElementMsg("benchmarkAllMsg", messageText(error), "error");
+    setElementMsg("benchmarksPageMsg", messageText(error), "error");
   }
 }
 function benchmarkStopButtonHtml(title = "Cancel Benchmark", extraAction = "") {
@@ -3656,9 +3587,9 @@ async function cancelBenchmarkJob(event = null) {
   try {
     await post("/admin/benchmarks/cancel", { force }, force ? "/admin/benchmarks/cancel force" : "/admin/benchmarks/cancel");
     await refreshStatus({ force: true });
-    renderBenchmarkAllModal();
+    renderBenchmarksPage();
   } catch (error) {
-    setElementMsg("benchmarkAllMsg", messageText(error), "error");
+    setElementMsg("benchmarksPageMsg", messageText(error), "error");
   }
 }
 function ensurePresetScoresModal() {
@@ -3857,7 +3788,7 @@ async function startBenchmarkPreset(selector, mode = "quick") {
       `/admin/benchmarks/start ${mode} ${key}`,
     );
     closePresetScoresModal();
-    openBenchmarkAllModal();
+    openBenchmarksPage();
   } catch (error) {
     setElementMsg("presetScoresMsg", messageText(error), "error");
   }
@@ -3894,7 +3825,7 @@ async function rerunModelScoreCategory(metricId) {
       `${active ? "/admin/benchmarks/rerun" : "/admin/benchmarks/start"} ${mode} ${selector} ${metric}`,
     );
     closePresetScoresModal();
-    openBenchmarkAllModal();
+    openBenchmarksPage();
   } catch (error) {
     setElementMsg("presetScoresMsg", messageText(error), "error");
   }
@@ -3933,7 +3864,7 @@ async function rerunModelScoreStage(stageId) {
       `${active ? "/admin/benchmarks/rerun" : "/admin/benchmarks/start"} ${mode} ${selector} ${stage}`,
     );
     closePresetScoresModal();
-    openBenchmarkAllModal();
+    openBenchmarksPage();
   } catch (error) {
     setElementMsg("presetScoresMsg", messageText(error), "error");
   }
@@ -3948,9 +3879,9 @@ async function retryFailedBenchmarkPreset(selector, mode = "full") {
       `/admin/benchmarks/start ${mode} ${key}`,
     );
     await refreshStatus({ force: true });
-    openBenchmarkAllModal();
+    openBenchmarksPage();
   } catch (error) {
-    setElementMsg("benchmarkAllMsg", messageText(error), "error");
+    setElementMsg("benchmarksPageMsg", messageText(error), "error");
   }
 }
 async function handleBenchmarkFailedQueueCheck(mode = "full", selector = "", checkbox = null, encodedStages = "") {
@@ -3985,10 +3916,10 @@ async function handleBenchmarkFailedQueueCheck(mode = "full", selector = "", che
       `/admin/benchmarks/rerun ${activeMode} ${key} append`,
     );
     await refreshStatus({ force: true });
-    renderBenchmarkAllModal();
+    renderBenchmarksPage();
   } catch (error) {
     if (checkbox) checkbox.checked = false;
-    setElementMsg("benchmarkAllMsg", messageText(error), "error");
+    setElementMsg("benchmarksPageMsg", messageText(error), "error");
   }
 }
 async function clearBenchmarkScore(selector) {
@@ -4899,7 +4830,7 @@ async function removeImageStudio() {
       loadRunScriptLog(scriptModalState.selectedJobId, true).catch(() => {});
     }
     renderScriptRunnerUi();
-    setElementMsg("runScriptMsg", "AI Studio removal queued. Downloaded models are left in place for Model Manager cleanup.", "success");
+    setElementMsg("runScriptMsg", "AI Studio removal queued. Downloaded models are left in place.", "success");
   } catch (error) {
     setElementMsg("runScriptMsg", messageText(error), "error");
   }
@@ -5148,25 +5079,13 @@ function renderRunScriptModal() {
 window.renderRunScriptModal = renderRunScriptModal;
 function renderBenchmarkSurfaces() {
   hydrateBenchmarkFloatingState();
-  if (benchmarkModalOpenPersisted && !benchmarkModalCollapsed) {
-    ensureBenchmarkAllModal();
-    $("benchmarkAllModal").classList.remove("hidden");
-    applyBenchmarkModalPosition();
-  }
-  const modal = $("benchmarkAllModal");
-  const modalOpen = !!modal && !modal.classList.contains("hidden");
-  if (modalOpen) {
-    const staleMini = $("benchmarkMiniWindow");
-    if (staleMini) staleMini.remove();
-    benchmarkModalCollapsed = false;
-    renderBenchmarkAllModal();
+  if (activeTabName === "benchmarks") {
+    renderBenchmarksPage();
     scheduleBenchmarkModalSnapshotRefresh();
     return;
   }
-  if (benchmarkModalCollapsed || $("benchmarkMiniWindow")) {
-    renderBenchmarkMiniWindow();
-    if ($("benchmarkMiniWindow")) scheduleBenchmarkModalSnapshotRefresh();
-  }
+  renderBenchmarkMiniWindow();
+  if ($("benchmarkMiniWindow")) scheduleBenchmarkModalSnapshotRefresh();
   if ($("presetScoresModal") && !$("presetScoresModal").classList.contains("hidden")) {
     renderPresetScoresModal();
     refreshPresetScoresModalDetailFromStatus().catch(() => {});
@@ -5177,12 +5096,10 @@ function handleBenchmarkJobTransition(previousStatus = {}, nextStatus = {}) {
   const previousJob = previousStatus?.benchmarks?.job || {};
   const nextJob = nextStatus?.benchmarks?.job || {};
   if (!previousJob.active && nextJob.active) {
-    const modal = $("benchmarkAllModal");
-    const modalOpen = !!modal && !modal.classList.contains("hidden");
-    if (!modalOpen) {
+    if (activeTabName !== "benchmarks") {
       hydrateBenchmarkFloatingState();
-      benchmarkModalCollapsed = true;
       benchmarkMiniHidden = false;
+      benchmarkMiniVisible = true;
       persistBenchmarkFloatingState();
       renderBenchmarkMiniWindow();
     }
@@ -5255,9 +5172,16 @@ function restoreTabScrollPosition(name = activeTabName) {
 }
 function activateTab(name, firstRender = false) {
   const requestedTab = normalizeTabName(name);
+  const previousTab = activeTabName;
   if (!uiStateHydrated) hydrateUiState({});
   if (!firstRender && requestedTab !== activeTabName) rememberTabScrollPosition(activeTabName);
   activeTabName = requestedTab;
+  if (requestedTab === "benchmarks") {
+    benchmarkMiniVisible = false;
+    benchmarkMiniHidden = false;
+  } else if (previousTab === "benchmarks" && (benchmarkJobActive() || benchmarkJobFinishedReviewable())) {
+    benchmarkMiniVisible = true;
+  }
   writeUiStateToLocationHash(currentUiState());
   writeUiStateToLocationSearch(currentUiState());
   writeCachedUiState(currentUiState());
@@ -5268,17 +5192,23 @@ function activateTab(name, firstRender = false) {
   if (activeTabName === "metrics") {
     redrawMetricsSoon();
   }
-  if (activeTabName === "presets") {
-    renderPresetScopeTabs();
-    renderModelInstallStatus();
-    if (renderCachedDynamicPresetModels()) {
-      requestAnimationFrame(() => renderDynamicPresetModels());
-    } else {
-      renderDynamicPresetModels();
+  if (activeTabName === "ai-studio") {
+    renderAIStudioTab();
+    if (aiStudioModelType === "text") {
+      renderPresetScopeTabs();
+      renderModelInstallStatus();
+      if (renderCachedDynamicPresetModels()) {
+        requestAnimationFrame(() => renderDynamicPresetModels());
+      } else {
+        renderDynamicPresetModels();
+      }
     }
-    if (!lastStatus?.runtime_inventory) {
-      refreshStatus({ force: true }).catch(() => {});
-    }
+    if (!lastStatus?.runtime_inventory) refreshStatus({ force: true }).catch(() => {});
+  }
+  if (activeTabName === "benchmarks") {
+    benchmarkMiniHidden = false;
+    renderBenchmarksPage();
+    scheduleBenchmarkModalSnapshotRefresh(true);
   }
   if (activeTabName === "chat") {
     hydrateChatState()
@@ -5315,7 +5245,7 @@ function statusRequestProfile(options = {}) {
   const includeSeries =
     !!options.includeSeries || tab === "metrics" || popupMetricsWindowOpen();
   const includeInventory =
-    !!options.includeInventory || tab === "presets" || tab === "chat";
+    !!options.includeInventory || tab === "ai-studio" || tab === "chat";
   const includeBenchmarkDetails =
     !!options.includeBenchmarkDetails;
   return {
@@ -5843,14 +5773,23 @@ async function bootAdminUi() {
     selectedScope =
       singleScopeItems()[0]?.id || pairScopeItems()[0]?.id || "GLOBAL";
   setScope(selectedScope, false);
-  if (activeTabName === "presets") {
-    renderPresetScopeTabs();
-    renderModelInstallStatus();
-    if (renderCachedDynamicPresetModels()) {
-      requestAnimationFrame(() => renderDynamicPresetModels());
-    } else {
-      renderDynamicPresetModels();
+  if (activeTabName === "ai-studio") {
+    renderAIStudioTab();
+    if (aiStudioModelType === "text") {
+      renderPresetScopeTabs();
+      renderModelInstallStatus();
+      if (renderCachedDynamicPresetModels()) {
+        requestAnimationFrame(() => renderDynamicPresetModels());
+      } else {
+        renderDynamicPresetModels();
+      }
     }
+    if (!lastStatus?.runtime_inventory) refreshStatus({ force: true }).catch(() => {});
+  }
+  if (activeTabName === "benchmarks") {
+    benchmarkMiniHidden = false;
+    renderBenchmarksPage();
+    scheduleBenchmarkModalSnapshotRefresh(true);
   }
   if (activeTabName === "chat") {
     hydrateChatState()
@@ -6068,9 +6007,6 @@ function readCachedSelectedPresetModel() {
 function hydrateSelectedPresetModel() {
   const models = inventoryModels();
   const valid = new Set(models.map((model) => String(model.model_id || "")));
-  valid.add(RESOURCE_MANAGER_MODEL_ID);
-  valid.add(HIDDEN_PRESETS_MODEL_ID);
-  valid.add(AI_STUDIO_MODEL_ID);
   const configured = String(lastStatus?.server_config?.selected_preset_model || "").trim();
   const cached = readCachedSelectedPresetModel();
   if (!selectedPresetModelHydrated) {
@@ -6088,6 +6024,9 @@ function hydrateSelectedPresetModel() {
 }
 function selectPresetModel(modelId = "") {
   selectedPresetModelId = String(modelId || "").trim();
+  if (selectedPresetModelId && inventoryModels().some((model) => String(model.model_id || "") === selectedPresetModelId)) {
+    try { localStorage.setItem("club3090_recent_model_family", selectedPresetModelId); } catch (e) {}
+  }
   selectedPresetModelHydrated = true;
   try {
     localStorage.setItem(SELECTED_PRESET_MODEL_CACHE_KEY, selectedPresetModelId);
@@ -6096,40 +6035,6 @@ function selectPresetModel(modelId = "") {
   renderDynamicPresetModels();
   renderModelInstallStatus();
   saveSelectedPresetModel(selectedPresetModelId);
-}
-function cssEscapeValue(value = "") {
-  const raw = String(value || "");
-  if (window.CSS && typeof window.CSS.escape === "function") return window.CSS.escape(raw);
-  return raw.replace(/["\\]/g, "\\$&");
-}
-function focusPresetCard(selector = "") {
-  const key = String(selector || "").trim();
-  if (!key) return false;
-  const attr = cssEscapeValue(key);
-  const target = document.querySelector(`[data-preset-selector="${attr}"]`);
-  if (!target) return false;
-  target.scrollIntoView({ block: "center", behavior: "smooth" });
-  target.classList.remove("preset-card-focus-pulse");
-  void target.offsetWidth;
-  target.classList.add("preset-card-focus-pulse");
-  setTimeout(() => target.classList.remove("preset-card-focus-pulse"), 2600);
-  return true;
-}
-function openPresetCardFromResourceManager(selector = "") {
-  const variant = findVariantBySelector(selector);
-  if (!variant) {
-    alert(`Preset ${selector || "unknown"} was not found in the current inventory.`);
-    return false;
-  }
-  clearPresetFilterStateForNavigation();
-  selectPresetModel(String(variant?.model_id || ""));
-  setTimeout(() => {
-    if (!focusPresetCard(variantSelector(variant))) {
-      renderDynamicPresetModels({ force: true });
-      setTimeout(() => focusPresetCard(variantSelector(variant)), 0);
-    }
-  }, 0);
-  return false;
 }
 function renderPresetModelSelector() {
   const host = $("presetModelSelector");
@@ -6141,79 +6046,24 @@ function renderPresetModelSelector() {
     return;
   }
   host.classList.remove("hidden");
-  const curated = curatedInventoryModels();
-  const custom = customInventoryModels();
+  let recent = "";
+  try { recent = String(localStorage.getItem("club3090_recent_model_family") || ""); } catch (e) {}
+  const sorted = [...models].sort((a, b) => {
+    const aId = String(a.model_id || "");
+    const bId = String(b.model_id || "");
+    if (aId === recent) return -1;
+    if (bId === recent) return 1;
+    return String(a.display_name || aId).localeCompare(String(b.display_name || bId), undefined, { sensitivity: "base" });
+  });
   const renderModelButton = (model) => {
     const modelId = String(model.model_id || "");
     return `<button class="subtab ${modelId === selectedPresetModelId ? "active" : ""}" onclick="selectPresetModel('${escapeJs(modelId)}')">${escapeHtml(model.display_name || modelId)}</button>`;
   };
   const parts = [
     `<button class="subtab ${!selectedPresetModelId ? "active" : ""}" onclick="selectPresetModel('')">Summary</button>`,
-    ...curated.map(renderModelButton),
+    ...sorted.map(renderModelButton),
   ];
-  if (custom.length) {
-    parts.push('<span class="scope-strip-separator" aria-hidden="true"></span>');
-    parts.push(...custom.map(renderModelButton));
-  }
   setHtmlIfChanged(host, parts.join(""));
-}
-function presetMenuIconHtml(icon, className = "") {
-  return `<span class="preset-menu-icon ${className}" aria-hidden="true">${svgIcon(icon)}</span>`;
-}
-function renderPresetMenuItem({ label, icon, className, onClick, active = false } = {}) {
-  const classes = `preset-menu-item ${className || ""}${active ? " active" : ""}`.trim();
-  return `<button type="button" class="${classes}" role="menuitem" onclick="closePresetActionsMenu(); ${onClick}">${presetMenuIconHtml(icon)}<span>${escapeHtml(label)}</span></button>`;
-}
-function renderPresetActionsMenu() {
-  const items = [
-    renderPresetMenuItem({
-      label: "Setup Assistant",
-      icon: "sparkles",
-      className: "preset-menu-setup",
-      onClick: "openSetupAssistantModal()",
-    }),
-    renderPresetMenuItem({
-      label: "Rebuild Model DB",
-      icon: "database",
-      className: "preset-menu-rebuild",
-      onClick: "promptRuntimeInventoryRebuild()",
-    }),
-    '<div class="preset-menu-separator" aria-hidden="true"></div>',
-    renderPresetMenuItem({
-      label: "Hidden Presets",
-      icon: "hide",
-      className: "preset-menu-hidden",
-      onClick: `selectPresetModel('${HIDDEN_PRESETS_MODEL_ID}')`,
-      active: selectedPresetModelId === HIDDEN_PRESETS_MODEL_ID,
-    }),
-    renderPresetMenuItem({
-      label: "Custom Model",
-      icon: "plus",
-      className: "preset-menu-custom",
-      onClick: "openCustomModelModal()",
-    }),
-    renderPresetMenuItem({
-      label: "Model Manager",
-      icon: "gear",
-      className: "preset-menu-manager",
-      onClick: `selectPresetModel('${RESOURCE_MANAGER_MODEL_ID}')`,
-      active: selectedPresetModelId === RESOURCE_MANAGER_MODEL_ID,
-    }),
-    renderPresetMenuItem({
-      label: "AI Studio",
-      icon: "sparkles",
-      className: "preset-menu-ai-studio",
-      onClick: `selectPresetModel('${AI_STUDIO_MODEL_ID}')`,
-      active: selectedPresetModelId === AI_STUDIO_MODEL_ID,
-    }),
-    renderPresetMenuItem({
-      label: "Benchmarks",
-      icon: "play",
-      className: "preset-menu-benchmarks",
-      onClick: "openBenchmarkAllModal()",
-    }),
-  ];
-  return `<div class="preset-head-menu" id="presetActionsMenu"><button type="button" class="preset-menu-button" id="presetActionsMenuButton" title="Preset actions" aria-label="Preset actions" aria-haspopup="menu" aria-expanded="false" onclick="togglePresetActionsMenu(event)">${svgIcon("menu")}</button><div class="preset-actions-menu hidden" id="presetActionsMenuList" role="menu">${items.join("")}</div></div>`;
 }
 function defaultPresetFilterState() {
   return {
@@ -6371,34 +6221,19 @@ function openPresetFilterModal() {
 function renderPresetHeaderActions() {
   const host = $("presetHeadActions");
   if (!host) return;
-  setHtmlIfChanged(
-    host,
-    `<button type="button" class="preset-menu-button preset-filter-button${presetFilterIsActive() ? " active" : ""}" title="Filter presets" aria-label="Filter presets" onclick="openPresetFilterModal()">${svgIcon("filter")}</button>${renderPresetActionsMenu()}`,
-  );
+  setHtmlIfChanged(host, renderPresetHeadActionsHtml());
 }
 function renderPresetHeadActionsHtml() {
-  return `<div class="preset-head-actions" id="presetHeadActions"><button type="button" class="preset-menu-button preset-filter-button${presetFilterIsActive() ? " active" : ""}" title="Filter presets" aria-label="Filter presets" onclick="openPresetFilterModal()">${svgIcon("filter")}</button>${renderPresetActionsMenu()}</div>`;
+  return `<div class="preset-toolbar-main"><button type="button" class="btn blue" onclick="openSetupAssistantModal()">Setup Assistant</button><button type="button" class="btn blue" onclick="promptRuntimeInventoryRebuild()">Rebuild Model DB</button><button type="button" class="btn green" onclick="openCustomModelModal()">Add custom model</button></div><div class="preset-toolbar-utilities"><button type="button" class="btn hidden-presets-trigger${showHiddenPresets ? " active" : ""}" id="hiddenPresetsToggle" aria-pressed="${showHiddenPresets}" onclick="toggleHiddenPresetsVisibility()">${showHiddenPresets ? "Hide hidden presets" : "Show hidden presets"}</button><button type="button" class="preset-toolbar-icon-button preset-filter-button${presetFilterIsActive() ? " active" : ""}" title="Filter presets" aria-label="Filter presets" onclick="openPresetFilterModal()">${svgIcon("filter")}</button></div>`;
 }
-function closePresetActionsMenu() {
-  const menu = $("presetActionsMenuList");
-  const button = $("presetActionsMenuButton");
-  if (menu) menu.classList.add("hidden");
-  if (button) button.setAttribute("aria-expanded", "false");
+var showHiddenPresets = false;
+try { showHiddenPresets = localStorage.getItem("club3090_show_hidden_presets") === "1"; } catch (e) {}
+function toggleHiddenPresetsVisibility() {
+  showHiddenPresets = !showHiddenPresets;
+  try { localStorage.setItem("club3090_show_hidden_presets", showHiddenPresets ? "1" : "0"); } catch (e) {}
+  renderPresetHeaderActions();
+  renderDynamicPresetModels({ force: true });
 }
-function togglePresetActionsMenu(event) {
-  if (event && typeof event.stopPropagation === "function") event.stopPropagation();
-  const menu = $("presetActionsMenuList");
-  const button = $("presetActionsMenuButton");
-  if (!menu) return;
-  const opening = menu.classList.contains("hidden");
-  menu.classList.toggle("hidden", !opening);
-  if (button) button.setAttribute("aria-expanded", opening ? "true" : "false");
-}
-document.addEventListener("click", (event) => {
-  const wrap = $("presetActionsMenu");
-  if (!wrap || wrap.contains(event.target)) return;
-  closePresetActionsMenu();
-});
 function customModelTriggerContent(label = "Custom Model") {
   return `<span class="custom-model-trigger-content"><span class="custom-model-trigger-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><circle cx="12" cy="12" r="11"></circle><path d="M12 7v10M7 12h10"></path></svg></span><span class="custom-model-trigger-label">${escapeHtml(label)}</span></span>`;
 }
@@ -6411,27 +6246,6 @@ function renderCustomModelTriggerButton({
 }
 var pendingHiddenPresetSelectors = null;
 var pendingHiddenPresetConfirmAfter = 0;
-function renderHiddenPresetsTriggerButton({
-  className = "subtab hidden-presets-trigger",
-  label = "Hidden Presets",
-  onClick = `selectPresetModel('${HIDDEN_PRESETS_MODEL_ID}')`,
-} = {}) {
-  return `<button class="${className}" onclick="${onClick}"><span class="custom-model-trigger-content"><span class="custom-model-trigger-icon hidden-presets-trigger-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path d="M2.5 12s3.6-6 9.5-6 9.5 6 9.5 6-3.6 6-9.5 6-9.5-6-9.5-6Z"></path><circle cx="12" cy="12" r="3.25"></circle><path d="M4 20 20 4"></path></svg></span><span class="custom-model-trigger-label">${escapeHtml(label)}</span></span></button>`;
-}
-function renderResourceManagerTriggerButton({
-  className = "subtab resource-manager-trigger",
-  label = "Model Manager",
-  onClick = `selectPresetModel('${RESOURCE_MANAGER_MODEL_ID}')`,
-} = {}) {
-  return `<button class="${className}" onclick="${onClick}"><span class="custom-model-trigger-content"><span class="custom-model-trigger-icon resource-manager-trigger-icon" aria-hidden="true">${svgIcon("gear")}</span><span class="custom-model-trigger-label">${escapeHtml(label)}</span></span></button>`;
-}
-function renderBenchmarkTriggerButton({
-  className = "subtab benchmark-manager-trigger",
-  label = "Benchmarks",
-  onClick = "openBenchmarkAllModal()",
-} = {}) {
-  return `<button class="${className}" onclick="${onClick}"><span class="custom-model-trigger-content"><span class="custom-model-trigger-icon benchmark-manager-trigger-icon" aria-hidden="true">${svgIcon("play")}</span><span class="custom-model-trigger-label">${escapeHtml(label)}</span></span></button>`;
-}
 function variantSelector(variant) {
   return (variant && (variant.upstream_tag || variant.selector || variant.variant_id)) || "";
 }
@@ -7402,7 +7216,7 @@ function ensureDynamicPresetLayout() {
   if (!firstPanel) return;
   firstPanel.id = "dynamicPresetPanel";
   if (!$("modelPresetGrid")) {
-    firstPanel.innerHTML = `<div class="panel-head"><h2>Model Presets</h2>${renderPresetHeadActionsHtml()}</div><div class="preset-help">Discovered presets are rendered directly from the local <code>/opt/ai/club-3090</code> clone. Global applies single-GPU presets across every GPU, dual presets across every two-GPU pair, and multi-GPU presets to the shared runtime.</div><div class="preset-section-label">Scope</div><div class="subtabs" id="presetScopeTabs"></div><div class="value smallgap" id="presetScopeSummary">-</div><div class="preset-section-label">Models</div><div class="subtabs" id="presetModelSelector"></div><div class="value smallgap" id="presetJobSummary">-</div><div class="msg" id="presetResourceMsg"></div><div id="modelPresetGrid" class="model-grid"></div>`;
+    firstPanel.innerHTML = `<div class="panel-head"><h2>Text models</h2></div><div class="preset-toolbar" id="presetHeadActions">${renderPresetHeadActionsHtml()}</div><div class="preset-help">Discovered presets come from the local <code>/opt/ai/club-3090</code> clone. Global applies single-GPU presets across every GPU, dual presets across every two-GPU pair, and multi-GPU presets to the shared runtime.</div><div class="preset-section-label">Scope</div><div class="subtabs" id="presetScopeTabs"></div><div class="value smallgap" id="presetScopeSummary">-</div><div class="preset-section-label">Models</div><div class="subtabs" id="presetModelSelector"></div><div class="value smallgap" id="presetJobSummary">-</div><div class="msg" id="presetResourceMsg"></div><div id="modelPresetGrid" class="model-grid"></div>`;
   }
   if ($("singlePresetCard")) $("singlePresetCard").removeAttribute("id");
   if ($("dualPresetCard")) $("dualPresetCard").remove();
@@ -8071,21 +7885,6 @@ function promptModelInstallById(variantId) {
   const variant = inventoryVariants().find((row) => String(row?.variant_id || "") === String(variantId || ""));
   if (!variant) throw new Error("Preset not found in runtime inventory.");
   return promptModelInstall(variant);
-}
-async function checkModelUpdatesNow() {
-  setElementMsg("presetResourceMsg", "Checking Hugging Face model updates...", "warning");
-  const payload = await post("/admin/model-updates/check", {}, "/admin/model-updates/check");
-  if (payload?.runtime_inventory) {
-    lastStatus = lastStatus || {};
-    lastStatus.runtime_inventory = payload.runtime_inventory;
-    lastStatus.models = payload.models || payload.runtime_inventory.models || [];
-    lastStatus.variants = payload.variants || payload.runtime_inventory.variants || [];
-    lastStatus.model_updates = payload.model_updates || lastStatus.model_updates;
-    writeRuntimeInventoryCacheFromStatus(lastStatus);
-  }
-  setElementMsg("presetResourceMsg", "Model update check started. Results will refresh automatically.", "success");
-  refreshStatus({ force: true }).catch(() => {});
-  renderDynamicPresetModels({ force: true });
 }
 async function startModelUpdateForVariant(variantId) {
   const variant = inventoryVariants().find((row) => String(row?.variant_id || "") === String(variantId || ""));
@@ -9119,7 +8918,7 @@ function renderDeleteCustomPresetButton(variant, disabled = false) {
 }
 function renderVariantSettingsCluster(variant, options = {}) {
   const selector = variantSelector(variant);
-  const visibilityButton = renderHiddenPresetToggleIcon(variant, false);
+  const visibilityButton = renderHiddenPresetToggleIcon(variant, presetIsHidden(variant));
   const cacheButton = renderPresetCacheClearButton(variant, !!options.cacheDisabled);
   const settingsButton = renderIconButton({
     title: "Launch settings",
@@ -9187,13 +8986,13 @@ async function promptDeletePresetResources(selector) {
   const rowsHtml = resources
     .map(
       (row) =>
-        `<div class="resource-delete-row"><code>${escapeHtml(row.path || "")}</code><span>${escapeHtml(formatDiskBytes(row.size_bytes || 0))}</span></div>`,
+        `<div class="resource-delete-row"><code>${escapeHtml(row.path || "")}</code><span>Model file · ${escapeHtml(formatDiskBytes(row.size_bytes || 0))}</span></div>`,
     )
     .join("");
   openActionChoiceModal({
-    title: "Preset Resource Actions",
+    title: "Delete downloaded model files?",
     errorTargetId: "presetResourceMsg",
-    body: `<div>Clear downloaded resources for <code>${escapeHtml(variantDisplayLabel(variant))}</code>?</div><div class="preset-help resource-delete-summary">${escapeHtml(formatResourcePlusCacheBytes(total, cacheTotal))} is associated with this preset.</div>`,
+    body: `<div>Delete the downloaded model files used by <code>${escapeHtml(variantDisplayLabel(variant))}</code>?</div><div class="preset-help">This removes the listed files from disk. Other presets may share them and will need to download them again. Preset settings and generated media are not deleted. Caches are separate and are removed only by a cache action.</div><div class="preset-help resource-delete-summary">${escapeHtml(formatResourcePlusCacheBytes(total, cacheTotal))} is associated with this preset.</div>`,
     detailsHtml: `<div class="resource-delete-list">${rowsHtml}</div>`,
     choices: [
       {
@@ -9294,17 +9093,17 @@ async function promptClearPresetCaches(selector) {
   const rowsHtml = [
     ...resources.map(
       (row) =>
-        `<div class="resource-delete-row"><code>${escapeHtml(row.path || "")}</code><span>${escapeHtml(formatDiskBytes(row.size_bytes || 0))}</span></div>`,
+        `<div class="resource-delete-row"><code>${escapeHtml(row.path || "")}</code><span>Model file · ${escapeHtml(formatDiskBytes(row.size_bytes || 0))}</span></div>`,
     ),
     ...caches.map(
       (row) =>
-        `<div class="resource-delete-row"><code>${escapeHtml(row.path || "")}</code><span>${escapeHtml(formatDiskBytes(row.size_bytes || 0))}</span></div>`,
+        `<div class="resource-delete-row"><code>${escapeHtml(row.path || "")}</code><span>Runtime cache · ${escapeHtml(formatDiskBytes(row.size_bytes || 0))}</span></div>`,
     ),
   ].join("");
   openActionChoiceModal({
-    title: "Preset Resource Actions",
+    title: "Clear model files or caches?",
     errorTargetId: "presetResourceMsg",
-    body: `<div>Choose what to clear for <code>${escapeHtml(variantDisplayLabel(variant))}</code>.</div><div class="preset-help resource-delete-summary">${escapeHtml(formatResourcePlusCacheBytes(total, cacheTotal))} is associated with this preset.</div>`,
+    body: `<div>Choose what to remove for <code>${escapeHtml(variantDisplayLabel(variant))}</code>.</div><div class="preset-help">Model files are downloaded weights and may be shared with other presets. Deleting shared files means they must be downloaded again. Cache actions remove runtime cache data only. Preset settings and generated media are not deleted.</div><div class="preset-help resource-delete-summary">${escapeHtml(formatResourcePlusCacheBytes(total, cacheTotal))} is associated with this preset.</div>`,
     detailsHtml: `<div class="resource-delete-list">${rowsHtml}</div>`,
     choices: [
       { label: "Cancel", className: "blue", onClick: async () => {} },
@@ -9354,7 +9153,7 @@ async function promptDeleteResourcePaths(paths, label = "resource", selectors = 
   const cleanPaths = [...new Set((paths || []).map((path) => String(path || "").trim()).filter(Boolean))];
   const cleanSelectors = [...new Set((selectors || []).map((selector) => String(selector || "").trim()).filter(Boolean))];
   if (!cleanPaths.length) return;
-  const matchingRows = inventoryResourceManagerRows()
+  const matchingRows = inventoryModelResourceRows()
     .filter((entry) => cleanPaths.includes(String(entry.path || "")) || entry.usages.some(({ resource }) => cleanPaths.includes(String(resource?.path || ""))));
   const total = matchingRows.reduce((sum, entry) => sum + Number(entry.sizeBytes || 0), 0);
   const associatedCaches = new Map();
@@ -9371,7 +9170,7 @@ async function promptDeleteResourcePaths(paths, label = "resource", selectors = 
   const cacheTotal = [...associatedCaches.values()].reduce((sum, size) => sum + size, 0);
   const rowsHtml = [
     ...cleanPaths.map(
-      (path) => `<div class="resource-delete-row"><code>${escapeHtml(path)}</code><span>Model</span></div>`,
+      (path) => `<div class="resource-delete-row"><code>${escapeHtml(path)}</code><span>Model file</span></div>`,
     ),
     ...[...associatedCaches.entries()].map(
       ([path, size]) =>
@@ -9380,9 +9179,9 @@ async function promptDeleteResourcePaths(paths, label = "resource", selectors = 
   ]
     .join("");
   openActionChoiceModal({
-    title: "Clear Model Resource",
+    title: "Delete shared model files?",
     errorTargetId: "presetResourceMsg",
-    body: `<div>Clear shared resource <code>${escapeHtml(label || "resource")}</code>?</div><div class="preset-help resource-delete-summary">${escapeHtml(formatResourcePlusCacheBytes(total || 0, cacheTotal || 0))} is associated with this resource.</div>`,
+    body: `<div>Delete downloaded model files for <code>${escapeHtml(label || "resource")}</code>?</div><div class="preset-help">These files may be shared by multiple text or image models; affected models will need to download them again. Generated gallery files and conversations are not deleted. Use a cache action separately to remove runtime cache data.</div><div class="preset-help resource-delete-summary">${escapeHtml(formatResourcePlusCacheBytes(total || 0, cacheTotal || 0))} is associated with this resource.</div>`,
     detailsHtml: `<div class="resource-delete-list">${rowsHtml}</div>`,
     choices: [
       {
@@ -9431,47 +9230,6 @@ async function promptDeleteResourcePaths(paths, label = "resource", selectors = 
             "/admin/model-resources/delete-with-caches",
             { paths: cleanPaths, selectors: cleanSelectors },
             `/admin/model-resources/delete-with-caches ${cleanPaths.length} path(s)`,
-          );
-          await refreshAfterResourceMutation(payload);
-        },
-      },
-    ],
-  });
-}
-async function promptDeleteModelCachePaths(paths, label = "model cache") {
-  if (benchmarkJobActive()) {
-    alert("Model Scores benchmarking is running. Cancel the benchmark before clearing model caches.");
-    return;
-  }
-  const cleanPaths = [...new Set((paths || []).map((path) => String(path || "").trim()).filter(Boolean))];
-  if (!cleanPaths.length) return;
-  const matchingRows = inventoryResourceManagerRows()
-    .filter((entry) => cleanPaths.includes(String(entry.path || "")));
-  const total = matchingRows.reduce(
-    (sum, entry) => sum + Number(entry.cacheSizeBytes || entry.sizeBytes || 0),
-    0,
-  );
-  const rowsHtml = cleanPaths
-    .map((path) => `<div class="resource-delete-row"><code>${escapeHtml(path)}</code></div>`)
-    .join("");
-  openActionChoiceModal({
-    title: "Clear Model Cache",
-    body: `<div>Clear model cache <code>${escapeHtml(label || "model cache")}</code>?</div><div class="preset-help resource-delete-summary">${escapeHtml(formatDiskBytes(total || 0))} is associated with this cache entry.</div>`,
-    detailsHtml: `<div class="resource-delete-list">${rowsHtml}</div>`,
-    choices: [
-      {
-        label: "Cancel",
-        className: "blue",
-        onClick: async () => {},
-      },
-      {
-        label: "Delete Cache",
-        className: "red",
-        onClick: async () => {
-          const payload = await post(
-            "/admin/model-cache/delete",
-            { paths: cleanPaths },
-            `/admin/model-cache/delete ${cleanPaths.length} path(s)`,
           );
           await refreshAfterResourceMutation(payload);
         },
@@ -9541,7 +9299,7 @@ function resourceUsageState(variant) {
   const installState = modelInstallStateForVariant(variant);
   return { selector, target, targetId, active, switching, failed, installing: installState.job, sharedInstalling: installState.shared };
 }
-function inventoryResourceManagerRows() {
+function inventoryModelResourceRows() {
   const map = new Map();
   const payloadFileEntries = (runtimeInventory()?.model_resource_file_entries || [])
     .map((entry) => ({ ...entry, path: String(entry?.path || "").trim() }))
@@ -9573,7 +9331,6 @@ function inventoryResourceManagerRows() {
           role: String(resource?.role || ""),
           sizeBytes: Number(resource?.size_bytes || 0),
           cacheSizeBytes: 0,
-          cacheSelectors: new Set(),
           hollow: presetResourceMarkerKind(resource) !== "solid",
           usages: [],
           selectors: new Set(),
@@ -9589,9 +9346,6 @@ function inventoryResourceManagerRows() {
       entry.usages.push({ variant, resource });
       entry.selectors.add(variantSelector(variant));
       const selector = variantSelector(variant);
-      if (selector && !entry.cacheSelectors.has(selector)) {
-        entry.cacheSelectors.add(selector);
-      }
       entry.models.add(String(variant?.model_display_name || variant?.model_id || ""));
       variantSourceRepoCandidates(variant).forEach((repo) => entry.repos.add(repo));
     });
@@ -9624,7 +9378,6 @@ function inventoryResourceManagerRows() {
       role: "model-resource",
       sizeBytes: Number(entry?.size_bytes || 0),
       cacheSizeBytes: 0,
-      cacheSelectors: new Set(),
       hollow: matchingUsages.length <= 0,
       unattachedResource: matchingUsages.length <= 0,
       deletePaths: [path],
@@ -9639,7 +9392,6 @@ function inventoryResourceManagerRows() {
       .map((entry) => [String(entry?.path || "").trim(), entry])
       .filter(([path]) => path),
   );
-  const attachedCachePaths = new Set();
   rows.forEach((row) => {
     const rowCaches = new Map();
     (row.usages || []).forEach(({ variant }) => {
@@ -9653,41 +9405,11 @@ function inventoryResourceManagerRows() {
         );
         if (sizeBytes <= 0) return;
         rowCaches.set(path, Math.max(Number(rowCaches.get(path) || 0), sizeBytes));
-        attachedCachePaths.add(path);
       });
     });
     row.cacheEntries = [...rowCaches.entries()].map(([path, size_bytes]) => ({ path, size_bytes }));
     row.cacheSizeBytes = row.cacheEntries.reduce((sum, cache) => sum + Number(cache.size_bytes || 0), 0);
   });
-  const sharedCacheEntries = [];
-  cacheEntriesByPath.forEach((entry, path) => {
-    if (attachedCachePaths.has(path)) return;
-    if (!path || attachedPaths.has(path)) return;
-    const sizeBytes = Number(entry?.size_bytes || 0);
-    if (sizeBytes < 1024 * 1024) return;
-    sharedCacheEntries.push({ path, size_bytes: sizeBytes });
-  });
-  if (sharedCacheEntries.length) {
-    const sizeBytes = sharedCacheEntries.reduce((sum, entry) => sum + Number(entry.size_bytes || 0), 0);
-    rows.push({
-      key: "model-cache:shared-runtime",
-      label: "Shared runtime cache",
-      path: `${sharedCacheEntries.length} cache path${sharedCacheEntries.length === 1 ? "" : "s"}`,
-      kind: "directory",
-      role: "model-cache",
-      sizeBytes: 0,
-      cacheSizeBytes: sizeBytes,
-      cacheEntries: sharedCacheEntries,
-      cacheSelectors: new Set(),
-      hollow: true,
-      unattachedCache: true,
-      deletePaths: sharedCacheEntries.map((entry) => entry.path),
-      usages: [],
-      selectors: new Set(),
-      repos: new Set(),
-      models: new Set(["Shared runtime cache"]),
-    });
-  }
   rows.forEach((row) => {
     const updateRows = [];
     const rowPath = String(row.path || "").replaceAll("\\", "/").replace(/\/+$/, "");
@@ -9731,18 +9453,6 @@ function inventoryResourceManagerRows() {
         String(left.label || "").localeCompare(String(right.label || "")),
     );
 }
-function inventoryUniqueCacheUsageBytes() {
-  const byPath = new Map();
-  inventoryVariants().forEach((variant) => {
-    const entries = Array.isArray(variant?.cache_entries) ? variant.cache_entries : [];
-    entries.forEach((entry) => {
-      const path = String(entry?.path || "").trim();
-      if (!path) return;
-      byPath.set(path, Math.max(Number(byPath.get(path) || 0), Number(entry?.size_bytes || 0)));
-    });
-  });
-  return [...byPath.values()].reduce((sum, value) => sum + Number(value || 0), 0);
-}
 async function requestStopModelInstall(jobId) {
   const key = String(jobId || "").trim();
   if (!key) return;
@@ -9775,11 +9485,8 @@ function modelInstallProgressLabel(job = {}) {
     : "";
   return `Downloading ${percent}%${byteLabel}...`;
 }
-function openPresetResourceManager() {
-  selectPresetModel(RESOURCE_MANAGER_MODEL_ID);
-}
 function openAIStudioPanel() {
-  selectPresetModel(AI_STUDIO_MODEL_ID);
+  activateTab("ai-studio", false);
 }
 async function refreshAIStudioGallery(options = {}) {
   const now = Date.now();
@@ -9803,7 +9510,7 @@ async function refreshAIStudioGallery(options = {}) {
   return aiStudioGalleryState;
 }
 function aiStudioResourceRows() {
-  return inventoryResourceManagerRows().filter((entry) => !!resourceManagerModality(entry));
+  return inventoryModelResourceRows().filter((entry) => !!resourceManagerModality(entry));
 }
 function aiStudioModalityCount(rows, modality) {
   return rows.filter((entry) => resourceManagerModality(entry) === modality).length;
@@ -10006,8 +9713,65 @@ function renderAIStudioGallerySection() {
   }
   return `<section class="resource-manager-card ai-studio-gallery-card">${header}<div class="ai-studio-gallery-grid">${items.map(renderAIStudioGalleryItem).join("")}</div></section>`;
 }
+function aiStudioModelTypeCount(type) {
+  const lanes = {
+    image: [
+      { primaryMatch: ["hidream-o1", "hidream_o1", "hidream"] },
+      { primaryMatch: ["ideogram4_fp8_scaled", "ideogram4_unconditional"] },
+      { primaryMatch: ["chroma1-hd"] },
+      { primaryMatch: ["z-image-turbo-fp8", "qwen_3_4b_fp8_mixed"] },
+      { primaryMatch: ["krea2_turbo_fp8_scaled", "qwen3vl_4b_fp8_scaled"] },
+    ],
+    audio: [
+      { primaryMatch: ["ace-step", "ace_step", "ace-step-1.5"] },
+      { primaryMatch: ["stable-audio", "stable_audio"] },
+    ],
+    speech: [
+      { primaryMatch: ["step-audio", "step_audio", "editx"] },
+      { primaryMatch: ["kokoro"] },
+    ],
+    video: [
+      { primaryMatch: ["ltx2.3", "ltx-2.3-22b-distilled"] },
+      { primaryMatch: ["sulphur-2", "sulphur_dev"] },
+      { primaryMatch: ["10eros", "10Eros_v1"] },
+      { primaryMatch: ["wan-rapid", "wan2.2-rapid-mega"] },
+    ],
+  }[type] || [];
+  return aiStudioLaneCountLabel(lanes);
+}
+function selectAIStudioModelType(type) {
+  const nextType = String(type || "").trim().toLowerCase();
+  if (!["image", "audio", "speech", "video", "text"].includes(nextType)) return;
+  aiStudioModelType = nextType;
+  renderAIStudioTab();
+  if (nextType === "text") {
+    ensureDynamicPresetLayout();
+    renderPresetScopeTabs();
+    renderModelInstallStatus();
+    if (renderCachedDynamicPresetModels()) requestAnimationFrame(() => renderDynamicPresetModels());
+    else renderDynamicPresetModels();
+  }
+}
+function renderAIStudioTab() {
+  if (activeTabName !== "ai-studio") return;
+  const typeHost = $("aiStudioModelTypes");
+  const contentHost = $("aiStudioContent");
+  const presets = $("presets");
+  if (!typeHost || !contentHost || !presets) return;
+  const counts = [
+    ["image", "Image Models"],
+    ["audio", "Audio Models"],
+    ["speech", "Speech Models"],
+    ["video", "Video Models"],
+    ["text", "Text Models"],
+  ];
+  setHtmlIfChanged(typeHost, `<div class="ai-studio-summary-row">${counts.map(([key, label]) => `<button type="button" class="resource-manager-total-card ai-studio-model-type${aiStudioModelType === key ? " active" : ""}" aria-pressed="${aiStudioModelType === key ? "true" : "false"}" onclick="selectAIStudioModelType('${key}')"><span class="resource-manager-total-label">${label}</span><span class="resource-manager-total-value">${key === "text" ? inventoryModels().length : aiStudioModelTypeCount(key)}</span></button>`).join("")}</div>`);
+  const textMode = aiStudioModelType === "text";
+  contentHost.classList.toggle("hidden", textMode);
+  presets.classList.toggle("hidden", !textMode);
+  if (!textMode) setHtmlIfChanged(contentHost, renderAIStudioView());
+}
 function renderAIStudioView() {
-  const rows = aiStudioResourceRows();
   const imageSummaryLanes = [
     { key: "hidream-o1", primaryMatch: ["hidream-o1", "hidream_o1", "hidream"] },
     { key: "ideogram-4", primaryMatch: ["ideogram4_fp8_scaled", "ideogram4_unconditional"] },
@@ -10029,10 +9793,6 @@ function renderAIStudioView() {
     { key: "step-audio-editx", primaryMatch: ["step-audio", "step_audio", "editx"] },
     { key: "kokoro", primaryMatch: ["kokoro"] },
   ];
-  const imageCount = aiStudioLaneCountLabel(imageSummaryLanes);
-  const audioCount = aiStudioLaneCountLabel(audioSummaryLanes);
-  const speechCount = aiStudioLaneCountLabel(speechSummaryLanes);
-  const videoCount = aiStudioLaneCountLabel(videoSummaryLanes);
   const laneGroups = [
     ["Image", "image", [
       { key: "hidream-o1", repo: "https://huggingface.co/drbaph/HiDream-O1-Image-Dev-2604-FP8", match: ["hidream-o1", "hidream_o1", "hidream"], title: "HiDream-O1 Image", modality: "image", best: "top-quality general / photoreal stills", prompt: "natural language", notes: "HiDream-O1-Image-Dev-2604 fp8; native 2048px, single GPU lane" },
@@ -10065,7 +9825,8 @@ function renderAIStudioView() {
     const directorLane = flatLanes.find((lane) => String(lane?.key || "") === "studio-director");
     if (directorLane) directorLane.extraContent = otherResources;
   }
-  const laneSections = `<div class="ai-studio-lane-masonry">${laneGroups.map(([title, modality, lanes]) =>
+  const visibleLaneGroups = laneGroups.filter(([, modality]) => modality === aiStudioModelType || modality === "text");
+  const laneSections = `<div class="ai-studio-lane-masonry">${visibleLaneGroups.map(([title, modality, lanes]) =>
     renderAIStudioLaneSection(title, modality, lanes.map((lane) => renderAIStudioLaneCard(lane))),
   ).join("")}</div>`;
   const comfyInstalled = aiStudioServiceInstalled();
@@ -10074,8 +9835,7 @@ function renderAIStudioView() {
     : "";
   const comfySection = `<h3 class="ai-studio-section-title">ComfyUI</h3><div class="resource-manager-card ai-studio-comfy-card"><div class="resource-manager-card-head"><div class="resource-manager-title-row">${resourceManagerModalityIcon({ modality: "image" })}<div class="resource-manager-title">ComfyUI Renderer</div></div><span class="status-badge status-${comfyInstalled ? "success" : "warning"}">${comfyInstalled ? "installed" : "not installed"}</span></div><div class="resource-manager-meta">Renderer service for image, video, music, and SFX lanes. Outputs are served by the gallery service when AI Studio is installed.</div>${comfyActions}</div>`;
   const anyInstalledLane = flatLanes.some((lane) => aiStudioLanePrimaryInstalled(lane));
-  const noResources = rows.length || anyInstalledLane ? "" : '<div class="empty-variant-note">No AI Studio resources are detected yet. Run Setup AI Studio to install ComfyUI lanes and their model payloads.</div>';
-  return `<div class="resource-manager-shell ai-studio-shell"><button type="button" class="script-help-btn ai-studio-help-btn" title="Open AI Studio docs" aria-label="Open AI Studio docs" onclick="openStorageBrowserFileReadOnly('/', 'opt/ai/club-3090/docs/ai-studio/README.md')">?</button><div class="resource-manager-intro">AI Studio collects setup, ComfyUI lane inventory, and multimodal model resources in one place for Chat Plan and Interactive generation.</div><div class="ai-studio-actions">${imageStudioActionButtonHtml()}${imageStudioRuntimeButtonHtml()}${imageStudioGalleryButtonHtml()}</div><div class="ai-studio-summary-row"><div class="resource-manager-total-card"><div class="resource-manager-total-label">Image Models</div><div class="resource-manager-total-value">${imageCount}</div></div><div class="resource-manager-total-card"><div class="resource-manager-total-label">Audio Models</div><div class="resource-manager-total-value">${audioCount}</div></div><div class="resource-manager-total-card"><div class="resource-manager-total-label">Speech Models</div><div class="resource-manager-total-value">${speechCount}</div></div><div class="resource-manager-total-card"><div class="resource-manager-total-label">Video Models</div><div class="resource-manager-total-value">${videoCount}</div></div></div>${renderAIStudioGallerySection()}<h3 class="ai-studio-section-title">Studio Lanes</h3>${laneSections}${comfySection}${noResources}</div>`;
+  return `<div class="resource-manager-shell ai-studio-shell"><button type="button" class="script-help-btn ai-studio-help-btn" title="Open AI Studio docs" aria-label="Open AI Studio docs" onclick="openStorageBrowserFileReadOnly('/', 'opt/ai/club-3090/docs/ai-studio/README.md')">?</button><div class="resource-manager-intro">AI Studio collects setup, ComfyUI lane inventory, and multimodal model resources in one place for Chat Plan and Interactive generation.</div><div class="ai-studio-actions">${imageStudioActionButtonHtml()}${imageStudioRuntimeButtonHtml()}${imageStudioGalleryButtonHtml()}</div>${renderAIStudioGallerySection()}<h3 class="ai-studio-section-title">Studio Lanes</h3>${laneSections}${comfySection}${noResources}</div>`;
 }
 function renderResourceUsageActions(variant) {
   const state = resourceUsageState(variant);
@@ -10129,89 +9889,6 @@ function renderHiddenPresetToggleIcon(variant, hidden = false) {
     icon: hidden ? "view" : "hide",
     className: "variant-hide-btn",
   });
-}
-function resourceManagerPresetUsageMeta(variant) {
-  const curated = String(variant?.best_for || variant?.quality_summary || "").trim();
-  if (curated) return curated;
-  const parts = [];
-  const engine = prettyEngineName(variant?.engine_display || variant?.engine || "");
-  if (engine && engine !== "Unknown") parts.push(engine);
-  const ctx = variantMaxCtx(variant);
-  if (ctx && ctx !== "n/a") parts.push(`${ctx} context`);
-  const hardware = variantHardwareSummary(variant);
-  if (hardware) parts.push(hardware);
-  const model = String(variant?.model_display_name || variant?.model_id || "").trim();
-  if (model) parts.push(`Uses ${model}`);
-  return parts.filter(Boolean).join(" · ") || "Discovered preset usage";
-}
-function renderModelResourceManagerView() {
-  const rows = inventoryResourceManagerRows();
-  const modelResourceRootBytes = Number(runtimeInventory()?.model_resource_root_size_bytes || 0);
-  const modelCacheRootBytes = Number(runtimeInventory()?.model_cache_size_bytes || 0);
-  if (!rows.length && modelCacheRootBytes <= 0 && modelResourceRootBytes <= 0) {
-    return `<div class="model-card"><div class="empty-variant-note">No downloaded model resources are currently present on disk.</div></div>`;
-  }
-  const attachedResourceBytes = rows.reduce((sum, entry) => sum + Number(entry.sizeBytes || 0), 0);
-  const totalBytes = modelResourceRootBytes > 0 ? modelResourceRootBytes : attachedResourceBytes;
-  const totalCacheBytes = inventoryUniqueCacheUsageBytes();
-  const cacheBytes = modelCacheRootBytes > 0 ? modelCacheRootBytes : totalCacheBytes;
-  const totalHint = `Models: ${formatDiskBytes(totalBytes)}. Cache: ${formatDiskBytes(cacheBytes)}. Model resource directories are never cleared by cache cleanup.`;
-  const updateSummary = lastStatus?.model_updates || runtimeInventory()?.model_updates || {};
-  const updateSummaryText = updateSummary?.checking
-    ? "Checking for updates..."
-    : `${Number(updateSummary?.pending || 0)} pending update${Number(updateSummary?.pending || 0) === 1 ? "" : "s"}${Number(updateSummary?.errors || 0) ? `, ${Number(updateSummary.errors)} warning${Number(updateSummary.errors) === 1 ? "" : "s"}` : ""}`;
-  return `<div class="resource-manager-shell"><div class="resource-manager-intro">Downloaded resources are grouped below by the shared disk asset they point at. Model resources are the actual GGUF/safetensors payloads. Cache is runtime/precompile/transient data and safe cleanup is exposed only for cache entries.</div><div class="resource-manager-actions"><button type="button" class="btn blue" onclick="checkModelUpdatesNow()">Check Updates</button><span class="preset-help">${escapeHtml(updateSummaryText)}</span></div><div class="resource-manager-total-card" title="${escapeHtml(totalHint)}"><div class="resource-manager-total-label">Total Downloaded Resource Disk Usage</div><div class="resource-manager-total-value">${escapeHtml(formatResourcePlusCacheBytes(totalBytes, cacheBytes))}</div><div class="preset-help">Models + Cache</div></div>${rows.length ? `<div class="resource-manager-grid">${rows
-    .map((entry) => {
-      const markerStyle = `--preset-resource-color:${resourceColorForKey(entry.key)};`;
-      const modelLabel = entry.models.join(" · ") || "Preset resource";
-      const usageCount = entry.selectors.length;
-      const usageLabel = entry.unattachedCache || entry.unattachedResource ? "Not currently attached to a discovered preset" : `Used by ${usageCount} Preset${usageCount === 1 ? "" : "s"}`;
-      const repoUrl = entry.repos[0] ? `https://huggingface.co/${entry.repos[0]}` : "";
-      const markerKind = (entry.usages || []).some(({ resource }) => presetResourceMarkerKind(resource || {}) === "speculative")
-        ? "speculative"
-        : presetResourceMarkerKind(entry.usages[0]?.resource || {});
-      const markerClass = `${entry.hollow ? " hollow" : ""}${markerKind === "speculative" ? " diamond" : ""}`;
-      const modalityIcon = resourceManagerModalityIcon(entry);
-      const diskMarker = modalityIcon
-        ? ""
-        : `<span class="preset-disk-marker${markerClass}" title="Double-click to randomize this resource color" ondblclick="randomizeResourceMarkerColor('${escapeJs(entry.key)}')" style="${markerStyle}"></span>`;
-      const cacheDeletePaths = (entry.deletePaths || entry.cacheEntries?.map((cache) => cache.path) || [])
-        .map((path) => `'${escapeJs(String(path || ""))}'`)
-        .join(",");
-      const deleteAction = entry.unattachedCache
-        ? `promptDeleteModelCachePaths([${cacheDeletePaths}], '${escapeJs(entry.label || "model cache")}')`
-        : `promptDeleteResourcePaths([${(entry.deletePaths || entry.usages.map(({ resource }) => String(resource?.path || ""))).map((path) => `'${escapeJs(String(path || ""))}'`).join(",")}], '${escapeJs(entry.label || "resource")}', [${entry.selectors.map((selector) => `'${escapeJs(selector)}'`).join(",")}])`;
-      const updateBadge = entry.updateState === "pending_update"
-        ? '<span class="status-badge status-warning">update available</span>'
-        : entry.updateState === "check_error"
-          ? '<span class="status-badge status-caveats">check warning</span>'
-          : "";
-      const updateButton = entry.updateState === "pending_update"
-        ? `<button class="btn amber" onclick="startModelUpdateForResource('${escapeJs(entry.updateResources[0]?.key || entry.key)}', '${escapeJs(entry.label || "model resource")}')">Update</button>`
-        : "";
-      const updateWarning = entry.updateState === "check_error"
-        ? `<div class="empty-variant-note">Update check warning: ${escapeHtml(entry.updateResources.find((resource) => resource.status === "error")?.error || "metadata check failed")}</div>`
-        : "";
-      return `<div class="resource-manager-card"><div class="resource-manager-card-head"><div class="resource-manager-title-row">${diskMarker}${modalityIcon}<div class="resource-manager-title">${escapeHtml(entry.label || "Resource")}</div>${updateBadge}</div><div class="resource-manager-card-subrow"><div class="resource-manager-card-copy"><div class="resource-manager-meta">${escapeHtml(modelLabel)}</div><div class="resource-manager-usage-count">${escapeHtml(usageLabel)}</div></div><div class="resource-manager-card-actions"><span class="resource-size-badge">${escapeHtml(formatResourcePlusCacheBytes(entry.sizeBytes || 0, entry.cacheSizeBytes || 0))}</span>${updateButton}${repoUrl ? `<a class="resource-hf-btn" href="${escapeHtml(repoUrl)}" target="_blank" rel="noopener noreferrer">${huggingFaceLogoSvg()}<span>HF</span></a>` : ""}${renderIconButton({ title: entry.unattachedCache ? "Clear model cache" : "Clear resource", action: deleteAction, icon: "delete", className: "resource-manager-delete-btn" })}</div></div></div><div class="resource-manager-path"><code>${escapeHtml(entry.path || "")}</code></div>${updateWarning}<div class="resource-manager-usage-list">${entry.unattachedCache ? '<div class="empty-variant-note">This cache entry is present on disk but is not referenced by the current preset inventory.</div>' : entry.unattachedResource ? '<div class="empty-variant-note">This model resource is present on disk but is not referenced by the current preset inventory.</div>' : entry.usages
-        .map(({ variant }) => {
-          const selector = variantSelector(variant);
-          return `<button type="button" class="resource-manager-usage-row resource-manager-usage-button" title="Open this preset card" onclick="openPresetCardFromResourceManager('${escapeJs(selector)}')"><div class="resource-manager-usage-copy"><div class="resource-manager-usage-title">${escapeHtml(variantDisplayLabel(variant))}</div><div class="resource-manager-usage-meta">${escapeHtml(resourceManagerPresetUsageMeta(variant))}</div></div></button>`;
-        })
-        .join("")}</div></div>`;
-    })
-    .join("")}</div>` : '<div class="empty-variant-note">Model cache data exists on disk, but no discovered preset currently points at those resources.</div>'}</div>`;
-}
-function renderHiddenPresetManagerView() {
-  const rows = inventoryVariants().filter((variant) => presetIsHidden(variant));
-  if (!rows.length) {
-    return `<div class="model-card"><div class="empty-variant-note">No presets are hidden right now.</div></div>`;
-  }
-  return `<div class="variant-group"><div class="variant-group-head"><h4>${escapeHtml(`Hidden Presets (${rows.length} Presets)`)}</h4></div><div class="variant-grid">${sortInventoryVariants(rows)
-    .map((variant) => {
-      const selector = variantSelector(variant);
-      return `<div class="variant-card"><div class="variant-card-head"><div class="variant-card-title">${escapeHtml(variantDisplayLabel(variant))}</div><div class="preset-actions">${renderHiddenPresetToggleIcon(variant, true)}</div></div><div class="variant-meta"><strong>Best for:</strong> ${escapeHtml(variant.best_for || variant.quality_summary || "Hidden preset")}</div><div class="variant-meta"><strong>Max ctx:</strong> ${escapeHtml(variantMaxCtx(variant))} <strong>Engine:</strong> ${escapeHtml(prettyEngineName(variant.engine_display || variant.engine))}</div><div class="variant-actions"><button class="btn green" ${benchmarkJobActive() ? "disabled" : ""} onclick="switchInventoryVariant('${escapeJs(selector)}')">Launch</button>${renderVariantMetricsGroup(variant)}</div></div>`;
-    })
-    .join("")}</div></div>`;
 }
 function beginPresetTpsLabelPress(event, selector) {
   if (event && event.button !== undefined && event.button !== 0) return;
@@ -11006,14 +10683,14 @@ function renderSummaryVariantCard(variant, modelId, options = {}) {
   const badges = `<div class="badge-row"><span class="state-badge ${rigBlockedReason ? "state-hardware_blocked" : stateClass}">${escapeHtml(stateLabel)}</span>${variantStatusBadgeHtml(variant, stateLabel, { failed, rigBlockedReason })}${variantCapabilityBadges(variant)}${renderVariantLineageStar(variant)}${removeAction}</div>`;
   const updateNote = variantModelUpdateNoteHtml(variant);
   const updateButton = variantModelUpdateButtonHtml(variant);
-  return `<div class="summary-preset-card${active || switching ? "" : " summary-preset-card-inactive"}" data-preset-selector="${escapeHtml(selector)}"><div class="summary-preset-head"><div class="summary-preset-title">${renderPresetQueueTitleTag(selector)}<span>${escapeHtml(title)}</span></div>${badges}</div><div class="variant-card-body"><div class="variant-card-main">${runtimeMeta}<div class="summary-preset-meta">${escapeHtml(variant.best_for || variant.quality_summary || "Cached preset")}</div>${updateNote}<div class="variant-actions variant-card-main-actions"><button class="btn ${buttonClass}" ${rigBlockedReason || scoreLock ? "disabled" : ""} onclick="${action}">${escapeHtml(buttonLabel)}</button>${updateButton}${metricsGroup}</div></div><aside class="variant-card-side">${renderPresetScoreLabel(selector, variant)}${sideControls}</aside></div></div>`;
+  return `<div class="summary-preset-card${active || switching ? "" : " summary-preset-card-inactive"}${presetIsHidden(variant) ? " hidden-preset-card" : ""}" data-preset-selector="${escapeHtml(selector)}"><div class="summary-preset-head"><div class="summary-preset-title">${renderPresetQueueTitleTag(selector)}<span>${escapeHtml(title)}</span>${presetIsHidden(variant) ? '<span class="status-badge status-caveats">hidden</span>' : ""}</div>${badges}</div><div class="variant-card-body"><div class="variant-card-main">${runtimeMeta}<div class="summary-preset-meta">${escapeHtml(variant.best_for || variant.quality_summary || "Cached preset")}</div>${updateNote}<div class="variant-actions variant-card-main-actions"><button class="btn ${buttonClass}" ${rigBlockedReason || scoreLock ? "disabled" : ""} onclick="${action}">${escapeHtml(buttonLabel)}</button>${updateButton}${metricsGroup}</div></div><aside class="variant-card-side">${renderPresetScoreLabel(selector, variant)}${sideControls}</aside></div></div>`;
 }
 function renderSummaryModelBody(model, modelVariants) {
   const entries = summaryEntriesForModel(model.model_id);
   const runtimeEntries = summaryRuntimeEntriesForModel(model.model_id, modelVariants);
   const runtimeSelectors = new Set(runtimeEntries.map((entry) => entry.selector));
   const bySelector = new Map(modelVariants.map((variant) => [variantSelector(variant), variant]));
-  const customRows = sortInventoryVariants(modelVariants.filter((variant) => variantIsCustom(variant) && !presetIsHidden(variant)));
+  const customRows = sortInventoryVariants(modelVariants.filter((variant) => variantIsCustom(variant) && (showHiddenPresets || !presetIsHidden(variant))));
   const customSelectors = new Set(customRows.map((variant) => variantSelector(variant)));
   const cards = runtimeEntries
     .filter((entry) => !customSelectors.has(String(entry?.selector || "")))
@@ -11172,7 +10849,7 @@ function renderVariantCard(variant) {
   const actionDisabled = !!rigBlockedReason || launchLocked || sharedInstalling || (ready && !target);
   const sideControls = settingsCluster;
   const updateButton = variantModelUpdateButtonHtml(variant);
-  return `<div class="variant-card${active ? " active-variant" : ""}" data-preset-selector="${escapeHtml(selector)}"><div class="variant-card-head"><div class="variant-card-title">${renderPresetQueueTitleTag(selector)}<span>${escapeHtml(variantDisplayLabel(variant))}</span></div><div class="badge-row"><span class="state-badge ${stateClass}"${stateAttrs}>${escapeHtml(stateLabel)}</span>${statusBadge}${variantCapabilityBadges(variant)}${renderVariantLineageStar(variant)}</div></div><div class="variant-card-body"><div class="variant-card-main"><div class="variant-meta"><strong>Best for:</strong> ${escapeHtml(variant.best_for || "No summary yet.")}</div><div class="variant-meta"><strong>Max ctx:</strong> ${escapeHtml(variantMaxCtx(variant))} <strong>Engine:</strong> ${escapeHtml(prettyEngineName(variant.engine_display || variant.engine))} <strong>Drafter:</strong> ${escapeHtml(variant.drafter || "none")} <strong>KV:</strong> ${escapeHtml(variant.kv_format || "n/a")}</div>${provenanceNote}${gateNote}${hardwareNote}${rigBlockedNote}${caveat}${installNote}${updateNote}${updateResourceDetails}${failureNote}<div class="variant-actions variant-card-main-actions"><button class="btn ${buttonClass}" title="${escapeHtml(buttonTitle)}" ${actionDisabled ? "disabled" : ""} onclick="${action}">${escapeHtml(buttonLabel)}</button>${updateButton}${metricsGroup}</div>${footer}</div><aside class="variant-card-side">${renderPresetScoreLabel(selector, variant)}${sideControls}</aside></div></div>`;
+  return `<div class="variant-card${active ? " active-variant" : ""}${presetIsHidden(variant) ? " hidden-preset-card" : ""}" data-preset-selector="${escapeHtml(selector)}"><div class="variant-card-head"><div class="variant-card-title">${renderPresetQueueTitleTag(selector)}<span>${escapeHtml(variantDisplayLabel(variant))}</span>${presetIsHidden(variant) ? '<span class="status-badge status-caveats">hidden</span>' : ""}</div><div class="badge-row"><span class="state-badge ${stateClass}"${stateAttrs}>${escapeHtml(stateLabel)}</span>${statusBadge}${variantCapabilityBadges(variant)}${renderVariantLineageStar(variant)}</div></div><div class="variant-card-body"><div class="variant-card-main"><div class="variant-meta"><strong>Best for:</strong> ${escapeHtml(variant.best_for || "No summary yet.")}</div><div class="variant-meta"><strong>Max ctx:</strong> ${escapeHtml(variantMaxCtx(variant))} <strong>Engine:</strong> ${escapeHtml(prettyEngineName(variant.engine_display || variant.engine))} <strong>Drafter:</strong> ${escapeHtml(variant.drafter || "none")} <strong>KV:</strong> ${escapeHtml(variant.kv_format || "n/a")}</div>${provenanceNote}${gateNote}${hardwareNote}${rigBlockedNote}${caveat}${installNote}${updateNote}${updateResourceDetails}${failureNote}<div class="variant-actions variant-card-main-actions"><button class="btn ${buttonClass}" title="${escapeHtml(buttonTitle)}" ${actionDisabled ? "disabled" : ""} onclick="${action}">${escapeHtml(buttonLabel)}</button>${updateButton}${metricsGroup}</div>${footer}</div><aside class="variant-card-side">${renderPresetScoreLabel(selector, variant)}${sideControls}</aside></div></div>`;
 }
 function renderVariantGroup(title, rows, options = {}) {
   const items =
@@ -11228,6 +10905,7 @@ function presetModelHtmlCacheIdentity() {
     built_at: inventory?.built_at || "",
     repo_head: inventory?.repo_head || "",
     selectedPresetModelId: selectedPresetModelId || "",
+    showHiddenPresets,
     selectedScope: currentScope(),
     presetFilter: getPresetFilterState(),
   };
@@ -11242,6 +10920,7 @@ function readPresetModelHtmlCache() {
       String(identity.built_at || "") !== String(expected.built_at || "") ||
       String(identity.repo_head || "") !== String(expected.repo_head || "") ||
       String(identity.selectedPresetModelId || "") !== String(expected.selectedPresetModelId || "") ||
+      !!identity.showHiddenPresets !== expected.showHiddenPresets ||
       String(identity.selectedScope || "") !== String(expected.selectedScope || "") ||
       JSON.stringify(identity.presetFilter || {}) !== JSON.stringify(expected.presetFilter || {})
     ) {
@@ -11294,6 +10973,7 @@ function dynamicPresetModelsRenderSignature() {
   ]);
   return JSON.stringify({
     selectedPresetModelId,
+    showHiddenPresets,
     selectedScope: currentScope(),
     presetFilter: getPresetFilterState(),
     inventory: {
@@ -11338,8 +11018,7 @@ function dynamicPresetModelsRenderSignature() {
   });
 }
 function renderDynamicPresetModels(options = {}) {
-  ensureDynamicPresetLayout();
-  hydrateSelectedPresetModel();
+  if (activeTabName === "ai-studio" && aiStudioModelType !== "text") renderAIStudioTab();
   const host = $("modelPresetGrid");
   if (!host) return;
   const nextSignature = dynamicPresetModelsRenderSignature();
@@ -11353,35 +11032,20 @@ function renderDynamicPresetModels(options = {}) {
     dynamicPresetRenderSignature = nextSignature;
     return;
   }
-  if (selectedPresetModelId === HIDDEN_PRESETS_MODEL_ID) {
-    setHtmlIfChanged(host, renderHiddenPresetManagerView());
-    dynamicPresetRenderSignature = nextSignature;
-    return;
-  }
-  if (selectedPresetModelId === RESOURCE_MANAGER_MODEL_ID) {
-    setHtmlIfChanged(host, renderModelResourceManagerView());
-    dynamicPresetRenderSignature = nextSignature;
-    return;
-  }
-  if (selectedPresetModelId === AI_STUDIO_MODEL_ID) {
-    setHtmlIfChanged(host, renderAIStudioView());
-    dynamicPresetRenderSignature = nextSignature;
-    return;
-  }
   const visibleModels = selectedPresetModelId
     ? models.filter((model) => String(model.model_id || "") === selectedPresetModelId)
-    : models;
+    : [...models].sort((a, b) => String(a.display_name || a.model_id || "").localeCompare(String(b.display_name || b.model_id || ""), undefined, { sensitivity: "base" }));
   const nextHtml = `${visibleModels
     .map((model) => {
       const modelVariants = variants.filter((row) => row.model_id === model.model_id);
-      const unhiddenModelVariants = modelVariants.filter((row) => !presetIsHidden(row));
+      const unhiddenModelVariants = modelVariants.filter((row) => showHiddenPresets || !presetIsHidden(row));
       const selected = String(model.model_id || "") === selectedPresetModelId;
       const visibleModelVariants = selected
         ? unhiddenModelVariants.filter((row) => variantMatchesPresetFilter(row))
         : unhiddenModelVariants;
       const familyActive = modelFamilyHasActivePreset(modelVariants);
       const presetCount = modelVariants.length;
-      const summaryBody = renderSummaryModelBody(model, modelVariants);
+      const summaryBody = renderSummaryModelBody(model, unhiddenModelVariants);
       const deprecatedRows = [];
       const nonDeprecatedRows = visibleModelVariants;
       const groupKey = (row) => resolvedVariantDisplayGroupKey(row, unhiddenModelVariants);
@@ -11454,9 +11118,9 @@ function renderModelInstallStatus() {
     target.textContent = `${job.summary || "Model install stopped."}`;
     return;
   }
-  const showIdleDownloadHint = !!selectedPresetModelId && ![HIDDEN_PRESETS_MODEL_ID, RESOURCE_MANAGER_MODEL_ID, AI_STUDIO_MODEL_ID].includes(selectedPresetModelId);
+  const showIdleDownloadHint = !!selectedPresetModelId;
   if (showIdleDownloadHint && presetFilterIsActive()) {
-    const rows = inventoryVariants().filter((row) => row.model_id === selectedPresetModelId && !presetIsHidden(row));
+    const rows = inventoryVariants().filter((row) => row.model_id === selectedPresetModelId && (showHiddenPresets || !presetIsHidden(row)));
     const matched = rows.filter((row) => variantMatchesPresetFilter(row)).length;
     setHtmlIfChanged(
       target,
@@ -12311,4 +11975,3 @@ function activeChatPresets() {
   }
   return rows;
 }
-

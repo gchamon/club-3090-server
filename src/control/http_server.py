@@ -861,21 +861,6 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             except Exception as e:
                 self.send_json({"ok": False, "error": str(e)}, 500)
             return
-        if path == "/admin/model-updates/check":
-            try:
-                summary = start_model_update_check("manual")
-                inventory = enrich_inventory_model_update_state(enrich_runtime_inventory_cache_sizes(load_runtime_inventory(force=True)))
-                self.send_json({
-                    "ok": True,
-                    "model_updates": summary,
-                    "runtime_inventory": inventory,
-                    "models": inventory.get("models") or [],
-                    "variants": inventory.get("variants") or [],
-                    "focus_log_source": "audit",
-                })
-            except Exception as e:
-                self.send_json({"ok": False, "error": str(e)}, 500)
-            return
         if path == "/admin/model-update":
             try:
                 data = self.read_json_body()
@@ -941,22 +926,6 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                     result = delete_model_resource_paths_and_caches(data.get("paths") or [], data.get("selectors") or [])
                 else:
                     result = delete_preset_resources_and_caches(data.get("selector"), data.get("variant_id"))
-                inventory = enrich_runtime_inventory_cache_sizes(load_runtime_inventory(force=True))
-                self.send_json({
-                    **result,
-                    "runtime_inventory": inventory,
-                    "models": inventory.get("models") or [],
-                    "variants": inventory.get("variants") or [],
-                    "focus_log_source": "audit",
-                }, 200 if result.get("ok") else 500)
-            except Exception as e:
-                self.send_json({"ok": False, "error": str(e)}, 500)
-            return
-        if path == "/admin/model-cache/delete":
-            try:
-                ensure_benchmark_idle("Model cache deletion")
-                data = self.read_json_body()
-                result = delete_model_cache_paths(data.get("paths") or [])
                 inventory = enrich_runtime_inventory_cache_sizes(load_runtime_inventory(force=True))
                 self.send_json({
                     **result,

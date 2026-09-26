@@ -3826,16 +3826,6 @@ def run_model_update_check(reason="scheduled", inventory=None):
             pass
 
 
-def start_model_update_check(reason="manual"):
-    threading.Thread(
-        target=run_model_update_check,
-        args=(reason,),
-        name="club3090-model-update-check",
-        daemon=True,
-    ).start()
-    return model_update_state_snapshot()
-
-
 def _variant_model_update_rows(variant, state=None):
     current = state if isinstance(state, dict) else read_model_update_state()
     resources = current.get("resources") if isinstance(current.get("resources"), dict) else {}
@@ -5190,7 +5180,7 @@ def enrich_runtime_inventory_cache_sizes(inventory):
             variant.setdefault("cache_count", 0)
             variant.setdefault("cache_paths", [])
             variant.setdefault("cache_entries", [])
-    payload.update(model_cache_root_size_summary())
+    payload.update(model_resource_inventory_entries())
     return payload
 
 
@@ -5208,7 +5198,7 @@ def _persistent_model_cache_roots():
     return sorted(set(roots))
 
 
-def model_cache_root_size_summary():
+def model_resource_inventory_entries():
     roots = [
         os.path.join(CLUB3090_DIR, "models-cache"),
         "/opt/ai/models-cache",
@@ -5220,10 +5210,7 @@ def model_cache_root_size_summary():
     seen = set()
     seen_stat_keys = set()
     cache_entries = []
-    resource_entries = []
     resource_file_entries = []
-    cache_total = 0
-    resource_total = 0
     model_file_exts = {".gguf", ".safetensors", ".bin", ".pt", ".pth", ".model", ".onnx", ".npy"}
 
     def seen_key_for_path(path):
@@ -5306,11 +5293,8 @@ def model_cache_root_size_summary():
                 "kind": "directory" if os.path.isdir(path) else ("file" if os.path.isfile(path) else "missing"),
             }
             if is_cache_path(path) and not has_model_payload(path):
-                cache_total += size
                 cache_entries.append(entry)
             else:
-                resource_total += size
-                resource_entries.append(entry)
                 if os.path.isdir(path):
                     try:
                         for dirpath, dirnames, filenames in os.walk(path):
@@ -5361,17 +5345,6 @@ def model_cache_root_size_summary():
         if not root_abs or not os.path.isdir(root_abs) or already_seen(root_abs):
             continue
         mark_seen(root_abs)
-        root_size = int(_fast_disk_usage_bytes(root_abs, timeout=3) or 0)
-        if root_size > 0:
-            resource_total += root_size
-            resource_entries.append({
-                "path": root_abs,
-                "real_path": root_abs,
-                "size_bytes": root_size,
-                "kind": "directory",
-                "role": "studio-model-root",
-                "modality": "image",
-            })
         try:
             for dirpath, dirnames, filenames in os.walk(root_abs):
                 dirnames[:] = [
@@ -5414,7 +5387,6 @@ def model_cache_root_size_summary():
             continue
         mark_seen(real)
         size = int(_fast_disk_usage_bytes(real, timeout=2) or 0)
-        cache_total += size
         cache_entries.append(
             {
                 "path": path,
@@ -5424,140 +5396,8 @@ def model_cache_root_size_summary():
             }
         )
     return {
-        "model_cache_size_bytes": int(cache_total or 0),
         "model_cache_entries": sorted(cache_entries, key=lambda item: item["path"]),
-        "model_resource_root_size_bytes": int(resource_total or 0),
-        "model_resource_root_entries": sorted(resource_entries, key=lambda item: item["path"]),
         "model_resource_file_entries": sorted(resource_file_entries, key=lambda item: item["path"]),
-    }
-
-
-def _model_cache_path_allowed(path):
-    try:
-        target = os.path.realpath(os.path.abspath(str(path or "")))
-    except Exception:
-        return False
-    if not target or target in {"/", os.path.expanduser("~")}:
-        return False
-    if target in _persistent_model_cache_roots():
-        return True
-    for root in (os.path.join(CLUB3090_DIR, "models-cache"), "/opt/ai/models-cache"):
-        try:
-            root_abs = os.path.realpath(os.path.abspath(root))
-            if target == root_abs:
-                return False
-            if os.path.commonpath([root_abs, target]) == root_abs:
-                name = os.path.basename(target.rstrip(os.sep)).lower()
-                if name not in {".cache", "cache", ".runtime", "runtime-cache", "__pycache__"} and not name.startswith(("vllm-cache", "torchinductor", "triton", "cuda-cache")):
-                    return False
-                if _path_contains_model_payload(target):
-                    return False
-                return True
-        except Exception:
-            continue
-    return False
-
-
-def _model_resource_path_allowed_generic(path):
-    try:
-        target = os.path.realpath(os.path.abspath(str(path or "")))
-    except Exception:
-        return False
-    if not target or target in {"/", os.path.expanduser("~")}:
-        return False
-    roots = [
-        os.path.join(CLUB3090_DIR, "models-cache"),
-        os.path.join(CLUB3090_DIR, "ai-studio-models"),
-        "/opt/ai/models-cache",
-        os.environ.get("COMFYUI_MODELS_DIR", os.path.join(CLUB3090_DIR, "ai-studio-models", "comfyui", "models")),
-        "/mnt/models/comfyui/models",
-    ]
-    for root in roots:
-        try:
-            root_abs = os.path.realpath(os.path.abspath(str(root or "")))
-        except Exception:
-            continue
-        if not root_abs or target == root_abs:
-            continue
-        try:
-            if os.path.commonpath([root_abs, target]) == root_abs:
-                return True
-        except Exception:
-            continue
-    return False
-
-
-def delete_model_cache_paths(paths):
-    requested_paths = [
-        os.path.realpath(os.path.abspath(str(path or "").strip()))
-        for path in (paths or [])
-        if str(path or "").strip()
-    ]
-    requested_paths = list(dict.fromkeys([path for path in requested_paths if path]))
-    if not requested_paths:
-        raise ValueError("Choose at least one model cache path to delete.")
-    inventory = load_runtime_inventory(force=True)
-    affected_variants = []
-    def _path_matches_requested(candidate):
-        if not candidate:
-            return False
-        for requested in requested_paths:
-            if candidate == requested:
-                return True
-            try:
-                if os.path.commonpath([requested, candidate]) == requested:
-                    return True
-            except Exception:
-                continue
-        return False
-    for variant in inventory.get("variants") or []:
-        resource_paths = {
-            os.path.realpath(os.path.abspath(str(item.get("path") or "").strip()))
-            for item in (variant_resource_plan_from_row(variant, include_missing=True).get("resources") or [])
-            if str(item.get("path") or "").strip()
-        }
-        cache_paths = {
-            os.path.realpath(os.path.abspath(str(item.get("path") or "").strip()))
-            for item in (preset_cache_size_summary_for_row(variant, max_age=0).get("cache_entries") or [])
-            if str(item.get("path") or "").strip()
-        }
-        if any(_path_matches_requested(path) for path in [*resource_paths, *cache_paths]):
-            affected_variants.append(dict(variant))
-    ensure_preset_resources_not_running(affected_variants, "deleting model cache paths")
-    removed = []
-    errors = []
-    for path in requested_paths:
-        if not _model_cache_path_allowed(path):
-            errors.append({"path": path, "error": "outside allowed model cache roots"})
-            continue
-        try:
-            size_bytes = _fast_disk_usage_bytes(path, timeout=5) if os.path.lexists(path) else 0
-            if os.path.isdir(path) and not os.path.islink(path):
-                shutil.rmtree(path)
-            else:
-                os.remove(path)
-            removed.append({"path": path, "size_bytes": int(size_bytes or 0)})
-        except FileNotFoundError:
-            pass
-        except Exception as exc:
-            errors.append({"path": path, "error": str(exc)})
-    if removed:
-        _preset_cache_size_summary_cache.clear()
-        _storage_browser_clear_size_cache()
-    try:
-        rebuild_runtime_inventory()
-    except Exception:
-        pass
-    log_audit(
-        "model_cache_paths_deleted",
-        result_summary=summarize_audit_result({"removed": len(removed), "errors": errors}),
-    )
-    return {
-        "ok": not errors,
-        "removed": removed,
-        "errors": errors,
-        "removed_size_bytes": sum(int(item.get("size_bytes") or 0) for item in removed),
-        "removed_count": len(removed),
     }
 
 

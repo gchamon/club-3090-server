@@ -958,14 +958,6 @@ let chatTranscriptRenderPendingForceFollow = false;
 let chatTranscriptRenderPendingReason = "update";
 let chatTranscriptRenderLastAt = 0;
 let statusPollNonce = 0;
-function escapeHtml(value) {
-  return String(value || "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
-}
 function svgIcon(name) {
   if (name === "close")
     return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" fill="none"/></svg>';

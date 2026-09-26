@@ -31,7 +31,8 @@
       <div class="tabs">
         <button class="tab" data-tab="overview" onclick="tab(event, 'overview')">Main</button
         ><button class="tab" data-tab="system" onclick="tab(event, 'system')">System</button
-        ><button class="tab" data-tab="presets" onclick="tab(event, 'presets')">Presets</button
+        ><button class="tab" data-tab="ai-studio" onclick="tab(event, 'ai-studio')">AI Studio</button
+        ><button class="tab" data-tab="benchmarks" id="benchmarksTabBtn" onclick="tab(event, 'benchmarks')">Benchmarks</button
         ><button class="tab" data-tab="users" id="usersTabBtn" onclick="tab(event, 'users')">
           Users</button
         ><button class="tab" data-tab="metrics" onclick="tab(event, 'metrics')">Metrics</button
@@ -228,150 +229,24 @@
           <div class="msg" id="servicesMsg"></div>
         </div>
       </section>
-      <section id="presets" class="tabpane content-tab">
+      <section id="ai-studio" class="tabpane content-tab">
+        <div id="aiStudioModelTypes"></div>
+        <div id="aiStudioContent"></div>
+        <section id="presets" class="hidden">
         <div class="panel">
-          <div class="panel-head">
-            <h2>Model Presets</h2>
-            <div class="preset-head-actions" id="presetHeadActions">
-              <button
-                type="button"
-                class="preset-menu-button preset-filter-button"
-                title="Filter presets"
-                aria-label="Filter presets"
-                onclick="openPresetFilterModal()"
-              >
-                <svg viewBox="0 0 24 24" aria-hidden="true">
-                  <path d="M4 5h16l-6.2 7.1v5.4l-3.6 1.8v-7.2L4 5Z" fill="none" />
-                </svg>
-              </button>
-              <div class="preset-head-menu" id="presetActionsMenu">
-              <button
-                type="button"
-                class="preset-menu-button"
-                id="presetActionsMenuButton"
-                title="Preset actions"
-                aria-label="Preset actions"
-                aria-haspopup="menu"
-                aria-expanded="false"
-                onclick="togglePresetActionsMenu(event)"
-              >
-                <svg viewBox="0 0 24 24" aria-hidden="true">
-                  <path d="M5 7h14M5 12h14M5 17h14" fill="none" />
-                </svg>
-              </button>
-              <div
-                class="preset-actions-menu hidden"
-                id="presetActionsMenuList"
-                role="menu"
-              >
-                <button
-                  type="button"
-                  class="preset-menu-item preset-menu-setup"
-                  role="menuitem"
-                  onclick="closePresetActionsMenu(); openSetupAssistantModal()"
-                >
-                  <span class="preset-menu-icon" aria-hidden="true">
-                    <svg viewBox="0 0 24 24" aria-hidden="true">
-                      <path d="M12 3l1.6 4.4L18 9l-4.4 1.6L12 15l-1.6-4.4L6 9l4.4-1.6L12 3Zm6 10 .9 2.1L21 16l-2.1.9L18 19l-.9-2.1L15 16l2.1-.9L18 13ZM5.5 14l.8 1.7 1.7.8-1.7.8-.8 1.7-.8-1.7-1.7-.8 1.7-.8.8-1.7Z" fill="none" />
-                    </svg>
-                  </span>
-                  <span>Setup Assistant</span>
-                </button>
-                <button
-                  type="button"
-                  class="preset-menu-item preset-menu-rebuild"
-                  role="menuitem"
-                  onclick="closePresetActionsMenu(); promptRuntimeInventoryRebuild()"
-                >
-                  <span class="preset-menu-icon" aria-hidden="true">
-                    <svg viewBox="0 0 24 24" aria-hidden="true">
-                      <path d="M5 6c0-1.7 3.1-3 7-3s7 1.3 7 3-3.1 3-7 3-7-1.3-7-3Zm0 0v6c0 1.7 3.1 3 7 3s7-1.3 7-3V6M5 12v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6" fill="none" />
-                    </svg>
-                  </span>
-                  <span>Rebuild Model DB</span>
-                </button>
-                <div class="preset-menu-separator" aria-hidden="true"></div>
-                <button
-                  type="button"
-                  class="preset-menu-item preset-menu-hidden"
-                  role="menuitem"
-                  onclick="closePresetActionsMenu(); selectPresetModel('__hidden_presets__')"
-                >
-                  <span class="preset-menu-icon" aria-hidden="true">
-                    <svg viewBox="0 0 24 24" aria-hidden="true">
-                      <path d="M2.5 12s3.6-6 9.5-6 9.5 6 9.5 6-3.6 6-9.5 6-9.5-6-9.5-6Z" fill="none" />
-                      <circle cx="12" cy="12" r="3.25" fill="none" />
-                      <path d="M4 20 20 4" fill="none" />
-                    </svg>
-                  </span>
-                  <span>Hidden Presets</span>
-                </button>
-                <button
-                  type="button"
-                  class="preset-menu-item preset-menu-custom"
-                  role="menuitem"
-                  onclick="closePresetActionsMenu(); openCustomModelModal()"
-                >
-                  <span class="preset-menu-icon" aria-hidden="true">
-                    <svg viewBox="0 0 24 24" aria-hidden="true">
-                      <path d="M12 5v14M5 12h14" fill="none" />
-                    </svg>
-                  </span>
-                  <span>Custom Model</span>
-                </button>
-                <button
-                  type="button"
-                  class="preset-menu-item preset-menu-manager"
-                  role="menuitem"
-                  onclick="closePresetActionsMenu(); selectPresetModel('__model_resources__')"
-                >
-                  <span class="preset-menu-icon" aria-hidden="true">
-                    <svg viewBox="0 0 24 24" aria-hidden="true">
-                      <path d="M12 8.5a3.5 3.5 0 1 0 0 7a3.5 3.5 0 0 0 0-7Zm8 3.5l-2.1.8a6.9 6.9 0 0 1-.6 1.4l.9 2l-2.1 2.1l-2-.9a6.9 6.9 0 0 1-1.4.6L12 20l-1.1-2.1a6.9 6.9 0 0 1-1.4-.6l-2 .9l-2.1-2.1l.9-2a6.9 6.9 0 0 1-.6-1.4L4 12l2.1-1.1a6.9 6.9 0 0 1 .6-1.4l-.9-2l2.1-2.1l2 .9a6.9 6.9 0 0 1 1.4-.6L12 4l1.1 2.1a6.9 6.9 0 0 1 1.4.6l2-.9l2.1 2.1l-.9 2a6.9 6.9 0 0 1 .6 1.4L20 12Z" fill="none" />
-                    </svg>
-                  </span>
-                  <span>Model Manager</span>
-                </button>
-                <button
-                  type="button"
-                  class="preset-menu-item preset-menu-ai-studio"
-                  role="menuitem"
-                  onclick="closePresetActionsMenu(); selectPresetModel('__ai_studio__')"
-                >
-                  <span class="preset-menu-icon" aria-hidden="true">
-                    <svg viewBox="0 0 24 24" aria-hidden="true">
-                      <path d="m12 3 1.4 4.3L18 9l-4.6 1.7L12 15l-1.4-4.3L6 9l4.6-1.7L12 3Z" fill="none" />
-                      <path d="m5 14 .8 2.2L8 17l-2.2.8L5 20l-.8-2.2L2 17l2.2-.8L5 14Zm14 1 .7 1.8 1.8.7-1.8.7L19 21l-.7-1.8-1.8-.7 1.8-.7L19 15Z" fill="none" />
-                    </svg>
-                  </span>
-                  <span>AI Studio</span>
-                </button>
-                <button
-                  type="button"
-                  class="preset-menu-item preset-menu-benchmarks"
-                  role="menuitem"
-                  onclick="closePresetActionsMenu(); openBenchmarkAllModal()"
-                >
-                  <span class="preset-menu-icon" aria-hidden="true">
-                    <svg viewBox="0 0 24 24" aria-hidden="true">
-                      <path d="M8 5.5 18 12 8 18.5Z" />
-                    </svg>
-                  </span>
-                  <span>Benchmarks</span>
-                </button>
-              </div>
-              </div>
+          <div class="panel-head"><h2>Text models</h2></div>
+          <div class="preset-toolbar" id="presetHeadActions">
+            <div class="preset-toolbar-main">
+              <button type="button" class="btn blue" onclick="openSetupAssistantModal()">Setup Assistant</button>
+              <button type="button" class="btn blue" onclick="promptRuntimeInventoryRebuild()">Rebuild Model DB</button>
+              <button type="button" class="btn green" onclick="openCustomModelModal()">Add custom model</button>
+            </div>
+            <div class="preset-toolbar-utilities">
+              <button type="button" class="btn hidden-presets-trigger" id="hiddenPresetsToggle" aria-pressed="false" onclick="toggleHiddenPresetsVisibility()">Show hidden presets</button>
+              <button type="button" class="preset-toolbar-icon-button preset-filter-button" title="Filter presets" aria-label="Filter presets" onclick="openPresetFilterModal()"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16l-6.2 7.1v5.4l-3.6 1.8v-7.2L4 5Z" fill="none" /></svg></button>
             </div>
           </div>
-          <div class="preset-help">
-            Discovered presets are rendered directly from the local
-            <code>/opt/ai/club-3090</code> clone. Global applies single-GPU
-            presets across every GPU, dual presets across every two-GPU pair,
-            and multi-GPU presets to the shared runtime. Use
-            the Custom Model menu item to bridge upstream
-            <code>pull.sh</code> into this panel without changing the core UI
-            flow.
-          </div>
+          <div class="preset-help">Discovered presets come from the local <code>/opt/ai/club-3090</code> clone. Global applies single-GPU presets across every GPU, dual presets across every two-GPU pair, and multi-GPU presets to the shared runtime.</div>
           <div class="preset-section-label">Scope</div>
           <div class="subtabs" id="presetScopeTabs"></div>
           <div class="value smallgap" id="presetScopeSummary">-</div>
@@ -551,6 +426,14 @@
               </button>
             </div>
           </div>
+        </div>
+      </section>
+        </section>
+      <section id="benchmarks" class="tabpane content-tab">
+        <div class="panel benchmark-page-panel">
+          <div class="panel-head"><h2 id="benchmarksPageTitle">Benchmarks</h2></div>
+          <div id="benchmarksPageBody"></div>
+          <div class="msg" id="benchmarksPageMsg"></div>
         </div>
       </section>
       <section id="users" class="tabpane content-tab"></section>

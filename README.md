@@ -58,7 +58,6 @@ Click any thumbnail to open the full-size screenshot.
   <a href="./screenshots/16.%20API%20Presets.png"><img src="./screenshots/16.%20API%20Presets.png" alt="16. API Presets" width="260" /></a>
   <a href="./screenshots/17.%20Benchmarks.png"><img src="./screenshots/17.%20Benchmarks.png" alt="17. Benchmarks" width="260" /></a>
   <a href="./screenshots/18.%20Detailed%20Benchmark%20Scores.png"><img src="./screenshots/18.%20Detailed%20Benchmark%20Scores.png" alt="18. Detailed Benchmark Scores" width="260" /></a>
-  <a href="./screenshots/19.%20Model%20Manager.png"><img src="./screenshots/19.%20Model%20Manager.png" alt="19. Model Manager" width="260" /></a>
   <a href="./screenshots/20.%20Custom%20Models.png"><img src="./screenshots/20.%20Custom%20Models.png" alt="20. Custom Models" width="260" /></a>
   <a href="./screenshots/21.%20Preset%20Launch%20Settings.png"><img src="./screenshots/21.%20Preset%20Launch%20Settings.png" alt="21. Preset Launch Settings" width="260" /></a>
   <a href="./screenshots/22.%20Duplicate%20Presets.png"><img src="./screenshots/22.%20Duplicate%20Presets.png" alt="22. Duplicate Presets" width="260" /></a>
@@ -211,12 +210,14 @@ Here is the simple mental model for the main tabs:
 
 - `Main`: quick status, running containers, uptime, and GPU overview
 - `System`: service controls, power/fan controls, and machine information
-- `Presets`: download models, start/stop presets, and manage which runtime is active
+- `AI Studio`: manage text, image, video, speech, and audio models, generation lanes, and the generated-media gallery
+- `Benchmarks`: select and run model benchmark suites, review saved scores, and monitor active runs
 - `Chat`: built-in local streaming chat client with server-backed conversation storage, lazy detail loading, per-conversation stats caching, share/export links, configuration, and local or remote MCP servers
-- `AI Studio`: multimodal setup, model-resource checks, gallery browsing, and Plan/Interactive generation lanes from the Presets and Chat surfaces
 - `Users`: create API users and keys if you want to share the server safely
 - `Metrics`: request counts, usage history, runtime performance data, storage browsing, and detachable monitoring
 - `Logs`: Docker logs and audit logs for troubleshooting
+
+Model Manager has been removed. Its former features and the remaining per-model cleanup controls are documented in [`docs/removed-model-manager.md`](./docs/removed-model-manager.md).
 
 ### Common first tasks
 
