@@ -2298,7 +2298,7 @@ def build_status_snapshot(refresh_remote_metadata=False):
         "script_version": SCRIPT_VERSION,
         "control_started_at": int(startup_time),
         "local_installer_metadata": local_installer_metadata,
-        "self_update": self_update_state,
+        "self_update_source": self_update_source_snapshot(),
         "remote_update": remote_update_metadata,
         "club3090_compat": club3090_compat,
         "uptime_seconds": int(time.time() - startup_time),

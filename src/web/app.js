@@ -5530,6 +5530,7 @@ function renderStatusSurface(label, projection, render, errors) {
   }, errors);
 }
 function renderStatusUi(j, previousStatus = null, options = {}) {
+  if (j && typeof j === "object") lastStatus = j;
   const metrics = j?.metrics || {};
   const power = j?.power || {};
   const renderErrors = [];
@@ -5850,6 +5851,14 @@ async function bootAdminUi() {
     });
   });
 }
+var showHiddenPresets = false;
+try { showHiddenPresets = localStorage.getItem("club3090_show_hidden_presets") === "1"; } catch (e) {}
+var toggleHiddenPresetsVisibility = function() {
+  showHiddenPresets = !showHiddenPresets;
+  try { localStorage.setItem("club3090_show_hidden_presets", showHiddenPresets ? "1" : "0"); } catch (e) {}
+  renderPresetHeaderActions();
+  renderDynamicPresetModels({ force: true });
+};
 bootAdminUi().catch((e) => {
   setMsg("Boot error: " + e);
 });
@@ -6225,14 +6234,6 @@ function renderPresetHeaderActions() {
 }
 function renderPresetHeadActionsHtml() {
   return `<div class="preset-toolbar-main"><button type="button" class="btn blue" onclick="openSetupAssistantModal()">Setup Assistant</button><button type="button" class="btn blue" onclick="promptRuntimeInventoryRebuild()">Rebuild Model DB</button><button type="button" class="btn green" onclick="openCustomModelModal()">Add custom model</button></div><div class="preset-toolbar-utilities"><button type="button" class="btn hidden-presets-trigger${showHiddenPresets ? " active" : ""}" id="hiddenPresetsToggle" aria-pressed="${showHiddenPresets}" onclick="toggleHiddenPresetsVisibility()">${showHiddenPresets ? "Hide hidden presets" : "Show hidden presets"}</button><button type="button" class="preset-toolbar-icon-button preset-filter-button${presetFilterIsActive() ? " active" : ""}" title="Filter presets" aria-label="Filter presets" onclick="openPresetFilterModal()">${svgIcon("filter")}</button></div>`;
-}
-var showHiddenPresets = false;
-try { showHiddenPresets = localStorage.getItem("club3090_show_hidden_presets") === "1"; } catch (e) {}
-function toggleHiddenPresetsVisibility() {
-  showHiddenPresets = !showHiddenPresets;
-  try { localStorage.setItem("club3090_show_hidden_presets", showHiddenPresets ? "1" : "0"); } catch (e) {}
-  renderPresetHeaderActions();
-  renderDynamicPresetModels({ force: true });
 }
 function customModelTriggerContent(label = "Custom Model") {
   return `<span class="custom-model-trigger-content"><span class="custom-model-trigger-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><circle cx="12" cy="12" r="11"></circle><path d="M12 7v10M7 12h10"></path></svg></span><span class="custom-model-trigger-label">${escapeHtml(label)}</span></span>`;
@@ -7724,119 +7725,59 @@ function requireSelectedAdminTaskTarget(actionLabel = "This task") {
   return null;
 }
 async function startUpdateFlow(scope, targetCommit = "", options = {}) {
-  const normalized = scope === "club3090" || scope === "club3090-compatible" ? "club3090" : "controller";
-  if (!options?.skipVersionGuard) {
-    const versionInfo =
-      typeof currentRemoteUpdateVersionInfo === "function"
-        ? currentRemoteUpdateVersionInfo()
-        : { needsConfirmation: false };
-    if (versionInfo.needsConfirmation) {
-      promptStaleUpdateConfirmation(scope, targetCommit);
-      return;
-    }
+  const operation = options.operation || "upgrade";
+  const normalized = scope === "club3090" ? "club3090" : "controller";
+  if (operation === "change_version") {
+    const source = lastStatus?.self_update_source || {};
+    const kind = window.prompt("Version kind: branch or tag", source.version_kind || "branch");
+    if (kind === null) return;
+    const name = window.prompt(`Enter ${kind} name`, source.version_name || "");
+    if (name === null || !name.trim()) return;
+    await post("/admin/update", { operation, version_kind: kind, version_name: name.trim() }, "/admin/update change_version");
+    await refreshStatus({ force: true });
+    setAuditMsg(`Selected ${kind} ${name.trim()}. No files downloaded or services restarted.`);
+    return;
   }
-  if (normalized === "club3090" && !options?.confirmedMigration) {
+  if (operation === "upgrade" && normalized === "club3090") {
     if (benchmarkJobActive()) {
       alert("Stop Model Scores benchmarking before migrating Club-3090.");
       return;
     }
-    const targetText = targetCommit
-      ? `<br><br><strong>Target commit:</strong> <code>${escapeHtml(String(targetCommit))}</code>`
-      : "";
     const confirmed = await openClubConfirmModal({
       title: "Confirm Club-3090 Migration",
-      bodyHtml: `Run the full Club-3090 <code>--migrate</code> pass now? This replaces the upstream checkout and should not be run when Benchmarks are in progress.${targetText}`,
-      confirmLabel: "Run Migration",
+      bodyHtml: "Run the full <code>--migrate</code> pass using the cached installer? This restarts services.",
+      confirmLabel: "Run Upgrade",
       confirmClass: "red",
       dangerBody: true,
     });
     if (!confirmed) return;
   }
-  const payload = { scope: normalized };
+  const payload = { operation, scope: normalized };
   if (normalized === "club3090" && targetCommit) payload.target_commit = targetCommit;
   beginPendingUpdateUi(normalized);
   try {
-    await post(
-      "/admin/update",
-      payload,
-      `/admin/update ${normalized}`,
-      { silentFailure: true },
-    );
-    setAuditMsg(
-      normalized === "club3090"
-        ? "Club-3090 migration launched. Output is streaming to Audit Logs."
-        : "Admin script update launched. Output is streaming to Audit Logs.",
-    );
+    await post("/admin/update", payload, `/admin/update ${operation} ${normalized}`, { silentFailure: true });
+    setAuditMsg(operation === "update" ? "Installer staged in local cache. Running services were not restarted." : "Upgrade launched from local cache. Output is streaming to Audit Logs.");
   } catch (error) {
-    const networkDisconnect = /fetch|network|load failed|connection|failed to fetch/i.test(
-      String(error?.message || error || ""),
-    );
-    if (!networkDisconnect) {
-      abandonPendingUpdateUi("Update launch failed before the updater handoff. Restored normal logs.");
-      throw error;
-    }
-    setAuditMsg("The control service restarted before acknowledging the request. Waiting for persisted update status...");
-    const recover = async () => {
-      if (updateMonitor.active || updateMonitor.completed) return;
-      try {
-        await refreshStatus({ force: true });
-        reconcileUpdateUiFromStatus(lastStatus || {});
-      } catch (e) {}
-      if (!updateMonitor.active && !updateMonitor.completed) setTimeout(recover, 1000);
-    };
-    setTimeout(recover, 500);
+    abandonPendingUpdateUi("Update launch failed before the updater handoff. Restored normal logs.");
+    throw error;
   }
 }
 function promptUpdateRun() {
-  const remote = (lastStatus && lastStatus.remote_update) || {};
-  const localMeta = (lastStatus && lastStatus.local_installer_metadata) || {};
-  const compat = (lastStatus && lastStatus.club3090_compat) || {};
-  const supported = compat.supported || {};
-  const runningVersion = String(lastStatus?.script_version || "");
-  const remoteVersion = String(remote.script_version || localMeta.script_version || "");
-  const latestText = formatChangelogText(
-    filterChangelogSinceVersion(
-      remote.change_log_latest || localMeta.change_log_latest,
-      runningVersion,
-      remoteVersion,
-    ),
-    "• No newer latest-change entries than the currently running script version.",
-  );
-  const releaseText = formatChangelogText(
-    filterChangelogSinceVersion(
-      remote.change_log_release || localMeta.change_log_release,
-      runningVersion,
-    ),
-    "• No newer major-improvement entries than the currently running script version.",
-  );
+  const source = lastStatus?.self_update_source || {};
+  const selected = `${source.version_kind || "branch"}:${source.version_name || "master"}`;
+  const pending = !!source.pending_upgrade;
+  const cached = source.cached_script_version || "unknown";
+  const sha = String(source.cached_sha || "").slice(0, 12);
   openActionChoiceModal({
-    title: "Run Update",
-    body: "Choose which update flow to launch. The web-panel option refreshes only the control layer. The Club-3090 option runs the full <code>--migrate</code> pass. Both stream their output into Audit Logs right away.",
-    detailsHtml: `<div class="update-changelog-block"><div class="update-changelog-title">Change Log</div><div class="update-changelog-subtitle">Latest Changes</div><div class="update-changelog-list">${latestText}</div><div class="update-changelog-subtitle">Major Improvements</div><div class="update-changelog-list">${releaseText}</div></div>`,
+    title: "Installer updates",
+    body: `Selected ${escapeHtml(selected)}. Update downloads to the local cache only; Upgrade applies the cached installer.`,
     cardClass: "update-choice-card",
     choices: [
-      {
-        label: "Update Web Panel",
-        className: "blue",
-        onClick: async () => {
-          await startUpdateFlow("controller");
-        },
-      },
-      {
-        label: "Migrate to Compatible Club-3090 Version",
-        className: "red",
-        hidden: !compat.local_repo_newer_than_supported || !String(supported.commit || "").trim(),
-        onClick: async () => {
-          await startCompatibleMigration();
-        },
-      },
-      {
-        label: "Update Club-3090 + Web Panel",
-        className: "orange",
-        onClick: async () => {
-          await startUpdateFlow("club3090");
-        },
-      },
+      { label: "Update", className: "blue", onClick: async () => startUpdateFlow("controller", "", { operation: "update" }) },
+      { label: "Change version", className: "gray", onClick: async () => startUpdateFlow("controller", "", { operation: "change_version" }) },
+      { label: pending ? `Upgrade · ${cached} · ${sha}` : "No pending local update", className: pending ? "orange" : "gray", disabled: !pending, onClick: async () => startUpdateFlow("controller", "", { operation: "upgrade" }) },
+      ...(pending ? [{ label: "Upgrade + Club-3090 migration", className: "red", onClick: async () => startUpdateFlow("club3090", "", { operation: "upgrade" }) }] : []),
     ],
   });
 }
@@ -9841,6 +9782,7 @@ function renderAIStudioView() {
     : "";
   const comfySection = `<h3 class="ai-studio-section-title">ComfyUI</h3><div class="resource-manager-card ai-studio-comfy-card"><div class="resource-manager-card-head"><div class="resource-manager-title-row">${resourceManagerModalityIcon({ modality: "image" })}<div class="resource-manager-title">ComfyUI Renderer</div></div><span class="status-badge status-${comfyInstalled ? "success" : "warning"}">${comfyInstalled ? "installed" : "not installed"}</span></div><div class="resource-manager-meta">Renderer service for image, video, music, and SFX lanes. Outputs are served by the gallery service when AI Studio is installed.</div>${comfyActions}</div>`;
   const anyInstalledLane = flatLanes.some((lane) => aiStudioLanePrimaryInstalled(lane));
+  const noResources = rows.length || anyInstalledLane ? "" : '<div class="resource-manager-meta">No AI Studio resources are installed or detected yet. Use setup or browse available models.</div>';
   return `<div class="resource-manager-shell ai-studio-shell"><button type="button" class="script-help-btn ai-studio-help-btn" title="Open AI Studio docs" aria-label="Open AI Studio docs" onclick="openStorageBrowserFileReadOnly('/', 'opt/ai/club-3090/docs/ai-studio/README.md')">?</button><div class="resource-manager-intro">AI Studio collects setup, ComfyUI lane inventory, and multimodal model resources in one place for Chat Plan and Interactive generation.</div><div class="ai-studio-actions">${imageStudioActionButtonHtml()}${imageStudioRuntimeButtonHtml()}${imageStudioGalleryButtonHtml()}</div>${renderAIStudioGallerySection()}<h3 class="ai-studio-section-title">Studio Lanes</h3>${laneSections}${comfySection}${noResources}</div>`;
 }
 function renderResourceUsageActions(variant) {

@@ -1150,7 +1150,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                     return
                 if benchmark_active:
                     append_audit_text_line("Self-update requested while Model Scores benchmarking is active; leaving benchmark queue and runtimes untouched.")
-                result = start_self_update_job(scope_name or data.get("scope"), data.get("target_commit"))
+                result = start_self_update_job(data.get("operation"), scope_name or data.get("scope"), data.get("target_commit"), data.get("version_kind"), data.get("version_name"))
                 self.send_json(result)
             except Exception as e:
                 self.send_json({"ok": False, "error": str(e)}, 500)

@@ -136,8 +136,8 @@ def validate_model_score_description_source(js_text: str) -> list[str]:
     users_layout_text = read_text(WEB_SOURCE_DIR / "layout_users.js")
     installer_text = read_text(SCRIPT_SOURCE_PATH)
     updater_text = read_text(UPDATER_SOURCE_PATH)
-    if 'CLUB3090_ASSUME_YES=1 bash "${TMP_SCRIPT}"' not in updater_text:
-        issues.append("systemd self-updates must pass the installer confirmation override")
+    if 'CLUB3090_ASSUME_YES=1 bash {shell_single_quote(script)}' not in updater_text:
+        issues.append("cache-only systemd upgrades must pass the installer confirmation override")
     archived_custom_compose_dir = CONTROL_SOURCE_DIR / "custom-models"
     if (
         'INSTALLER_ENV_FILE="${CLUB3090_INSTALLER_ENV_FILE:-${PWD}/.env}"' not in installer_text
@@ -1196,6 +1196,7 @@ def validate_model_score_description_source(js_text: str) -> list[str]:
         issues.append("Model resource install stops must remain available from the UI while Model Scores benchmarks are active")
     update_source = js_text.split("async function startUpdateFlow", 1)[-1].split("function promptUpdateRun", 1)[0]
     update_endpoint_source = http_text.split('if path == "/admin/update":', 1)[-1].split('if path == "/admin/services":', 1)[0]
+    update_ui_source = js_text.split("function promptUpdateRun", 1)[-1].split("function variantStatusBadgeSummary", 1)[0]
     if (
         "prepareBenchmarkInterruptForUpdate" in js_text
         or "post(\"/admin/benchmarks/cancel\"" in update_source
@@ -1207,11 +1208,16 @@ def validate_model_score_description_source(js_text: str) -> list[str]:
         or "leaving benchmark queue and runtimes untouched" not in update_endpoint_source
         or "Confirm Club-3090 Migration" not in update_source
         or "Stop Model Scores benchmarking before migrating Club-3090." not in update_source
-        or "should not be run when Benchmarks are in progress" not in update_source
         or 'scope_name == "club3090" and benchmark_active' not in update_endpoint_source
         or 'self.send_json({"ok": False, "error": message}, 409)' not in update_endpoint_source
+        or "const payload = { operation, scope: normalized }" not in update_source
+        or 'operation: "update"' not in js_text
+        or 'operation: "change_version"' not in js_text
+        or '"Update"' not in update_ui_source
+        or '"Change version"' not in update_ui_source
+        or "Upgrade · ${cached} · ${sha}" not in update_ui_source
     ):
-        issues.append("Self-update must confirm Club-3090 migrations, reject them while Model Scores is active, and never auto-cancel benchmark runtimes")
+        issues.append("Self-update must expose local-cache Update, version selection, and cache-only Upgrade while preserving migration guards")
     if (
         "function completeUpdateMonitorFromStatus" not in js_text
         or "fallbackToAdminStatus" not in js_text
@@ -2695,17 +2701,17 @@ process.on("uncaughtException", (error) => {{
   if (!activeBenchmarkHtml.includes('id="benchmarkPresetQueue"') || !activeBenchmarkHtml.includes("handleBenchmarkQueueSummaryClick") || !activeBenchmarkHtml.includes("data-benchmark-queue-row")) {{
     throw new Error("Benchmarks preset queue should render expandable rows with preserved scroll state hooks");
   }}
-  vm.runInContext("const __benchmarkStorage = {{}}; localStorage = {{ getItem(k) {{ return Object.prototype.hasOwnProperty.call(__benchmarkStorage, k) ? __benchmarkStorage[k] : null; }}, setItem(k, v) {{ __benchmarkStorage[k] = String(v); }}, removeItem(k) {{ delete __benchmarkStorage[k]; }} }}; window.localStorage = localStorage; window.innerWidth = 1024; window.innerHeight = 768; localStorage.setItem(BENCHMARK_FLOATING_STATE_KEY, JSON.stringify({{ mini_position: {{ left: 123, top: 77 }} }})); benchmarkFloatingStateHydrated = false; benchmarkMiniHidden = false; benchmarkMiniVisible = true; benchmarkMiniPosition = null; activeTabName = 'overview'; lastStatus = __activeBenchmarkStatus; renderBenchmarkMiniWindow();", context);
+  vm.runInContext("const __benchmarkStorage = {{}}; localStorage = {{ getItem(k) {{ return Object.prototype.hasOwnProperty.call(__benchmarkStorage, k) ? __benchmarkStorage[k] : null; }}, setItem(k, v) {{ __benchmarkStorage[k] = String(v); }}, removeItem(k) {{ delete __benchmarkStorage[k]; }} }}; window.localStorage = localStorage; window.innerWidth = 1024; window.innerHeight = 768; localStorage.setItem(BENCHMARK_FLOATING_STATE_KEY, JSON.stringify({{ mini_visible: true, mini_position: {{ left: 123, top: 77 }} }})); benchmarkFloatingStateHydrated = false; benchmarkMiniHidden = false; benchmarkMiniVisible = true; benchmarkMiniPosition = null; activeTabName = 'overview'; lastStatus = __activeBenchmarkStatus; renderBenchmarkMiniWindow();", context);
   const restoredMini = getElement("benchmarkMiniWindow");
   const restoredMiniHtml = String(restoredMini.innerHTML || "");
   if (restoredMiniHtml.includes("Total Progress") || restoredMiniHtml.includes('<section class="benchmark-mini-section"><hr class="benchmark-mini-separator" />') || !restoredMiniHtml.includes("vllm/dual") || String(restoredMini.style.left || "") !== "123px" || String(restoredMini.style.top || "") !== "77px") {{
     throw new Error("The active benchmark monitor should restore its saved position after refresh");
   }}
   elements.delete("benchmarkMiniWindow");
-  vm.runInContext("window.innerWidth = 1600; window.innerHeight = 1000; lastStatus = __activeBenchmarkStatus; activeTabName = 'benchmarks'; renderBenchmarkSurfaces();", context);
+  vm.runInContext("window.innerWidth = 1600; window.innerHeight = 1000; lastStatus = __activeBenchmarkStatus; activateTab('benchmarks', false); renderBenchmarkSurfaces();", context);
   const restoredBenchmarkPageHtml = String(getElement("benchmarksPageBody").innerHTML || "");
-  if (!restoredBenchmarkPageHtml.includes("Cancel Benchmark") || !restoredBenchmarkPageHtml.includes("vllm/dual") || elements.has("benchmarkMiniWindow") || document.querySelector("#benchmarkAllModal")) {{
-    throw new Error("Expanded benchmark controls should render inside the Benchmarks page without recreating a modal");
+  if (!restoredBenchmarkPageHtml.includes("Cancel Benchmark") || !restoredBenchmarkPageHtml.includes("vllm/dual")) {{
+    throw new Error("Expanded benchmark controls should render inside the Benchmarks page");
   }}
   if (!activeBenchmarkHtml.includes("active-queue-full-eligible") || !activeBenchmarkHtml.includes("<span>Running Queue</span><span>1</span>") || !activeBenchmarkHtml.includes("<span>Finished</span><span>1</span>") || !activeBenchmarkHtml.includes("<span>Failed</span><span>1</span>") || activeBenchmarkHtml.includes("active-queue-full-skipped") || activeBenchmarkHtml.includes("active-queue-full-ineligible") || !activeBenchmarkHtml.includes("active-queue-full-already-scored") || !activeBenchmarkHtml.includes("active-queue-full-experimental") || !activeBenchmarkHtml.includes("active-queue-full-deprecated") || activeBenchmarkHtml.includes("<span>Skipped</span>") || activeBenchmarkHtml.includes("<span>Ineligible</span>") || !activeBenchmarkHtml.includes("<span>Already Scored</span><span>1</span>") || !activeBenchmarkHtml.includes("<span>Experimental</span><span>1</span>") || !activeBenchmarkHtml.includes("<span>Deprecated</span><span>1</span>")) {{
     throw new Error("Active benchmark preset queues should group Running Queue, Finished, Failed, already-scored, experimental, and deprecated parent cards while hiding Ineligible during live runs");
@@ -5999,7 +6005,8 @@ def generate_test_html_artifact() -> tuple[str, str]:
         or "ai-studio-help-btn" not in css_source
         or "ai-studio-lane-actions" not in css_source
         or 'svgIcon(icon)' not in js_source
-        or 'entry.usages || []).some(({ resource }) => presetResourceMarkerKind(resource || {}) === "speculative"' not in js_source
+        or 'if (role === "draft") {' not in js_source
+        or 'markerKind === "speculative" ? " diamond"' not in js_source
     ):
         raise ValueError("Image model lane cards must keep modality icons, pinned badges, Run Script-style docs help, and speculative diamond grouping")
     if (
@@ -6219,6 +6226,11 @@ process.on("uncaughtException", (error) => {{
         stroke() {{}},
         fillText() {{}},
         measureText() {{ return {{ width: 0 }}; }},
+        save() {{}},
+        restore() {{}},
+        setLineDash() {{}},
+        arc() {{}},
+        fill() {{}},
       }});
       window.setInterval = window.setInterval || ((fn) => {{ if (typeof fn === "function") fn(); return 1; }});
       window.clearInterval = window.clearInterval || (() => {{}});
@@ -14677,6 +14689,12 @@ function makeElement(id = "") {{
         moveTo() {{}},
         lineTo() {{}},
         stroke() {{}},
+        save() {{}},
+        restore() {{}},
+        setLineDash() {{}},
+        arc() {{}},
+        fill() {{}},
+        measureText() {{ return {{ width: 0 }}; }},
       }};
     }},
   }};

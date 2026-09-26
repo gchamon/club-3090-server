@@ -6805,42 +6805,94 @@ def request_self_update_service(path, payload=None, timeout=15):
         raise RuntimeError(detail or str(exc))
 
 
-def start_self_update_job(scope, target_commit=""):
+SELF_UPDATE_SOURCE_FILE = os.path.join(CONTROL_DIR, "self-update-source.json")
+
+
+def normalize_self_update_version(kind, name):
+    kind = str(kind or "").strip().lower()
+    name = str(name or "").strip()
+    if kind not in {"branch", "tag"} or not name or any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
+        raise ValueError("Invalid branch or tag")
+    ref = f"refs/heads/{name}" if kind == "branch" else f"refs/tags/{name}"
+    result = subprocess.run(["git", "check-ref-format", ref], capture_output=True, text=True, check=False, timeout=10)
+    if result.returncode:
+        raise ValueError("Invalid branch or tag name")
+    return kind, name
+
+
+def read_self_update_source():
+    saved = read_json_file(SELF_UPDATE_SOURCE_FILE, {})
+    if not isinstance(saved, dict) or not saved.get("version_name"):
+        saved = {"version_kind": "branch", "version_name": REMOTE_UPDATE_BRANCH}
+    try:
+        kind, name = normalize_self_update_version(saved.get("version_kind", "branch"), saved.get("version_name", REMOTE_UPDATE_BRANCH))
+    except (ValueError, subprocess.TimeoutExpired):
+        saved = {"version_kind": "branch", "version_name": REMOTE_UPDATE_BRANCH}
+        kind, name = normalize_self_update_version("branch", REMOTE_UPDATE_BRANCH)
+    try:
+        cached_at = int(saved.get("cached_at") or 0)
+    except (TypeError, ValueError):
+        cached_at = 0
+    return {
+        "version_kind": kind, "version_name": name,
+        "cached_sha": str(saved.get("cached_sha") or "").lower(),
+        "cached_script_version": str(saved.get("cached_script_version") or ""),
+        "cached_at": cached_at,
+        "applied_sha": str(saved.get("applied_sha") or "").lower(),
+    }
+
+
+def self_update_ref(source=None):
+    source = source if isinstance(source, dict) else read_self_update_source()
+    kind, name = normalize_self_update_version(source.get("version_kind"), source.get("version_name"))
+    return f"refs/heads/{name}" if kind == "branch" else f"refs/tags/{name}"
+
+
+def self_update_source_snapshot():
+    source = read_self_update_source()
+    source["pending_upgrade"] = bool(source["cached_sha"] and source["cached_sha"] != source["applied_sha"])
+    return source
+
+
+def start_self_update_job(operation, scope="controller", target_commit="", version_kind="", version_name=""):
+    if read_self_update_state().get("active"):
+        raise RuntimeError("A self-update job is already running")
+    operation = str(operation or "").strip().lower()
+    if operation not in {"update", "change_version", "upgrade"}:
+        raise ValueError("Invalid update operation")
     scope_name = _selector_token(scope)
-    if scope_name not in {"controller", "club3090"}:
+    if operation != "upgrade":
+        scope_name = "controller"
+        target_commit = ""
+    elif scope_name not in {"controller", "club3090"}:
         raise ValueError("Invalid update scope")
-    target_commit = re.sub(r"[^0-9A-Fa-f]+", "", str(target_commit or "").strip())
-    fetch_remote_script_metadata(force=True)
-    if model_install_jobs_active():
+    if operation == "change_version":
+        version_kind, version_name = normalize_self_update_version(version_kind, version_name)
+        source = read_self_update_source()
+        source.update(version_kind=version_kind, version_name=version_name)
+        write_json_file(SELF_UPDATE_SOURCE_FILE, source)
+        log_audit("self_update_version_changed", version_kind=version_kind, version_name=version_name)
+        return {"ok": True, "operation": operation, "self_update_source": self_update_source_snapshot()}
+    if operation == "upgrade":
+        if model_install_jobs_active():
             raise RuntimeError("Wait for the current model install job to finish before starting an update")
-    if scope_name == "club3090":
-        active_fn = globals().get("benchmark_job_active")
-        try:
+        if scope_name == "club3090":
+            active_fn = globals().get("benchmark_job_active")
             if callable(active_fn) and active_fn():
                 raise RuntimeError("Stop Model Scores benchmarking before migrating Club-3090.")
-        except RuntimeError:
-            raise
-        except Exception:
-            pass
-    prefix = f"[self-update {scope_name}]"
     subprocess.run(["systemctl", "start", "club3090-updater.service"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
-    result = request_self_update_service("/start", {"scope": scope_name, "target_commit": target_commit}, timeout=20)
+    payload = {"operation": operation, "scope": scope_name, "target_commit": target_commit}
+    if operation == "change_version":
+        payload.update(version_kind=version_kind, version_name=version_name)
+    result = request_self_update_service("/start", payload, timeout=20)
     if not result or result.get("ok") is False:
         raise RuntimeError(str((result or {}).get("error") or "Self-update service rejected the request"))
-    label = str(result.get("label") or ("club-3090 migration" if scope_name == "club3090" else "admin script update"))
-    command = str(result.get("command") or "")
-    append_audit_text_line(f"{prefix} queued {label} via club3090-updater.service")
-    if command:
-        append_audit_text_line(f"{prefix} command: {command}")
-    log_audit("self_update_job_started", scope=scope_name, command=command, target_commit=target_commit, via="club3090-updater.service")
+    log_audit("self_update_job_started", operation=operation, scope=scope_name, target_commit=target_commit, via="club3090-updater.service")
     return {
-        "ok": True,
-        "scope": scope_name,
-        "label": label,
-        "command": command,
+        "ok": True, "operation": operation, "scope": scope_name,
+        "label": result.get("label") or operation, "command": result.get("command") or "",
         "target_commit": target_commit,
-        "stream_url": result.get("stream_url") or "",
-        "status_url": result.get("status_url") or "",
+        "stream_url": result.get("stream_url") or "", "status_url": result.get("status_url") or "",
         "update_token": str(result.get("token") or ""),
         "focus_log_source": "update",
     }

@@ -1277,11 +1277,12 @@ function renderUpdateNotices(status = {}) {
     typeof benchmarkJobActive === "function" ? benchmarkJobActive(status) : false;
   const startedAt = Number(status.control_started_at || 0);
   const remoteKey = currentUpdateBannerRemoteKey(status);
-  const hasUpdate = !!remote.update_available && remote.script_version;
+  const source = status.self_update_source || {};
+  const hasUpdate = !!source.pending_upgrade;
   const dismissed = readUpdateBannerDismissed(startedAt, remoteKey);
   const greenBar =
     hasUpdate && !dismissed && !updateActive
-      ? `<div class="update-notice-bar update-notice-bar-green"><button class="update-notice-dismiss" onclick="dismissUpdateNotice()" aria-label="Dismiss update notice">✕</button><button class="update-notice-message" onclick="openUpdateNoticeModal()">${escapeHtml(`A new update is Available (${remote.script_version})!`)} — Click here to update now</button><span class="update-notice-spacer"></span></div>`
+      ? `<div class="update-notice-bar update-notice-bar-green"><button class="update-notice-dismiss" onclick="dismissUpdateNotice()" aria-label="Dismiss update notice">✕</button><button class="update-notice-message" onclick="openUpdateNoticeModal()">Upgrade ${escapeHtml(source.cached_script_version || "cached installer")} from local cache (${escapeHtml(String(source.cached_sha || "").slice(0, 12))})</button><span class="update-notice-spacer"></span></div>`
       : "";
   const compatButton = updateActive
     ? '<button class="update-notice-link" type="button" disabled aria-disabled="true">Compatible migration unavailable while an update is running.</button>'
@@ -1307,9 +1308,11 @@ function renderUpdateButton(status = {}) {
   const button = $("systemUpdateBtn");
   if (!button) return;
   const updateActive = selfUpdateActive(status);
-  const hasUpdate = !!(status.remote_update && status.remote_update.update_available);
-  button.textContent = updateActive ? "Update Running..." : hasUpdate ? "⚠️ UPDATE AVAILABLE!" : "Update";
-  button.className = hasUpdate ? "btn blue btn-update-available" : "btn blue";
+  const source = status.self_update_source || {};
+  const pending = !!source.pending_upgrade;
+  button.textContent = updateActive ? "Update Running..." : pending ? "Update Available in Cache" : "Update";
+  button.title = `Selected ${source.version_kind || "branch"}:${source.version_name || "master"} · Cached ${source.cached_script_version || "none"}${pending ? " · Upgrade pending" : ""}`;
+  button.className = pending ? "btn blue btn-update-available" : "btn blue";
   button.disabled = updateActive;
 }
 function parseClientScriptVersionTuple(value) {
