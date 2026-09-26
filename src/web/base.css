@@ -204,6 +204,34 @@ header {
 .subtabs {
   margin-bottom: 10px;
 }
+.metrics-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  overflow-x: auto;
+  white-space: nowrap;
+}
+.metrics-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+.metrics-controls select,
+.metrics-controls input {
+  min-height: 30px;
+  border: 1px solid #34445a;
+  border-radius: 6px;
+  background: var(--field);
+  color: var(--text);
+  padding: 4px 8px;
+}
+.metrics-controls input {
+  width: 70px;
+}
 .tab,
 .subtab,
 .btn {

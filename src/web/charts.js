@@ -125,6 +125,64 @@ function setActiveMetricPaneInDocument(doc, paneId) {
   });
   return nextPaneId;
 }
+let metricTimeValue = 5;
+let metricTimeUnit = "m";
+function normalizeMetricTimeValue(value) {
+  const parsed = Number.parseInt(String(value ?? "").trim(), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, 31536000) : 5;
+}
+function normalizeMetricTimeUnit(value) {
+  return ["s", "m", "d", "w", "mo", "y"].includes(String(value || "")) ? String(value) : "m";
+}
+function currentMetricIntervalState() {
+  return { value: metricTimeValue, unit: metricTimeUnit };
+}
+function metricIntervalSeconds(value = metricTimeValue, unit = metricTimeUnit) {
+  return normalizeMetricTimeValue(value) * ({ s: 1, m: 60, d: 86400, w: 604800, mo: 2592000, y: 31536000 }[normalizeMetricTimeUnit(unit)] || 60);
+}
+function syncMetricControls() {
+  const docs = [document];
+  Object.values(window.metricsPopupStates || {}).forEach((state) => {
+    if (state?.win && !state.win.closed) docs.push(state.win.document);
+  });
+  docs.forEach((doc) => {
+    const source = doc?.getElementById?.("metricsSourceSelect");
+    const value = doc?.getElementById?.("metricsTimeValue");
+    const unit = doc?.getElementById?.("metricsTimeUnit");
+    if (source) source.value = activeMetricPaneId(doc);
+    if (value) value.value = String(metricTimeValue);
+    if (unit) unit.value = metricTimeUnit;
+  });
+}
+function setMetricIntervalState(value, unit, options = {}) {
+  metricTimeValue = normalizeMetricTimeValue(value);
+  metricTimeUnit = normalizeMetricTimeUnit(unit);
+  syncMetricControls();
+  if (options.persist !== false && typeof queueUiStateSave === "function") queueUiStateSave();
+  if (options.refresh !== false) {
+    redrawMetricsSoon();
+    refreshStatus({ force: true, includeSeries: true }).catch(() => {});
+  }
+}
+function metricSourceChanged(paneId) {
+  const nextPaneId = normalizeMetricPaneId(paneId);
+  setActiveMetricPaneInDocument(document, nextPaneId);
+  Object.values(window.metricsPopupStates || {}).forEach((state) => {
+    if (state?.win && !state.win.closed) {
+      state.paneId = nextPaneId;
+      state.label = metricPaneLabel(nextPaneId);
+      setActiveMetricPaneInDocument(state.win.document, nextPaneId);
+    }
+  });
+  syncMetricControls();
+  writeCachedUiState(currentUiState());
+  queueUiStateSave();
+  redrawMetricsSoon();
+  refreshStatus({ force: true, includeSeries: true }).catch(() => {});
+}
+function metricIntervalChanged(value, unit) {
+  setMetricIntervalState(value, unit);
+}
 function currentMetricsPopupTarget() {
   const paneId = activeMetricPaneId(document);
   return {
@@ -1900,12 +1958,14 @@ function storageEditorRedo() {
   }
 }
 function metricsPopupPanelHtml() {
-  return `<div class="subtabs">
-            <button class="subtab active" data-metric-pane="mMain">Main</button>
-            <button class="subtab" data-metric-pane="mGpu">GPUs</button>
-            <button class="subtab" data-metric-pane="mCpuRam">CPU+RAM</button>
-            <button class="subtab" data-metric-pane="mSystem">System</button>
-            <button class="subtab" data-metric-pane="mNetwork">Network</button>
+  return `<div class="metrics-controls" id="metricsControls">
+            <label class="metrics-control"><span>Source:</span><select id="metricsSourceSelect" aria-label="Metrics source">
+              <option value="mMain">Main</option><option value="mGpu">GPUs</option><option value="mCpuRam">CPU+RAM</option><option value="mSystem">System</option><option value="mNetwork">Network</option>
+            </select></label>
+            <label class="metrics-control"><span>Time interval:</span><input id="metricsTimeValue" type="text" inputmode="numeric" value="5" aria-label="Metrics time interval"></label>
+            <select id="metricsTimeUnit" aria-label="Metrics time unit">
+              <option value="s">Seconds</option><option value="m" selected>Minutes</option><option value="d">Days</option><option value="w">Weeks</option><option value="mo">Months</option><option value="y">Years</option>
+            </select>
           </div>
           <div id="mMain" class="metricpane active">
             <div class="chartgrid">
@@ -2124,23 +2184,22 @@ function detachedMetricsPopupHtml(state) {
             window.alert(e && e.message ? e.message : String(e || ""));
           }
         });
-        document.querySelectorAll("[data-metric-pane]")?.forEach((button) => {
-          button.addEventListener("click", () => {
-            const paneId = String(button.getAttribute("data-metric-pane") || "");
-            document.querySelectorAll("[data-metric-pane]")?.forEach((node) => {
-              node.classList.toggle("active", node === button);
-            });
-            document.querySelectorAll(".metricpane")?.forEach((node) => {
-              node.classList.toggle("active", node.id === paneId);
-            });
-            try {
-              if (window.opener && !window.opener.closed && typeof window.opener.updateDetachedMetricsPopupPane === "function") {
-                window.opener.updateDetachedMetricsPopupPane(signature, paneId);
-              }
-            } catch (e) {}
-            notify();
-          });
+        document.getElementById("metricsSourceSelect")?.addEventListener("change", (event) => {
+          notify();
+          try { invoke("metricSourceChanged", event.target.value); } catch (e) {}
         });
+        const updateInterval = () => {
+          notify();
+          try {
+            invoke(
+              "metricIntervalChanged",
+              document.getElementById("metricsTimeValue")?.value,
+              document.getElementById("metricsTimeUnit")?.value,
+            );
+          } catch (e) {}
+        };
+        document.getElementById("metricsTimeValue")?.addEventListener("change", updateInterval);
+        document.getElementById("metricsTimeUnit")?.addEventListener("change", updateInterval);
         let resizeTimer = 0;
         window.addEventListener("resize", () => {
           notify();
@@ -2207,6 +2266,7 @@ function renderDetachedMetricsPopup(state, status = lastStatus) {
   if (title && title.textContent !== String(state.title || "Metrics")) title.textContent = String(state.title || "Metrics");
   setActiveMetricPaneInDocument(doc, state.paneId);
   withMetricsRenderDocument(doc, () => renderMetrics(status || lastStatus || {}, { skipPopups: true }));
+  syncMetricControls();
 }
 function markDetachedMetricsPopupActive(signature) {
   const state = window.metricsPopupStates[String(signature || "")];
@@ -2283,7 +2343,7 @@ function applyMetricsVisibility() {
   const detached = currentMetricsPaneDetached();
   if (section) section.classList.remove("metrics-card-hidden");
   if ($("metricsDetachedNotice")) $("metricsDetachedNotice").classList.toggle("hidden", !(isMetrics && detached));
-  const metricsTabs = document.querySelector("#metrics .subtabs");
+  const metricsTabs = document.getElementById("metricsControls");
   if (metricsTabs) metricsTabs.classList.toggle("hidden", isMetrics && detached);
   if ($("metricsResetBtn")) $("metricsResetBtn").classList.toggle("hidden", isMetrics && detached);
   document.querySelectorAll("#metrics .metricpane").forEach((node) => {
@@ -2382,6 +2442,7 @@ function metricsChartState(doc) {
     metricsChartRegistryByDocument.set(doc, {
       charts: new Map(),
       hoverIndex: -1,
+      hoveredChartId: "",
       active: false,
       lastPointer: null,
     });
@@ -2423,12 +2484,16 @@ function metricPointTooltip(doc, record, index, event) {
 }
 function metricsChartRedraw(doc) {
   const state = metricsChartState(doc);
-  state.charts.forEach((record) => {
+  const records = [...state.charts.values()];
+  records.forEach((record) => {
     draw(record.id, record.data, record.key, record.label, record.color, record.options);
   });
   if (!state.active || state.hoverIndex < 0) return;
-  const record = [...state.charts.values()].find((item) => item.points?.[state.hoverIndex]);
-  if (record && state.lastPointer) {
+  const record = state.charts.get(state.hoveredChartId);
+  if (record && state.lastPointer && record.points?.[state.hoverIndex]) {
+    doc.querySelectorAll(".metric-hover-tooltip").forEach((node) => {
+      if (node.parentElement !== record.canvas.parentElement) node.classList.remove("visible", "metric-hover-tooltip-right");
+    });
     metricPointTooltip(doc, record, state.hoverIndex, state.lastPointer);
   } else {
     doc.querySelectorAll(".metric-hover-tooltip").forEach((node) => {
@@ -2441,9 +2506,15 @@ function metricsChartPointerMove(event, record) {
   const doc = record.canvas.ownerDocument;
   const state = metricsChartState(doc);
   const rect = record.canvas.getBoundingClientRect();
-  const count = record.points?.length || record.data?.length || 0;
-  if (!count || !rect.width) return;
-  state.hoverIndex = Math.max(0, Math.min(count - 1, Math.round(((event.clientX - rect.left) / rect.width) * (count - 1))));
+  const points = record.points || record.data || [];
+  if (!points.length || !rect.width) return;
+  const fraction = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+  const options = record.options || {};
+  const start = Number(options.timeWindowEnd || 0) - Number(options.timeWindowSeconds || 0);
+  const target = start + fraction * Number(options.timeWindowSeconds || 0);
+  state.hoverIndex = points.reduce((best, point, index) =>
+    Math.abs(Number(point?.t || 0) - target) < Math.abs(Number(points[best]?.t || 0) - target) ? index : best, 0);
+  state.hoveredChartId = record.id;
   state.lastPointer = event;
   state.active = true;
   metricsChartRedraw(doc);
@@ -2452,6 +2523,7 @@ function metricsChartPointerLeave(event, record) {
   if (!record) return;
   const state = metricsChartState(record.canvas.ownerDocument);
   state.active = false;
+  state.hoveredChartId = "";
   state.lastPointer = null;
   record.canvas.ownerDocument.querySelectorAll(".metric-hover-tooltip").forEach((node) => {
     node.classList.remove("visible", "metric-hover-tooltip-right");
@@ -2481,10 +2553,19 @@ function metricsChartCopyPoint(event, record) {
     if (tooltip) tooltip.textContent = "Copied all point values";
   }).catch(() => {});
 }
-function drawMetricHoverOverlay(ctx, values, state, dpr, w, h, maxValue, chartHeight, chartBottomPad) {
+function metricChartPointX(point, index, count, width, dpr, options = {}) {
+  const timestamp = Number(point?.t || 0);
+  const end = Number(options.timeWindowEnd || 0);
+  const seconds = Number(options.timeWindowSeconds || 0);
+  if (timestamp > 0 && end > 0 && seconds > 0) {
+    return Math.max(0, Math.min(1, (timestamp - (end - seconds)) / seconds)) * (width - 2 * dpr);
+  }
+  return (index / (count - 1 || 1)) * (width - 2 * dpr);
+}
+function drawMetricHoverOverlay(ctx, values, points, state, options, dpr, w, h, maxValue, chartHeight, chartBottomPad) {
   if (!state.active || state.hoverIndex < 0 || !values.length) return;
   const index = Math.min(state.hoverIndex, values.length - 1);
-  const x = (index / (values.length - 1 || 1)) * (w - 2 * dpr);
+  const x = metricChartPointX(points?.[index], index, values.length, w, dpr, options);
   const y = h - (Number(values[index] || 0) / maxValue) * chartHeight - chartBottomPad;
   ctx.save();
   ctx.strokeStyle = "rgba(232,238,247,.55)";
@@ -2505,6 +2586,11 @@ function draw(id, data, key, label, color, options = {}) {
   const c = metricsElement(id);
   if (!c) return;
   const doc = c.ownerDocument;
+  options = {
+    ...options,
+    timeWindowSeconds: Number(options.timeWindowSeconds || metricIntervalSeconds()),
+    timeWindowEnd: Number(options.timeWindowEnd || Math.floor(Date.now() / 1000)),
+  };
   const state = metricsChartState(doc);
   const record = {
     id,
@@ -2568,12 +2654,8 @@ function draw(id, data, key, label, color, options = {}) {
   const drawSeries = (seriesValues, strokeStyle, width, alpha = 1, dashed = false) => {
     ctx.save();
     ctx.strokeStyle = strokeStyle;
-    ctx.lineWidth = width * dpr;
-    ctx.globalAlpha = alpha;
-    if (dashed) ctx.setLineDash([5 * dpr, 4 * dpr]);
-    ctx.beginPath();
     seriesValues.forEach((value, index) => {
-      const x = (index / (seriesValues.length - 1 || 1)) * (w - 2 * dpr);
+      const x = metricChartPointX(record.points?.[index], index, seriesValues.length, w, dpr, options);
       const y = h - (Number(value || 0) / maxValue) * chartHeight - chartBottomPad;
       index ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
     });
@@ -2603,8 +2685,7 @@ function draw(id, data, key, label, color, options = {}) {
       0.65,
       true,
     );
-  drawSeries(values, color, 2.2, 1);
-  drawMetricHoverOverlay(ctx, values, state, dpr, w, h, maxValue, chartHeight, chartBottomPad);
+  drawMetricHoverOverlay(ctx, values, record.points, state, options, dpr, w, h, maxValue, chartHeight, chartBottomPad);
 }
 function drawGpuSeries(id, series, index, key, label, color, options = {}) {
   draw(
@@ -2692,7 +2773,10 @@ function currentStatusMetricPoint(status = {}) {
 }
 function renderMetrics(j, options = {}) {
   const currentPoint = currentStatusMetricPoint(j);
-  const s = (j.series && j.series.length) ? [...j.series, currentPoint] : [currentPoint];
+  const intervalSeconds = metricIntervalSeconds();
+  const windowStart = Number(currentPoint.t || Math.floor(Date.now() / 1000)) - intervalSeconds;
+  const s = ((j.series && j.series.length) ? [...j.series, currentPoint] : [currentPoint])
+    .filter((point) => Number(point?.t || 0) >= windowStart);
   const systemMemory = j.system?.memory || {};
   const currentRamUsedGib = Number(currentPoint.ram_used_gib || Number(systemMemory.used_mib || 0) / 1024 || 0);
   const currentRamTotalGib = Number(currentPoint.ram_total_gib || Number(systemMemory.total_mib || 0) / 1024 || 0);

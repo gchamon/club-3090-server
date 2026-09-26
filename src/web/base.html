@@ -684,18 +684,23 @@
               </button>
             </div>
           </div>
-          <div class="subtabs">
-            <button class="subtab active" data-metric-pane="mMain" onclick="metricTab(event, 'mMain')">
-              Main</button
-            ><button class="subtab" data-metric-pane="mGpu" onclick="metricTab(event, 'mGpu')">
-              GPUs</button
-            ><button class="subtab" data-metric-pane="mCpuRam" onclick="metricTab(event, 'mCpuRam')">
-              CPU+RAM</button
-            ><button class="subtab" data-metric-pane="mSystem" onclick="metricTab(event, 'mSystem')">
-              System</button
-            ><button class="subtab" data-metric-pane="mNetwork" onclick="metricTab(event, 'mNetwork')">
-              Network
-            </button>
+          <div class="metrics-controls" id="metricsControls">
+            <label class="metrics-control"><span>Source:</span><select id="metricsSourceSelect" aria-label="Metrics source" onchange="metricSourceChanged(this.value)">
+              <option value="mMain">Main</option>
+              <option value="mGpu">GPUs</option>
+              <option value="mCpuRam">CPU+RAM</option>
+              <option value="mSystem">System</option>
+              <option value="mNetwork">Network</option>
+            </select></label>
+            <label class="metrics-control"><span>Time interval:</span><input id="metricsTimeValue" type="text" inputmode="numeric" value="5" aria-label="Metrics time interval" onchange="metricIntervalChanged(this.value, document.getElementById('metricsTimeUnit')?.value)"></label>
+            <select id="metricsTimeUnit" aria-label="Metrics time unit" onchange="metricIntervalChanged(document.getElementById('metricsTimeValue')?.value, this.value)">
+              <option value="s">Seconds</option>
+              <option value="m" selected>Minutes</option>
+              <option value="d">Days</option>
+              <option value="w">Weeks</option>
+              <option value="mo">Months</option>
+              <option value="y">Years</option>
+            </select>
           </div>
           <div
             id="metricsDetachedNotice"

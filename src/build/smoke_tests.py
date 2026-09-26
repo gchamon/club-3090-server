@@ -1687,8 +1687,9 @@ process.on("uncaughtException", (error) => {{
     throw new Error("clicking Web UI Server logs should not redirect to Runtime Docker");
   }}
   vm.runInContext("currentLogSource = 'model:GPU0'; renderLogSourcePanel(); __modelLogConfig = logStreamConfig(); __modelBootstrap = logBootstrapUrlForSource('model:GPU0'); __modelExport = currentLogExportRequest();", context);
-  if (!String(getElement("logSourcePanel").innerHTML || "").includes("Model: beellama/dflash · GPU0")) {{
-    throw new Error("log source controls should expose active model service logs by preset and scope");
+  if (!String(getElement("logSourcePanel").innerHTML || "").includes("Model") ||
+      !String(getElement("logSourcePanel").innerHTML || "").includes("GPU0")) {{
+    throw new Error("log source controls should use a stable Model pill with detailed model summary");
   }}
   if (vm.runInContext("__modelLogConfig.url", context) !== "/admin/logs?instance=GPU0" || vm.runInContext("__modelBootstrap", context) !== "/admin/log-bootstrap?instance=GPU0&tail=250") {{
     throw new Error("model service log source should route to the runtime container log stream");
@@ -7306,6 +7307,7 @@ process.on("uncaughtException", (error) => {{
   const chartState = window.metricsChartState(window.document);
   chartState.charts.set(chartRecord.id, chartRecord);
   chartState.hoverIndex = 0;
+  chartState.hoveredChartId = chartRecord.id;
   chartState.active = true;
   chartState.lastPointer = {{ clientX: 75 }};
   window.metricsChartRedraw(window.document);
@@ -7316,6 +7318,34 @@ process.on("uncaughtException", (error) => {{
       chartShell.querySelector(".metric-hover-tooltip")?.textContent !== stableTimestamp) {{
     throw new Error("unchanged metrics redraw replaced the active timestamp tooltip");
   }}
+  const secondShell = window.document.createElement("div");
+  const secondCanvas = window.document.createElement("canvas");
+  secondShell.appendChild(secondCanvas);
+  window.document.body.appendChild(secondShell);
+  secondCanvas.id = "smokeMetricsCanvasSecond";
+  secondCanvas.getBoundingClientRect = () => ({{ left: 0, width: 100 }});
+  Object.defineProperty(secondShell, "clientWidth", {{ configurable: true, value: 100 }});
+  const secondRecord = {{
+    id: "smokeMetricsCanvasSecond",
+    canvas: secondCanvas,
+    data: [{{ metric: 34 }}],
+    key: "metric",
+    label: "Second",
+    points: [{{ t: 1700000000, value: 2 }}],
+    options: {{}},
+  }};
+  window.metricsChartState(window.document).charts.set(secondRecord.id, secondRecord);
+  window.metricsChartPointerMove({{ clientX: 60 }}, secondRecord);
+  if (!secondShell.querySelector(".metric-hover-tooltip")?.classList.contains("visible") ||
+      chartShell.querySelector(".metric-hover-tooltip")?.classList.contains("visible")) {{
+    throw new Error("metrics hover tooltip should remain attached to the hovered chart");
+  }}
+  if (window.normalizeMetricTimeValue("bad") !== 5 ||
+      window.normalizeMetricTimeUnit("month") !== "m" ||
+      window.metricIntervalSeconds(5, "m") !== 300) {{
+    throw new Error("metrics interval normalization failed");
+  }}
+  window.setMetricIntervalState(5, "m", {{ persist: false, refresh: false }});
   chartRecord.points = [];
   window.metricsChartRedraw(window.document);
   if (stableTooltip.classList.contains("visible")) {{

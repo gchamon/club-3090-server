@@ -17,6 +17,13 @@ function writeCachedUiState(data) {
     localStorage.setItem(UI_STATE_KEY, JSON.stringify(data || {}));
   } catch (e) {}
 }
+function normalizeUiLogSource(source) {
+  const value = String(source || "").trim();
+  return ["audit", "debug", "docker", "benchmarks", "script", "control", "update"].includes(value) ||
+      value.startsWith("model:") || value.startsWith("service:")
+    ? value
+    : "docker";
+}
 function readUiStateFromLocationHash() {
   try {
     const raw = String(window.location.hash || "").replace(/^#/, "");
@@ -26,6 +33,9 @@ function readUiStateFromLocationHash() {
     const scroll = Number(params.get("scroll") || "");
     const state = {};
     if (tab) state.active_tab = tab;
+    if (tab === "logs" && params.has("log_source")) {
+      state.current_log_source = normalizeUiLogSource(params.get("log_source"));
+    }
     if (tab && Number.isFinite(scroll) && scroll > 0) {
       state.tab_scroll_positions = { [tab]: Math.max(0, scroll) };
     }
@@ -79,6 +89,7 @@ function applyLocationUiStateOverride() {
   const rawTab = String(state.active_tab || "").trim();
   const tab = rawTab ? normalizeTabName(rawTab) : "";
   if (tab && tab !== activeTabName) activeTabName = tab;
+  if (state.current_log_source) currentLogSource = normalizeUiLogSource(state.current_log_source);
   if (state.tab_scroll_positions && typeof state.tab_scroll_positions === "object") {
     Object.entries(state.tab_scroll_positions).forEach(([name, value]) => {
       const key = normalizeTabName(name);
@@ -92,6 +103,7 @@ function writeUiStateToLocationHash(data = {}) {
     const scroll = Math.max(0, Number((data.tab_scroll_positions || {})[tab] || 0));
     const params = new URLSearchParams();
     params.set("tab", tab);
+    if (tab === "logs") params.set("log_source", normalizeUiLogSource(data.current_log_source || currentLogSource));
     if (scroll > 0) params.set("scroll", String(Math.round(scroll)));
     const nextHash = `#${params.toString()}`;
     const nextUrl = `${window.location.pathname || ""}${window.location.search || ""}${nextHash}`;
@@ -570,25 +582,22 @@ function persistChatConversationState() {
 }
 function normalizeTabName(name) {
   if (name === "audit") return "logs";
-  return ["overview", "system", "ai-studio", "benchmarks", "metrics", "users", "logs", "chat"].includes(
-    name,
-  )
+  return ["overview", "system", "ai-studio", "benchmarks", "metrics", "users", "logs", "chat"].includes(name)
     ? name
     : "overview";
 }
 function currentUiState() {
+  const metricInterval = typeof currentMetricIntervalState === "function"
+    ? currentMetricIntervalState()
+    : { value: 5, unit: "m" };
   return {
     active_tab: normalizeTabName(activeTabName),
     active_metric_pane: typeof activeMetricPaneId === "function" ? activeMetricPaneId(document) : "mMain",
+    metric_time_value: Number(metricInterval.value || 5),
+    metric_time_unit: String(metricInterval.unit || "m"),
     tab_scroll_positions: { ...tabScrollPositions, [normalizeTabName(activeTabName)]: currentPageScrollTop() },
     selected_scope: selectedScope || "GLOBAL",
-    current_log_source:
-      currentLogSource === "audit" ||
-      currentLogSource === "debug" ||
-      currentLogSource === "docker" ||
-      String(currentLogSource || "").startsWith("service:")
-        ? currentLogSource
-        : "docker",
+    current_log_source: normalizeUiLogSource(currentLogSource),
     selected_log_instance_id: String(selectedLogInstanceId || ""),
     show_global_logs: !!showGlobalLogs,
     show_global_logs_by_source: { ...showGlobalLogSources },
@@ -640,9 +649,11 @@ function hydrateUiState(cfg) {
       tabScrollPositions[key] = Math.max(0, Number(value || 0));
     });
   }
-  activeTabName = normalizeTabName(state.active_tab || activeTabName);
   if (typeof setActiveMetricPaneInDocument === "function") {
     setActiveMetricPaneInDocument(document, state.active_metric_pane || "mMain");
+  }
+  if (typeof setMetricIntervalState === "function") {
+    setMetricIntervalState(state.metric_time_value, state.metric_time_unit, { persist: false, refresh: false });
   }
   if (restoreTab) {
     activeTabName = restoreTab;
@@ -650,18 +661,7 @@ function hydrateUiState(cfg) {
       tabScrollPositions[restoreTab] = Math.max(0, restoreScroll);
     }
   }
-  currentLogSource =
-    state.current_log_source === "audit" ||
-    state.current_log_source === "debug" ||
-    state.current_log_source === "docker" ||
-    state.current_log_source === "benchmarks" ||
-    state.current_log_source === "script" ||
-    state.current_log_source === "control" ||
-    state.current_log_source === "update" ||
-    String(state.current_log_source || "").startsWith("model:") ||
-    String(state.current_log_source || "").startsWith("service:")
-      ? String(state.current_log_source)
-      : "docker";
+  currentLogSource = normalizeUiLogSource(state.current_log_source);
   selectedLogInstanceId = String(state.selected_log_instance_id || selectedLogInstanceId || "");
   showGlobalLogs =
     typeof state.show_global_logs === "boolean"

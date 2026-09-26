@@ -72,7 +72,7 @@ function renderLogSourcePanel() {
   if (String(currentLogSource || "").startsWith("model:")) {
     const modelSource = modelLogSourceFromSource(currentLogSource);
     $("logsSourceSummary").innerHTML = modelSource
-      ? `${escapeHtml(modelSource.label)} selected. The live viewer follows container <code>${escapeHtml(modelSource.container || modelSource.instanceId)}</code>.`
+      ? `${escapeHtml(modelSource.preset || modelSource.scope || modelSource.instanceId)}${modelSource.scope && modelSource.scope !== modelSource.preset ? ` · ${escapeHtml(modelSource.scope)}` : ""} selected. The live viewer follows container <code>${escapeHtml(modelSource.container || modelSource.instanceId)}</code>.`
       : "Model service log source selected.";
     return;
   }
@@ -112,9 +112,11 @@ function modelLogSourceEntries() {
       const scope = String(row.display_name || instanceId).trim();
       return {
         id: `model:${instanceId}`,
-        label: `Model: ${preset}${scope ? ` · ${scope}` : ""}`,
+        label: "Model",
         instanceId,
         selector,
+        preset,
+        scope,
         container: String(row.container || "").trim(),
       };
     })
@@ -1717,7 +1719,7 @@ setCurrentLogSource = function (source) {
   currentLogSource = nextSource;
   noteKnownLogSource(currentLogSource);
   applyLogVisibility();
-  queueUiStateSave({ current_log_source: currentLogSource });
+  if (typeof writeUiStateToLocationHash === "function") writeUiStateToLocationHash({ active_tab: activeTabName, current_log_source: currentLogSource });
   connectLogs(true);
   scheduleLogCacheRefresh(LOG_CACHE_REFRESH_MS);
   updateLogVisualMode();
@@ -1896,11 +1898,7 @@ post = async function (path, obj, label = "", options = {}) {
   }
 };
 metricTab = function (e, n) {
-  setActiveMetricPaneInDocument(document, n);
-  writeCachedUiState(currentUiState());
-  queueUiStateSave();
-  redrawMetricsSoon();
-  refreshStatus({ force: true }).catch(() => {});
+  metricSourceChanged(n);
 };
 togglePowerOptimizations = async function () {
   const enable =
