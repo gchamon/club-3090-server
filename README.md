@@ -146,6 +146,8 @@ After logging in, open the `Presets` tab.
 
 You will see discovered model presets from the local `club-3090` checkout. Some presets may show that downloads are still required.
 
+Presets blocked by the detected GPU hardware are hidden by default. Use **Show hardware blocked presets** beside **Show hidden presets** to reveal them; the choice is saved in this browser.
+
 If a preset is not ready:
 
 1. Click its `Download` button.
@@ -212,6 +214,7 @@ Here is the simple mental model for the main tabs:
 - `System`: service controls, power/fan controls, and machine information
 - `AI Studio`: manage text, image, video, speech, and audio models, generation lanes, and the generated-media gallery
 - `Benchmarks`: select and run model benchmark suites, review saved scores, and monitor active runs
+- `Scripts`: manage queued jobs; AI Studio workflows use concise task summaries, with full commands under `Inspect`
 - `Chat`: built-in local streaming chat client with server-backed conversation storage, lazy detail loading, per-conversation stats caching, share/export links, configuration, and local or remote MCP servers
 - `Users`: create API users and keys if you want to share the server safely
 - `Metrics`: request counts, usage history, runtime performance data, storage browsing, and detachable monitoring

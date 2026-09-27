@@ -424,6 +424,17 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
         if path == "/admin/scripts/jobs":
             self.send_json({"ok": True, "job": script_job_snapshot()})
             return
+        if path == "/admin/scripts/log/raw":
+            params = parse_admin_query_params(parsed)
+            job_id = str(params.get("job_id") or "").strip()
+            state = read_script_job_state()
+            row = script_queue_job(state, job_id)
+            log_file = script_current_log_file(job_id) if row else ""
+            if not row or not log_file or not os.path.isfile(log_file):
+                self.send_bytes(b"No script log found for that job.\n", content_type="text/plain; charset=utf-8", code=404)
+                return
+            self.send_stream(log_file, "text/plain; charset=utf-8")
+            return
         if path == "/admin/scripts/log":
             params = parse_admin_query_params(parsed)
             self.send_json({"ok": True, **script_log_snapshot(job_id=params.get("job_id") or "", tail_lines=parse_tail_lines_param(params, 500))})
@@ -459,7 +470,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             instance_id = str(params.get("instance") or "").strip().upper()
             service_id = str(params.get("service") or "").strip().lower()
             tail_lines = parse_tail_lines_param(params, 250)
-            payload = read_selected_log_snapshot(source=source, instance_id=instance_id, service_id=service_id, tail_lines=tail_lines)
+            payload = read_selected_log_snapshot(source=source, instance_id=instance_id, service_id=service_id, tail_lines=tail_lines, job_id=params.get("job_id") or "")
             self.send_json({"ok": True, **payload})
             return
         if path == "/admin/logs":

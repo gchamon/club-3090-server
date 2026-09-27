@@ -911,20 +911,27 @@ function scrollLogToBottom(box = $("logRender") || $("log")) {
   if (other) other.scrollTop = box.scrollTop;
 }
 function logCacheEntry(signature) {
-  if (!logCache[signature]) logCache[signature] = { text: "", loaded: false };
+  if (!logCache[signature]) logCache[signature] = { text: "", loaded: false, truncatedLineCount: 0 };
   return logCache[signature];
 }
 function renderCurrentLog(signature, options = {}) {
   const box = $("log");
   const renderBox = $("logRender");
   const entry = logCacheEntry(signature);
-  const nextValue = entry.loaded ? collapseRepeatedLogText(entry.text) : "Connecting...\n";
+  const notice =
+    currentLogSource === "script" &&
+    String(signature || "").startsWith("script:") &&
+    Number(entry.truncatedLineCount || 0) > 0
+      ? `… ${Number(entry.truncatedLineCount)} earlier log lines omitted — select Show raw log to view all output.\n`
+      : "";
+  const nextValue = entry.loaded ? collapseRepeatedLogText(notice + entry.text) : "Connecting...\n";
   const changed = (!!box && box.value !== nextValue) || (!!renderBox && renderBox.dataset.renderedSig !== `${signature}:${nextValue.length}`);
   if (box && changed) box.value = nextValue;
   if (renderBox && changed) {
     renderBox.innerHTML = renderAnsiHtml(nextValue);
     renderBox.dataset.renderedSig = `${signature}:${nextValue.length}`;
   }
+  $("scriptLogActions")?.classList.toggle("hidden", currentLogSource !== "script");
   if (changed) {
     if (searchState.active) {
       recalculateMatches(true);
@@ -1123,7 +1130,10 @@ function logBootstrapUrlForSource(source) {
   if (normalized === "control") return "/admin/log-bootstrap?source=control&tail=250";
   if (normalized === "debug") return "/admin/log-bootstrap?source=debug&tail=250";
   if (normalized === "benchmarks") return "/admin/log-bootstrap?source=benchmarks&tail=250";
-  if (normalized === "script") return "/admin/log-bootstrap?source=script&tail=250";
+  if (normalized === "script") {
+    const jobId = String(selectedScriptLogJobId || lastStatus?.script_job?.job_id || "");
+    return `/admin/log-bootstrap?source=script&tail=1000${jobId ? `&job_id=${encodeURIComponent(jobId)}` : ""}`;
+  }
   if (String(normalized).startsWith("service:")) {
     const serviceId = String(normalized).split(":", 2)[1] || "";
     return `/admin/log-bootstrap?source=service&service=${encodeURIComponent(serviceId)}&tail=250`;
@@ -1158,7 +1168,36 @@ async function refreshLogCacheSnapshot(source, options = {}) {
   if (!response.ok) return;
   const payload = await response.json();
   const signature = payload?.signature || options.signature || logSignatureForSource(source);
+  const entry = logCacheEntry(signature);
+  entry.truncatedLineCount = Number(payload?.truncated_line_count || 0);
   replaceLogBuffer(signature, String(payload?.text || ""));
+}
+function scriptRawLogUrl() {
+  const jobId = String(selectedScriptLogJobId || lastStatus?.script_job?.job_id || "");
+  return `/admin/scripts/log/raw?job_id=${encodeURIComponent(jobId)}`;
+}
+function showRawScriptLog() {
+  const url = scriptRawLogUrl();
+  if (!selectedScriptLogJobId && !lastStatus?.script_job?.job_id) {
+    const message = "No script job is selected.";
+    if ($("scriptLogActionMsg")) $("scriptLogActionMsg").textContent = message;
+    return;
+  }
+  const opened = window.open(url, "_blank");
+  if (opened) opened.opener = null;
+  if (!opened && $("scriptLogActionMsg")) $("scriptLogActionMsg").textContent = `Popup blocked. Open ${url}`;
+}
+async function copyAllScriptLog() {
+  const message = $("scriptLogActionMsg");
+  try {
+    const response = await fetch(scriptRawLogUrl(), { cache: "no-store" });
+    if (!response.ok) throw new Error((await response.text()) || `Request failed (${response.status})`);
+    const copied = await copyTextValue(await response.text());
+    if (!copied) throw new Error("Copy failed on this browser.");
+    if (message) message.textContent = "Copied all script logs.";
+  } catch (error) {
+    if (message) message.textContent = String(error?.message || "Unable to load the full script log.");
+  }
 }
 async function refreshBackgroundLogCaches() {
   const currentSource = String(currentLogSource || "docker");

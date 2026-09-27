@@ -166,15 +166,37 @@ def script_current_log_file(job_id=""):
     return os.path.join(SCRIPT_RUNS_DIR, "script.log")
 
 
+def script_log_tail_snapshot(path, tail_lines):
+    from collections import deque
+
+    try:
+        limit = max(0, int(tail_lines))
+        lines = deque(maxlen=limit)
+        total = 0
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                total += 1
+                if limit:
+                    lines.append(line)
+        returned = len(lines)
+        return "".join(lines), total, returned, max(0, total - returned)
+    except (OSError, ValueError, TypeError):
+        return "no script output yet; waiting...\n", 0, 0, 0
+
+
 def script_log_snapshot(job_id="", tail_lines=500):
     state = read_script_job_state()
     requested = str(job_id or "").strip()
     row = script_queue_job(state, requested) or state
     log_file = script_current_log_file(requested)
+    text, line_count, returned_count, truncated_count = script_log_tail_snapshot(log_file, tail_lines)
     return {
         "source": "script",
         "signature": f"script:{requested or row.get('job_id') or 'latest'}",
-        "text": query_text_log_file(log_file, tail_lines=tail_lines) if log_file and os.path.exists(log_file) else "no script output yet; waiting...\n",
+        "text": text,
+        "line_count": line_count,
+        "returned_line_count": returned_count,
+        "truncated_line_count": truncated_count,
         "label": str(row.get("label") or row.get("script_id") or "Script"),
         "script_id": str(row.get("script_id") or ""),
         "job_id": str(row.get("job_id") or requested),
@@ -1252,9 +1274,48 @@ stop_ai_studio_production_service() {
 """
 
 
+def ai_studio_required_assets_snippet():
+    voice_assets = IMAGE_STUDIO_OPTIONAL_MODEL_PATHS.get("voice", ())
+    voice_label = IMAGE_STUDIO_LANES.get("voice", {}).get("label", "voice")
+    entries = "\n".join(
+        f'  check_asset "{IMAGE_STUDIO_LANES.get(lane, {}).get("label", lane)}" "{relative}"'
+        for lane, assets in IMAGE_STUDIO_OPTIONAL_MODEL_PATHS.items()
+        if lane != "voice"
+        for relative in assets
+    )
+    voice_entries = "\n".join(
+        f'    check_asset "{voice_label}" "{relative}"'
+        for relative in voice_assets
+    )
+    return r"""
+verify_ai_studio_required_assets() {
+  local missing=""
+  check_asset() {
+    local label="$1"
+    local relative="$2"
+    if [ ! -e "$COMFYUI_MODELS_DIR/$relative" ]; then
+      missing="${missing}${label}: ${relative}"$'\n'
+    fi
+  }
+""" + entries + r"""
+  if [ "${WITH_VOICE:-0}" != "1" ]; then
+    :
+  else
+""" + voice_entries + r"""
+  fi
+  if [ -n "$missing" ]; then
+    printf '[ai-studio] ERROR: required AI Studio assets are missing:\n%s' "$missing" >&2
+    return 1
+  fi
+  echo "[ai-studio] verified required AI Studio assets"
+}
+"""
+
+
 def image_studio_setup_command():
     return r"""
 set -euo pipefail
+trap 'rc=$?; trap - ERR; printf "[ai-studio] ERROR: setup aborted (rc=%s); an upstream “models — done” banner does not prove every asset downloaded. Inspect the denied or missing download above.\n" "$rc" >&2; exit "$rc"' ERR
 echo "[ai-studio] starting full setup"
 studio_setup_script="scripts/setup-ai-studio.sh"
 if [ ! -x "$studio_setup_script" ] && [ ! -f "$studio_setup_script" ]; then
@@ -1338,9 +1399,9 @@ fi
 run_image_studio_step() {
   sudo env HOME="$HOME" PATH="$PATH" HF_TOKEN="$HF_TOKEN" HF_HUB_DISABLE_XET="$HF_HUB_DISABLE_XET" SKIP_BUILD="$SKIP_BUILD" SKIP_DOWNLOAD="$SKIP_DOWNLOAD" WITH_VOICE="$WITH_VOICE" ASSUME_YES="$ASSUME_YES" LANIP="$LANIP" MODEL_DIR="$MODEL_DIR" AI_STUDIO_MODELS_ROOT="$AI_STUDIO_MODELS_ROOT" COMFYUI_MODELS_ROOT="$COMFYUI_MODELS_ROOT" COMFYUI_MODELS_DIR="$COMFYUI_MODELS_DIR" "$@"
 }
-""" + ai_studio_docker_headroom_snippet() + ai_studio_production_service_snippet() + ai_studio_runtime_compat_snippet() + r"""
-echo "[ai-studio] running upstream $studio_setup_script --yes"
+""" + ai_studio_docker_headroom_snippet() + ai_studio_production_service_snippet() + ai_studio_runtime_compat_snippet() + ai_studio_required_assets_snippet() + r"""
 run_image_studio_step bash "$studio_setup_script" --yes
+verify_ai_studio_required_assets
 apply_ai_studio_director_healthcheck_override
 if [ -z "${SKIP_DOWNLOAD:-}" ] && [ -f services/comfyui/download_hidream_o1.sh ]; then
   echo "[ai-studio] downloading HiDream-O1 assets not covered by the upstream all-models script"

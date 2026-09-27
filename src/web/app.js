@@ -4915,6 +4915,20 @@ function scriptQueueRows() {
   if (Array.isArray(job.queue)) return job.queue.filter((row) => row && row.job_id);
   return job.job_id ? [job] : [];
 }
+function scriptQueuePrimaryInfo(row) {
+  const scriptId = String(row?.script_id || "");
+  const workflows = {
+    "setup-ai-studio": "Full AI Studio setup",
+    "remove-ai-studio": "Remove AI Studio services",
+    "start-ai-studio": "Start AI Studio runtime",
+    "stop-ai-studio": "Stop AI Studio runtime",
+  };
+  const workflow = workflows[scriptId] ||
+    (scriptId.startsWith("download-ai-studio-") ? "Download AI Studio model assets" : "");
+  if (workflow) return `Workflow: ${workflow}`;
+  const command = String(row?.command || "").replace(/^(?:bash|python3)\s+\S+\s*/, "").trim();
+  return command ? `Arguments: ${command}` : "No arguments";
+}
 async function loadRunScriptLog(jobId, force = false) {
   const id = String(jobId || "").trim();
   if (!id || scriptModalState.logLoadingJob === id) return;
@@ -5010,9 +5024,9 @@ function renderScriptsQueueTab() {
     const id = String(row.job_id || "");
     const status = statusOf(row);
     const label = String(row.label || row.script_id || `Script ${index + 1}`);
-    const args = String(row.command || "").replace(/^(?:bash|python3)\s+\S+\s*/, "").trim();
+    const primaryInfo = scriptQueuePrimaryInfo(row);
     const progress = Math.round(Math.max(0, Math.min(1, Number(row.progress ?? (status === "running" ? 0.5 : ["success", "failed", "cancelled"].includes(status) ? 1 : 0)))) * 100);
-    return `<article class="script-queue-item ${escapeHtml(status)}"><label class="script-queue-check"><input type="checkbox" aria-label="Select ${escapeHtml(label)}" ${scriptQueueSelection.has(id) ? "checked" : ""} onchange="setScriptQueueSelection('${escapeJs(id)}',this.checked)"></label><div class="script-queue-main"><div><span class="status-badge status-${status === "success" ? "success" : status === "failed" || status === "cancelled" ? "danger" : status === "running" ? "warning" : "info"}">${escapeHtml(status)}</span> <strong>${escapeHtml(label)}</strong> <code>${escapeHtml(row.script_id || id)}</code></div><div>${escapeHtml(args || "No arguments")}</div><div class="script-queue-progress" role="progressbar" aria-label="${escapeHtml(label)} progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progress}"><span style="width:${progress}%"></span><b>${progress}%</b></div><small>${escapeHtml(row.scope || row.instance_id || row.context?.instance_id || "Global")} · Queued ${escapeHtml(row.queued_at || row.created_at || "—")} ${row.started_at ? `· Started ${escapeHtml(row.started_at)}` : ""} ${row.finished_at ? `· Finished ${escapeHtml(row.finished_at)}` : ""}</small>${scriptQueueDetails(row)}</div><button class="btn secondary-btn" onclick="showQueuedScriptLog('${escapeJs(id)}')">View logs</button></article>`;
+    return `<article class="script-queue-item ${escapeHtml(status)}"><label class="script-queue-check"><input type="checkbox" aria-label="Select ${escapeHtml(label)}" ${scriptQueueSelection.has(id) ? "checked" : ""} onchange="setScriptQueueSelection('${escapeJs(id)}',this.checked)"></label><div class="script-queue-main"><div><span class="status-badge status-${status === "success" ? "success" : status === "failed" || status === "cancelled" ? "danger" : status === "running" ? "warning" : "info"}">${escapeHtml(status)}</span> <strong>${escapeHtml(label)}</strong> <code>${escapeHtml(row.script_id || id)}</code></div><div>${escapeHtml(primaryInfo)}</div><div class="script-queue-progress" role="progressbar" aria-label="${escapeHtml(label)} progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progress}"><span style="width:${progress}%"></span><b>${progress}%</b></div><small>${escapeHtml(row.scope || row.instance_id || row.context?.instance_id || "Global")} · Queued ${escapeHtml(row.queued_at || row.created_at || "—")} ${row.started_at ? `· Started ${escapeHtml(row.started_at)}` : ""} ${row.finished_at ? `· Finished ${escapeHtml(row.finished_at)}` : ""}</small>${scriptQueueDetails(row)}</div><button class="btn secondary-btn" onclick="showQueuedScriptLog('${escapeJs(id)}')">View logs</button></article>`;
   }).join("") : '<div class="empty-variant-note">No script jobs yet.</div>';
   host.innerHTML = `<section class="panel scripts-queue-panel"><div class="resource-manager-card-head"><div><h2>Script Queue</h2><div class="preset-help">${rows.length} retained jobs</div></div><label><input type="checkbox" ${rows.length && selected.length === rows.length ? "checked" : ""} onchange="selectAllScriptQueue(this.checked)"> Select all</label></div><div class="script-queue-toolbar"><button class="btn" onclick="selectAllScriptQueue(false)">Clear selection</button><span>${selected.length} selected</span><button class="btn" ${eligible(["queued","running"]).length ? "" : "disabled"} onclick="mutateScriptQueue('/admin/scripts/cancel')">Cancel selected</button><button class="btn" ${eligible(["success","failed","cancelled"]).length ? "" : "disabled"} onclick="mutateScriptQueue('/admin/scripts/retry')">Retry selected</button><button class="btn" ${eligible(["queued"]).length ? "" : "disabled"} onclick="mutateScriptQueue('/admin/scripts/reorder',{position:'front'})">Move to front</button><button class="btn" ${eligible(["queued"]).length ? "" : "disabled"} onclick="mutateScriptQueue('/admin/scripts/reorder',{position:'end'})">Move to end</button><button class="btn danger-btn" ${selected.length ? "" : "disabled"} onclick="mutateScriptQueue('/admin/scripts/bulk-remove',{},true)">Remove selected</button></div><div id="scriptsQueueMessage" role="alert"></div><div class="script-queue-list">${renderRows}</div></section>`;
 }
@@ -5031,14 +5045,8 @@ async function copyLatestRigReport() {
   }
 }
 function renderScriptRunnerUi() {
-  const isScriptTab = currentLogSource === "script";
-  if ($("scriptControlsWrap")) {
-    $("scriptControlsWrap").classList.toggle("hidden", !isScriptTab);
-  }
-  const targets = [];
-  if (isScriptTab && $("scriptControlsWrap")) targets.push($("scriptControlsWrap"));
-  if ($("runScriptBody")) targets.push($("runScriptBody"));
-  if (!targets.length) return;
+  if (!$("runScriptBody")) return;
+  const targets = [$("runScriptBody")];
   const previousLogViewer = targets[0].querySelector(".run-script-log-viewer");
   const shouldFollowScriptLog =
     !!$("autoscroll")?.checked &&
@@ -5875,9 +5883,17 @@ async function bootAdminUi() {
 }
 var showHiddenPresets = false;
 try { showHiddenPresets = localStorage.getItem("club3090_show_hidden_presets") === "1"; } catch (e) {}
+var showHardwareBlockedPresets = false;
+try { showHardwareBlockedPresets = localStorage.getItem("club3090_show_hardware_blocked_presets") === "1"; } catch (e) {}
 var toggleHiddenPresetsVisibility = function() {
   showHiddenPresets = !showHiddenPresets;
   try { localStorage.setItem("club3090_show_hidden_presets", showHiddenPresets ? "1" : "0"); } catch (e) {}
+  renderPresetHeaderActions();
+  renderDynamicPresetModels({ force: true });
+};
+var toggleHardwareBlockedPresetsVisibility = function() {
+  showHardwareBlockedPresets = !showHardwareBlockedPresets;
+  try { localStorage.setItem("club3090_show_hardware_blocked_presets", showHardwareBlockedPresets ? "1" : "0"); } catch (e) {}
   renderPresetHeaderActions();
   renderDynamicPresetModels({ force: true });
 };
@@ -6255,7 +6271,7 @@ function renderPresetHeaderActions() {
   setHtmlIfChanged(host, renderPresetHeadActionsHtml());
 }
 function renderPresetHeadActionsHtml() {
-  return `<div class="preset-toolbar-main"><button type="button" class="btn blue" onclick="openSetupAssistantModal()">Setup Assistant</button><button type="button" class="btn blue" onclick="promptRuntimeInventoryRebuild()">Rebuild Model DB</button><button type="button" class="btn green" onclick="openCustomModelModal()">Add custom model</button></div><div class="preset-toolbar-utilities"><button type="button" class="btn hidden-presets-trigger${showHiddenPresets ? " active" : ""}" id="hiddenPresetsToggle" aria-pressed="${showHiddenPresets}" onclick="toggleHiddenPresetsVisibility()">${showHiddenPresets ? "Hide hidden presets" : "Show hidden presets"}</button><button type="button" class="preset-toolbar-icon-button preset-filter-button${presetFilterIsActive() ? " active" : ""}" title="Filter presets" aria-label="Filter presets" onclick="openPresetFilterModal()">${svgIcon("filter")}</button></div>`;
+  return `<div class="preset-toolbar-main"><button type="button" class="btn blue" onclick="openSetupAssistantModal()">Setup Assistant</button><button type="button" class="btn blue" onclick="promptRuntimeInventoryRebuild()">Rebuild Model DB</button><button type="button" class="btn green" onclick="openCustomModelModal()">Add custom model</button></div><div class="preset-toolbar-utilities"><button type="button" class="btn hidden-presets-trigger${showHiddenPresets ? " active" : ""}" id="hiddenPresetsToggle" aria-pressed="${showHiddenPresets}" onclick="toggleHiddenPresetsVisibility()">${showHiddenPresets ? "Hide hidden presets" : "Show hidden presets"}</button><button type="button" class="btn hidden-presets-trigger${showHardwareBlockedPresets ? " active" : ""}" id="hardwareBlockedPresetsToggle" aria-pressed="${showHardwareBlockedPresets}" onclick="toggleHardwareBlockedPresetsVisibility()">${showHardwareBlockedPresets ? "Hide hardware blocked presets" : "Show hardware blocked presets"}</button><button type="button" class="preset-toolbar-icon-button preset-filter-button${presetFilterIsActive() ? " active" : ""}" title="Filter presets" aria-label="Filter presets" onclick="openPresetFilterModal()">${svgIcon("filter")}</button></div>`;
 }
 function customModelTriggerContent(label = "Custom Model") {
   return `<span class="custom-model-trigger-content"><span class="custom-model-trigger-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><circle cx="12" cy="12" r="11"></circle><path d="M12 7v10M7 12h10"></path></svg></span><span class="custom-model-trigger-label">${escapeHtml(label)}</span></span>`;
@@ -6317,6 +6333,13 @@ function hiddenPresetSelectorSet() {
 }
 function presetIsHidden(variant) {
   return hiddenPresetSelectorSet().has(String(variantSelector(variant) || "").trim());
+}
+function presetIsHardwareBlocked(variant) {
+  return variantEffectiveInstallState(variant) === "hardware_blocked";
+}
+function presetPassesVisibility(variant) {
+  return (showHiddenPresets || !presetIsHidden(variant)) &&
+    (showHardwareBlockedPresets || !presetIsHardwareBlocked(variant));
 }
 async function saveHiddenPresetSelectors(selectors) {
   const next = [...new Set((selectors || []).map((item) => String(item || "").trim()).filter(Boolean))];
@@ -10667,7 +10690,7 @@ function renderSummaryModelBody(model, modelVariants) {
   const runtimeEntries = summaryRuntimeEntriesForModel(model.model_id, modelVariants);
   const runtimeSelectors = new Set(runtimeEntries.map((entry) => entry.selector));
   const bySelector = new Map(modelVariants.map((variant) => [variantSelector(variant), variant]));
-  const customRows = sortInventoryVariants(modelVariants.filter((variant) => variantIsCustom(variant) && (showHiddenPresets || !presetIsHidden(variant))));
+  const customRows = sortInventoryVariants(modelVariants.filter((variant) => variantIsCustom(variant) && presetPassesVisibility(variant)));
   const customSelectors = new Set(customRows.map((variant) => variantSelector(variant)));
   const cards = runtimeEntries
     .filter((entry) => !customSelectors.has(String(entry?.selector || "")))
@@ -10876,6 +10899,17 @@ function renderSelectedVariantGroups({ customRows = [], singleRows = [], dualRow
   const layoutClass = left && right ? "variant-groups-two-column" : "variant-groups-single-column";
   return `<div class="variant-groups ${layoutClass}"><div class="variant-group-column variant-group-column-left">${left}</div><div class="variant-group-column variant-group-column-right">${right}</div></div>`;
 }
+function presetHardwareRenderIdentity() {
+  const status = lastStatus || {};
+  return {
+    gpus: (Array.isArray(status.gpus) ? status.gpus : []).map((row) => [
+      !!row?.error,
+      row?.mem_total_mib,
+      row?.compute_cap,
+    ]),
+    nvlink: !!status.nvlink?.present,
+  };
+}
 function presetModelHtmlCacheIdentity() {
   const inventory = runtimeInventory();
   return {
@@ -10883,6 +10917,8 @@ function presetModelHtmlCacheIdentity() {
     repo_head: inventory?.repo_head || "",
     selectedPresetModelId: selectedPresetModelId || "",
     showHiddenPresets,
+    showHardwareBlockedPresets,
+    hardware: presetHardwareRenderIdentity(),
     selectedScope: currentScope(),
     presetFilter: getPresetFilterState(),
   };
@@ -10897,7 +10933,9 @@ function readPresetModelHtmlCache() {
       String(identity.built_at || "") !== String(expected.built_at || "") ||
       String(identity.repo_head || "") !== String(expected.repo_head || "") ||
       String(identity.selectedPresetModelId || "") !== String(expected.selectedPresetModelId || "") ||
-      !!identity.showHiddenPresets !== expected.showHiddenPresets ||
+      identity.showHiddenPresets !== expected.showHiddenPresets ||
+      identity.showHardwareBlockedPresets !== expected.showHardwareBlockedPresets ||
+      JSON.stringify(identity.hardware || null) !== JSON.stringify(expected.hardware) ||
       String(identity.selectedScope || "") !== String(expected.selectedScope || "") ||
       JSON.stringify(identity.presetFilter || {}) !== JSON.stringify(expected.presetFilter || {})
     ) {
@@ -10951,6 +10989,8 @@ function dynamicPresetModelsRenderSignature() {
   return JSON.stringify({
     selectedPresetModelId,
     showHiddenPresets,
+    showHardwareBlockedPresets,
+    hardware: presetHardwareRenderIdentity(),
     selectedScope: currentScope(),
     presetFilter: getPresetFilterState(),
     inventory: {
@@ -11015,17 +11055,17 @@ function renderDynamicPresetModels(options = {}) {
   const nextHtml = `${visibleModels
     .map((model) => {
       const modelVariants = variants.filter((row) => row.model_id === model.model_id);
-      const unhiddenModelVariants = modelVariants.filter((row) => showHiddenPresets || !presetIsHidden(row));
+      const visibleModelVariants = modelVariants.filter((row) => presetPassesVisibility(row));
       const selected = String(model.model_id || "") === selectedPresetModelId;
-      const visibleModelVariants = selected
-        ? unhiddenModelVariants.filter((row) => variantMatchesPresetFilter(row))
-        : unhiddenModelVariants;
+      const filteredModelVariants = selected
+        ? visibleModelVariants.filter((row) => variantMatchesPresetFilter(row))
+        : visibleModelVariants;
       const familyActive = modelFamilyHasActivePreset(modelVariants);
       const presetCount = modelVariants.length;
-      const summaryBody = renderSummaryModelBody(model, unhiddenModelVariants);
+      const summaryBody = renderSummaryModelBody(model, visibleModelVariants);
       const deprecatedRows = [];
-      const nonDeprecatedRows = visibleModelVariants;
-      const groupKey = (row) => resolvedVariantDisplayGroupKey(row, unhiddenModelVariants);
+      const nonDeprecatedRows = filteredModelVariants;
+      const groupKey = (row) => resolvedVariantDisplayGroupKey(row, visibleModelVariants);
       const customRows = nonDeprecatedRows.filter((row) => variantIsCustom(row) && !variantIsMigrated(row) && groupKey(row) !== "nvlink" && !variantOldCounterpartKey(row));
       const catalogRows = nonDeprecatedRows.filter((row) => !customRows.includes(row));
       const singleRows = catalogRows.filter((row) => groupKey(row) === "single");
@@ -11038,7 +11078,7 @@ function renderDynamicPresetModels(options = {}) {
       const customBadge = modelIsCustom(model) && !modelVariants.some((row) => variantIsMigrated(row))
         ? '<span class="status-badge status-custom">custom</span>'
         : "";
-      const familyUpdateBadge = modelFamilyUpdateBadgeHtml(unhiddenModelVariants);
+      const familyUpdateBadge = modelFamilyUpdateBadgeHtml(visibleModelVariants);
       const body = selected
         ? renderSelectedVariantGroups({ customRows, singleRows, dualRows, advancedRows, deprecatedRows, experimentalRows })
         : summaryBody;
@@ -11097,7 +11137,7 @@ function renderModelInstallStatus() {
   }
   const showIdleDownloadHint = !!selectedPresetModelId;
   if (showIdleDownloadHint && presetFilterIsActive()) {
-    const rows = inventoryVariants().filter((row) => row.model_id === selectedPresetModelId && (showHiddenPresets || !presetIsHidden(row)));
+    const rows = inventoryVariants().filter((row) => row.model_id === selectedPresetModelId && presetPassesVisibility(row));
     const matched = rows.filter((row) => variantMatchesPresetFilter(row)).length;
     setHtmlIfChanged(
       target,

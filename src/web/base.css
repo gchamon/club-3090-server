@@ -3475,19 +3475,18 @@ details[open] > summary .score-collapse-cue::before {
   gap: 12px;
   flex-wrap: wrap;
 }
-.script-controls-wrap {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  margin-bottom: 14px;
+.script-log-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
-.script-controls-wrap.hidden {
+.script-log-actions.hidden {
   display: none !important;
 }
-.script-controls-wrap .run-script-queue-card,
-.script-controls-wrap .run-script-validation-card,
-.script-controls-wrap .run-script-internal-card {
-  margin-bottom: 0;
+.script-log-action-msg {
+  color: var(--muted, #9aa8b8);
+  font-size: 12px;
+  max-width: 260px;
 }
 .run-script-report-actions {
   display: inline-flex;

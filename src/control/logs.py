@@ -47,7 +47,7 @@ def resolve_log_source(source="docker", instance_id="", service_id=""):
     return {"source": "docker", "instance": instance, "container": container, "service": {}, "label": label}
 
 
-def read_selected_log_snapshot(source="docker", instance_id="", service_id="", tail_lines=250):
+def read_selected_log_snapshot(source="docker", instance_id="", service_id="", tail_lines=250, job_id=""):
     resolved = resolve_log_source(source, instance_id, service_id)
     source_name = str(resolved.get("source") or "docker")
     if source_name == "control":
@@ -75,7 +75,7 @@ def read_selected_log_snapshot(source="docker", instance_id="", service_id="", t
             **benchmark_log_only_snapshot(tail_lines=tail_lines),
         }
     if source_name == "script":
-        return script_log_snapshot(tail_lines=tail_lines)
+        return script_log_snapshot(job_id=job_id, tail_lines=tail_lines)
     if source_name == "service":
         service = resolved.get("service") or {}
         service_id_text = str(service.get("id") or service_id or "").strip().lower()

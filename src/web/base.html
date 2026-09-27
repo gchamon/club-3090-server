@@ -245,6 +245,7 @@
             </div>
             <div class="preset-toolbar-utilities">
               <button type="button" class="btn hidden-presets-trigger" id="hiddenPresetsToggle" aria-pressed="false" onclick="toggleHiddenPresetsVisibility()">Show hidden presets</button>
+              <button type="button" class="btn hidden-presets-trigger" id="hardwareBlockedPresetsToggle" aria-pressed="false" onclick="toggleHardwareBlockedPresetsVisibility()">Show hardware blocked presets</button>
               <button type="button" class="preset-toolbar-icon-button preset-filter-button" title="Filter presets" aria-label="Filter presets" onclick="openPresetFilterModal()"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16l-6.2 7.1v5.4l-3.6 1.8v-7.2L4 5Z" fill="none" /></svg></button>
             </div>
           </div>
@@ -820,9 +821,13 @@
               ><input type="checkbox" id="autoscroll" checked />
               auto-scroll</label
             >
+            <span id="scriptLogActions" class="script-log-actions hidden">
+              <button type="button" class="btn" onclick="showRawScriptLog()">Show raw log</button>
+              <button type="button" class="btn" onclick="copyAllScriptLog()">Copy all logs</button>
+              <span id="scriptLogActionMsg" class="script-log-action-msg" role="status" aria-live="polite"></span>
+            </span>
           </div>
         </div>
-        <div id="scriptControlsWrap" class="script-controls-wrap hidden"></div>
         <div class="resizable-surface resizable-surface-log" id="logSurface">
           <div id="logRender" class="log log-render" tabindex="0">Connecting...</div>
           <textarea id="log" class="log log-plain-mirror hidden" readonly wrap="soft">

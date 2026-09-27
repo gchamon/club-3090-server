@@ -1808,12 +1808,57 @@ process.on("uncaughtException", (error) => {{
     throw new Error("preset model selector should retain both fixture model families");
   }}
   const presetToolbarHtml = String(vm.runInContext("renderPresetHeadActionsHtml()", context) || "");
-  for (const marker of ["Setup Assistant", "Rebuild Model DB", "Add custom model", "Show hidden presets", "openPresetFilterModal()", "toggleHiddenPresetsVisibility()"] ) {{
+  for (const marker of ["Setup Assistant", "Rebuild Model DB", "Add custom model", "Show hidden presets", "Show hardware blocked presets", "openPresetFilterModal()", "toggleHiddenPresetsVisibility()", "toggleHardwareBlockedPresetsVisibility()"] ) {{
     if (!presetToolbarHtml.includes(marker)) throw new Error("Text models toolbar is missing " + marker);
   }}
   if (presetToolbarHtml.includes("Model Manager") || presetToolbarHtml.includes("presetActionsMenu")) {{
     throw new Error("Text models toolbar must not recreate the removed preset actions menu or Model Manager");
   }}
+  context.__hardwareVisibilityStatus = {{
+    gpus: [{{ index: 0, mem_total_mib: 24576, compute_cap: "8.6" }}],
+    nvlink: {{ present: false }},
+    server_config: {{ hidden_preset_selectors: ["fixture/hidden"] }},
+    models: [{{ model_id: "visibility-fixture", display_name: "Visibility fixture", installed_state: "ready" }}],
+    variants: [
+      {{ upstream_tag: "fixture/visible", variant_id: "fixture-visible", model_id: "visibility-fixture", install_state: "ready", topology: "single", engine: "vllm" }},
+      {{ upstream_tag: "fixture/hardware-blocked", variant_id: "fixture-blocked", model_id: "visibility-fixture", install_state: "ready", topology: "single", requires_min_gpu_count: 2, engine: "vllm" }},
+      {{ upstream_tag: "fixture/hidden", variant_id: "fixture-hidden", model_id: "visibility-fixture", install_state: "ready", topology: "single", engine: "vllm" }},
+    ],
+  }};
+  context.__priorSelectedPresetModelId = vm.runInContext("selectedPresetModelId", context);
+  vm.runInContext("localStorage.removeItem('club3090_show_hidden_presets'); localStorage.removeItem('club3090_show_hardware_blocked_presets'); showHiddenPresets = false; showHardwareBlockedPresets = false; selectedPresetModelId = 'visibility-fixture'; lastStatus = __hardwareVisibilityStatus; renderDynamicPresetModels({{ force: true }});", context);
+  const defaultVisibilityHtml = String(getElement("modelPresetGrid").innerHTML || "");
+  const defaultVisibilityControls = String(vm.runInContext("renderPresetHeadActionsHtml()", context) || "");
+  if (!defaultVisibilityHtml.includes('data-preset-selector="fixture/visible"') ||
+      defaultVisibilityHtml.includes('data-preset-selector="fixture/hardware-blocked"') ||
+      defaultVisibilityHtml.includes('data-preset-selector="fixture/hidden"') ||
+      !defaultVisibilityControls.includes('id="hardwareBlockedPresetsToggle" aria-pressed="false"') ||
+      !defaultVisibilityControls.includes("Show hardware blocked presets")) {{
+    throw new Error("hardware-blocked and user-hidden presets should both be hidden by default, with an unpressed hardware toggle");
+  }}
+  vm.runInContext("toggleHardwareBlockedPresetsVisibility()", context);
+  const hardwareShownHtml = String(getElement("modelPresetGrid").innerHTML || "");
+  const hardwareShownControls = String(vm.runInContext("renderPresetHeadActionsHtml()", context) || "");
+  if (!hardwareShownHtml.includes('data-preset-selector="fixture/hardware-blocked"') ||
+      hardwareShownHtml.includes('data-preset-selector="fixture/hidden"') ||
+      !hardwareShownControls.includes('id="hardwareBlockedPresetsToggle" aria-pressed="true"') ||
+      !hardwareShownControls.includes("Hide hardware blocked presets") ||
+      vm.runInContext("localStorage.getItem('club3090_show_hardware_blocked_presets')", context) !== "1") {{
+    throw new Error("the hardware toggle should reveal blocked presets without revealing hidden presets and persist its state");
+  }}
+  vm.runInContext("toggleHiddenPresetsVisibility()", context);
+  const bothShownHtml = String(getElement("modelPresetGrid").innerHTML || "");
+  if (!bothShownHtml.includes('data-preset-selector="fixture/hardware-blocked"') ||
+      !bothShownHtml.includes('data-preset-selector="fixture/hidden"')) {{
+    throw new Error("the hidden and hardware-blocked visibility controls should operate independently");
+  }}
+  vm.runInContext("toggleHardwareBlockedPresetsVisibility()", context);
+  const hardwareHiddenHtml = String(getElement("modelPresetGrid").innerHTML || "");
+  if (hardwareHiddenHtml.includes('data-preset-selector="fixture/hardware-blocked"') ||
+      !hardwareHiddenHtml.includes('data-preset-selector="fixture/hidden"')) {{
+    throw new Error("hiding hardware-blocked presets should leave explicitly shown hidden presets visible");
+  }}
+  vm.runInContext("showHiddenPresets = false; showHardwareBlockedPresets = false; selectedPresetModelId = __priorSelectedPresetModelId; lastStatus = __selectorStatus; renderDynamicPresetModels({{ force: true }}); localStorage.removeItem('club3090_show_hidden_presets'); localStorage.removeItem('club3090_show_hardware_blocked_presets');", context);
   const presetStatus = {{
     ...statusPayload,
     gpu_count: 2,
@@ -3307,6 +3352,7 @@ process.on("uncaughtException", (error) => {{
     queue: [
       {{ job_id: "script-a", script_id: "bench.sh", label: "Bench", status: "running", command: "bash /club/scripts/bench.sh --runs 2" }},
       {{ job_id: "script-b", script_id: "quality-test.sh", label: "Quality Test", status: "queued", command: "bash /club/scripts/quality-test.sh --quick" }},
+      {{ job_id: "script-studio", script_id: "setup-ai-studio", label: "Setup AI Studio", status: "queued", command: "set -euo pipefail " + "setup-step ".repeat(160) }},
     ],
   }} }};
   context.__scriptRows = [
@@ -3332,6 +3378,14 @@ process.on("uncaughtException", (error) => {{
       !scriptsPageHtml.includes("Move to front") || !scriptsPageHtml.includes("Move to end") ||
       !scriptsPageHtml.includes("Remove selected")) {{
     throw new Error("Scripts tab must render inspection, selection, and full queue-management controls");
+  }}
+  const queueWithoutInspect = scriptsPageHtml.split('<details class="script-queue-inspect">')
+    .map((part, index) => index ? part.slice(part.indexOf("</details>") + 10) : part)
+    .join("");
+  if (!queueWithoutInspect.includes("Workflow: Full AI Studio setup") ||
+      queueWithoutInspect.includes("setup-step") ||
+      !scriptsPageHtml.includes("setup-step setup-step")) {{
+    throw new Error("AI Studio queue rows should show a concise workflow category while keeping the full command under Inspect");
   }}
   vm.runInContext("setScriptQueueSelection('script-b', true); lastStatus = {{ ...__scriptStatus, script_job: {{ ...__scriptStatus.script_job, queue: [...__scriptStatus.script_job.queue, {{ job_id: 'script-c', script_id: 'done.sh', label: 'Done', status: 'success', command: 'bash /club/done.sh' }}] }} }}; renderScriptsQueueTab();", context);
   if (!String(getElement("scriptsQueuePanel").innerHTML || "").includes('aria-label="Select Quality Test" checked')) {{
@@ -5068,7 +5122,7 @@ def generate_test_html_artifact() -> tuple[str, str]:
     ):
         raise ValueError("Benchmark preset queue rows must expose chevron affordances for expandable stage details")
     boot_call_offset = js_source.find("bootAdminUi().catch")
-    for sentinel in ("showHiddenPresets", "toggleHiddenPresetsVisibility"):
+    for sentinel in ("showHiddenPresets", "toggleHiddenPresetsVisibility", "showHardwareBlockedPresets", "toggleHardwareBlockedPresetsVisibility"):
         declaration_offset = js_source.find(f'var {sentinel} =')
         if declaration_offset < 0 or boot_call_offset < 0 or declaration_offset > boot_call_offset:
             raise ValueError(f"{sentinel} must be initialized before the synchronous admin boot path")
@@ -6070,6 +6124,7 @@ def generate_test_html_artifact() -> tuple[str, str]:
         'onclick="promptRuntimeInventoryRebuild()">Rebuild Model DB',
         'onclick="openCustomModelModal()">Add custom model',
         'onclick="toggleHiddenPresetsVisibility()">Show hidden presets',
+        'onclick="toggleHardwareBlockedPresetsVisibility()">Show hardware blocked presets',
         'id="benchmarks" class="tabpane content-tab"',
     ):
         if toolbar_marker not in html_source:
@@ -7704,6 +7759,12 @@ try:
     assert len(queued_scripts) == 2 and [row["status"] for row in queued_scripts] == ["queued", "queued"], queued_scripts
     assert queued_scripts[0]["job_id"] != queued_scripts[1]["job_id"], queued_scripts
     setup_command = module.image_studio_setup_command()
+    assert "verify_ai_studio_required_assets()" in setup_command, setup_command
+    assert '[ai-studio] ERROR: setup aborted (rc=%s)' in setup_command, setup_command
+    assert 'HF_TOKEN="$HF_TOKEN"' in setup_command and "HF_TOKEN=hf_" not in setup_command, setup_command
+    upstream_run_index = setup_command.index('run_image_studio_step bash "$studio_setup_script" --yes')
+    verify_call_index = setup_command.find("verify_ai_studio_required_assets", upstream_run_index + len('run_image_studio_step bash "$studio_setup_script" --yes'))
+    assert verify_call_index >= 0, setup_command
     assert 'studio_setup_script="scripts/setup-ai-studio.sh"' in setup_command and 'bash "$studio_setup_script" --yes' in setup_command, setup_command
     assert 'export LANIP="${LANIP:-127.0.0.1}"' in setup_command, setup_command
     assert "getent passwd" in setup_command and 'export HOME="${HOME:-/tmp}"' in setup_command, setup_command
@@ -7820,6 +7881,25 @@ try:
     second_log.write_text("second script output\\n", encoding="utf-8")
     assert "first script output" in module.script_log_snapshot(queued_scripts[0]["job_id"])["text"]
     assert "second script output" in module.script_log_snapshot(queued_scripts[1]["job_id"])["text"]
+    first_log.write_text("".join(f"line {index}\\n" for index in range(1, 1006)), encoding="utf-8")
+    snapshot = module.script_log_snapshot(queued_scripts[0]["job_id"], tail_lines=1000)
+    assert (snapshot["line_count"], snapshot["returned_line_count"], snapshot["truncated_line_count"]) == (1005, 1000, 5), snapshot
+    assert snapshot["text"].splitlines()[0] == "line 6" and snapshot["text"].splitlines()[-1] == "line 1005", snapshot
+    class ScriptRawRouteFixture:
+        path = f"/admin/scripts/log/raw?job_id={queued_scripts[0]['job_id']}"
+        def require_auth(self):
+            return True
+        def send_stream(self, file_path, content_type):
+            self.streamed = (file_path, content_type, pathlib.Path(file_path).read_text(encoding="utf-8"))
+        def send_bytes(self, payload, content_type="", code=200, **kwargs):
+            self.response = (code, payload.decode("utf-8"))
+    raw_fixture = ScriptRawRouteFixture()
+    module.AdminHandler.do_GET(raw_fixture)
+    assert raw_fixture.streamed[0] == str(first_log) and len(raw_fixture.streamed[2].splitlines()) == 1005, raw_fixture.streamed[:2]
+    missing_raw_fixture = ScriptRawRouteFixture()
+    missing_raw_fixture.path = "/admin/scripts/log/raw?job_id=unknown"
+    module.AdminHandler.do_GET(missing_raw_fixture)
+    assert missing_raw_fixture.response[0] == 404, missing_raw_fixture.response
     after_queued_remove = module.remove_script_job(queued_scripts[1]["job_id"])
     assert [row["job_id"] for row in after_queued_remove["queue"]] == [
         queued_scripts[0]["job_id"],
