@@ -5979,13 +5979,17 @@ def generate_test_html_artifact() -> tuple[str, str]:
         or "return `${installed} / ${models.length}`;" not in js_source
         or '["text", "Text Models"]' not in js_source
         or 'const rows = aiStudioResourceRows();' not in js_source
-        or 'id="aiStudioContent" class="ai-studio-model-surface"' not in html_source
-        or 'id="presets" class="ai-studio-model-surface hidden"' not in html_source
+        or 'id="aiStudioContent" class="logs panel ai-studio-model-surface"' not in html_source
+        or 'id="aiStudioResourceView"' not in html_source
+        or 'id="aiStudioTextModels" class="hidden"' not in html_source
+        or 'id="presets"' in html_source
+        or 'resourceView.classList.toggle("hidden", textMode);' not in js_source
+        or 'textModels.classList.toggle("hidden", !textMode);' not in js_source
         or ".ai-studio-model-surface" not in css_source
         or "flex-direction: column;" not in css_source
         or "gap: 6px;" not in css_source
     ):
-        raise ValueError("AI Studio must order Text first, count fully-ready text models, render category data, and separate both surfaces and pill contents")
+        raise ValueError("AI Studio must order Text first, count fully-ready text models, and switch inner views within one shared logCard-style surface")
     if (
         "resource-manager-modality-image" not in css_source
         or "ai-studio-modality-badge" not in js_source
@@ -6336,26 +6340,35 @@ process.on("uncaughtException", (error) => {{
   await new Promise((resolve) => setTimeout(resolve, 50));
   const modelTypeButtons = Array.from(window.document.querySelectorAll(".ai-studio-model-type"));
   if (modelTypeButtons.length !== 5) throw new Error("AI Studio should expose five model-type controls");
-  const modelTypeLabels = modelTypeButtons.map((button) => button.querySelector(".resource-manager-total-label")?.textContent.trim());
-  if (modelTypeLabels.join("|") !== "Text Models|Image Models|Audio Models|Speech Models|Video Models") throw new Error("AI Studio categories must put Text Models first");
-  const textPill = modelTypeButtons[0];
-  if (textPill.querySelector(".resource-manager-total-value")?.textContent.trim() !== "1 / 3") throw new Error("Text Models count must include only ready inventory models");
+  const sharedAiStudioSection = window.document.getElementById("aiStudioContent");
+  const resourceView = window.document.getElementById("aiStudioResourceView");
+  const textModels = window.document.getElementById("aiStudioTextModels");
+  if (!sharedAiStudioSection || !sharedAiStudioSection.classList.contains("logs") ||
+      !sharedAiStudioSection.classList.contains("panel") || !resourceView || !textModels) {{
+    throw new Error("AI Studio views must share one logCard-style section");
+  }}
   for (const type of ["image", "audio", "speech", "video"]) {{
     window.selectAIStudioModelType(type);
     const content = window.document.getElementById("aiStudioContent");
     const selectedButton = window.document.querySelector(`.ai-studio-model-type[aria-pressed="true"]`);
-    const lane = content.querySelector(`.ai-studio-lane-${{type}}`);
-    if (content.classList.contains("hidden") || !selectedButton?.textContent.includes(type[0].toUpperCase() + type.slice(1)) || !lane) throw new Error(type + " category surface did not render or select");
+    const lane = resourceView.querySelector(`.ai-studio-lane-${{type}}`);
+    if (content !== sharedAiStudioSection || content.classList.contains("hidden") ||
+        resourceView.classList.contains("hidden") || !textModels.classList.contains("hidden") ||
+        !selectedButton?.textContent.includes(type[0].toUpperCase() + type.slice(1)) || !lane) {{
+      throw new Error(type + " category did not render inside the shared AI Studio section");
+    }}
     const laneBody = lane.querySelector(".ai-studio-lane-column-body");
     if (!laneBody || !laneBody.querySelector(".ai-studio-lane-card")) throw new Error(type + " lane body has no visible lane card");
-    if (!content.querySelector(".ai-studio-lane-text")) throw new Error("Studio Director support lane did not render");
+    if (!resourceView.querySelector(".ai-studio-lane-text")) throw new Error("Studio Director support lane did not render");
   }}
   window.selectAIStudioModelType("text");
   const presetToolbar = window.document.getElementById("presetHeadActions");
   if (!presetToolbar || !presetToolbar.textContent.includes("Setup Assistant")) throw new Error("Text Models did not render the Model Presets toolbar");
-  if (!window.document.getElementById("aiStudioContent").classList.contains("hidden") ||
-      window.document.querySelector(".ai-studio-lane-image")) throw new Error("Text Models should hide AI Studio lanes");
-  if (window.document.getElementById("presets").classList.contains("hidden")) throw new Error("Text Models preset surface is hidden");
+  if (window.document.getElementById("aiStudioContent") !== sharedAiStudioSection ||
+      !resourceView.classList.contains("hidden") || textModels.classList.contains("hidden") ||
+      resourceView.querySelector(".ai-studio-lane-image")) {{
+    throw new Error("Text Models must switch the inner view without replacing the shared AI Studio section");
+  }}
   window.renderStatusUi({{ metrics: {{ active_requests: 1 }}, presets: policyFixture.presets }});
   if (window.document.querySelector('.ai-studio-model-type[aria-pressed="true"]')?.textContent.includes("Text Models") !== true) {{
     throw new Error("status rerender should retain the selected Text Models type");

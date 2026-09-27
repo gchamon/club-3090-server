@@ -7211,7 +7211,7 @@ function sortInventoryVariants(rows) {
   });
 }
 function ensureDynamicPresetLayout() {
-  const presets = $("presets");
+  const presets = $("aiStudioTextModels");
   if (!presets) return;
   const firstPanel = presets.querySelector(".panel");
   if (!firstPanel) return;
@@ -9702,8 +9702,9 @@ function renderAIStudioTab() {
   if (activeTabName !== "ai-studio") return;
   const typeHost = $("aiStudioModelTypes");
   const contentHost = $("aiStudioContent");
-  const presets = $("presets");
-  if (!typeHost || !contentHost || !presets) return;
+  const resourceView = $("aiStudioResourceView");
+  const textModels = $("aiStudioTextModels");
+  if (!typeHost || !contentHost || !resourceView || !textModels) return;
   const counts = [
     ["text", "Text Models"],
     ["image", "Image Models"],
@@ -9713,9 +9714,9 @@ function renderAIStudioTab() {
   ];
   setHtmlIfChanged(typeHost, `<div class="ai-studio-summary-row">${counts.map(([key, label]) => `<button type="button" class="resource-manager-total-card ai-studio-model-type${aiStudioModelType === key ? " active" : ""}" aria-pressed="${aiStudioModelType === key ? "true" : "false"}" onclick="selectAIStudioModelType('${key}')"><span class="resource-manager-total-label">${label}</span><span class="resource-manager-total-value">${key === "text" ? aiStudioTextModelCount() : aiStudioModelTypeCount(key)}</span></button>`).join("")}</div>`);
   const textMode = aiStudioModelType === "text";
-  contentHost.classList.toggle("hidden", textMode);
-  presets.classList.toggle("hidden", !textMode);
-  if (!textMode) setHtmlIfChanged(contentHost, renderAIStudioView());
+  resourceView.classList.toggle("hidden", textMode);
+  textModels.classList.toggle("hidden", !textMode);
+  if (!textMode) setHtmlIfChanged(resourceView, renderAIStudioView());
 }
 function renderAIStudioView() {
   const rows = aiStudioResourceRows();
