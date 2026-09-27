@@ -9703,21 +9703,15 @@ function aiStudioModelTypeCount(type) {
   return aiStudioLaneCountLabel(lanes);
 }
 function aiStudioTextModelCount() {
-  const ids = new Set();
-  const ready = new Set();
-  for (const model of inventoryModels()) {
-    const id = String(model?.model_id || "").trim();
-    if (!id) continue;
-    ids.add(id);
-    if (model?.installed_state === "ready") ready.add(id);
-  }
+  const presetStates = new Map();
   for (const variant of inventoryVariants()) {
-    const id = String(variant?.model_id || "").trim();
-    if (!id) continue;
-    ids.add(id);
-    if (variant?.install_state === "ready") ready.add(id);
+    const id = String(variant?.variant_id || variant?.selector || "").trim();
+    const state = String(variant?.install_state || "").trim().toLowerCase();
+    if (!id || state === "unavailable") continue;
+    if (state === "ready" || !presetStates.has(id)) presetStates.set(id, state);
   }
-  return `${[...ready].filter((id) => ids.has(id)).length} / ${ids.size}`;
+  const ready = [...presetStates.values()].filter((state) => state === "ready").length;
+  return `${ready} / ${presetStates.size}`;
 }
 function selectAIStudioModelType(type) {
   const nextType = String(type || "").trim().toLowerCase();

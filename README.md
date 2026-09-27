@@ -348,6 +348,7 @@ Current AI Studio support includes:
 - dynamic Studio Director placement: the Director defaults to GPU-first auto placement for fast planning, falls back to an already-loaded chat runtime when possible, and offloads to CPU only when media lanes need the VRAM or CPU is explicitly requested
 - compatibility with the current upstream v0.10 AI Studio lanes, including HiDream-O1, Ideogram 4, Chroma, Z-Image, Krea 2, LTX/Sulphur, 10Eros, Wan2.2, ACE-Step music, Stable Audio Open SFX, Kokoro, and Step-Audio
 - model readiness, storage usage, related resource subcards, and Download actions only for lanes whose shared or primary assets are genuinely not installed yet
+- Text Models counts individual presets rather than model families, showing ready presets over all launchable presets; unavailable inventory entries are excluded.
 - a separate Backend Plan option for upstream's Production Director flow, alongside the original local Plan and Interactive modes
 
 The control layer keeps AI Studio integration in its own wrapper/setup logic instead of patching files inside the upstream checkout. Legacy `/admin/image-studio/...` routes remain as backend compatibility aliases, but the browser and current API surface use `/admin/ai-studio/...`.

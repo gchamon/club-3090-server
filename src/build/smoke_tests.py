@@ -6008,9 +6008,10 @@ def generate_test_html_artifact() -> tuple[str, str]:
         raise ValueError("Image models must remain available as a top-level page with setup/docs/multimodal resource management")
     if (
         "function aiStudioTextModelCount()" not in js_source
-        or 'model?.installed_state === "ready"' not in js_source
-        or 'variant?.install_state === "ready"' not in js_source
-        or "return `${[...ready].filter((id) => ids.has(id)).length} / ${ids.size}`;" not in js_source
+        or 'variant?.variant_id || variant?.selector' not in js_source
+        or 'state === "unavailable"' not in js_source
+        or 'state === "ready"' not in js_source
+        or "return `${ready} / ${presetStates.size}`;" not in js_source
         or 'const rows = aiStudioResourceRows();' not in js_source
         or 'id="aiStudioContent" class="logs panel ai-studio-model-surface"' not in html_source
         or 'id="aiStudioResourceView"' not in html_source
@@ -6022,7 +6023,7 @@ def generate_test_html_artifact() -> tuple[str, str]:
         or "flex-direction: column;" not in css_source
         or "gap: 6px;" not in css_source
     ):
-        raise ValueError("AI Studio must order Text first, count fully-ready text models, and switch inner views within one shared logCard-style surface")
+        raise ValueError("AI Studio must order Text first, count individual ready text presets, and switch inner views within one shared logCard-style surface")
     if (
         "resource-manager-modality-image" not in css_source
         or "ai-studio-modality-badge" not in js_source
@@ -6360,18 +6361,25 @@ process.on("uncaughtException", (error) => {{
       policySaveBody.allow_proxy_with_invalid_api_key !== true) {{
     throw new Error(`access policy save payload did not include both booleans: ${{JSON.stringify(policySaveBody)}}`);
   }}
+  const textPresetFixture = [
+    {{ variant_id: "ready-preset", model_id: "ready-fixture", install_state: "ready" }},
+    {{ variant_id: "partial-ready-preset", model_id: "partial-fixture", install_state: "ready" }},
+    {{ variant_id: "partial-download-preset", model_id: "partial-fixture", install_state: "requires_download" }},
+    {{ variant_id: "missing-download-preset", model_id: "missing-fixture", install_state: "requires_download" }},
+    {{ variant_id: "unavailable-preset", model_id: "missing-fixture", install_state: "unavailable" }},
+  ];
   window.renderStatusUi({{ metrics: {{}}, runtime_inventory: {{ models: [
     {{ model_id: "ready-fixture", installed_state: "ready" }},
     {{ model_id: "partial-fixture", installed_state: "partial" }},
     {{ model_id: "missing-fixture", installed_state: "missing" }},
-  ], variants: [{{ model_id: "partial-fixture", install_state: "ready" }}] }}, models: [
+  ], variants: textPresetFixture }}, models: [
     {{ model_id: "ready-fixture", installed_state: "ready" }},
     {{ model_id: "partial-fixture", installed_state: "partial" }},
     {{ model_id: "missing-fixture", installed_state: "missing" }},
-  ], variants: [{{ model_id: "partial-fixture", install_state: "ready" }}] }});
+  ], variants: textPresetFixture }});
   window.activateTab("ai-studio");
   await new Promise((resolve) => setTimeout(resolve, 50));
-  if (window.aiStudioTextModelCount() !== "2 / 3") throw new Error("Text Models availability should count ready variants within partial families");
+  if (window.aiStudioTextModelCount() !== "2 / 4") throw new Error("Text Models count should include launchable presets and exclude unavailable presets");
   const modelTypeButtons = Array.from(window.document.querySelectorAll(".ai-studio-model-type"));
   if (modelTypeButtons.length !== 5) throw new Error("AI Studio should expose five model-type controls");
   const sharedAiStudioSection = window.document.getElementById("aiStudioContent");
@@ -6403,7 +6411,7 @@ process.on("uncaughtException", (error) => {{
       resourceView.querySelector(".ai-studio-lane-image")) {{
     throw new Error("Text Models must switch the inner view without replacing the shared AI Studio section");
   }}
-  if (window.aiStudioTextModelCount() !== "2 / 3") throw new Error("Text Models count changed after switching to Text Models");
+  if (window.aiStudioTextModelCount() !== "2 / 4") throw new Error("Text Models preset count changed after switching to Text Models");
   window.renderStatusUi({{ metrics: {{ active_requests: 1 }}, presets: policyFixture.presets }});
   if (window.document.querySelector('.ai-studio-model-type[aria-pressed="true"]')?.textContent.includes("Text Models") !== true) {{
     throw new Error("status rerender should retain the selected Text Models type");
