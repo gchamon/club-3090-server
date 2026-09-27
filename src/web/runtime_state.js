@@ -582,7 +582,7 @@ function persistChatConversationState() {
 }
 function normalizeTabName(name) {
   if (name === "audit") return "logs";
-  return ["overview", "system", "ai-studio", "benchmarks", "metrics", "users", "logs", "chat"].includes(name)
+  return ["overview", "system", "ai-studio", "benchmarks", "metrics", "users", "scripts", "logs", "chat"].includes(name)
     ? name
     : "overview";
 }

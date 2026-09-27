@@ -156,6 +156,7 @@ var modelScoreDetailRefreshInFlight = false;
 var modelScoreLogScrollTopByKey = {};
 var modelScoreActiveLogTabsByKey = {};
 var scriptModalState = { loading: false, error: "", scripts: [], expandedOptions: "", argsById: {}, showInternal: false, view: "scripts", selectedJobId: "", logByJob: {}, logLoadedAtByJob: {}, logLoadingJob: "" };
+var scriptQueueSelection = new Set();
 var aiStudioGalleryState = { loading: false, loadedAt: 0, error: "", items: [], open: false };
 var aiStudioModelType = "image";
 
@@ -4935,34 +4936,9 @@ async function loadRunScriptLog(jobId, force = false) {
 }
 function showQueuedScriptLog(jobId) {
   scriptModalState.selectedJobId = String(jobId || "");
-  scriptModalState.view = "logs";
-  focusScriptLogs();
+  focusScriptLogs(scriptModalState.selectedJobId);
   renderScriptRunnerUi();
   loadRunScriptLog(scriptModalState.selectedJobId, true).catch(() => {});
-}
-async function removeQueuedScript(jobId) {
-  const id = String(jobId || "").trim();
-  const row = scriptQueueRows().find((item) => String(item?.job_id || "") === id);
-  if (!row) return;
-  const running = String(row.status || "") === "running";
-  const prompt = running
-    ? `Terminate ${row.label || row.script_id || "this script"} immediately and remove it from the queue?`
-    : `Remove ${row.label || row.script_id || "this script"} from the queue?`;
-  if (!confirm(prompt)) return;
-  try {
-    const payload = await post("/admin/scripts/remove", { job_id: id }, `/admin/scripts/remove ${id}`);
-    if (payload.script_job) lastStatus = { ...(lastStatus || {}), script_job: payload.script_job };
-    delete scriptModalState.logByJob[id];
-    delete scriptModalState.logLoadedAtByJob[id];
-    if (scriptModalState.selectedJobId === id) {
-      const queue = Array.isArray(payload?.script_job?.queue) ? payload.script_job.queue : [];
-      scriptModalState.selectedJobId = String((queue.find((item) => item?.status === "running") || queue[queue.length - 1])?.job_id || "");
-      if (!scriptModalState.selectedJobId) scriptModalState.view = "scripts";
-    }
-    renderRunScriptModal();
-  } catch (error) {
-    setElementMsg("runScriptMsg", messageText(error), "error");
-  }
 }
 function renderScriptCard(row) {
   const id = String(row?.id || "");
@@ -4981,17 +4957,66 @@ function renderScriptCard(row) {
   const internalBadge = row?.internal ? '<span class="status-badge status-warning">internal</span>' : (row?.category === "validation" ? '<span class="status-badge status-success">validation</span>' : "");
   return `<div class="run-script-card resource-manager-card"><div class="resource-manager-card-head"><div class="resource-manager-card-subrow"><div><h3>${escapeHtml(row?.label || row?.name || id)}</h3><div class="preset-help"><code>${escapeHtml(id)}</code></div></div><div class="script-card-controls">${internalBadge}${docsHtml}<button class="script-help-btn" title="Options" aria-label="Show script options" onclick="toggleScriptOptions('${escapeJs(id)}')">?</button></div></div><div class="preset-help">${escapeHtml(row?.description || "Upstream script.")}</div></div><label class="script-args-row">Arguments<input value="${escapeHtml(args)}" placeholder="optional switches or values" oninput="setScriptArgs('${escapeJs(id)}', this.value)" /></label><div class="resource-manager-card-actions"><button class="btn green" ${locked ? "disabled" : ""} onclick="startDiscoveredScript('${escapeJs(id)}')">${queueBusy ? "Enqueue" : "Run"}</button></div>${optionsHtml}</div>`;
 }
-function renderScriptQueueRow(row, index) {
-  const jobId = String(row?.job_id || "");
-  const status = String(row?.status || "queued").toLowerCase();
-  const selected = scriptModalState.selectedJobId === jobId;
-  const label = String(row?.label || row?.script_id || `Script ${index + 1}`);
-  const args = String(row?.command || "").replace(/^(?:bash|python3)\s+\S+\s*/, "").trim();
-  const progress = Math.round(Math.max(0, Math.min(1, Number(row?.progress ?? (status === "running" ? 0.5 : ["success", "failed", "cancelled"].includes(status) ? 1 : 0)))) * 100);
-  const logButton = renderIconButton({ title: `View ${label} Logs`, action: `showQueuedScriptLog('${escapeJs(jobId)}')`, icon: "terminal", className: "run-script-queue-log" });
-  const removeButton = renderIconButton({ title: status === "running" ? `Terminate and Remove ${label}` : `Remove ${label}`, action: `removeQueuedScript('${escapeJs(jobId)}')`, icon: "close", className: "run-script-queue-remove" });
-  return `<div class="run-script-queue-row ${escapeHtml(status)}${selected ? " focused" : ""}" data-script-job-id="${escapeHtml(jobId)}"><span class="status-badge status-${status === "success" ? "success" : status === "failed" || status === "cancelled" ? "danger" : status === "running" ? "warning" : "info"}">${escapeHtml(status)}</span><div class="run-script-queue-main"><strong>${escapeHtml(label)}</strong><code>${escapeHtml(row?.script_id || "")}</code>${args ? `<span>${escapeHtml(args)}</span>` : ""}<div class="run-script-queue-progress"><i style="width:${progress}%"></i><span>Progress ${progress}%</span></div></div><div class="run-script-queue-actions">${logButton}${removeButton}</div></div>`;
+function scriptQueuePruneSelection() {
+  const ids = new Set(scriptQueueRows().map((row) => String(row.job_id || "")));
+  for (const id of scriptQueueSelection) if (!ids.has(id)) scriptQueueSelection.delete(id);
 }
+function setScriptQueueSelection(id, checked) {
+  if (checked) scriptQueueSelection.add(String(id));
+  else scriptQueueSelection.delete(String(id));
+  renderScriptsQueueTab();
+}
+function selectAllScriptQueue(checked) {
+  scriptQueueSelection = new Set(checked ? scriptQueueRows().map((row) => String(row.job_id || "")) : []);
+  renderScriptsQueueTab();
+}
+async function mutateScriptQueue(path, extra = {}, destructive = false) {
+  scriptQueuePruneSelection();
+  const statuses = path.endsWith("/cancel") ? ["queued", "running"] : path.endsWith("/retry") ? ["success", "failed", "cancelled"] : path.endsWith("/reorder") ? ["queued"] : null;
+  const rows = scriptQueueRows().filter((row) => scriptQueueSelection.has(String(row.job_id)) && (!statuses || statuses.includes(String(row.status || "queued").toLowerCase())));
+  const ids = rows.map((row) => String(row.job_id));
+  if (!ids.length) return;
+  if (destructive && !confirm(`Remove ${ids.length} selected job(s)? Selected running jobs will be terminated. Removed history and log links will disappear.`)) return;
+  try {
+    const payload = await post(path, { job_ids: ids, ...extra }, `${path} ${ids.join(",")}`);
+    if (payload?.script_job) lastStatus = { ...(lastStatus || {}), script_job: payload.script_job };
+    if (path.endsWith("bulk-remove")) {
+      for (const id of ids) {
+        scriptQueueSelection.delete(id);
+        delete scriptModalState.logByJob[id];
+        delete scriptModalState.logLoadedAtByJob[id];
+      }
+    }
+    scriptQueuePruneSelection();
+    renderScriptsQueueTab();
+  } catch (error) {
+    const node = $("scriptsQueueMessage");
+    if (node) node.textContent = messageText(error);
+  }
+}
+function scriptQueueDetails(row) {
+  const context = row?.context || row?.runtime_context || {};
+  return `<details class="script-queue-inspect"><summary>Inspect</summary><dl><dt>Command</dt><dd><code>${escapeHtml(row?.command || "")}</code></dd><dt>Context</dt><dd><code>${escapeHtml(JSON.stringify(context))}</code></dd><dt>Return code</dt><dd>${escapeHtml(row?.return_code ?? "—")}</dd><dt>Summary</dt><dd>${escapeHtml(row?.summary || "—")}</dd><dt>Log file</dt><dd><code>${escapeHtml(row?.log_file || "—")}</code></dd></dl></details>`;
+}
+function renderScriptsQueueTab() {
+  const host = $("scriptsQueuePanel");
+  if (!host) return;
+  const rows = scriptQueueRows();
+  scriptQueuePruneSelection();
+  const selected = rows.filter((row) => scriptQueueSelection.has(String(row.job_id)));
+  const statusOf = (row) => String(row.status || "queued").toLowerCase();
+  const eligible = (statuses) => selected.filter((row) => statuses.includes(statusOf(row)));
+  const renderRows = rows.length ? rows.map((row, index) => {
+    const id = String(row.job_id || "");
+    const status = statusOf(row);
+    const label = String(row.label || row.script_id || `Script ${index + 1}`);
+    const args = String(row.command || "").replace(/^(?:bash|python3)\s+\S+\s*/, "").trim();
+    const progress = Math.round(Math.max(0, Math.min(1, Number(row.progress ?? (status === "running" ? 0.5 : ["success", "failed", "cancelled"].includes(status) ? 1 : 0)))) * 100);
+    return `<article class="script-queue-item ${escapeHtml(status)}"><label class="script-queue-check"><input type="checkbox" aria-label="Select ${escapeHtml(label)}" ${scriptQueueSelection.has(id) ? "checked" : ""} onchange="setScriptQueueSelection('${escapeJs(id)}',this.checked)"></label><div class="script-queue-main"><div><span class="status-badge status-${status === "success" ? "success" : status === "failed" || status === "cancelled" ? "danger" : status === "running" ? "warning" : "info"}">${escapeHtml(status)}</span> <strong>${escapeHtml(label)}</strong> <code>${escapeHtml(row.script_id || id)}</code></div><div>${escapeHtml(args || "No arguments")}</div><div class="script-queue-progress" role="progressbar" aria-label="${escapeHtml(label)} progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progress}"><span style="width:${progress}%"></span><b>${progress}%</b></div><small>${escapeHtml(row.scope || row.instance_id || row.context?.instance_id || "Global")} · Queued ${escapeHtml(row.queued_at || row.created_at || "—")} ${row.started_at ? `· Started ${escapeHtml(row.started_at)}` : ""} ${row.finished_at ? `· Finished ${escapeHtml(row.finished_at)}` : ""}</small>${scriptQueueDetails(row)}</div><button class="btn secondary-btn" onclick="showQueuedScriptLog('${escapeJs(id)}')">View logs</button></article>`;
+  }).join("") : '<div class="empty-variant-note">No script jobs yet.</div>';
+  host.innerHTML = `<section class="panel scripts-queue-panel"><div class="resource-manager-card-head"><div><h2>Script Queue</h2><div class="preset-help">${rows.length} retained jobs</div></div><label><input type="checkbox" ${rows.length && selected.length === rows.length ? "checked" : ""} onchange="selectAllScriptQueue(this.checked)"> Select all</label></div><div class="script-queue-toolbar"><button class="btn" onclick="selectAllScriptQueue(false)">Clear selection</button><span>${selected.length} selected</span><button class="btn" ${eligible(["queued","running"]).length ? "" : "disabled"} onclick="mutateScriptQueue('/admin/scripts/cancel')">Cancel selected</button><button class="btn" ${eligible(["success","failed","cancelled"]).length ? "" : "disabled"} onclick="mutateScriptQueue('/admin/scripts/retry')">Retry selected</button><button class="btn" ${eligible(["queued"]).length ? "" : "disabled"} onclick="mutateScriptQueue('/admin/scripts/reorder',{position:'front'})">Move to front</button><button class="btn" ${eligible(["queued"]).length ? "" : "disabled"} onclick="mutateScriptQueue('/admin/scripts/reorder',{position:'end'})">Move to end</button><button class="btn danger-btn" ${selected.length ? "" : "disabled"} onclick="mutateScriptQueue('/admin/scripts/bulk-remove',{},true)">Remove selected</button></div><div id="scriptsQueueMessage" role="alert"></div><div class="script-queue-list">${renderRows}</div></section>`;
+}
+window.renderScriptsQueueTab = renderScriptsQueueTab;
 async function copyLatestRigReport() {
   try {
     const res = await fetchJsonWithTimeout(`/admin/scripts/report?_=${Date.now()}`, { cache: "no-store" }, 10000);
@@ -5037,24 +5062,19 @@ function renderScriptRunnerUi() {
   const internalSection = scriptModalState.showInternal
     ? `<section class="run-script-internal-card resource-manager-card"><div class="resource-manager-card-head"><h3>Internal Backend Scripts</h3><div class="preset-help">These are backend plumbing scripts exposed only for explicit maintenance runs.</div></div><div class="run-script-grid resource-manager-grid">${scriptModalState.loading ? '<div class="empty-variant-note">Discovering internal scripts...</div>' : internalScripts.length ? internalScripts.map((row) => renderScriptCard(row)).join("") : '<div class="empty-variant-note">No internal backend scripts were discovered.</div>'}</div></section>`
     : "";
-  const running = queue.find((row) => row?.status === "running");
-  const queuedCount = queue.filter((row) => row?.status === "queued").length;
-  const queueRows = queue.length ? queue.map((row, index) => renderScriptQueueRow(row, index)).join("") : '<div class="empty-variant-note">No scripts queued.</div>';
-  const queueSummary = running ? `${running.label || running.script_id || "Script"} running${queuedCount ? ` · ${queuedCount} queued` : ""}` : queuedCount ? `${queuedCount} queued` : `${queue.length} retained result${queue.length === 1 ? "" : "s"}`;
-  const selectedJob = queue.find((row) => String(row?.job_id || "") === scriptModalState.selectedJobId) || running || queue[queue.length - 1] || {};
+  const selectedJob = queue.find((row) => String(row?.job_id || "") === scriptModalState.selectedJobId) || queue.find((row) => row?.status === "running") || queue[queue.length - 1] || {};
   const selectedJobId = String(selectedJob?.job_id || "");
   if (!scriptModalState.selectedJobId && selectedJobId) scriptModalState.selectedJobId = selectedJobId;
   const selectedLog = String(scriptModalState.logByJob[selectedJobId] || (selectedJobId === String(job.job_id || "") && Array.isArray(job.log_tail) ? job.log_tail.slice(-500).join("\n") : ""));
   const logToggle = renderIconButton({ title: scriptModalState.view === "logs" ? "Show Scripts" : "View Logs", action: "toggleRunScriptLogView()", icon: scriptModalState.view === "logs" ? "chevron-left" : "terminal", className: "benchmark-run-toggle run-script-log-toggle" });
-  const scriptControls = `<div class="benchmark-actions"><label class="script-internal-toggle"><input type="checkbox" ${scriptModalState.showInternal ? "checked" : ""} onchange="setRunScriptsInternalVisible(this.checked)" />Display internal backend scripts</label></div>`;
+  const scriptControls = `<div class="benchmark-actions"><label class="script-internal-toggle"><input type="checkbox" ${scriptModalState.showInternal ? "checked" : ""} onchange="setRunScriptsInternalVisible(this.checked)" />Display internal backend scripts</label>${logToggle}</div>`;
   const scriptsView = `${validationCards}<div class="run-script-grid resource-manager-grid">${cards}</div>${internalSection}`;
   const isReportJob = String(selectedJob?.script_id || "").includes("report") || String(selectedJob?.command || "").includes("report.sh");
   const reportActionsHtml = isReportJob
     ? `<div class="run-script-report-actions"><a class="btn primary-btn run-script-report-btn" href="/admin/scripts/report?download=1" target="_blank" rel="noopener">${svgIcon("download")} Download my-rig.md</a><button type="button" class="btn secondary-btn run-script-report-btn" onclick="copyLatestRigReport()">${svgIcon("copy")} Copy Report</button></div>`
     : "";
   const logsView = `<div class="run-script-selected-log"><div class="resource-manager-card-head"><div class="run-script-log-title-row"><h3>${escapeHtml(selectedJob?.label || selectedJob?.script_id || "Script Log")}</h3>${reportActionsHtml}</div><span class="run-script-status-label">${escapeHtml(selectedJob?.status || "idle")}</span></div><pre class="benchmark-log-tail run-script-log-viewer" tabindex="0">${renderAnsiHtml(selectedLog || (scriptModalState.logLoadingJob === selectedJobId ? "Loading script log..." : "No script log entries yet."))}</pre></div>`;
-  const queueCard = `<section class="run-script-queue-card resource-manager-card"><div class="resource-manager-card-head"><div><h3>Script Queue</h3><div class="preset-help">${escapeHtml(queueSummary)}</div></div><span class="benchmark-ready-controls run-script-ready-controls">${logToggle}</span></div><div class="run-script-queue">${queueRows}</div></section>`;
-  const htmlContent = `<div class="msg" id="runScriptMsg"></div>${queueCard}<div class="preset-help">${locked ? "Scripts cannot be run during a Model Scores benchmark, but discovery and logs remain available." : "Scripts run sequentially against the selected scope when a runtime is available."}</div>${scriptControls}${scriptModalState.view === "logs" ? logsView : scriptsView}`;
+  const htmlContent = `<div class="msg" id="runScriptMsg"></div><div class="preset-help">${locked ? "Scripts cannot be run during a Model Scores benchmark, but discovery and logs remain available." : "Scripts run sequentially against the selected scope when a runtime is available."}</div>${scriptControls}${scriptModalState.view === "logs" ? logsView : scriptsView}`;
   for (const target of targets) {
     target.innerHTML = htmlContent;
     const nextLogViewer = target.querySelector(".run-script-log-viewer");
@@ -5205,6 +5225,7 @@ function activateTab(name, firstRender = false) {
     }
     if (!lastStatus?.runtime_inventory) refreshStatus({ force: true }).catch(() => {});
   }
+  if (activeTabName === "scripts") renderScriptsQueueTab();
   if (activeTabName === "benchmarks") {
     benchmarkMiniHidden = false;
     renderBenchmarksPage();
@@ -5586,6 +5607,7 @@ function renderStatusUi(j, previousStatus = null, options = {}) {
     }, renderErrors);
   }
   renderStatusSurface("benchmark surfaces", [j.benchmarks, j.instances], () => renderBenchmarkSurfaces(), renderErrors);
+  safeRenderStep("script queue", () => renderScriptsQueueTab(), renderErrors);
   if (activeTabName === "chat") {
     renderStatusSurface("chat", [
       j.instances, j.running_runtimes, j.instance_runtime_metrics, j.presets,
@@ -9681,9 +9703,21 @@ function aiStudioModelTypeCount(type) {
   return aiStudioLaneCountLabel(lanes);
 }
 function aiStudioTextModelCount() {
-  const models = inventoryModels();
-  const installed = models.filter((model) => model?.installed_state === "ready").length;
-  return `${installed} / ${models.length}`;
+  const ids = new Set();
+  const ready = new Set();
+  for (const model of inventoryModels()) {
+    const id = String(model?.model_id || "").trim();
+    if (!id) continue;
+    ids.add(id);
+    if (model?.installed_state === "ready") ready.add(id);
+  }
+  for (const variant of inventoryVariants()) {
+    const id = String(variant?.model_id || "").trim();
+    if (!id) continue;
+    ids.add(id);
+    if (variant?.install_state === "ready") ready.add(id);
+  }
+  return `${[...ready].filter((id) => ids.has(id)).length} / ${ids.size}`;
 }
 function selectAIStudioModelType(type) {
   const nextType = String(type || "").trim().toLowerCase();

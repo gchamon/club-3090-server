@@ -2103,29 +2103,147 @@ def terminate_script_process(process):
             pass
 
 
-def remove_script_job(job_id=""):
+def _script_job_ids(job_ids):
+    if isinstance(job_ids, (str, bytes)):
+        job_ids = [job_ids]
+    return {str(job_id or "").strip() for job_id in (job_ids or []) if str(job_id or "").strip()}
+
+
+def cancel_script_jobs(job_ids):
     global script_process
+    wanted = _script_job_ids(job_ids)
     process = None
     with script_job_lock:
         state = read_script_job_state()
-        wanted = str(job_id or state.get("job_id") or "").strip()
-        queue = list(state.get("queue") or [])
-        target = next((dict(row) for row in queue if str((row or {}).get("job_id") or "") == wanted), {})
-        if not target:
+        queue = [dict(row) for row in (state.get("queue") or [])]
+        live_ids = {str(row.get("job_id") or "") for row in queue}
+        targets = wanted & live_ids
+        if not targets:
             return script_job_snapshot()
-        running = str(target.get("status") or "") in {"running", "cancelling"}
-        queue = [row for row in queue if str((row or {}).get("job_id") or "") != wanted]
+        running_id = next(
+            (str(row.get("job_id") or "") for row in queue if str(row.get("status") or "") == "running"),
+            "",
+        )
+        changed = False
+        for index, row in enumerate(queue):
+            job_id = str(row.get("job_id") or "")
+            status = str(row.get("status") or "")
+            if job_id not in targets or status not in {"queued", "running", "cancelling"}:
+                continue
+            row = dict(row)
+            if status == "queued":
+                row.update({
+                    "status": "cancelled",
+                    "summary": f"{row.get('label') or 'Script'} cancelled",
+                    "finished_at": benchmark_utc_now(),
+                    "return_code": 130,
+                })
+            elif job_id == running_id:
+                row["status"] = "cancelling"
+                row["summary"] = f"{row.get('label') or 'Script'} cancelling"
+                process = script_process
+            queue[index] = row
+            changed = True
+        if changed:
+            state["queue"] = queue
+            current = next((row for row in queue if str(row.get("job_id") or "") == str(state.get("job_id") or "")), {})
+            if current:
+                state = script_state_mirror_job(state, current)
+                state["queue"] = queue
+            write_script_job_state(state)
+    if process is not None:
+        terminate_script_process(process)
+    ensure_script_queue_worker()
+    return script_job_snapshot()
+
+
+def retry_script_jobs(job_ids):
+    wanted = _script_job_ids(job_ids)
+    with script_job_lock:
+        state = read_script_job_state()
+        queue = [dict(row) for row in (state.get("queue") or [])]
+        existing_ids = {str(row.get("job_id") or "") for row in queue}
+        sources = [row for row in queue if str(row.get("job_id") or "") in wanted and str(row.get("status") or "") in {"success", "failed", "cancelled"}]
+        if not sources:
+            return script_job_snapshot()
+        copies = []
+        for source in sources:
+            source_id = str(source.get("job_id") or "")
+            token = _selector_token(source_id)
+            base_id = time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + f"-{time.time_ns() % 1000000:06d}-{token}"
+            job_id = base_id
+            suffix = 1
+            while job_id in existing_ids:
+                job_id = f"{base_id}-{suffix}"
+                suffix += 1
+            existing_ids.add(job_id)
+            job = dict(source)
+            job.update({
+                "job_id": job_id,
+                "status": "queued",
+                "summary": f"{source.get('label') or 'Script'} queued",
+                "queued_at": benchmark_utc_now(),
+                "started_at": "",
+                "finished_at": "",
+                "return_code": None,
+                "log_file": os.path.join(SCRIPT_RUNS_DIR, job_id, "script.log"),
+                "log_tail": [],
+                "retry_of": source_id,
+            })
+            for key in ("process_id", "process_group_id", "progress"):
+                job.pop(key, None)
+            copies.append(job)
+        queue.extend(copies)
+        state["queue"] = queue[-50:]
+        if not state.get("job_id") or str(state.get("status") or "") in {"success", "failed", "cancelled"}:
+            state = script_state_mirror_job(state, copies[-1])
+        write_script_job_state(state)
+    ensure_script_queue_worker()
+    return script_job_snapshot()
+
+
+def reorder_script_jobs(job_ids, position):
+    position = str(position or "")
+    if position not in {"front", "end"}:
+        raise ValueError("position must be 'front' or 'end'")
+    wanted = _script_job_ids(job_ids)
+    with script_job_lock:
+        state = read_script_job_state()
+        queue = [dict(row) for row in (state.get("queue") or [])]
+        moving = [row for row in queue if str(row.get("job_id") or "") in wanted and str(row.get("status") or "") == "queued"]
+        if not moving:
+            return script_job_snapshot()
+        moving_ids = {str(row.get("job_id") or "") for row in moving}
+        remaining = [row for row in queue if str(row.get("job_id") or "") not in moving_ids]
+        state["queue"] = moving + remaining if position == "front" else remaining + moving
+        write_script_job_state(state)
+    return script_job_snapshot()
+
+
+def remove_script_jobs(job_ids):
+    global script_process
+    wanted = _script_job_ids(job_ids)
+    process = None
+    with script_job_lock:
+        state = read_script_job_state()
+        queue = [dict(row) for row in (state.get("queue") or [])]
+        targets = {str(row.get("job_id") or "") for row in queue} & wanted
+        if not targets:
+            return script_job_snapshot()
+        removed = [row for row in queue if str(row.get("job_id") or "") in targets]
+        running = next((row for row in removed if str(row.get("status") or "") in {"running", "cancelling"}), {})
+        queue = [row for row in queue if str(row.get("job_id") or "") not in targets]
         state["queue"] = queue
         if running:
             state.update({
                 "active": False,
                 "status": "cancelled",
-                "summary": f"{target.get('label') or 'Script'} cancelled",
+                "summary": f"{running.get('label') or 'Script'} cancelled",
                 "finished_at": benchmark_utc_now(),
                 "return_code": 130,
             })
             process = script_process
-        elif str(state.get("job_id") or "") == wanted:
+        elif str(state.get("job_id") or "") in targets:
             replacement = next((dict(row) for row in reversed(queue)), {})
             state = script_state_mirror_job(state, replacement) if replacement else default_script_job_state()
             state["queue"] = queue
@@ -2136,8 +2254,16 @@ def remove_script_job(job_id=""):
     return script_job_snapshot()
 
 
+def remove_script_job(job_id=""):
+    wanted = str(job_id or "").strip()
+    if not wanted:
+        with script_job_lock:
+            wanted = str(read_script_job_state().get("job_id") or "").strip()
+    return remove_script_jobs([wanted] if wanted else [])
+
+
 def cancel_script_job(job_id=""):
-    return remove_script_job(job_id)
+    return cancel_script_jobs([job_id] if job_id else [])
 
 
 def recover_script_queue():

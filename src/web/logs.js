@@ -1053,8 +1053,12 @@ function logStreamConfig() {
     return { signature: "debug", url: "/admin/debug-stream?tail=4000" };
   if (currentLogSource === "benchmarks")
     return { signature: "benchmarks", url: "/admin/logs?source=benchmarks&tail=4000" };
-  if (currentLogSource === "script")
-    return { signature: `script:${lastStatus?.script_job?.job_id || "latest"}`, url: "/admin/logs?source=script&tail=4000" };
+  if (currentLogSource === "script") {
+    const selectedId = String(selectedScriptLogJobId || "");
+    const streamId = selectedId || lastStatus?.script_job?.job_id || "latest";
+    const url = `/admin/logs?source=script&tail=4000${selectedId ? `&job_id=${encodeURIComponent(selectedId)}` : ""}`;
+    return { signature: `script:${streamId}`, url };
+  }
   if (String(currentLogSource || "").startsWith("service:")) {
     const serviceId = String(currentLogSource).split(":", 2)[1] || "";
     return {
@@ -1702,7 +1706,7 @@ connectLogs = function (force = false) {
     scheduleLogStreamReconnect(5000);
   };
 };
-setCurrentLogSource = function (source) {
+setCurrentLogSource = function (source, options = {}) {
   const nextSource =
     source === "audit" ||
     source === "debug" ||
@@ -1715,6 +1719,8 @@ setCurrentLogSource = function (source) {
     String(source || "").startsWith("service:")
       ? String(source)
       : "docker";
+  if (nextSource === "script") selectedScriptLogJobId = String(options.scriptJobId || "");
+  else selectedScriptLogJobId = "";
   if (selfUpdateActive(lastStatus) && nextSource !== "update") return;
   currentLogSource = nextSource;
   noteKnownLogSource(currentLogSource);
@@ -1761,15 +1767,16 @@ function focusBenchmarkLogs() {
   if (currentLogSource !== "benchmarks") setCurrentLogSource("benchmarks");
   activateTab("logs", true);
 }
-function focusScriptLogs() {
+function focusScriptLogs(jobId = "") {
   if (typeof closeRunScriptModal === "function") closeRunScriptModal();
-  if (currentLogSource !== "script") setCurrentLogSource("script");
+  selectedScriptLogJobId = String(jobId || "");
+  setCurrentLogSource("script", { scriptJobId: selectedScriptLogJobId });
   activateTab("logs", true);
   if (typeof loadRunScripts === "function") loadRunScripts().catch(() => {});
   if (typeof renderScriptRunnerUi === "function") renderScriptRunnerUi();
   setTimeout(() => {
-    const wrap = $("scriptControlsWrap") || $("logCard");
-    if (wrap) wrap.scrollIntoView({ behavior: "smooth", block: "start" });
+    const card = $("logCard");
+    if (card) card.scrollIntoView({ behavior: "smooth", block: "start" });
   }, 50);
 }
 function clearActiveLogJump() {

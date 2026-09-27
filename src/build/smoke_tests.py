@@ -3321,15 +3321,48 @@ process.on("uncaughtException", (error) => {{
   if (!publicScriptHtml.includes("script-info-btn") || !publicScriptHtml.includes("More Info") || !publicScriptHtml.includes("View Logs")) {{
     throw new Error("Run Scripts modal should render an info icon and icon-only log toggle");
   }}
-  if (!publicScriptHtml.includes("Script Queue") || !publicScriptHtml.includes('data-script-job-id="script-a"') || !publicScriptHtml.includes('data-script-job-id="script-b"') || !publicScriptHtml.includes("Enqueue")) {{
-    throw new Error("Run Scripts modal should render active and pending scripts in a sequential queue");
+  if (publicScriptHtml.includes("Script Queue") || publicScriptHtml.includes('data-script-job-id="script-a"')) {{
+    throw new Error("Script queue management must not be duplicated in the Scripts modal or Logs source");
   }}
-  if (!publicScriptHtml.includes("Progress 50%") || !publicScriptHtml.includes("Progress 0%") || !publicScriptHtml.includes("run-script-queue-progress")) {{
-    throw new Error("Run Scripts queue entries should retain visible per-job progress labels");
+  vm.runInContext("activeTabName = 'scripts'; renderScriptsQueueTab();", context);
+  const scriptsPageHtml = String(getElement("scriptsQueuePanel").innerHTML || "");
+  if (!scriptsPageHtml.includes("Script Queue") || !scriptsPageHtml.includes("Inspect") ||
+      !scriptsPageHtml.includes("View logs") || !scriptsPageHtml.includes("Select all") ||
+      !scriptsPageHtml.includes("Cancel selected") || !scriptsPageHtml.includes("Retry selected") ||
+      !scriptsPageHtml.includes("Move to front") || !scriptsPageHtml.includes("Move to end") ||
+      !scriptsPageHtml.includes("Remove selected")) {{
+    throw new Error("Scripts tab must render inspection, selection, and full queue-management controls");
   }}
-  if (!publicScriptHtml.includes("View Bench Logs") || !publicScriptHtml.includes("View Quality Test Logs") || !publicScriptHtml.includes("Terminate and Remove Bench") || !publicScriptHtml.includes("Remove Quality Test")) {{
-    throw new Error("Run Scripts queue entries should expose distinct log and removal controls");
+  vm.runInContext("setScriptQueueSelection('script-b', true); lastStatus = {{ ...__scriptStatus, script_job: {{ ...__scriptStatus.script_job, queue: [...__scriptStatus.script_job.queue, {{ job_id: 'script-c', script_id: 'done.sh', label: 'Done', status: 'success', command: 'bash /club/done.sh' }}] }} }}; renderScriptsQueueTab();", context);
+  if (!String(getElement("scriptsQueuePanel").innerHTML || "").includes('aria-label="Select Quality Test" checked')) {{
+    throw new Error("Scripts queue selection should persist through status projection rerender");
   }}
+  const queueMutationCalls = [];
+  context.post = async (url, body) => {{
+    queueMutationCalls.push({{ url, body }});
+    return {{ ok: true, script_job: __scriptStatus.script_job }};
+  }};
+  vm.runInContext("scriptQueueSelection.add('script-c');", context);
+  await vm.runInContext("mutateScriptQueue('/admin/scripts/retry')", context);
+  if (queueMutationCalls.length !== 1 || queueMutationCalls[0].url !== "/admin/scripts/retry" ||
+      JSON.stringify(queueMutationCalls[0].body) !== JSON.stringify({{ job_ids: ["script-c"] }})) {{
+    throw new Error("Retry selected should post only terminal selected job IDs to the exact endpoint");
+  }}
+  vm.runInContext("focusScriptLogs = (id = '') => {{ selectedScriptLogJobId = id; currentLogSource = 'script'; activeTabName = 'logs'; }}; showQueuedScriptLog('script-c');", context);
+  const selectedStreamData = JSON.parse(vm.runInContext("JSON.stringify([activeTabName,currentLogSource,logStreamConfig()])", context));
+  if (selectedStreamData[0] !== "logs" || selectedStreamData[1] !== "script" ||
+      selectedStreamData[2].signature !== "script:script-c" ||
+      !selectedStreamData[2].url.includes("source=script") ||
+      !selectedStreamData[2].url.includes("tail=4000") ||
+      !selectedStreamData[2].url.includes("job_id=script-c")) {{
+    throw new Error("Opening a queue job should select that job's Script log stream");
+  }}
+  vm.runInContext("focusScriptLogs();", context);
+  const latestStream = JSON.parse(vm.runInContext("JSON.stringify(logStreamConfig())", context));
+  if (latestStream.signature !== "script:script-a" || latestStream.url.includes("job_id=")) {{
+    throw new Error("Normal Script source should clear a specific selected job and return to latest/current");
+  }}
+  vm.runInContext("scriptModalState.selectedJobId = 'script-a'; scriptModalState.logByJob['script-a'] = 'script output line';", context);
   vm.runInContext("toggleRunScriptLogView();", context);
   const scriptLogHtml = String(getElement("runScriptBody").innerHTML || "");
   if (!scriptLogHtml.includes("run-script-log-viewer") || !scriptLogHtml.includes("script output line") || !scriptLogHtml.includes("Show Scripts") || scriptLogHtml.includes("script-args-row")) {{
@@ -5976,8 +6009,8 @@ def generate_test_html_artifact() -> tuple[str, str]:
     if (
         "function aiStudioTextModelCount()" not in js_source
         or 'model?.installed_state === "ready"' not in js_source
-        or "return `${installed} / ${models.length}`;" not in js_source
-        or '["text", "Text Models"]' not in js_source
+        or 'variant?.install_state === "ready"' not in js_source
+        or "return `${[...ready].filter((id) => ids.has(id)).length} / ${ids.size}`;" not in js_source
         or 'const rows = aiStudioResourceRows();' not in js_source
         or 'id="aiStudioContent" class="logs panel ai-studio-model-surface"' not in html_source
         or 'id="aiStudioResourceView"' not in html_source
@@ -6331,13 +6364,14 @@ process.on("uncaughtException", (error) => {{
     {{ model_id: "ready-fixture", installed_state: "ready" }},
     {{ model_id: "partial-fixture", installed_state: "partial" }},
     {{ model_id: "missing-fixture", installed_state: "missing" }},
-  ], variants: [] }}, models: [
+  ], variants: [{{ model_id: "partial-fixture", install_state: "ready" }}] }}, models: [
     {{ model_id: "ready-fixture", installed_state: "ready" }},
     {{ model_id: "partial-fixture", installed_state: "partial" }},
     {{ model_id: "missing-fixture", installed_state: "missing" }},
-  ] }});
+  ], variants: [{{ model_id: "partial-fixture", install_state: "ready" }}] }});
   window.activateTab("ai-studio");
   await new Promise((resolve) => setTimeout(resolve, 50));
+  if (window.aiStudioTextModelCount() !== "2 / 3") throw new Error("Text Models availability should count ready variants within partial families");
   const modelTypeButtons = Array.from(window.document.querySelectorAll(".ai-studio-model-type"));
   if (modelTypeButtons.length !== 5) throw new Error("AI Studio should expose five model-type controls");
   const sharedAiStudioSection = window.document.getElementById("aiStudioContent");
@@ -6369,6 +6403,7 @@ process.on("uncaughtException", (error) => {{
       resourceView.querySelector(".ai-studio-lane-image")) {{
     throw new Error("Text Models must switch the inner view without replacing the shared AI Studio section");
   }}
+  if (window.aiStudioTextModelCount() !== "2 / 3") throw new Error("Text Models count changed after switching to Text Models");
   window.renderStatusUi({{ metrics: {{ active_requests: 1 }}, presets: policyFixture.presets }});
   if (window.document.querySelector('.ai-studio-model-type[aria-pressed="true"]')?.textContent.includes("Text Models") !== true) {{
     throw new Error("status rerender should retain the selected Text Models type");
@@ -6386,6 +6421,10 @@ process.on("uncaughtException", (error) => {{
   if (tabs.length < 3) throw new Error("top-level tabs did not render");
   const logsButton = tabs.find((button) => /logs/i.test(button.textContent || ""));
   if (!logsButton) throw new Error("logs tab button was not found");
+  const scriptsButton = tabs.find((button) => /scripts/i.test(button.textContent || ""));
+  if (!scriptsButton || tabs.indexOf(scriptsButton) + 1 !== tabs.indexOf(logsButton)) {{
+    throw new Error("Scripts tab must immediately precede Logs");
+  }}
   logsButton.click();
   const chatButton = window.document.getElementById("chatLaunchBtn");
   if (!chatButton) throw new Error("chat launcher button missing");
@@ -7781,6 +7820,65 @@ try:
         image_start_row["job_id"],
         image_stop_row["job_id"],
     ], after_queued_remove
+    queue_fixture = [
+        {"job_id": "queue-running", "status": "running", "label": "Running", "log_file": str(temp_root / "queue-running.log"), "command": "echo running", "context": {}},
+        {"job_id": "queue-a", "status": "queued", "label": "Queued A", "log_file": str(temp_root / "queue-a.log"), "command": "echo a", "context": {}},
+        {"job_id": "queue-success", "status": "success", "label": "Succeeded", "script_id": "ai-studio", "log_file": str(temp_root / "queue-success.log"), "command": "echo success", "context": {"mode": "fixture", "instance_id": "GLOBAL"}},
+        {"job_id": "queue-b", "status": "queued", "label": "Queued B", "log_file": str(temp_root / "queue-b.log"), "command": "echo b", "context": {}},
+        {"job_id": "queue-failed", "status": "failed", "label": "Failed", "log_file": str(temp_root / "queue-failed.log"), "command": "echo failed", "context": {}},
+        {"job_id": "queue-cancelled", "status": "cancelled", "label": "Cancelled", "log_file": str(temp_root / "queue-cancelled.log"), "command": "echo cancelled", "context": {}},
+        {"job_id": "queue-c", "status": "queued", "label": "Queued C", "log_file": str(temp_root / "queue-c.log"), "command": "echo c", "context": {}},
+    ]
+    pathlib.Path(queue_fixture[1]["log_file"]).write_text("queued output retained\\n", encoding="utf-8")
+    module.write_script_job_state({
+        "active": True, "job_id": "queue-running", "status": "running", "label": "Running",
+        "log_file": queue_fixture[0]["log_file"], "queue": queue_fixture,
+    })
+    original_terminate_script_process = module.terminate_script_process
+    terminated_processes = []
+    class FixtureScriptProcess:
+        pass
+    fixture_process = FixtureScriptProcess()
+    module.script_process = fixture_process
+    module.terminate_script_process = lambda process: terminated_processes.append(process)
+    original_ensure_script_queue_worker = module.ensure_script_queue_worker
+    worker_start_requests = []
+    module.ensure_script_queue_worker = lambda: worker_start_requests.append(True)
+    try:
+        cancelled_queue = module.cancel_script_jobs(["queue-running", "queue-a"])
+        cancelled_rows = {row["job_id"]: row for row in cancelled_queue["queue"]}
+        assert cancelled_rows["queue-running"]["status"] == "cancelling", cancelled_rows
+        assert cancelled_rows["queue-a"]["status"] == "cancelled" and cancelled_rows["queue-a"]["log_file"] == queue_fixture[1]["log_file"], cancelled_rows
+        assert "queued output retained" in module.script_log_snapshot("queue-a")["text"]
+        assert terminated_processes == [fixture_process], terminated_processes
+        retried_queue = module.retry_script_jobs(["queue-success", "queue-failed", "queue-cancelled"])
+        retries = [row for row in retried_queue["queue"] if row.get("retry_of")]
+        assert [row["retry_of"] for row in retries] == ["queue-success", "queue-failed", "queue-cancelled"], retries
+        assert all(row["status"] == "queued" and row["command"] == f"echo {row['retry_of'].removeprefix('queue-')}" and not row["started_at"] and not row["finished_at"] and row["return_code"] is None and not row["log_tail"] for row in retries), retries
+        assert retries[0]["context"] == queue_fixture[2]["context"] and retries[0]["script_id"] == "ai-studio", retries[0]
+        assert all(row["job_id"] != row["retry_of"] and row["log_file"] != next(source["log_file"] for source in queue_fixture if source["job_id"] == row["retry_of"]) for row in retries), retries
+        moved_front = module.reorder_script_jobs(["queue-c", "queue-b"], "front")
+        assert [row["job_id"] for row in moved_front["queue"][:2]] == ["queue-b", "queue-c"], moved_front["queue"]
+        assert [row["job_id"] for row in moved_front["queue"][2:]] == ["queue-running", "queue-a", "queue-success", "queue-failed", "queue-cancelled"] + [row["job_id"] for row in retries], moved_front["queue"]
+        moved_end = module.reorder_script_jobs(["queue-b", "queue-c"], "end")
+        assert [row["job_id"] for row in moved_end["queue"][-2:]] == ["queue-b", "queue-c"], moved_end["queue"]
+        try:
+            module.reorder_script_jobs(["queue-b"], "middle")
+            raise AssertionError("invalid script queue position should be rejected")
+        except ValueError:
+            pass
+        removed_queue = module.remove_script_jobs(["queue-running", "queue-b", "not-in-queue"])
+        assert len(worker_start_requests) == 3, worker_start_requests
+        removed_ids = [row["job_id"] for row in removed_queue["queue"]]
+        assert "queue-running" not in removed_ids and "queue-b" not in removed_ids and "queue-a" in removed_ids, removed_queue["queue"]
+        assert terminated_processes == [fixture_process, fixture_process], terminated_processes
+        persisted_queue = module.read_script_job_state()["queue"]
+        assert [row["job_id"] for row in persisted_queue] == removed_ids, persisted_queue
+        assert next(row for row in persisted_queue if row["job_id"] == "queue-a")["status"] == "cancelled", persisted_queue
+    finally:
+        module.terminate_script_process = original_terminate_script_process
+        module.ensure_script_queue_worker = original_ensure_script_queue_worker
+        module.script_process = None
     stale_script_log = str(temp_root / "script-runs" / "stale-download" / "script.log")
     module.write_script_job_state({
         "active": False,

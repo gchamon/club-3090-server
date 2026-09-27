@@ -1127,7 +1127,28 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
         if path == "/admin/scripts/cancel":
             try:
                 data = self.read_json_body()
-                self.send_json({"ok": True, "script_job": cancel_script_job(data.get("job_id") or ""), "focus_log_source": "script"})
+                self.send_json({"ok": True, "script_job": cancel_script_jobs(data.get("job_ids") or []), "focus_log_source": "script"})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path == "/admin/scripts/retry":
+            try:
+                data = self.read_json_body()
+                self.send_json({"ok": True, "script_job": retry_script_jobs(data.get("job_ids") or []), "focus_log_source": "script"})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path == "/admin/scripts/reorder":
+            try:
+                data = self.read_json_body()
+                self.send_json({"ok": True, "script_job": reorder_script_jobs(data.get("job_ids") or [], data.get("position")), "focus_log_source": "script"})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path == "/admin/scripts/bulk-remove":
+            try:
+                data = self.read_json_body()
+                self.send_json({"ok": True, "script_job": remove_script_jobs(data.get("job_ids") or []), "focus_log_source": "script"})
             except Exception as e:
                 self.send_json({"ok": False, "error": str(e)}, 500)
             return

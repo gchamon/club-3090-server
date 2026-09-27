@@ -36,6 +36,7 @@
         ><button class="tab" data-tab="users" id="usersTabBtn" onclick="tab(event, 'users')">
           Users</button
         ><button class="tab" data-tab="metrics" onclick="tab(event, 'metrics')">Metrics</button
+        ><button class="tab" data-tab="scripts" onclick="tab(event, 'scripts')">Scripts</button
         ><button class="tab" data-tab="logs" onclick="tab(event, 'logs')">Logs</button>
       </div>
     </header>
@@ -752,6 +753,9 @@
             </div>
           </div>
         </div>
+      </section>
+      <section id="scripts" class="tabpane content-tab">
+        <div id="scriptsQueuePanel"></div>
       </section>
       <section id="logs" class="tabpane"></section>
       <section class="panel logtools">

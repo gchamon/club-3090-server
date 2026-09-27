@@ -21,6 +21,7 @@ let showGlobalLogs = true;
 let showGlobalLogSources =
   window.showGlobalLogSources || (window.showGlobalLogSources = Object.create(null));
 let currentLogSource = "docker";
+let selectedScriptLogJobId = "";
 const knownLogSources = new Set(["docker", "audit", "debug", "benchmarks", "script"]);
 window.logPopupStates = window.logPopupStates || Object.create(null);
 var LOG_POPUP_WIDTH = 980;

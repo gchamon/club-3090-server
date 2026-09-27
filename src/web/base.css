@@ -3453,113 +3453,6 @@ details[open] > summary .score-collapse-cue::before {
 .run-script-internal-card {
   margin-top: 10px;
 }
-.run-script-modal-card .run-script-queue-card {
-  margin: 3px 0 5px;
-  padding: 6px 8px;
-  gap: 2px;
-}
-.run-script-queue-card .resource-manager-card-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 6px;
-}
-.run-script-queue-card .resource-manager-card-head > div {
-  display: grid;
-  gap: 2px;
-}
-.run-script-queue-card h3,
-.run-script-queue-card .preset-help {
-  margin: 0;
-}
-.run-script-queue {
-  display: grid;
-  gap: 3px;
-  max-height: 190px;
-  overflow: auto;
-  margin-top: 1px;
-}
-.run-script-queue-row {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 6px;
-  border: 1px solid #26364c;
-  border-radius: 8px;
-  background: #0b121c;
-}
-.run-script-queue-row.running {
-  border-color: #f2a33a;
-}
-.run-script-queue-row.success {
-  border-color: #2c8a54;
-}
-.run-script-queue-row.failed,
-.run-script-queue-row.cancelled {
-  border-color: #8d2f46;
-}
-.run-script-queue-row.focused {
-  box-shadow: 0 0 0 2px rgba(77, 215, 199, 0.28);
-}
-.run-script-queue-main {
-  display: grid;
-  min-width: 0;
-  gap: 0;
-}
-.run-script-queue-main strong,
-.run-script-queue-main code,
-.run-script-queue-main span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.run-script-queue-main span {
-  color: #9fb3c8;
-  font-size: 11px;
-}
-.run-script-queue-progress {
-  display: grid;
-  grid-template-columns: minmax(50px, 120px) auto;
-  align-items: center;
-  gap: 6px;
-  margin-top: 1px;
-}
-.run-script-queue-progress::before {
-  content: "";
-  grid-column: 1;
-  grid-row: 1;
-  height: 4px;
-  border-radius: 999px;
-  background: #172435;
-}
-.run-script-queue-progress i {
-  grid-column: 1;
-  grid-row: 1;
-  display: block;
-  height: 4px;
-  border-radius: 999px;
-  background: linear-gradient(90deg, #72c7ff, #7bd88f);
-  z-index: 1;
-}
-.run-script-queue-progress span {
-  grid-column: 2;
-  grid-row: 1;
-  font-size: 10px;
-  font-weight: 800;
-  white-space: nowrap;
-}
-.run-script-queue-actions {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-.run-script-queue-actions .iconbtn {
-  width: 30px;
-  min-width: 30px;
-  height: 30px;
-  padding: 0;
-}
 .run-script-selected-log {
   margin-top: 10px;
 }
@@ -8483,4 +8376,64 @@ details[open] > summary .score-collapse-cue::before {
     max-width: min(92vw, 360px);
     width: 100%;
   }
+}
+.scripts-queue-panel {
+  display: grid;
+  gap: 12px;
+}
+.script-queue-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.script-queue-list {
+  display: grid;
+  gap: 8px;
+}
+.script-queue-item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid #26364c;
+  border-radius: 9px;
+  background: #0b121c;
+}
+.script-queue-item.running { border-color: #f2a33a; }
+.script-queue-item.success { border-color: #2c8a54; }
+.script-queue-item.failed,
+.script-queue-item.cancelled { border-color: #8d2f46; }
+.script-queue-item:focus-within { outline: 2px solid rgba(77, 215, 199, .65); outline-offset: 1px; }
+.script-queue-main { display: grid; gap: 7px; min-width: 0; overflow-wrap: anywhere; }
+.script-queue-main small { color: var(--muted, #aab6c5); }
+.script-queue-progress {
+  position: relative;
+  height: 18px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #172435;
+}
+.script-queue-progress span {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, #72c7ff, #7bd88f);
+}
+.script-queue-progress b {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-size: 11px;
+}
+.script-queue-check { padding-top: 3px; }
+.script-queue-inspect summary { cursor: pointer; width: fit-content; }
+.script-queue-inspect dl { display: grid; grid-template-columns: minmax(90px, auto) minmax(0, 1fr); gap: 5px 10px; }
+.script-queue-inspect dt { font-weight: 700; }
+.script-queue-inspect dd { margin: 0; overflow-wrap: anywhere; }
+@media (max-width: 720px) {
+  .script-queue-item { grid-template-columns: auto minmax(0, 1fr); }
+  .script-queue-item > .btn { grid-column: 2; justify-self: start; }
+  .script-queue-toolbar { align-items: stretch; }
 }
