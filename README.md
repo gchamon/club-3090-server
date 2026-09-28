@@ -144,7 +144,7 @@ In other words, log in with the same account you would normally use for `sudo` o
 
 After logging in, open the `Presets` tab.
 
-You will see discovered model presets from the local `club-3090` checkout. Some presets may show that downloads are still required.
+The Presets tab combines discovered variants from the local `club-3090` checkout with control-owned catalog entries, including experimental Qwen 3.8 27B llama.cpp presets. Model-family tabs are searchable and keep the three most recently selected families first across sessions. Some presets may show that downloads are still required.
 
 Presets blocked by the detected GPU hardware are hidden by default. Use **Show hardware blocked presets** beside **Show hidden presets** to reveal them; the choice is saved in this browser.
 
@@ -278,14 +278,16 @@ The script reads `/etc/os-release` and installs the right package names for the 
 
 ## Supported Runtime Presets
 
-As of `v0.5`, the server no longer ships a hardcoded preset catalog. Instead it scans the local upstream repo under `/opt/ai/club-3090`, parses compose headers and compose files directly, and builds `/opt/club3090-control/runtime_inventory.json`.
+As of `v0.5`, the server builds `/opt/club3090-control/runtime_inventory.json` by scanning the local upstream repo under `/opt/ai/club-3090`, parsing compose headers and files, then merging control-owned catalog additions and user-managed custom models. Catalog overlays stay in the server-management layer; the upstream checkout remains unmodified.
 
-That means the Presets tab now reflects whatever models and variants exist in the checked-out upstream repo, including:
+That means the Presets tab reflects runtime variants from the checked-out upstream repo and the server-owned catalog, including:
 
 - single-GPU presets
 - dual-GPU presets
 - multi-GPU presets
-- experimental or caveat-marked upstream variants
+- experimental or caveat-marked variants
+
+The server currently includes experimental Qwen 3.8 27B llama.cpp vision/MTP options for OrcaRouter and HauhauCS Aggressive IQ4_XS GGUFs. Both require matching projector files; the OrcaRouter Hugging Face repository is gated and requires an authenticated account with access.
 
 Upstream switch tags such as `vllm/default`, `vllm/dual`, `vllm/gemma-mtp`, and `llamacpp/default` are still recognized when present, but the control layer can also launch compose variants that are only discoverable by scanning the repo tree.
 

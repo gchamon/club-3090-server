@@ -245,7 +245,7 @@
             </div>
             <div class="preset-toolbar-utilities">
               <button type="button" class="btn hidden-presets-trigger" id="hiddenPresetsToggle" aria-pressed="false" onclick="toggleHiddenPresetsVisibility()">Show hidden presets</button>
-              <button type="button" class="btn hidden-presets-trigger" id="hardwareBlockedPresetsToggle" aria-pressed="false" onclick="toggleHardwareBlockedPresetsVisibility()">Show hardware blocked presets</button>
+              <button type="button" class="btn hidden-presets-trigger state-hardware_blocked" id="hardwareBlockedPresetsToggle" aria-pressed="false" onclick="toggleHardwareBlockedPresetsVisibility()">Show hardware blocked presets</button>
               <button type="button" class="preset-toolbar-icon-button preset-filter-button" title="Filter presets" aria-label="Filter presets" onclick="openPresetFilterModal()"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16l-6.2 7.1v5.4l-3.6 1.8v-7.2L4 5Z" fill="none" /></svg></button>
             </div>
           </div>
@@ -254,7 +254,11 @@
           <div class="subtabs" id="presetScopeTabs"></div>
           <div class="value smallgap" id="presetScopeSummary">-</div>
           <div class="preset-section-label">Models</div>
-          <div class="subtabs" id="presetModelSelector"></div>
+          <div class="preset-model-family-picker" id="presetModelFamilyPicker">
+            <label class="preset-model-search-label" for="presetModelSearch">Search model families<input id="presetModelSearch" type="search" autocomplete="off" oninput="setPresetModelSearch(this.value)" /></label>
+            <div class="subtabs" id="presetModelSelector"></div>
+            <div class="preset-family-search-empty hidden" id="presetFamilySearchEmpty">No model families match this search.</div>
+          </div>
           <div class="value smallgap" id="presetJobSummary">-</div>
           <div id="modelPresetGrid" class="model-grid"></div>
         </div>

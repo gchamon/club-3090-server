@@ -62,6 +62,7 @@ TEST_HTML_PATH = ARTIFACTS_DIR / "web-ui.test.html"
 HIGHLIGHT_SUPPORTED_LANGUAGES_PATH = ROOT / "node_modules" / "highlight.js" / "SUPPORTED_LANGUAGES.md"
 CONTROL_SOURCE_ORDER = [
     "shared.py",
+    "qwen38_catalog.py",
     "chat.py",
     "runtime_inventory.py",
     "services_config.py",

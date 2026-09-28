@@ -204,6 +204,42 @@ header {
 .subtabs {
   margin-bottom: 10px;
 }
+.preset-model-family-picker {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.preset-model-family-picker .subtabs {
+  margin-bottom: 0;
+}
+.preset-model-search-label {
+  display: grid;
+  gap: 5px;
+  max-width: 360px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+.preset-model-search-label input {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 36px;
+  border: 1px solid #34445a;
+  border-radius: 8px;
+  background: var(--field);
+  color: var(--text);
+  padding: 7px 10px;
+  font: inherit;
+  font-weight: 400;
+}
+.preset-model-search-label input:focus-visible {
+  outline: 2px solid rgba(114, 199, 255, 0.65);
+  outline-offset: 1px;
+}
+.preset-family-search-empty {
+  color: var(--muted);
+  font-size: 12px;
+}
 .metrics-controls {
   display: flex;
   align-items: center;
@@ -4426,6 +4462,13 @@ details[open] > summary .score-collapse-cue::before {
 }
 .status-hardware_blocked,
 .state-hardware_blocked {
+  background: #463114;
+  border-color: #d7b15e;
+  color: #fff0cf;
+}
+.hidden-presets-trigger.state-hardware_blocked,
+.hidden-presets-trigger.state-hardware_blocked.active,
+.hidden-presets-trigger.state-hardware_blocked:hover {
   background: #463114;
   border-color: #d7b15e;
   color: #fff0cf;

@@ -5885,6 +5885,33 @@ var showHiddenPresets = false;
 try { showHiddenPresets = localStorage.getItem("club3090_show_hidden_presets") === "1"; } catch (e) {}
 var showHardwareBlockedPresets = false;
 try { showHardwareBlockedPresets = localStorage.getItem("club3090_show_hardware_blocked_presets") === "1"; } catch (e) {}
+var presetModelFamilySearch = "";
+var recentPresetModelFamiliesKey = "club3090_recent_model_families";
+var legacyRecentPresetModelFamilyKey = "club3090_recent_model_family";
+function readRecentPresetModelFamilies() {
+  let recent = [];
+  try {
+    const saved = JSON.parse(localStorage.getItem(recentPresetModelFamiliesKey) || "[]");
+    if (Array.isArray(saved)) recent = saved;
+    else if (saved) recent = [saved];
+  } catch (e) {}
+  if (!recent.length) {
+    try {
+      const legacy = String(localStorage.getItem(legacyRecentPresetModelFamilyKey) || "").trim();
+      if (legacy) recent = [legacy];
+    } catch (e) {}
+  }
+  return [...new Set(recent.map((id) => String(id || "").trim()).filter(Boolean))].slice(0, 3);
+}
+function rememberPresetModelFamily(modelId) {
+  const id = String(modelId || "").trim();
+  if (!id || !inventoryModels().some((model) => String(model.model_id || "") === id)) return;
+  const recent = [id, ...readRecentPresetModelFamilies().filter((item) => item !== id)].slice(0, 3);
+  try {
+    localStorage.setItem(recentPresetModelFamiliesKey, JSON.stringify(recent));
+    localStorage.removeItem(legacyRecentPresetModelFamilyKey);
+  } catch (e) {}
+}
 var toggleHiddenPresetsVisibility = function() {
   showHiddenPresets = !showHiddenPresets;
   try { localStorage.setItem("club3090_show_hidden_presets", showHiddenPresets ? "1" : "0"); } catch (e) {}
@@ -6062,8 +6089,8 @@ function hydrateSelectedPresetModel() {
       : valid.has(cached)
         ? cached
         : "";
+    rememberPresetModelFamily(selectedPresetModelId);
     selectedPresetModelHydrated = true;
-    return;
   }
   if (!selectedPresetModelId) return;
   if (selectedPresetModelId && valid.has(selectedPresetModelId)) return;
@@ -6071,9 +6098,7 @@ function hydrateSelectedPresetModel() {
 }
 function selectPresetModel(modelId = "") {
   selectedPresetModelId = String(modelId || "").trim();
-  if (selectedPresetModelId && inventoryModels().some((model) => String(model.model_id || "") === selectedPresetModelId)) {
-    try { localStorage.setItem("club3090_recent_model_family", selectedPresetModelId); } catch (e) {}
-  }
+  rememberPresetModelFamily(selectedPresetModelId);
   selectedPresetModelHydrated = true;
   try {
     localStorage.setItem(SELECTED_PRESET_MODEL_CACHE_KEY, selectedPresetModelId);
@@ -6083,25 +6108,45 @@ function selectPresetModel(modelId = "") {
   renderModelInstallStatus();
   saveSelectedPresetModel(selectedPresetModelId);
 }
+function setPresetModelSearch(search = "") {
+  presetModelFamilySearch = String(search || "");
+  renderPresetModelSelector();
+}
 function renderPresetModelSelector() {
   const host = $("presetModelSelector");
-  if (!host) return;
+  const picker = $("presetModelFamilyPicker");
+  const search = $("presetModelSearch");
+  const empty = $("presetFamilySearchEmpty");
+  if (!host || !picker) return;
   const models = inventoryModels();
   if (!models.length) {
-    host.classList.add("hidden");
+    picker.classList.add("hidden");
     host.innerHTML = "";
+    if (search) search.value = "";
+    if (empty) empty.classList.add("hidden");
+    presetModelFamilySearch = "";
     return;
   }
-  host.classList.remove("hidden");
-  let recent = "";
-  try { recent = String(localStorage.getItem("club3090_recent_model_family") || ""); } catch (e) {}
-  const sorted = [...models].sort((a, b) => {
-    const aId = String(a.model_id || "");
-    const bId = String(b.model_id || "");
-    if (aId === recent) return -1;
-    if (bId === recent) return 1;
-    return String(a.display_name || aId).localeCompare(String(b.display_name || bId), undefined, { sensitivity: "base" });
-  });
+  picker.classList.remove("hidden");
+  if (search && search.value !== presetModelFamilySearch) search.value = presetModelFamilySearch;
+  const validIds = new Set(models.map((model) => String(model.model_id || "")));
+  const recent = readRecentPresetModelFamilies().filter((id) => validIds.has(id));
+  const recentOrder = new Map(recent.map((id, index) => [id, index]));
+  const query = presetModelFamilySearch.trim().toLowerCase();
+  const sorted = [...models]
+    .filter((model) => {
+      const id = String(model.model_id || "");
+      const name = String(model.display_name || id);
+      return !query || `${name} ${id}`.toLowerCase().includes(query);
+    })
+    .sort((a, b) => {
+      const aId = String(a.model_id || "");
+      const bId = String(b.model_id || "");
+      const aRecent = recentOrder.has(aId) ? recentOrder.get(aId) : Infinity;
+      const bRecent = recentOrder.has(bId) ? recentOrder.get(bId) : Infinity;
+      if (aRecent !== bRecent) return aRecent - bRecent;
+      return String(a.display_name || aId).localeCompare(String(b.display_name || bId), undefined, { sensitivity: "base" });
+    });
   const renderModelButton = (model) => {
     const modelId = String(model.model_id || "");
     return `<button class="subtab ${modelId === selectedPresetModelId ? "active" : ""}" onclick="selectPresetModel('${escapeJs(modelId)}')">${escapeHtml(model.display_name || modelId)}</button>`;
@@ -6111,6 +6156,7 @@ function renderPresetModelSelector() {
     ...sorted.map(renderModelButton),
   ];
   setHtmlIfChanged(host, parts.join(""));
+  if (empty) empty.classList.toggle("hidden", !query || sorted.length > 0);
 }
 function defaultPresetFilterState() {
   return {
@@ -6271,7 +6317,7 @@ function renderPresetHeaderActions() {
   setHtmlIfChanged(host, renderPresetHeadActionsHtml());
 }
 function renderPresetHeadActionsHtml() {
-  return `<div class="preset-toolbar-main"><button type="button" class="btn blue" onclick="openSetupAssistantModal()">Setup Assistant</button><button type="button" class="btn blue" onclick="promptRuntimeInventoryRebuild()">Rebuild Model DB</button><button type="button" class="btn green" onclick="openCustomModelModal()">Add custom model</button></div><div class="preset-toolbar-utilities"><button type="button" class="btn hidden-presets-trigger${showHiddenPresets ? " active" : ""}" id="hiddenPresetsToggle" aria-pressed="${showHiddenPresets}" onclick="toggleHiddenPresetsVisibility()">${showHiddenPresets ? "Hide hidden presets" : "Show hidden presets"}</button><button type="button" class="btn hidden-presets-trigger${showHardwareBlockedPresets ? " active" : ""}" id="hardwareBlockedPresetsToggle" aria-pressed="${showHardwareBlockedPresets}" onclick="toggleHardwareBlockedPresetsVisibility()">${showHardwareBlockedPresets ? "Hide hardware blocked presets" : "Show hardware blocked presets"}</button><button type="button" class="preset-toolbar-icon-button preset-filter-button${presetFilterIsActive() ? " active" : ""}" title="Filter presets" aria-label="Filter presets" onclick="openPresetFilterModal()">${svgIcon("filter")}</button></div>`;
+  return `<div class="preset-toolbar-main"><button type="button" class="btn blue" onclick="openSetupAssistantModal()">Setup Assistant</button><button type="button" class="btn blue" onclick="promptRuntimeInventoryRebuild()">Rebuild Model DB</button><button type="button" class="btn green" onclick="openCustomModelModal()">Add custom model</button></div><div class="preset-toolbar-utilities"><button type="button" class="btn hidden-presets-trigger${showHiddenPresets ? " active" : ""}" id="hiddenPresetsToggle" aria-pressed="${showHiddenPresets}" onclick="toggleHiddenPresetsVisibility()">${showHiddenPresets ? "Hide hidden presets" : "Show hidden presets"}</button><button type="button" class="btn hidden-presets-trigger state-hardware_blocked${showHardwareBlockedPresets ? " active" : ""}" id="hardwareBlockedPresetsToggle" aria-pressed="${showHardwareBlockedPresets}" onclick="toggleHardwareBlockedPresetsVisibility()">${showHardwareBlockedPresets ? "Hide hardware blocked presets" : "Show hardware blocked presets"}</button><button type="button" class="preset-toolbar-icon-button preset-filter-button${presetFilterIsActive() ? " active" : ""}" title="Filter presets" aria-label="Filter presets" onclick="openPresetFilterModal()">${svgIcon("filter")}</button></div>`;
 }
 function customModelTriggerContent(label = "Custom Model") {
   return `<span class="custom-model-trigger-content"><span class="custom-model-trigger-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><circle cx="12" cy="12" r="11"></circle><path d="M12 7v10M7 12h10"></path></svg></span><span class="custom-model-trigger-label">${escapeHtml(label)}</span></span>`;

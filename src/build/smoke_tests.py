@@ -5,6 +5,7 @@ import secrets
 import subprocess
 import sys
 import tempfile
+import shutil
 from pathlib import Path
 
 import build_support as support
@@ -1785,6 +1786,10 @@ process.on("uncaughtException", (error) => {{
       models: [
         {{ model_id: "qwen3.6-27b", display_name: "Qwen3.6-27B", installed_state: "ready" }},
         {{ model_id: "custom-fixture", display_name: "Fixture Custom", installed_state: "ready", source_kind: "custom", custom_model: true }},
+        {{ model_id: "family-alpha", display_name: "Alpha Family", installed_state: "ready" }},
+        {{ model_id: "family-gamma", display_name: "Gamma Family", installed_state: "ready" }},
+        {{ model_id: "family-delta", display_name: "Delta Family", installed_state: "ready" }},
+        {{ model_id: "family-epsilon", display_name: "Epsilon Family", installed_state: "ready" }},
       ],
       variants: [],
       profile_likes: [{{ key: "vllm/minimal", model_id: "qwen3.6-27b", model_display_name: "Qwen3.6-27B", tp: 1 }}],
@@ -1792,11 +1797,15 @@ process.on("uncaughtException", (error) => {{
     models: [
       {{ model_id: "qwen3.6-27b", display_name: "Qwen3.6-27B", installed_state: "ready" }},
       {{ model_id: "custom-fixture", display_name: "Fixture Custom", installed_state: "ready", source_kind: "custom", custom_model: true }},
+      {{ model_id: "family-alpha", display_name: "Alpha Family", installed_state: "ready" }},
+      {{ model_id: "family-gamma", display_name: "Gamma Family", installed_state: "ready" }},
+      {{ model_id: "family-delta", display_name: "Delta Family", installed_state: "ready" }},
+      {{ model_id: "family-epsilon", display_name: "Epsilon Family", installed_state: "ready" }},
     ],
     variants: [],
   }};
   context.__selectorStatus = selectorStatus;
-  vm.runInContext("localStorage.setItem('club3090_recent_model_family', 'custom-fixture'); lastStatus = __selectorStatus; ensureDynamicPresetLayout(); renderPresetModelSelector();", context);
+  vm.runInContext("localStorage.removeItem('club3090_recent_model_families'); localStorage.setItem('club3090_recent_model_family', 'custom-fixture'); lastStatus = __selectorStatus; selectedPresetModelId = ''; ensureDynamicPresetLayout(); renderPresetModelSelector();", context);
   const selectorHtml = String(getElement("presetModelSelector").innerHTML || "");
   if (!selectorHtml.includes("Fixture Custom")) {{
     throw new Error("preset model selector should render custom model tabs");
@@ -1807,6 +1816,32 @@ process.on("uncaughtException", (error) => {{
   if (!selectorHtml.includes("Fixture Custom") || !selectorHtml.includes("Qwen3.6-27B")) {{
     throw new Error("preset model selector should retain both fixture model families");
   }}
+  vm.runInContext("__testRenderDynamicPresetModels = renderDynamicPresetModels; __testRenderModelInstallStatus = renderModelInstallStatus; __testSaveSelectedPresetModel = saveSelectedPresetModel; renderDynamicPresetModels = function() {{}}; renderModelInstallStatus = function() {{}}; saveSelectedPresetModel = function() {{}}; selectPresetModel('family-gamma'); selectPresetModel('family-alpha'); selectPresetModel('family-delta'); selectPresetModel('family-gamma');", context);
+  const recentFamilies = JSON.parse(vm.runInContext("localStorage.getItem('club3090_recent_model_families')", context) || "[]");
+  if (JSON.stringify(recentFamilies) !== JSON.stringify(["family-gamma", "family-delta", "family-alpha"])) {{
+    throw new Error("selecting model families should move them to the front of a unique three-family history");
+  }}
+  const recentSelectorHtml = String(getElement("presetModelSelector").innerHTML || "");
+  const gammaPosition = recentSelectorHtml.indexOf("Gamma Family");
+  const deltaPosition = recentSelectorHtml.indexOf("Delta Family");
+  const alphaPosition = recentSelectorHtml.indexOf("Alpha Family");
+  const epsilonPosition = recentSelectorHtml.indexOf("Epsilon Family");
+  if (!(gammaPosition >= 0 && gammaPosition < deltaPosition && deltaPosition < alphaPosition && alphaPosition < epsilonPosition)) {{
+    throw new Error("recent model families should precede the remaining alphabetical families");
+  }}
+  vm.runInContext("setPresetModelSearch('FAMILY-DELTA')", context);
+  const filteredSelectorHtml = String(getElement("presetModelSelector").innerHTML || "");
+  if (!filteredSelectorHtml.includes("Delta Family") || filteredSelectorHtml.includes("Gamma Family") ||
+      vm.runInContext("selectedPresetModelId", context) !== "family-gamma") {{
+    throw new Error("family search should match model IDs case-insensitively without changing the hidden active family");
+  }}
+  vm.runInContext("setPresetModelSearch('no-such-family')", context);
+  const noMatchSelectorHtml = String(getElement("presetModelSelector").innerHTML || "");
+  if (!noMatchSelectorHtml.includes("Summary") || noMatchSelectorHtml.includes(" Family") ||
+      vm.runInContext("selectedPresetModelId", context) !== "family-gamma") {{
+    throw new Error("no-match family search should preserve the active family and summary tab");
+  }}
+  vm.runInContext("setPresetModelSearch(''); renderDynamicPresetModels = __testRenderDynamicPresetModels; renderModelInstallStatus = __testRenderModelInstallStatus; saveSelectedPresetModel = __testSaveSelectedPresetModel; localStorage.removeItem('club3090_recent_model_families'); localStorage.removeItem('club3090_recent_model_family');", context);
   const presetToolbarHtml = String(vm.runInContext("renderPresetHeadActionsHtml()", context) || "");
   for (const marker of ["Setup Assistant", "Rebuild Model DB", "Add custom model", "Show hidden presets", "Show hardware blocked presets", "openPresetFilterModal()", "toggleHiddenPresetsVisibility()", "toggleHardwareBlockedPresetsVisibility()"] ) {{
     if (!presetToolbarHtml.includes(marker)) throw new Error("Text models toolbar is missing " + marker);
@@ -12823,6 +12858,8 @@ control_path = pathlib.Path(sys.argv[1])
 spec = importlib.util.spec_from_file_location("club3090_control_remote_update_smoke", control_path)
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
+module.REMOTE_UPDATE_REF = "refs/heads/master"
+module.REMOTE_UPDATE_BRANCH = "master"
 
 module.SCRIPT_VERSION = "2026-05-31.v0.9.12"
 commit_sha = "3d1fb7cd41c39c568c7eff0c7afd63087fb7aabc"
@@ -13380,6 +13417,38 @@ try:
     assert iq4ks_command.startswith("hf download ubergarm/Qwen3.6-27B-GGUF "), iq4ks_command
     assert "bash scripts/setup.sh" not in iq4ks_command, iq4ks_command
     assert str(iq4ks.get("engine_display") or "") == "ik-llama", iq4ks
+    qwen38_rows = [
+        by_tag.get("llamacpp/qwen38-27b-single-iq4xs"),
+        by_tag.get("llamacpp/qwen38-27b-hauhaucs-aggressive-single-iq4xs"),
+    ]
+    assert all(qwen38_rows), qwen38_rows
+    assert [row["weights_variant"] for row in qwen38_rows] == ["orcarouter-uncensored-iq4xs", "hauhaucs-aggressive-iq4xs"], qwen38_rows
+    partial_row = dict(qwen38_rows[0])
+    with tempfile.TemporaryDirectory(prefix="qwen38-partial-assets-") as partial_root:
+        partial_model_name = str(partial_row["model_path"]).rsplit("/", 1)[-1]
+        partial_model_path = partial_root.rstrip("/") + "/" + partial_model_name
+        open(partial_model_path, "wb").close()
+        original_host_dir = str(partial_row.get("host_model_dir") or "")
+        partial_row["host_model_dir"] = partial_root
+        partial_row["install_command"] = str(partial_row["install_command"]).replace(original_host_dir, partial_root)
+        partial_state = module._detect_variant_install_state(partial_row, partial_root)
+        assert partial_state["install_state"] == "requires_download", partial_state
+    for row in qwen38_rows:
+        assert row["inventory_origin"] == "control_catalog", row
+        assert all(item.get("selector") != row["selector"] for item in inventory.get("custom_models") or []), inventory.get("custom_models")
+        assert row["model_id"] == "qwen3.8-27b" and row["model_display_name"] == "Qwen 3.8 27B", row
+        assert row["status_kind"] == "experimental" and row["engine"] == "llamacpp", row
+        assert row["drafter"] == "qwen-mtp-builtin" and row["kv_format"] == "q4_0" and row["vision"], row
+        assert row["requires_min_vram_gb"] == 20 and row["max_model_len"] == 65536 and row["requires_min_gpu_count"] == 1, row
+        assert row["install_command"].startswith("hf download ") and " --local-dir " in row["install_command"], row
+        compose_path = pathlib.Path(row["compose_abs_path"])
+        compose_text = compose_path.read_text(encoding="utf-8")
+        assert str(pathlib.Path(row["host_model_dir"]).parents[1]) in compose_text and "--mmproj /models/" in compose_text, compose_text
+        assert "--spec-type draft-mtp" in compose_text and "--spec-draft-n-max ${MTP_DRAFT_N_MAX:-2}" in compose_text, compose_text
+        assert "${CTX_SIZE:-65536}" in compose_text and "capabilities: [compute, utility]" in compose_text, compose_text
+    qwen38_model = next(model for model in inventory["models"] if model["model_id"] == "qwen3.8-27b")
+    assert qwen38_model["display_name"] == "Qwen 3.8 27B" and qwen38_model["source_kind"] == "curated", qwen38_model
+    assert qwen38_model["profile"]["family"] == "qwen35-dense" and qwen38_model["profile"]["num_gdn_layers"] == 48, qwen38_model
     duplicate_source_variant = {
         "selector": "ik-llama/source",
         "engine": "ik-llama",
