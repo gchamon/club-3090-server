@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import shutil
+import os
 from pathlib import Path
 
 import build_support as support
@@ -1894,6 +1895,65 @@ process.on("uncaughtException", (error) => {{
     throw new Error("hiding hardware-blocked presets should leave explicitly shown hidden presets visible");
   }}
   vm.runInContext("showHiddenPresets = false; showHardwareBlockedPresets = false; selectedPresetModelId = __priorSelectedPresetModelId; lastStatus = __selectorStatus; renderDynamicPresetModels({{ force: true }}); localStorage.removeItem('club3090_show_hidden_presets'); localStorage.removeItem('club3090_show_hardware_blocked_presets');", context);
+  const gatedAccessVariant = {{
+    variant_id: "qwen38-orca-fixture",
+    upstream_tag: "llamacpp/qwen38-27b-single-iq4xs",
+    model_id: "qwen3.8-27b",
+    model_display_name: "Qwen 3.8 27B",
+    display_name: "OrcaRouter Uncensored IQ4_XS",
+    source_kind: "custom",
+    custom_preset: true,
+    engine: "llamacpp",
+    engine_display: "llama.cpp",
+    topology: "single",
+    install_state: "requires_download",
+    status_kind: "experimental",
+    requires_hf_approval: true,
+    install_command: "hf download orcarouter/Qwen3.8-27B-Uncensored-GGUF model.gguf mmproj.gguf --local-dir /tmp/qwen-orca",
+    install_reason: "This gated repository requires an authenticated account that accepted its access terms.",
+  }};
+  const publicAccessVariant = {{
+    ...gatedAccessVariant,
+    variant_id: "qwen38-hauhaucs-fixture",
+    upstream_tag: "llamacpp/qwen38-27b-hauhaucs-aggressive-single-iq4xs",
+    display_name: "HauhauCS Aggressive IQ4_XS",
+    requires_hf_approval: false,
+    install_command: "hf download HauhauCS/public-repo model.gguf mmproj.gguf --local-dir /tmp/qwen-hauhaucs",
+    install_reason: "Public HauhauCS files.",
+  }};
+  context.__gatedAccessVariant = gatedAccessVariant;
+  context.__publicAccessVariant = publicAccessVariant;
+  vm.runInContext("lastStatus = __selectorStatus; selectedPresetModelId = 'qwen3.8-27b';", context);
+  const gatedPresetCard = String(vm.runInContext("renderVariantCard(__gatedAccessVariant)", context) || "");
+  const publicPresetCard = String(vm.runInContext("renderVariantCard(__publicAccessVariant)", context) || "");
+  const approvalBadgeTitle = "Accept this Hugging Face repository's access terms with the authenticated download account before downloading.";
+  if ((gatedPresetCard.match(/HF approval required/g) || []).length !== 1 ||
+      !gatedPresetCard.includes('class="status-badge status-upstream_gated"') ||
+      !gatedPresetCard.includes(`title="${{approvalBadgeTitle}}"`)) {{
+    throw new Error("gated preset cards must show one HF approval badge with the authenticated-account requirement");
+  }}
+  if (publicPresetCard.includes("HF approval required")) {{
+    throw new Error("public Qwen presets must not show the HF approval badge");
+  }}
+  if (!gatedPresetCard.includes("promptModelInstallById('qwen38-orca-fixture')") ||
+      !gatedPresetCard.includes("orcarouter/Qwen3.8-27B-Uncensored-GGUF")) {{
+    throw new Error("gated preset card must keep its original manual Download action and source");
+  }}
+  vm.runInContext("promptModelInstall(__gatedAccessVariant)", context);
+  if (getElement("presetActionModalDetail").value !== gatedAccessVariant.install_command ||
+      !getElement("presetActionModalBody").innerHTML.includes(gatedAccessVariant.install_reason)) {{
+    throw new Error("manual Download confirmation must preserve the original command and explain its access gate");
+  }}
+  vm.runInContext("closePresetActionModal();", context);
+  context.__accessRecommendations = [{{ variant: gatedAccessVariant }}, {{ variant: publicAccessVariant }}];
+  vm.runInContext("setupAssistantRecommendations = function() {{ return __accessRecommendations; }}; openSetupAssistantModal();", context);
+  const assistantAccessHtml = String(getElement("setupAssistantRecommendations").innerHTML || "");
+  if ((assistantAccessHtml.match(/HF approval required/g) || []).length !== 1 ||
+      !assistantAccessHtml.includes(`title="${{approvalBadgeTitle}}"`) ||
+      !assistantAccessHtml.includes("OrcaRouter Uncensored IQ4_XS") ||
+      !assistantAccessHtml.includes("HauhauCS Aggressive IQ4_XS")) {{
+    throw new Error("Setup Assistant should show approval only for the gated recommendation while retaining both choices: " + assistantAccessHtml);
+  }}
   const presetStatus = {{
     ...statusPayload,
     gpu_count: 2,
@@ -13407,6 +13467,7 @@ try:
 
     llama_cpp = by_tag["llamacpp/mtp"]
     assert llama_cpp["compose_rel_path"].endswith("models/qwen3.6-27b/llama-cpp/compose/single/unsloth-q4km/mtp.yml"), llama_cpp
+    assert llama_cpp["install_on_bootstrap"] is True and llama_cpp["requires_hf_approval"] is False, llama_cpp
     llama_cpp_command = str(llama_cpp.get("install_command") or "")
     assert llama_cpp_command.startswith("hf download unsloth/Qwen3.6-27B-MTP-GGUF "), llama_cpp_command
     assert "bash scripts/setup.sh" not in llama_cpp_command, llama_cpp_command
@@ -13423,6 +13484,8 @@ try:
     ]
     assert all(qwen38_rows), qwen38_rows
     assert [row["weights_variant"] for row in qwen38_rows] == ["orcarouter-uncensored-iq4xs", "hauhaucs-aggressive-iq4xs"], qwen38_rows
+    assert [row["install_on_bootstrap"] for row in qwen38_rows] == [False, False], qwen38_rows
+    assert [row["requires_hf_approval"] for row in qwen38_rows] == [True, False], qwen38_rows
     partial_row = dict(qwen38_rows[0])
     with tempfile.TemporaryDirectory(prefix="qwen38-partial-assets-") as partial_root:
         partial_model_name = str(partial_row["model_path"]).rsplit("/", 1)[-1]
@@ -13446,6 +13509,24 @@ try:
         assert str(pathlib.Path(row["host_model_dir"]).parents[1]) in compose_text and "--mmproj /models/" in compose_text, compose_text
         assert "--spec-type draft-mtp" in compose_text and "--spec-draft-n-max ${MTP_DRAFT_N_MAX:-2}" in compose_text, compose_text
         assert "${CTX_SIZE:-65536}" in compose_text and "capabilities: [compute, utility]" in compose_text, compose_text
+    captured_manual_threads = []
+    class NoStartThread:
+        def __init__(self, *args, **kwargs):
+            self.kwargs = kwargs
+        def start(self):
+            captured_manual_threads.append(self.kwargs)
+    original_thread = module.threading.Thread
+    module.threading.Thread = NoStartThread
+    try:
+        manual_job = module.start_model_install_job(
+            qwen38_rows[0]["model_id"],
+            qwen38_rows[0]["variant_id"],
+            qwen38_rows[0]["install_command"],
+        )
+    finally:
+        module.threading.Thread = original_thread
+    assert manual_job["status"] == "queued" and manual_job["command"] == qwen38_rows[0]["install_command"], manual_job
+    assert len(captured_manual_threads) == 1 and captured_manual_threads[0]["args"][3] == qwen38_rows[0]["install_command"], captured_manual_threads
     qwen38_model = next(model for model in inventory["models"] if model["model_id"] == "qwen3.8-27b")
     assert qwen38_model["display_name"] == "Qwen 3.8 27B" and qwen38_model["source_kind"] == "curated", qwen38_model
     assert qwen38_model["profile"]["family"] == "qwen35-dense" and qwen38_model["profile"]["num_gdn_layers"] == 48, qwen38_model
@@ -15302,3 +15383,57 @@ def run_ui_smoke_test(js_text: str, cwd: Path, filename: str) -> tuple[bool, str
         pass
     detail = (result.stderr or result.stdout or "").strip()
     return result.returncode == 0, detail
+
+def run_installer_setup_opt_in_smoke_test(script_text: str, cwd: Path) -> tuple[bool, str]:
+    heredoc_marker = "<<'PYSETUPCMDS'\n"
+    if script_text.count(heredoc_marker) != 1:
+        return False, "Expected exactly one installer setup-command collector heredoc."
+    collector_source = script_text.split(heredoc_marker, 1)[1].split("\nPYSETUPCMDS", 1)[0]
+    with tempfile.TemporaryDirectory(prefix="club3090-installer-opt-in-") as temp_dir:
+        control_dir = Path(temp_dir) / "control"
+        control_dir.mkdir()
+        qwen_selector = "llamacpp/qwen38-27b-single-iq4xs"
+        normal_selector = "llamacpp/default"
+        inventory = {
+            "variants": [
+                {
+                    "variant_id": "opt-in-qwen",
+                    "upstream_tag": qwen_selector,
+                    "install_state": "requires_download",
+                    "install_on_bootstrap": False,
+                    "install_command": "hf download orcarouter/gated-repo private.gguf",
+                },
+                {
+                    "variant_id": "normal-model",
+                    "upstream_tag": normal_selector,
+                    "install_state": "requires_download",
+                    "setup_command": "printf normal-setup",
+                },
+            ],
+        }
+        (control_dir / "runtime_inventory.json").write_text(json.dumps(inventory), encoding="utf-8")
+        (control_dir / "instances.json").write_text(
+            json.dumps([{"enabled": True, "mode": normal_selector}]),
+            encoding="utf-8",
+        )
+        (control_dir / "active_mode").write_text(qwen_selector, encoding="utf-8")
+        (control_dir / "last_good_mode").write_text("", encoding="utf-8")
+        for action in ("install", "migrate"):
+            env = dict(os.environ)
+            env.update({"ACTION": action, "DEFAULT_MODE": qwen_selector})
+            result = subprocess.run(
+                [sys.executable, "-c", collector_source, str(control_dir)],
+                cwd=str(cwd),
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            expected_audit_line = f"{action} setup: skipped opt-in preset {qwen_selector}"
+            if result.returncode != 0:
+                return False, result.stderr.strip() or f"Collector failed for ACTION={action}."
+            if result.stdout.splitlines() != ["printf normal-setup"]:
+                return False, f"ACTION={action} collector emitted unexpected commands: {result.stdout!r}"
+            if expected_audit_line not in result.stderr.splitlines():
+                return False, f"ACTION={action} collector did not report {expected_audit_line!r}: {result.stderr!r}"
+    return True, "Install and migrate collector skipped the opt-in HF download while retaining a normal setup command."

@@ -6561,12 +6561,19 @@ function variantUncensoredBadgeHtml(variant) {
     ? '<span class="status-badge status-uncensored" title="Compliance scoring rewards direct completion for unsafe prompts on this uncensored preset.">Uncensored</span>'
     : "";
 }
+function variantAccessRequirementBadgeHtml(variant) {
+  return variant?.requires_hf_approval === true
+    ? '<span class="status-badge status-upstream_gated" title="Accept this Hugging Face repository\'s access terms with the authenticated download account before downloading.">HF approval required</span>'
+    : "";
+}
 function variantCapabilityBadges(variant) {
   const bits = [];
   const updateBadge = variantModelUpdateBadgeHtml(variant);
   if (updateBadge) bits.push(updateBadge);
   const uncensoredBadge = variantUncensoredBadgeHtml(variant);
   if (uncensoredBadge) bits.push(uncensoredBadge);
+  const accessRequirementBadge = variantAccessRequirementBadgeHtml(variant);
+  if (accessRequirementBadge) bits.push(accessRequirementBadge);
   const nvlinkMode = variantNvlinkMode(variant);
   if (nvlinkMode === "required") {
     bits.push('<span class="status-badge status-nvlink">NVLink</span>');

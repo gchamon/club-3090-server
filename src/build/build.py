@@ -35,6 +35,7 @@ SMOKE_TEST_REGISTRY = [
     (18, "storage_browser_chunk_smoke", "Storage browser chunk smoke"),
     (19, "docker_logrotate_refresh_smoke", "Docker logrotate refresh smoke"),
     (20, "script_validation_suite_smoke", "Script validation suite and power management smoke"),
+    (21, "installer_setup_opt_in_smoke", "Installer setup opt-in exclusion smoke"),
 ]
 SMOKE_TEST_ID_TO_NAME = {str(test_id): name for test_id, name, _label in SMOKE_TEST_REGISTRY}
 SMOKE_TEST_NAME_TO_ID = {name: test_id for test_id, name, _label in SMOKE_TEST_REGISTRY}
@@ -934,6 +935,16 @@ def build_release(
             print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
             return 1
         report.add_test("installer_flow_scan", "passed", "Install/update/migrate flow markers detected")
+
+        if not smoke_test_selector.skip(report, "installer_setup_opt_in_smoke"):
+            flush_build_report(report, "running installer opt-in setup smoke test")
+            opt_in_setup_ok, opt_in_setup_detail = run_installer_setup_opt_in_smoke_test(built_script, temp_dir)
+            if not opt_in_setup_ok:
+                report.add_test("installer_setup_opt_in_smoke", "failed", opt_in_setup_detail or "Installer opt-in setup smoke failed")
+                flush_build_report(report, "build failed: installer opt-in setup smoke")
+                print(json.dumps(report.__dict__, indent=2), file=sys.stderr)
+                return 1
+            report.add_test("installer_setup_opt_in_smoke", "passed", opt_in_setup_detail)
 
         installer_contract_issues = validate_installer_control_contract(built_script, built_control)
         if installer_contract_issues:

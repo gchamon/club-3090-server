@@ -146,6 +146,8 @@ After logging in, open the `Presets` tab.
 
 The Presets tab combines discovered variants from the local `club-3090` checkout with control-owned catalog entries, including experimental Qwen 3.8 27B llama.cpp presets. Model-family tabs are searchable and keep the three most recently selected families first across sessions. Some presets may show that downloads are still required.
 
+Qwen 3.8 presets are opt-in: install and migration setup do not download them automatically. Start either download explicitly from its Presets card. The OrcaRouter card is marked **HF approval required**; its Hugging Face repository access terms must be accepted by the authenticated download account before downloading.
+
 Presets blocked by the detected GPU hardware are hidden by default. Use **Show hardware blocked presets** beside **Show hidden presets** to reveal them; the choice is saved in this browser.
 
 If a preset is not ready:
@@ -287,7 +289,7 @@ That means the Presets tab reflects runtime variants from the checked-out upstre
 - multi-GPU presets
 - experimental or caveat-marked variants
 
-The server currently includes experimental Qwen 3.8 27B llama.cpp vision/MTP options for OrcaRouter and HauhauCS Aggressive IQ4_XS GGUFs. Both require matching projector files; the OrcaRouter Hugging Face repository is gated and requires an authenticated account with access.
+The server currently includes experimental Qwen 3.8 27B llama.cpp vision/MTP options for OrcaRouter and HauhauCS Aggressive IQ4_XS GGUFs. Both require matching projector files and are excluded from automatic install/migration downloads. Start them manually from Presets. OrcaRouter is Hugging Face gated and requires the authenticated download account to have accepted the repository access terms.
 
 Upstream switch tags such as `vllm/default`, `vllm/dual`, `vllm/gemma-mtp`, and `llamacpp/default` are still recognized when present, but the control layer can also launch compose variants that are only discoverable by scanning the repo tree.
 

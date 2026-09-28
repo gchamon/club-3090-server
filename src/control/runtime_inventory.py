@@ -5000,6 +5000,8 @@ def rebuild_runtime_inventory():
 
     def append_variant(variant, force_install_state=None):
         entry = _apply_builtin_launch_setting_defaults(variant)
+        entry["install_on_bootstrap"] = bool(entry.get("install_on_bootstrap", True))
+        entry["requires_hf_approval"] = bool(entry.get("requires_hf_approval", False))
         selector = _mode_selector_for_variant(entry)
         variant_id = str(entry.get("variant_id") or "").strip()
         if not selector and not variant_id:
@@ -5381,6 +5383,8 @@ def rebuild_runtime_inventory():
             "derived_compose_path": compose_abs_path,
             "compat_status": str(row.get("compat_status") or gate_terminal or "").strip(),
             "compat_reason_summary": str(row.get("compat_reason_summary") or "").strip(),
+            "install_on_bootstrap": bool(row.get("install_on_bootstrap", True)),
+            "requires_hf_approval": bool(row.get("requires_hf_approval", False)),
             "install_command": str(row.get("install_command") or "").strip(),
             "install_reason": str(row.get("install_reason") or "").strip(),
             "compose_environment": runtime_meta.get("compose_environment") or [],

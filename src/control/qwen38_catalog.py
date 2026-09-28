@@ -36,6 +36,7 @@ QWEN38_WEIGHT_VARIANTS = (
         "mmproj_size_gb": 0.93,
         "subdir": "qwen3.8-27b-gguf/orcarouter-uncensored-iq4xs",
         "name": "OrcaRouter Uncensored IQ4_XS",
+        "requires_hf_approval": True,
         "caveats": "Experimental third-party GGUF. The Hugging Face repository is gated and requires an authenticated account that accepted its access terms. Publisher behavior and quality are not independently validated.",
     },
     {
@@ -156,6 +157,8 @@ def qwen38_builtin_custom_model_rows():
                 "compose_path": compose_path,
                 "compose_rel_path": f"control-builtin-models/qwen3.8-27b/{variant}/mtp-vision.yml",
                 "host_model_dir": target_dir,
+                "install_on_bootstrap": False,
+                "requires_hf_approval": bool(weight.get("requires_hf_approval", False)),
                 "install_command": _recipe_download_command(model_cache_root, recipe),
                 "install_reason": f"Download both the model and {weight['mmproj_kind'].upper()} vision projector from {weight['repo']} into {target_dir}.",
                 "compose_meta": {"max_model_len": 65536, "kv_format": "q4_0", "max_num_seqs": 1},

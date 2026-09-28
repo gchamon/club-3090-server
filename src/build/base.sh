@@ -1685,7 +1685,7 @@ migrate_custom_presets_cli() {
 }
 
 collect_required_setup_commands() {
-  "${SUDO[@]}" env CLUB3090_DIR="${CLUB3090_DIR}" DEFAULT_MODE="${DEFAULT_MODE}" "${PYTHON_BIN}" - "${CONTROL_DIR}" <<'PYSETUPCMDS'
+  "${SUDO[@]}" env CLUB3090_DIR="${CLUB3090_DIR}" DEFAULT_MODE="${DEFAULT_MODE}" ACTION="${ACTION}" "${PYTHON_BIN}" - "${CONTROL_DIR}" <<'PYSETUPCMDS'
 import json, os, sys
 control_dir = sys.argv[1]
 inventory_path = os.path.join(control_dir, "runtime_inventory.json")
@@ -1722,9 +1722,14 @@ for row in load_json(instances_path, []):
         modes.append(str(row.get("mode")))
 commands = []
 seen = set()
+action = str(os.environ.get("ACTION") or "install").strip()
 for mode in modes:
     variant = lookup.get(str(mode))
     if not variant:
+        continue
+    if variant.get("install_on_bootstrap") is False:
+        selector = str(variant.get("upstream_tag") or variant.get("selector") or mode)
+        print(f"{action} setup: skipped opt-in preset {selector}", file=sys.stderr)
         continue
     if str(variant.get("install_state") or "").strip() == "ready":
         continue
