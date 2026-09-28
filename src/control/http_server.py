@@ -473,6 +473,39 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             payload = read_selected_log_snapshot(source=source, instance_id=instance_id, service_id=service_id, tail_lines=tail_lines, job_id=params.get("job_id") or "")
             self.send_json({"ok": True, **payload})
             return
+        if path == "/admin/logs/archive":
+            archive_name = f"club3090-logs-{time.strftime('%Y%m%d-%H%M%S')}.zip"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".zip", dir=CONTROL_DIR) as handle:
+                archive_path = handle.name
+            try:
+                with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
+                    for root, directories, files in os.walk(CONTROL_DIR, followlinks=False):
+                        directories[:] = sorted(
+                            directory
+                            for directory in directories
+                            if not os.path.islink(os.path.join(root, directory))
+                        )
+                        for file_name in sorted(files):
+                            if not file_name.lower().endswith(".log"):
+                                continue
+                            file_path = os.path.join(root, file_name)
+                            if os.path.islink(file_path) or not os.path.isfile(file_path):
+                                continue
+                            archive.write(file_path, os.path.relpath(file_path, CONTROL_DIR))
+            except Exception as e:
+                try:
+                    os.remove(archive_path)
+                except OSError:
+                    pass
+                self.send_json({"ok": False, "error": str(e)}, 500)
+                return
+            self.send_stream(
+                archive_path,
+                content_type="application/zip",
+                download_name=archive_name,
+                cleanup_path=archive_path,
+            )
+            return
         if path == "/admin/logs":
             params = parse_admin_query_params(parsed)
             if str(params.get("source") or "").strip().lower() == "benchmarks":

@@ -1199,6 +1199,29 @@ async function copyAllScriptLog() {
     if (message) message.textContent = String(error?.message || "Unable to load the full script log.");
   }
 }
+async function copyCurrentLog() {
+  const message = $("logActionMsg");
+  try {
+    const text = String($("log")?.value || "");
+    if (!text) throw new Error("There is no displayed log to copy.");
+    if (!(await copyTextValue(text))) throw new Error("Copy failed on this browser.");
+    if (message) message.textContent = `Copied the displayed ${currentLogHeading()} log.`;
+  } catch (error) {
+    if (message) message.textContent = String(error?.message || "Unable to copy the displayed log.");
+  }
+}
+async function downloadAllLogs() {
+  const message = $("logActionMsg");
+  try {
+    const response = await fetch("/admin/logs/archive", { cache: "no-store" });
+    if (!response.ok) throw new Error((await response.text()) || `Request failed (${response.status})`);
+    const fileName = parseDownloadNameFromHeaders(response.headers.get("Content-Disposition")) || "club3090-logs.zip";
+    triggerBrowserDownload(await response.blob(), fileName);
+    if (message) message.textContent = "Downloaded the log archive.";
+  } catch (error) {
+    if (message) message.textContent = String(error?.message || "Unable to download the log archive.");
+  }
+}
 async function refreshBackgroundLogCaches() {
   const currentSource = String(currentLogSource || "docker");
   const ordered = logViewerVisible()

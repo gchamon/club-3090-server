@@ -6619,6 +6619,59 @@ process.on("uncaughtException", (error) => {{
   if (summary.textContent !== longSummary || summaryStyle.direction !== "rtl" || summaryStyle.textAlign !== "left") {{
     throw new Error("The status summary must preserve the complete title and truncate from the opposite edge");
   }}
+  const modelFamilySearch = window.document.getElementById("presetModelSearch");
+  const modelFamilySearchLabel = modelFamilySearch?.closest(".preset-model-search-label");
+  const modelFamilySearchCaption = modelFamilySearchLabel?.querySelector("span");
+  if (modelFamilySearch?.type !== "search" || modelFamilySearchLabel?.children[0] !== modelFamilySearch ||
+      modelFamilySearchCaption?.textContent !== "Search model families" ||
+      window.getComputedStyle(modelFamilySearchLabel).display !== "flex") {{
+    throw new Error("Model family search must appear inline before its visible label");
+  }}
+  const presetScopeSummary = window.document.getElementById("presetScopeSummary");
+  const pageText = window.document.body.textContent || "";
+  if (!presetScopeSummary || presetScopeSummary.textContent.trim() ||
+      pageText.includes("Discovered presets come from the local") ||
+      pageText.includes("Global scope fans single-GPU presets out")) {{
+    throw new Error("The redundant Presets discovery and global-scope notices must be absent");
+  }}
+  const copyLogButton = window.document.getElementById("copyCurrentLogBtn");
+  const downloadLogsButton = window.document.getElementById("downloadAllLogsBtn");
+  const visibleLog = window.document.getElementById("log");
+  const logRender = window.document.getElementById("logRender");
+  if (!copyLogButton || !downloadLogsButton || !visibleLog || !logRender) {{
+    throw new Error("Logs tab must expose copy and archive actions");
+  }}
+  const copiedLogBefore = "visible log line 1\\nvisible log line 2\\n";
+  visibleLog.value = copiedLogBefore;
+  logRender.scrollTop = 37;
+  let copiedLog = "";
+  const originalCopyTextValue = window.copyTextValue;
+  window.copyTextValue = async (text) => {{ copiedLog = String(text); return true; }};
+  await window.copyCurrentLog();
+  window.copyTextValue = originalCopyTextValue;
+  if (copiedLog !== copiedLogBefore || logRender.scrollTop !== 37 ||
+      !window.document.getElementById("logActionMsg").textContent.includes("Copied the displayed")) {{
+    throw new Error("Copy log must copy the current viewer text without changing its scroll position");
+  }}
+  let archiveUrl = "";
+  let downloadedArchiveName = "";
+  const originalFetchForLogArchive = window.fetch;
+  const originalTriggerBrowserDownload = window.triggerBrowserDownload;
+  window.fetch = async (url) => {{
+    archiveUrl = String(url);
+    return {{
+      ok: true,
+      headers: {{ get: () => 'attachment; filename="club3090-logs-test.zip"' }},
+      blob: async () => new Blob(["zip"]),
+    }};
+  }};
+  window.triggerBrowserDownload = (_blob, fileName) => {{ downloadedArchiveName = fileName; }};
+  await window.downloadAllLogs();
+  window.fetch = originalFetchForLogArchive;
+  window.triggerBrowserDownload = originalTriggerBrowserDownload;
+  if (archiveUrl !== "/admin/logs/archive" || downloadedArchiveName !== "club3090-logs-test.zip") {{
+    throw new Error("Download all logs must fetch the authenticated archive endpoint and honor its filename");
+  }}
   chatButton.click();
   await new Promise((resolve) => setTimeout(resolve, 40));
   const chatPane = window.document.getElementById("chat");

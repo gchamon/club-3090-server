@@ -249,13 +249,12 @@
               <button type="button" class="preset-toolbar-icon-button preset-filter-button" title="Filter presets" aria-label="Filter presets" onclick="openPresetFilterModal()"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16l-6.2 7.1v5.4l-3.6 1.8v-7.2L4 5Z" fill="none" /></svg></button>
             </div>
           </div>
-          <div class="preset-help">Discovered presets come from the local <code>/opt/ai/club-3090</code> clone. Global applies single-GPU presets across every GPU, dual presets across every two-GPU pair, and multi-GPU presets to the shared runtime.</div>
           <div class="preset-section-label">Scope</div>
           <div class="subtabs" id="presetScopeTabs"></div>
-          <div class="value smallgap" id="presetScopeSummary">-</div>
+          <div class="value smallgap" id="presetScopeSummary"></div>
           <div class="preset-section-label">Models</div>
           <div class="preset-model-family-picker" id="presetModelFamilyPicker">
-            <label class="preset-model-search-label" for="presetModelSearch">Search model families<input id="presetModelSearch" type="search" autocomplete="off" oninput="setPresetModelSearch(this.value)" /></label>
+            <label class="preset-model-search-label" for="presetModelSearch"><input id="presetModelSearch" type="search" autocomplete="off" oninput="setPresetModelSearch(this.value)" /><span>Search model families</span></label>
             <div class="subtabs" id="presetModelSelector"></div>
             <div class="preset-family-search-empty hidden" id="presetFamilySearchEmpty">No model families match this search.</div>
           </div>
@@ -825,6 +824,9 @@
               ><input type="checkbox" id="autoscroll" checked />
               auto-scroll</label
             >
+            <button type="button" class="btn" id="copyCurrentLogBtn" onclick="copyCurrentLog()">Copy log</button>
+            <button type="button" class="btn" id="downloadAllLogsBtn" onclick="downloadAllLogs()">Download all logs</button>
+            <span id="logActionMsg" class="script-log-action-msg" role="status" aria-live="polite"></span>
             <span id="scriptLogActions" class="script-log-actions hidden">
               <button type="button" class="btn" onclick="showRawScriptLog()">Show raw log</button>
               <button type="button" class="btn" onclick="copyAllScriptLog()">Copy all logs</button>
