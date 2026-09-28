@@ -14,17 +14,6 @@
           <div class="brand">Club-3090 Server &bull; __SCRIPT_VERSION__</div>
           <div class="header-row">
             <div class="pill" id="summary">loading...</div>
-            <button
-              class="iconbtn header-chat-btn"
-              id="chatLaunchBtn"
-              title="Open chat"
-              aria-label="Open chat"
-              onclick="openChatTab()"
-            >
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M5 18V6h14v9H8l-3 3Zm3-7h8m-8 3h5" fill="none" />
-              </svg>
-            </button>
           </div>
         </div>
       </div>
@@ -38,6 +27,17 @@
         ><button class="tab" data-tab="metrics" onclick="tab(event, 'metrics')">Metrics</button
         ><button class="tab" data-tab="scripts" onclick="tab(event, 'scripts')">Scripts</button
         ><button class="tab" data-tab="logs" onclick="tab(event, 'logs')">Logs</button>
+        <button
+          class="iconbtn header-chat-btn"
+          id="chatLaunchBtn"
+          title="Chat"
+          aria-label="Chat"
+          onclick="openChatTab()"
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M5 18V6h14v9H8l-3 3Zm3-7h8m-8 3h5" fill="none" />
+          </svg>
+        </button>
       </div>
     </header>
     <main class="container">

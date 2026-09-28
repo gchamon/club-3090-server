@@ -5,6 +5,8 @@ function ensureV413Layout() {
   const logsBtn = tabs && tabs.querySelector('.tab[onclick*=\"logs\"]');
   if (auditBtn) auditBtn.remove();
   if (tabs && logsBtn) tabs.appendChild(logsBtn);
+  const chatBtn = tabs && tabs.querySelector("#chatLaunchBtn");
+  if (tabs && chatBtn) tabs.appendChild(chatBtn);
   const system = $("system");
   const logs = $("logs");
   const audit = $("audit");

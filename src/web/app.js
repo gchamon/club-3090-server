@@ -9790,9 +9790,10 @@ function aiStudioTextModelCount() {
   return `${ready} / ${presetStates.size}`;
 }
 function selectAIStudioModelType(type) {
-  const nextType = String(type || "").trim().toLowerCase();
-  if (!["image", "audio", "speech", "video", "text"].includes(nextType)) return;
+  const nextType = normalizeAIStudioModelType(type);
+  if (!nextType) return;
   aiStudioModelType = nextType;
+  persistCurrentTabPosition();
   renderAIStudioTab();
   if (nextType === "text") {
     ensureDynamicPresetLayout();

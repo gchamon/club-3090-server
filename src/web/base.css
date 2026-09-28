@@ -149,6 +149,8 @@ header {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  direction: rtl;
+  text-align: left;
 }
 .admin-disconnected .pill {
   color: #ffdca4;
@@ -181,6 +183,12 @@ header {
   box-shadow:
     inset 0 0 0 1px rgba(150, 217, 255, 0.18),
     0 0 0 1px rgba(114, 199, 255, 0.08);
+}
+.tabs .header-chat-btn {
+  position: sticky;
+  right: 0;
+  z-index: 1;
+  margin-left: auto;
 }
 .header-chat-btn svg {
   width: 18px;

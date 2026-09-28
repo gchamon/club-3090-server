@@ -6562,6 +6562,23 @@ process.on("uncaughtException", (error) => {{
     throw new Error("Text Models must switch the inner view without replacing the shared AI Studio section");
   }}
   if (window.aiStudioTextModelCount() !== "2 / 4") throw new Error("Text Models preset count changed after switching to Text Models");
+  const locationWrites = [];
+  const originalReplaceState = window.history.replaceState.bind(window.history);
+  window.history.replaceState = (_state, _title, url) => locationWrites.push(String(url || ""));
+  window.selectAIStudioModelType("text");
+  window.selectAIStudioModelType("image");
+  window.history.replaceState = originalReplaceState;
+  const savedCategoryUrl = locationWrites
+    .map((url) => new URL(url, "http://localhost"))
+    .find((url) => url.searchParams.get("ui_ai_studio_category") === "text");
+  if (!savedCategoryUrl || !locationWrites.some((url) => new URL(url, "http://localhost").searchParams.get("ui_ai_studio_category") === "image")) {{
+    throw new Error("AI Studio category changes were not persisted to the URL");
+  }}
+  const restoredCategory = window.readUiStateFromLocationSearch("?ui_ai_studio_category=text");
+  if (restoredCategory.ai_studio_model_type !== "text") {{
+    throw new Error("AI Studio category URL state was not restored from the query string");
+  }}
+  window.selectAIStudioModelType("text");
   window.renderStatusUi({{ metrics: {{ active_requests: 1 }}, presets: policyFixture.presets }});
   if (window.document.querySelector('.ai-studio-model-type[aria-pressed="true"]')?.textContent.includes("Text Models") !== true) {{
     throw new Error("status rerender should retain the selected Text Models type");
@@ -6586,6 +6603,22 @@ process.on("uncaughtException", (error) => {{
   logsButton.click();
   const chatButton = window.document.getElementById("chatLaunchBtn");
   if (!chatButton) throw new Error("chat launcher button missing");
+  const nav = chatButton.closest(".tabs");
+  if (chatButton.title !== "Chat" || chatButton.getAttribute("aria-label") !== "Chat" ||
+      !chatButton.querySelector("svg") || !nav || logsButton.nextElementSibling !== chatButton) {{
+    throw new Error("Chat must retain its icon, follow Logs, and expose the Chat title");
+  }}
+  const chatStyle = window.getComputedStyle(chatButton);
+  if (chatStyle.position !== "sticky" || chatStyle.marginLeft !== "auto") {{
+    throw new Error("Chat must stay latched to the right edge of the scrollable tab bar");
+  }}
+  const summary = window.document.getElementById("summary");
+  const longSummary = "GPU0 | llamacpp/qwen38-27b-single-iq4xs | club3090-gpu0-llamacpp-qwen38-27b-single-iq4xs | GPU balanced / CPU performance | GPUs 1";
+  summary.textContent = longSummary;
+  const summaryStyle = window.getComputedStyle(summary);
+  if (summary.textContent !== longSummary || summaryStyle.direction !== "rtl" || summaryStyle.textAlign !== "left") {{
+    throw new Error("The status summary must preserve the complete title and truncate from the opposite edge");
+  }}
   chatButton.click();
   await new Promise((resolve) => setTimeout(resolve, 40));
   const chatPane = window.document.getElementById("chat");

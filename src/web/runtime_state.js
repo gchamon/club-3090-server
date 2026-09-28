@@ -44,13 +44,23 @@ function readUiStateFromLocationHash() {
     return {};
   }
 }
-function readUiStateFromLocationSearch() {
+function normalizeAIStudioModelType(type) {
+  const value = String(type || "").trim().toLowerCase();
+  return ["text", "image", "audio", "speech", "video"].includes(value) ? value : "";
+}
+function readUiStateFromLocationSearch(search) {
   try {
-    const params = new URLSearchParams(window.location.search || "");
+    const locationLike =
+      (typeof window !== "undefined" && window.location) ||
+      (typeof location !== "undefined" ? location : null) ||
+      {};
+    const params = new URLSearchParams(search === undefined ? locationLike.search || "" : search);
     const tab = params.has("ui_tab") ? normalizeTabName(params.get("ui_tab") || "") : "";
     const scroll = Number(params.get("ui_scroll") || "");
+    const modelType = normalizeAIStudioModelType(params.get("ui_ai_studio_category"));
     const state = {};
     if (tab) state.active_tab = tab;
+    if (modelType) state.ai_studio_model_type = modelType;
     if (tab && Number.isFinite(scroll) && scroll > 0) {
       state.tab_scroll_positions = { [tab]: Math.max(0, scroll) };
     }
@@ -88,7 +98,9 @@ function applyLocationUiStateOverride() {
   const state = readUiStateFromLocationNow();
   const rawTab = String(state.active_tab || "").trim();
   const tab = rawTab ? normalizeTabName(rawTab) : "";
+  const modelType = normalizeAIStudioModelType(state.ai_studio_model_type);
   if (tab && tab !== activeTabName) activeTabName = tab;
+  if (modelType) aiStudioModelType = modelType;
   if (state.current_log_source) currentLogSource = normalizeUiLogSource(state.current_log_source);
   if (state.tab_scroll_positions && typeof state.tab_scroll_positions === "object") {
     Object.entries(state.tab_scroll_positions).forEach(([name, value]) => {
@@ -113,8 +125,11 @@ function writeUiStateToLocationHash(data = {}) {
 function writeUiStateToLocationSearch(data = {}) {
   try {
     const nextUrl = new URL(window.location.href);
+    const modelType = normalizeAIStudioModelType(data.ai_studio_model_type);
     nextUrl.searchParams.delete("ui_tab");
     nextUrl.searchParams.delete("ui_scroll");
+    if (modelType) nextUrl.searchParams.set("ui_ai_studio_category", modelType);
+    else nextUrl.searchParams.delete("ui_ai_studio_category");
     const nextPath = `${nextUrl.pathname}${nextUrl.search}${nextUrl.hash}`;
     const currentPath = `${window.location.pathname || ""}${window.location.search || ""}${window.location.hash || ""}`;
     if (nextPath !== currentPath) window.history.replaceState(null, "", nextPath);
@@ -597,6 +612,7 @@ function currentUiState() {
     metric_time_unit: String(metricInterval.unit || "m"),
     tab_scroll_positions: { ...tabScrollPositions, [normalizeTabName(activeTabName)]: currentPageScrollTop() },
     selected_scope: selectedScope || "GLOBAL",
+    ai_studio_model_type: normalizeAIStudioModelType(aiStudioModelType) || "image",
     current_log_source: normalizeUiLogSource(currentLogSource),
     selected_log_instance_id: String(selectedLogInstanceId || ""),
     show_global_logs: !!showGlobalLogs,
@@ -643,6 +659,8 @@ function hydrateUiState(cfg) {
     restoreTab = normalizeTabName(urlParams.get("restore_tab") || ""),
     restoreScroll = Number(urlParams.get("restore_scroll") || ""),
     state = { ...(cfg || {}), ...searchState, ...cached, ...hashState };
+  const locationModelType = normalizeAIStudioModelType(searchState.ai_studio_model_type);
+  if (locationModelType) state.ai_studio_model_type = locationModelType;
   if (state.tab_scroll_positions && typeof state.tab_scroll_positions === "object") {
     Object.entries(state.tab_scroll_positions).forEach(([name, value]) => {
       const key = normalizeTabName(name);
@@ -661,8 +679,8 @@ function hydrateUiState(cfg) {
       tabScrollPositions[restoreTab] = Math.max(0, restoreScroll);
     }
   }
+  aiStudioModelType = normalizeAIStudioModelType(state.ai_studio_model_type) || aiStudioModelType;
   currentLogSource = normalizeUiLogSource(state.current_log_source);
-  selectedLogInstanceId = String(state.selected_log_instance_id || selectedLogInstanceId || "");
   showGlobalLogs =
     typeof state.show_global_logs === "boolean"
       ? state.show_global_logs
