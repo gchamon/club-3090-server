@@ -718,21 +718,42 @@ def preflight_instance_docker_images(instance, context="preset launch"):
             f"{f' sizes={sizes}' if sizes else ''}"
         )
 
+def _is_instance_container_name_conflict(output, container_name):
+    name = str(container_name or "").strip().lower()
+    message = str(output or "").lower()
+    return bool(
+        name
+        and "conflict" in message
+        and "already in use" in message
+        and f'"/{name}"' in message
+    )
+
+
+def _run_instance_compose_up(instance):
+    cmd = instance_compose_args(instance) + ["up", "-d", "--force-recreate"]
+    cwd = instance_compose_project_dir(instance)
+    env = instance_subprocess_env(instance)
+    rc, output = run_cmd(cmd, timeout=1800, cwd=cwd, env=env)
+    if rc != 0 and _is_instance_container_name_conflict(output, instance_container_name(instance)):
+        container_name = instance_container_name(instance)
+        rm_rc, rm_output = run_cmd(["docker", "rm", "-f", container_name], timeout=120)
+        if rm_rc != 0:
+            raise RuntimeError(
+                f"{output}\nCould not remove conflicting container {container_name}: {rm_output}"
+            )
+        log_control(f"INSTANCE removed conflicting container {container_name}; retrying compose up")
+        rc, output = run_cmd(cmd, timeout=1800, cwd=cwd, env=env)
+    log_control(f"INSTANCE start {instance['id']} mode={instance['mode']} rc={rc}: {str(output or '')[-4000:]}")
+    if rc != 0:
+        raise RuntimeError(str(output or f"docker compose up failed for {instance['id']}"))
+    return {"instance": instance, "output": str(output or "")[-4000:]}
+
+
 def _instance_launch(instance):
     spec = instance_variant_spec(instance)
     ensure_variant_install_ready(spec)
     preflight_instance_docker_images(instance, context="preset launch")
-    cmd = instance_compose_args(instance) + ["up", "-d", "--force-recreate"]
-    rc, out = run_cmd(
-        cmd,
-        timeout=1800,
-        cwd=instance_compose_project_dir(instance),
-        env=instance_subprocess_env(instance),
-    )
-    log_control(f"INSTANCE start {instance['id']} mode={instance['mode']} rc={rc}: {out[-4000:]}")
-    if rc != 0:
-        raise RuntimeError(out or f"docker compose up failed for {instance['id']}")
-    return {"instance": instance, "output": out[-4000:]}
+    return _run_instance_compose_up(instance)
 
 
 def _instance_wait_until_ready(instance):

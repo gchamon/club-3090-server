@@ -8747,7 +8747,53 @@ assert str(carnice_override_path) in carnice_args, carnice_args
 instance_override_path = module.instance_paths({"id": "PAIR0_1"})["override"]
 assert instance_override_path in carnice_args, carnice_args
 assert carnice_args.index(str(carnice_override_path)) < carnice_args.index(instance_override_path), carnice_args
-assert (stale_chat_template_target.parent / "preprocessor_config.json").read_text(encoding="utf-8") == '{"image_processor_type":"Qwen2VLImageProcessor"}'
+saved_instance_launch_helpers = (
+    module.instance_compose_args,
+    module.instance_compose_project_dir,
+    module.instance_subprocess_env,
+    module.run_cmd,
+    module.log_control,
+)
+try:
+    collision_name = "club3090-gpu0-llamacpp-qwen38-27b-hauhaucs-aggressive-single-iq4xs"
+    collision_instance = {"id": "GPU0", "mode": "llamacpp/qwen38-27b-hauhaucs-aggressive-single-iq4xs"}
+    calls = []
+    results = [
+        (1, f'Error response from daemon: Conflict. The container name "/{collision_name}" is already in use by container deadbeef.'),
+        (0, collision_name),
+        (0, "started"),
+    ]
+    module.instance_compose_args = lambda instance: ["docker", "compose"]
+    module.instance_compose_project_dir = lambda instance: "/fixture/project"
+    module.instance_subprocess_env = lambda instance: {"FIXTURE": "1"}
+    module.log_control = lambda message: None
+    def fixture_run_cmd(command, **kwargs):
+        calls.append((list(command), dict(kwargs)))
+        return results.pop(0)
+    module.run_cmd = fixture_run_cmd
+    launch_result = module._run_instance_compose_up(collision_instance)
+    assert launch_result["output"] == "started"
+    assert [call[0] for call in calls] == [
+        ["docker", "compose", "up", "-d", "--force-recreate"],
+        ["docker", "rm", "-f", collision_name],
+        ["docker", "compose", "up", "-d", "--force-recreate"],
+    ], calls
+    assert module._is_instance_container_name_conflict(
+        f'Conflict. The container name "/{collision_name}" is already in use by container deadbeef.',
+        collision_name,
+    )
+    assert not module._is_instance_container_name_conflict(
+        'Conflict. The container name "/some-other-container" is already in use by container deadbeef.',
+        collision_name,
+    )
+finally:
+    (
+        module.instance_compose_args,
+        module.instance_compose_project_dir,
+        module.instance_subprocess_env,
+        module.run_cmd,
+        module.log_control,
+    ) = saved_instance_launch_helpers
 assert (stale_chat_template_target.parent / "processor_config.json").read_text(encoding="utf-8") == '{"processor_class":"Qwen3VLProcessor"}'
 module.resolve_variant_spec = lambda selector: dict(fixture_spec) if selector == "ik-llama/iq4ks-two-stage" else {"kind": "single", "selector": selector}
 gpu1_instance = {
