@@ -421,6 +421,47 @@ header {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
 }
+.overview-ai-studio {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid #222d3c;
+}
+.overview-ai-studio h3 {
+  margin: 0;
+  font-size: 13px;
+  white-space: nowrap;
+}
+.overview-ai-studio-links {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-left: auto;
+}
+.overview-ai-studio-links .overview-ai-studio-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  font-size: 14px;
+  text-decoration: none;
+}
+.overview-ai-studio-link strong {
+  font-weight: 800;
+}
+.overview-ai-studio-link:hover,
+.overview-ai-studio-link:focus-visible {
+  border-color: #3d6fa3;
+  background: #203149;
+}
+.overview-ai-studio-link:focus-visible {
+  outline: 2px solid #8dd2ff;
+  outline-offset: 2px;
+}
 .stat {
   background: #0b1119;
   border: 1px solid #222d3c;

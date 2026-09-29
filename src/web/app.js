@@ -5552,6 +5552,7 @@ function renderStatusUi(j, previousStatus = null, options = {}) {
     j.metrics, j.power, j.system, j.system_metric_peaks, j.uptime_seconds,
     j.machine_uptime_seconds, j.instances, j.benchmarks?.job,
   ], () => renderOverviewStatus(j), renderErrors);
+  renderOverviewAIStudioCategories();
   renderStatusSurface("gpu", j.gpus, () => renderGpuCards(j.gpus), renderErrors);
   renderStatusSurface("services", [
     j.system, j.upstream_services, j.instances, j.switch_job, j.power,
@@ -9762,6 +9763,37 @@ function aiStudioTextModelCount() {
   }
   const ready = [...presetStates.values()].filter((state) => state === "ready").length;
   return `${ready} / ${presetStates.size}`;
+}
+function aiStudioCategoryPermalink(type) {
+  const category = normalizeAIStudioModelType(type);
+  if (!category) return "";
+  const location = window.location;
+  const target = location && location.href ? new URL(location.href) : new URL("/", "http://localhost");
+  ["ui_tab", "ui_scroll", "_", "restore_tab", "restore_scroll"].forEach((key) => {
+    target.searchParams.delete(key);
+  });
+  target.searchParams.set("ui_ai_studio_category", category);
+  target.hash = "tab=ai-studio";
+  return `${target.pathname}${target.search}${target.hash}`;
+}
+function renderOverviewAIStudioCategories() {
+  const host = $("overviewAiStudioCategories");
+  if (!host) return;
+  const categories = [
+    ["text", "Text", aiStudioTextModelCount()],
+    ["image", "Image", aiStudioModelTypeCount("image")],
+    ["audio", "Audio", aiStudioModelTypeCount("audio")],
+    ["speech", "Speech", aiStudioModelTypeCount("speech")],
+    ["video", "Video", aiStudioModelTypeCount("video")],
+  ];
+  setHtmlIfChanged(
+    host,
+    categories.map(([type, label, rawCount]) => {
+      const count = String(rawCount || "0 / 0").replace(/\s*\/\s*/g, "/");
+      const [ready, total] = count.split("/");
+      return `<a class="subtab overview-ai-studio-link" href="${escapeHtml(aiStudioCategoryPermalink(type))}" aria-label="Open AI Studio ${escapeHtml(label)}, ${escapeHtml(ready)} of ${escapeHtml(total)} ready"><strong>${escapeHtml(count)}</strong><span>${escapeHtml(label)}</span></a>`;
+    }).join(""),
+  );
 }
 function selectAIStudioModelType(type) {
   const nextType = normalizeAIStudioModelType(type);

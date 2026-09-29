@@ -1600,6 +1600,7 @@ const context = {{
   confirm() {{ return false; }},
   prompt() {{ return null; }},
   devicePixelRatio: 1,
+  URL,
   URLSearchParams,
   AbortController,
   Date,
@@ -3585,7 +3586,22 @@ process.on("uncaughtException", (error) => {{
   if (!sharedDownloadCardHtml.includes("Downloading 42%...") || !sharedDownloadCardHtml.includes("Shared assets are downloading for vllm/shared-owner (42%).") || !sharedDownloadCardHtml.includes("disabled") || sharedDownloadCardHtml.includes("requestStopModelInstall")) {{
     throw new Error("shared model downloads should disable related preset cards and identify the owning preset");
   }}
-  console.log("ui smoke ok");
+  vm.runInContext("window.location = {{ href: 'http://localhost/admin?keep=1&ui_tab=overview&ui_scroll=60&_=123#tab=overview', pathname: '/admin', search: '?keep=1&ui_tab=overview&ui_scroll=60&_=123', hash: '#tab=overview' }}; window.history = {{ replaceState() {{}} }};", context);
+  const imageCategoryPermalink = vm.runInContext("aiStudioCategoryPermalink('image')", context);
+  const imageCategoryUrl = new URL(imageCategoryPermalink, "http://localhost");
+  if (imageCategoryUrl.searchParams.get("keep") !== "1" ||
+      imageCategoryUrl.searchParams.get("ui_ai_studio_category") !== "image" ||
+      imageCategoryUrl.searchParams.has("ui_tab") || imageCategoryUrl.searchParams.has("ui_scroll") ||
+      imageCategoryUrl.searchParams.has("_") ||
+      new URLSearchParams(imageCategoryUrl.hash.slice(1)).get("tab") !== "ai-studio") {{
+    throw new Error("AI Studio category permalink should preserve unrelated query state and select the requested tab/category");
+  }}
+  vm.runInContext(`window.location.href = ${{JSON.stringify(imageCategoryUrl.href)}}; window.location.pathname = ${{JSON.stringify(imageCategoryUrl.pathname)}}; window.location.search = ${{JSON.stringify(imageCategoryUrl.search)}}; window.location.hash = ${{JSON.stringify(imageCategoryUrl.hash)}}; applyLocationUiStateOverride();`, context);
+  if (vm.runInContext("activeTabName === 'ai-studio' && aiStudioModelType === 'image'", context) !== true) {{
+    throw new Error("AI Studio category permalink should restore its destination tab and model category");
+  }}
+  vm.runInContext("activeTabName = 'overview'; aiStudioModelType = 'text';", context);
+  process.exit(0);
 }})().catch((error) => {{
   console.error(error && error.stack ? error.stack : String(error));
   process.exit(1);
@@ -6568,6 +6584,26 @@ process.on("uncaughtException", (error) => {{
     {{ model_id: "partial-fixture", installed_state: "partial" }},
     {{ model_id: "missing-fixture", installed_state: "missing" }},
   ], variants: textPresetFixture }});
+  const overviewAiStudioHeading = window.document.getElementById("overviewAiStudioHeading");
+  const overviewAiStudioLinks = Array.from(window.document.querySelectorAll("#overviewAiStudioCategories a.overview-ai-studio-link"));
+  const expectedStudioCategories = [["text", "Text"], ["image", "Image"], ["audio", "Audio"], ["speech", "Speech"], ["video", "Video"]];
+  if (overviewAiStudioHeading?.textContent !== "AI Studio" || overviewAiStudioLinks.length !== expectedStudioCategories.length) {{
+    throw new Error("Main status must show the AI Studio category-link view");
+  }}
+  expectedStudioCategories.forEach(([type, label], index) => {{
+    const link = overviewAiStudioLinks[index];
+    const expectedCount = String(type === "text" ? window.aiStudioTextModelCount() : window.aiStudioModelTypeCount(type)).replace(/\\s*\\/\\s*/g, "/");
+    const href = new URL(link.getAttribute("href"), window.location.href);
+    const restoredCategory = window.readUiStateFromLocationSearch(href.search);
+    if (link.querySelector("strong")?.textContent !== expectedCount ||
+        link.querySelector("span")?.textContent !== label ||
+        href.searchParams.get("ui_ai_studio_category") !== type ||
+        new URLSearchParams(href.hash.slice(1)).get("tab") !== "ai-studio" ||
+        restoredCategory.ai_studio_model_type !== type ||
+        link.textContent.indexOf(expectedCount) > link.textContent.indexOf(label)) {{
+      throw new Error(`Main status ${{label}} link did not preserve its live count and category permalink`);
+    }}
+  }});
   window.activateTab("ai-studio");
   await new Promise((resolve) => setTimeout(resolve, 50));
   if (window.aiStudioTextModelCount() !== "2 / 4") throw new Error("Text Models count should include launchable presets and exclude unavailable presets");
@@ -6603,6 +6639,12 @@ process.on("uncaughtException", (error) => {{
     throw new Error("Text Models must switch the inner view without replacing the shared AI Studio section");
   }}
   if (window.aiStudioTextModelCount() !== "2 / 4") throw new Error("Text Models preset count changed after switching to Text Models");
+  textPresetFixture[0].install_state = "requires_download";
+  window.renderStatusUi({{ metrics: {{}}, runtime_inventory: {{ models: [], variants: textPresetFixture }}, variants: textPresetFixture }});
+  const updatedTextLink = Array.from(window.document.querySelectorAll("#overviewAiStudioCategories a")).find((link) => link.querySelector("span")?.textContent === "Text");
+  if (updatedTextLink?.querySelector("strong")?.textContent !== "1/4") throw new Error("Main status AI Studio counts should refresh when model availability changes");
+  textPresetFixture[0].install_state = "ready";
+  window.renderStatusUi({{ metrics: {{}}, runtime_inventory: {{ models: [], variants: textPresetFixture }}, variants: textPresetFixture }});
   const locationWrites = [];
   const originalReplaceState = window.history.replaceState.bind(window.history);
   window.history.replaceState = (_state, _title, url) => locationWrites.push(String(url || ""));
