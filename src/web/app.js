@@ -7292,6 +7292,13 @@ function ensureDynamicPresetLayout() {
   if (!$("modelPresetGrid")) {
     firstPanel.innerHTML = `<div class="panel-head"><h2>Text models</h2></div><div class="preset-toolbar" id="presetHeadActions">${renderPresetHeadActionsHtml()}</div><div class="preset-section-label">Scope</div><div class="subtabs" id="presetScopeTabs"></div><div class="value smallgap" id="presetScopeSummary"></div><div class="preset-section-label">Models</div><div class="preset-model-family-picker" id="presetModelFamilyPicker"><label class="preset-model-search-label" for="presetModelSearch"><input id="presetModelSearch" type="search" autocomplete="off" oninput="setPresetModelSearch(this.value)" /><span>Search model families</span></label><div class="subtabs" id="presetModelSelector"></div><div class="preset-family-search-empty hidden" id="presetFamilySearchEmpty">No model families match this search.</div></div><div class="value smallgap" id="presetJobSummary">-</div><div class="msg" id="presetResourceMsg"></div><div id="modelPresetGrid" class="model-grid"></div>`;
   }
+  const modelGrid = $("modelPresetGrid");
+  if (modelGrid && !$("modelPresetDiv")) {
+    const modelPresetDiv = document.createElement("div");
+    modelPresetDiv.id = "modelPresetDiv";
+    modelGrid.parentNode.insertBefore(modelPresetDiv, modelGrid);
+    modelPresetDiv.appendChild(modelGrid);
+  }
   if ($("singlePresetCard")) $("singlePresetCard").removeAttribute("id");
   if ($("dualPresetCard")) $("dualPresetCard").remove();
   if ($("presetScopePanel")) $("presetScopePanel").remove();

@@ -213,17 +213,22 @@ header {
   margin-bottom: 10px;
 }
 .preset-model-family-picker {
-  display: grid;
+  display: flex;
+  align-items: flex-start;
+  flex-wrap: wrap;
   gap: 8px;
   margin-bottom: 10px;
 }
 .preset-model-family-picker .subtabs {
+  flex: 1 1 320px;
+  min-width: 0;
   margin-bottom: 0;
 }
 .preset-model-search-label {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex: 0 0 auto;
   max-width: 100%;
   color: var(--muted);
   font-size: 12px;
@@ -231,10 +236,10 @@ header {
 }
 .preset-model-search-label input {
   box-sizing: border-box;
-  flex: 0 1 360px;
-  width: 100%;
+  flex: 0 1 180px;
+  width: 180px;
   min-width: 0;
-  max-width: 360px;
+  max-width: 180px;
   min-height: 36px;
   border: 1px solid #34445a;
   border-radius: 8px;
@@ -1731,6 +1736,15 @@ canvas {
 }
 .machine-row {
   margin-top: 7px;
+}
+.preset-configuration-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  gap: 12px;
+}
+.preset-configuration-grid > .panel {
+  min-width: 0;
 }
 .api-grid {
   display: grid;
@@ -4240,6 +4254,37 @@ details[open] > summary .score-collapse-cue::before {
   grid-template-columns: 1fr;
   gap: 12px;
   margin-top: 12px;
+}
+@media (min-width: 721px) {
+  #modelPresetDiv .model-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (max-width: 720px) {
+  .preset-configuration-grid {
+    grid-template-columns: 1fr;
+  }
+  #modelPresetDiv .model-grid {
+    grid-template-columns: 1fr;
+  }
+  .preset-model-family-picker {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .preset-model-family-picker .subtabs {
+    flex: none;
+    width: 100%;
+  }
+  .preset-model-search-label {
+    width: 100%;
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .preset-model-search-label input {
+    flex: 1 1 auto;
+    width: 100%;
+    max-width: none;
+  }
 }
 .model-card {
   background: #0b1119;
