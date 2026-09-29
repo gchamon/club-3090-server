@@ -1939,7 +1939,7 @@ process.on("uncaughtException", (error) => {{
   vm.runInContext("showHiddenPresets = false; showHardwareBlockedPresets = false; selectedPresetModelId = __priorSelectedPresetModelId; lastStatus = __selectorStatus; renderDynamicPresetModels({{ force: true }}); localStorage.removeItem('club3090_show_hidden_presets'); localStorage.removeItem('club3090_show_hardware_blocked_presets');", context);
   const gatedAccessVariant = {{
     variant_id: "qwen38-orca-fixture",
-    upstream_tag: "llamacpp/qwen38-27b-single-iq4xs",
+    upstream_tag: "llamacpp/qwen38-27b-orcarouter-uncensored-single-iq4xs",
     model_id: "qwen3.8-27b",
     model_display_name: "Qwen 3.8 27B",
     display_name: "OrcaRouter Uncensored IQ4_XS",
@@ -6696,7 +6696,7 @@ process.on("uncaughtException", (error) => {{
     throw new Error("Chat must stay latched to the right edge of the scrollable tab bar");
   }}
   const summary = window.document.getElementById("summary");
-  const longSummary = "GPU0 | llamacpp/qwen38-27b-single-iq4xs | club3090-gpu0-llamacpp-qwen38-27b-single-iq4xs | GPU balanced / CPU performance | GPUs 1";
+  const longSummary = "GPU0 | llamacpp/qwen38-27b-orcarouter-uncensored-single-iq4xs | club3090-gpu0-llamacpp-qwen38-27b-orcarouter-uncensored-single-iq4xs | GPU balanced / CPU performance | GPUs 1";
   summary.textContent = longSummary;
   const summaryStyle = window.getComputedStyle(summary);
   if (summary.textContent !== longSummary || summaryStyle.direction !== "rtl" || summaryStyle.textAlign !== "left") {{
@@ -7669,11 +7669,49 @@ process.on("uncaughtException", (error) => {{
   if (!brand || /__SCRIPT_VERSION__/.test(brand.textContent || "")) {{
     throw new Error("script version placeholder was not replaced");
   }}
+  const attachedMetricsReset = window.document.getElementById("metricsResetBtn");
+  const popupMetricsHtml = window.detachedMetricsPopupHtml({{ signature: "smoke" }});
+  if (!attachedMetricsReset?.classList.contains("danger-iconbtn") ||
+      !popupMetricsHtml.includes('class="iconbtn danger-iconbtn popup-metrics-reset-btn"') ||
+      !popupMetricsHtml.includes('invoke("promptClearRecordedMetrics")')) {{
+    throw new Error("attached and detached Metrics history reset must share destructive styling and confirmation");
+  }}
   const chartShell = window.document.createElement("div");
   const chartCanvas = window.document.createElement("canvas");
   chartShell.appendChild(chartCanvas);
   window.document.body.appendChild(chartShell);
   chartCanvas.getBoundingClientRect = () => ({{ left: 0, width: 100 }});
+  const drawCanvas = window.document.createElement("canvas");
+  drawCanvas.id = "smokeMetricsSeriesCanvas";
+  window.document.body.appendChild(drawCanvas);
+  Object.defineProperty(drawCanvas, "clientWidth", {{ configurable: true, value: 100 }});
+  Object.defineProperty(drawCanvas, "clientHeight", {{ configurable: true, value: 80 }});
+  const seriesStrokes = [];
+  let currentSeriesPath = [];
+  drawCanvas.getContext = () => ({{
+    clearRect() {{}},
+    fillText() {{}},
+    measureText() {{ return {{ width: 0 }}; }},
+    save() {{}},
+    restore() {{}},
+    beginPath() {{ currentSeriesPath = []; }},
+    moveTo(x, y) {{ currentSeriesPath.push(["moveTo", x, y]); }},
+    lineTo(x, y) {{ currentSeriesPath.push(["lineTo", x, y]); }},
+    stroke() {{ seriesStrokes.push(currentSeriesPath.slice()); }},
+    setLineDash() {{}},
+  }});
+  window.draw(
+    "smokeMetricsSeriesCanvas",
+    [{{ metric: 12 }}, {{ metric: 68 }}],
+    "metric",
+    "GPU util %",
+    "#00ffff",
+    {{ metricPoints: [{{ t: 100 }}, {{ t: 200 }}], timeWindowSeconds: 100, timeWindowEnd: 200 }},
+  );
+  if (seriesStrokes.length !== 1 ||
+      seriesStrokes[0].filter((entry) => entry[0] === "lineTo").length !== 1) {{
+    throw new Error("non-empty metrics series must render its two-point segment in a canvas stroke");
+  }}
   Object.defineProperty(chartShell, "clientWidth", {{ configurable: true, value: 100 }});
   const chartRecord = {{
     canvas: chartCanvas,
@@ -13817,13 +13855,20 @@ try:
     assert "bash scripts/setup.sh" not in iq4ks_command, iq4ks_command
     assert str(iq4ks.get("engine_display") or "") == "ik-llama", iq4ks
     qwen38_rows = [
-        by_tag.get("llamacpp/qwen38-27b-single-iq4xs"),
+        by_tag.get("llamacpp/qwen38-27b-orcarouter-uncensored-single-iq4xs"),
         by_tag.get("llamacpp/qwen38-27b-hauhaucs-aggressive-single-iq4xs"),
     ]
     assert all(qwen38_rows), qwen38_rows
     assert [row["weights_variant"] for row in qwen38_rows] == ["orcarouter-uncensored-iq4xs", "hauhaucs-aggressive-iq4xs"], qwen38_rows
     assert [row["install_on_bootstrap"] for row in qwen38_rows] == [False, False], qwen38_rows
     assert [row["requires_hf_approval"] for row in qwen38_rows] == [True, False], qwen38_rows
+    qwen38_catalog_rows = module.qwen38_builtin_custom_model_rows()
+    assert [row["repo"] for row in module.QWEN38_WEIGHT_VARIANTS] == ["orcarouter/Qwen3.8-27B-Uncensored-GGUF", "HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF"], module.QWEN38_WEIGHT_VARIANTS
+    assert "llamacpp/qwen38-27b-single-iq4xs" not in {row["selector"] for row in qwen38_catalog_rows}, qwen38_catalog_rows
+    assert str(qwen38_rows[0]["host_model_dir"]).endswith("/qwen3.8-27b-gguf/orcarouter-uncensored-iq4xs"), qwen38_rows[0]
+    assert str(qwen38_rows[1]["host_model_dir"]).endswith("/qwen3.8-27b-gguf/hauhaucs-aggressive-iq4xs"), qwen38_rows[1]
+    assert "orcarouter/Qwen3.8-27B-Uncensored-GGUF" in qwen38_rows[0]["install_command"] and "orcarouter-uncensored-iq4xs" in qwen38_rows[0]["install_command"], qwen38_rows[0]
+    assert "HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF" in qwen38_rows[1]["install_command"] and "hauhaucs-aggressive-iq4xs" in qwen38_rows[1]["install_command"], qwen38_rows[1]
     partial_row = dict(qwen38_rows[0])
     with tempfile.TemporaryDirectory(prefix="qwen38-partial-assets-") as partial_root:
         partial_model_name = str(partial_row["model_path"]).rsplit("/", 1)[-1]
@@ -15730,7 +15775,7 @@ def run_installer_setup_opt_in_smoke_test(script_text: str, cwd: Path) -> tuple[
     with tempfile.TemporaryDirectory(prefix="club3090-installer-opt-in-") as temp_dir:
         control_dir = Path(temp_dir) / "control"
         control_dir.mkdir()
-        qwen_selector = "llamacpp/qwen38-27b-single-iq4xs"
+        qwen_selector = "llamacpp/qwen38-27b-orcarouter-uncensored-single-iq4xs"
         normal_selector = "llamacpp/default"
         inventory = {
             "variants": [

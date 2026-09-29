@@ -2118,7 +2118,7 @@ function detachedMetricsPopupHtml(state) {
             <option value="ods">ODS</option>
           </select>
           <button class="popup-btn" type="button" id="popupMetricsExportBtn" title="Export metrics" aria-label="Export metrics">↓</button>
-          <button class="iconbtn popup-metrics-reset-btn" type="button" id="popupMetricsResetBtn" title="Clear recorded metrics" aria-label="Clear recorded metrics">
+          <button class="iconbtn danger-iconbtn popup-metrics-reset-btn" type="button" id="popupMetricsResetBtn" title="Clear recorded metrics" aria-label="Clear recorded metrics">
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path d="M5 7h14M9 7V5h6v2m-7 3v7m4-7v7m4-7v7M7 7l1 12h8l1-12" />
             </svg>
@@ -2698,7 +2698,11 @@ function draw(id, data, key, label, color, options = {}) {
   if (!values.length) return;
   const drawSeries = (seriesValues, strokeStyle, width, alpha = 1, dashed = false) => {
     ctx.save();
+    ctx.beginPath();
     ctx.strokeStyle = strokeStyle;
+    ctx.lineWidth = width * dpr;
+    ctx.globalAlpha = alpha;
+    if (dashed) ctx.setLineDash([5 * dpr, 4 * dpr]);
     seriesValues.forEach((value, index) => {
       const x = metricChartPointX(record.points?.[index], index, seriesValues.length, w, dpr, options);
       const y = h - (Number(value || 0) / maxValue) * chartHeight - chartBottomPad;
@@ -2722,6 +2726,7 @@ function draw(id, data, key, label, color, options = {}) {
     ctx.stroke();
     ctx.restore();
   };
+  drawSeries(values, color, 2, 1, false);
   if (options.showPeakLine)
     drawHorizontalLine(
       peakValue,

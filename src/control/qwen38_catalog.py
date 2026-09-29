@@ -107,7 +107,7 @@ def qwen38_builtin_custom_model_rows():
     for weight in QWEN38_WEIGHT_VARIANTS:
         variant = weight["variant"]
         selector = (
-            "llamacpp/qwen38-27b-single-iq4xs"
+            "llamacpp/qwen38-27b-orcarouter-uncensored-single-iq4xs"
             if variant == "orcarouter-uncensored-iq4xs"
             else "llamacpp/qwen38-27b-hauhaucs-aggressive-single-iq4xs"
         )
