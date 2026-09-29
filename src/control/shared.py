@@ -101,9 +101,6 @@ DEFAULT_RUNTIME_CONFIG = {
         "updater_bind_port": _env_int("CLUB3090_UPDATER_BIND_PORT", 18010),
     },
     "metrics": {
-        "history_retention_seconds": max(86400, _env_int("CLUB3090_METRICS_HISTORY_RETENTION_SECONDS", 86400)),
-        "history_max_points": max(240, min(172800, _env_int("CLUB3090_METRICS_HISTORY_MAX_POINTS", _env_int("CLUB3090_METRICS_HISTORY_RETENTION_SECONDS", 86400)))),
-        "history_status_max_points": max(240, min(480, _env_int("CLUB3090_METRICS_HISTORY_STATUS_MAX_POINTS", 480))),
         "history_persist_interval_seconds": max(5, _env_int("CLUB3090_METRICS_HISTORY_PERSIST_INTERVAL_SECONDS", 30)),
     },
     "power": {
@@ -392,17 +389,7 @@ def normalize_runtime_config_file_defaults():
 
             return re.sub(pattern, repl, source)
 
-        updated = re.sub(
-            r"(^\s*history_status_max_points\s*=\s*)2880(\s*$)",
-            r"\g<1>480\2",
-            text,
-            flags=re.MULTILINE,
-        )
-        updated = re.sub(
-            r"(?ms)(^\s*\[profiles\.benchmark_ready\]\s*$(?:(?!^\s*\[).)*?^\s*gpu_active\s*=\s*)250(\s*(?:#.*)?$)",
-            r"\g<1>220\2",
-            updated,
-        )
+        updated = text
         updated = replace_section_numeric_floor(
             updated,
             "benchmarks.thermal",
@@ -440,9 +427,8 @@ def ensure_runtime_config_file():
         return False
 
 
-METRICS_HISTORY_RETENTION_SECONDS = max(86400, config_int("metrics", "history_retention_seconds", _env_int("CLUB3090_METRICS_HISTORY_RETENTION_SECONDS", 86400)))
-METRICS_HISTORY_MAX_POINTS = max(240, min(172800, config_int("metrics", "history_max_points", _env_int("CLUB3090_METRICS_HISTORY_MAX_POINTS", str(METRICS_HISTORY_RETENTION_SECONDS)))))
-METRICS_HISTORY_STATUS_MAX_POINTS = max(240, min(480, config_int("metrics", "history_status_max_points", _env_int("CLUB3090_METRICS_HISTORY_STATUS_MAX_POINTS", 480))))
+METRICS_SERIES_RETENTION_SECONDS = 30 * 60
+METRICS_SERIES_MAX_POINTS = 1800
 METRICS_HISTORY_PERSIST_INTERVAL_SECONDS = max(5, config_int("metrics", "history_persist_interval_seconds", _env_int("CLUB3090_METRICS_HISTORY_PERSIST_INTERVAL_SECONDS", 30)))
 CUSTOM_PRESETS_FILE = os.path.join(CONTROL_DIR, "custom_presets.json")
 CUSTOM_MODELS_FILE = os.path.join(CONTROL_DIR, "custom_models.json")
@@ -600,7 +586,7 @@ ADMIN_SESSIONS_FILE = os.path.join(CONTROL_DIR, "admin_sessions.json")
 ADMIN_AUTH_DENIAL_LOG_WINDOW_SECONDS = int(os.environ.get("CLUB3090_ADMIN_AUTH_DENIAL_LOG_WINDOW_SECONDS", "30"))
 startup_time = time.time()
 recent_requests = collections.deque(maxlen=120)
-series_points = collections.deque(maxlen=METRICS_HISTORY_MAX_POINTS)
+series_points = collections.deque(maxlen=METRICS_SERIES_MAX_POINTS)
 request_queue = collections.deque(maxlen=50)
 metrics = {"total_requests":0,"active_requests":0,"completed_requests":0,"failed_requests":0,"streaming_requests":0,"queued_requests":0,"cold_starts":0,"failovers":0,"last_latency_s":None,"last_ttft_s":None,"last_tokens_per_second":None,"last_estimated_tokens":None,"last_preset":None,"last_path":None,"last_status":None}
 LOG_BOOTSTRAP_MARKER = os.environ.get("CLUB3090_LOG_BOOTSTRAP_MARKER", "Application startup complete")

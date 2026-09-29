@@ -429,7 +429,7 @@ def sanitize_metrics_history_point(point):
 
 
 def prune_metrics_history_points(points):
-    cutoff = int(time.time() - METRICS_HISTORY_RETENTION_SECONDS)
+    cutoff = int(time.time() - METRICS_SERIES_RETENTION_SECONDS)
     seen = {}
     for point in points or []:
         clean = sanitize_metrics_history_point(point)
@@ -437,7 +437,45 @@ def prune_metrics_history_points(points):
             continue
         seen[int(clean["t"])] = clean
     ordered = [seen[key] for key in sorted(seen.keys())]
-    return ordered[-int(METRICS_HISTORY_MAX_POINTS):]
+    return ordered[-METRICS_SERIES_MAX_POINTS:]
+
+
+def metrics_series_chunk(start_t, end_t, after_t=None, limit=240):
+    now_t = int(time.time())
+    try:
+        end_t = min(now_t, int(float(end_t)))
+    except (TypeError, ValueError, OverflowError):
+        end_t = now_t
+    if end_t <= 0:
+        end_t = now_t
+    try:
+        start_t = int(float(start_t))
+    except (TypeError, ValueError, OverflowError):
+        start_t = end_t - METRICS_SERIES_RETENTION_SECONDS
+    if start_t <= 0:
+        start_t = end_t - METRICS_SERIES_RETENTION_SECONDS
+    try:
+        limit = max(1, min(240, int(float(limit))))
+    except (TypeError, ValueError, OverflowError):
+        limit = 240
+    try:
+        after_t = int(float(after_t)) if after_t is not None else None
+    except (TypeError, ValueError, OverflowError):
+        after_t = None
+    with metrics_lock:
+        points = [sanitize_metrics_history_point(point) for point in series_points]
+        points = [point for point in points if point]
+        earliest = min((point["t"] for point in points), default=None)
+        latest = max((point["t"] for point in points), default=None)
+        start_t = max(start_t, end_t - METRICS_SERIES_RETENTION_SECONDS)
+        if earliest is not None:
+            start_t = max(start_t, earliest)
+        matching = [point for point in points if start_t <= point["t"] <= end_t and (after_t is None or point["t"] > after_t)]
+        matching.sort(key=lambda point: point["t"])
+        page = matching[:limit]
+        return {"ok": True, "series": page, "next_after": page[-1]["t"] if page else None,
+                "has_more": len(matching) > len(page), "earliest_t": earliest, "latest_t": latest,
+                "retention_seconds": METRICS_SERIES_RETENTION_SECONDS}
 
 
 def ensure_metrics_history_loaded():
@@ -467,35 +505,13 @@ def persist_metrics_history_if_due(force=False):
         payload = {
             "schema_version": 1,
             "updated_at": int(now),
-            "retention_seconds": int(METRICS_HISTORY_RETENTION_SECONDS),
+            "retention_seconds": METRICS_SERIES_RETENTION_SECONDS,
             "series": points,
         }
         write_json_atomic_if_changed(METRICS_HISTORY_FILE, payload, separators=(",", ":"))
         metrics_history_cache["loaded"] = True
         metrics_history_cache["write_time"] = now
         return True
-
-
-def normalize_status_series_limit(value, default=METRICS_HISTORY_STATUS_MAX_POINTS):
-    try:
-        limit = int(float(str(value).strip()))
-    except Exception:
-        limit = int(default or METRICS_HISTORY_STATUS_MAX_POINTS)
-    return max(1, min(int(METRICS_HISTORY_STATUS_MAX_POINTS), limit))
-
-
-def metric_series_status_snapshot_unlocked(max_points=None):
-    limit = normalize_status_series_limit(max_points)
-    total = len(series_points)
-    if total <= limit:
-        return list(series_points)
-    step = max(1, int(math.ceil(total / max(1, limit))))
-    sampled = [point for index, point in enumerate(series_points) if index % step == 0]
-    if series_points:
-        sampled.append(series_points[-1])
-    return sampled[-limit:]
-
-
 def clear_recorded_metrics_history():
     global latest_gpu_rows, latest_system_snapshot, latest_metrics_collected_at, system_metric_peaks_cache
     with metrics_lock:
@@ -518,7 +534,7 @@ def clear_recorded_metrics_history():
             {
                 "schema_version": 1,
                 "updated_at": int(time.time()),
-                "retention_seconds": int(METRICS_HISTORY_RETENTION_SECONDS),
+                "retention_seconds": METRICS_SERIES_RETENTION_SECONDS,
                 "series": [],
             },
             separators=(",", ":"),
@@ -657,7 +673,7 @@ def export_metrics_history(format_name):
     payload = {
         "schema_version": 1,
         "exported_at": int(time.time()),
-        "retention_seconds": int(METRICS_HISTORY_RETENTION_SECONDS),
+        "retention_seconds": METRICS_SERIES_RETENTION_SECONDS,
         "point_count": len(points),
         "series": points,
     }
@@ -1956,7 +1972,7 @@ def build_series_point():
         vram_total_gib=round(sum(mem_total)/1024.0,3) if mem_total else 0
         point={"t":int(time.time()),"gpu_util":round(sum(util)/len(util),1) if util else 0,"mem_pct":round(sum(mem)/len(mem),1) if mem else 0,"mem_used_gib":vram_used_gib,"mem_total_gib":vram_total_gib,"temp_c":round(max(temps),1) if temps else 0,"power_w":round(sum(watts),1) if watts else 0,"ram_pct":round(ram_pct,1),"ram_used_gib":ram_used_gib,"ram_total_gib":ram_total_gib,"cpu_pct":round(cpu_pct,1),"disk_pct":round(disk_pct,1),"system_util_pct":round((cpu_pct+ram_pct+(sum(util)/len(util) if util else 0))/3,1),"net_rx_mbps":round(rx_mbps,2),"net_tx_mbps":round(tx_mbps,2),"net_rx_kbps":round(rx_mbps*1000,1),"net_tx_kbps":round(tx_mbps*1000,1),"gpus":gpu_points,"active_requests":max(int(metrics.get("active_requests",0) or 0), 1 if benchmark_active or studio_active else 0),"latency_s":0 if benchmark_metric_sample else metrics.get("last_latency_s") or 0,"ttft_s":0 if benchmark_metric_sample else metrics.get("last_ttft_s") or 0,"tps":0 if benchmark_metric_sample else metrics.get("last_tokens_per_second") or 0}
         series_points.append(point)
-        cutoff = int(time.time() - METRICS_HISTORY_RETENTION_SECONDS)
+        cutoff = int(time.time() - METRICS_SERIES_RETENTION_SECONDS)
         while series_points and int(safe_float((series_points[0] or {}).get("t"))) < cutoff:
             series_points.popleft()
         latest_gpu_rows = gpus
@@ -2175,7 +2191,7 @@ def build_status_snapshot(refresh_remote_metadata=False):
     with metrics_lock:
         m = dict(metrics)
         recent = list(recent_requests)
-        series = metric_series_status_snapshot_unlocked()
+
     runtime_inventory = enrich_inventory_model_update_state(load_runtime_inventory())
     local_installer_metadata = read_local_installer_metadata()
     self_update_state = read_self_update_state()
@@ -2313,7 +2329,7 @@ def build_status_snapshot(refresh_remote_metadata=False):
         "gpus": gpus_snapshot,
         "power": power_status(),
         "system": system_snapshot,
-        "series": series,
+
         "system_metric_peaks": system_metric_peaks_snapshot(),
         "ui_config": read_ui_config(),
         "resource_colors": resource_color_config(),
@@ -2422,7 +2438,6 @@ def build_status_error_snapshot(error, previous=None):
         "gpus": list(previous.get("gpus") or []),
         "power": dict(previous.get("power") or {}),
         "system": dict(previous.get("system") or {}),
-        "series": list(previous.get("series") or []),
         "system_metric_peaks": previous.get("system_metric_peaks") if isinstance(previous.get("system_metric_peaks"), dict) else system_metric_peaks_snapshot(),
         "ui_config": ui_cfg,
         "preset_tps_stats": previous.get("preset_tps_stats") if isinstance(previous.get("preset_tps_stats"), dict) else preset_tps_stats_snapshot(),
@@ -2460,11 +2475,11 @@ def build_status_error_snapshot(error, previous=None):
     return snapshot
 
 
-def build_status_lightweight_snapshot(previous=None, reason="", series_limit=None):
+def build_status_lightweight_snapshot(previous=None, reason=""):
     global status_lightweight_cache, status_lightweight_updated_at
-    series_limit = normalize_status_series_limit(series_limit)
     previous = dict(previous) if isinstance(previous, dict) else {}
     snapshot = dict(previous)
+    snapshot.pop("series", None)
     acquired = False
     try:
         acquired = metrics_lock.acquire(timeout=1.0)
@@ -2474,7 +2489,7 @@ def build_status_lightweight_snapshot(previous=None, reason="", series_limit=Non
         try:
             snapshot["metrics"] = dict(metrics)
             snapshot["recent_requests"] = list(recent_requests)
-            snapshot["series"] = metric_series_status_snapshot_unlocked(max_points=series_limit)
+
             snapshot["gpus"] = list(latest_gpu_rows or snapshot.get("gpus") or [])
             snapshot["system"] = dict(latest_system_snapshot or snapshot.get("system") or {})
             status_lightweight_cache = dict(snapshot)
@@ -2548,18 +2563,18 @@ def build_status_lightweight_snapshot(previous=None, reason="", series_limit=Non
     return snapshot
 
 
-def build_status_stale_overlay_snapshot(previous=None, reason="", series_limit=None):
-    return build_status_lightweight_snapshot(previous, reason or "status snapshot refresh is stale", series_limit=series_limit)
+def build_status_stale_overlay_snapshot(previous=None, reason=""):
+    return build_status_lightweight_snapshot(previous, reason or "status snapshot refresh is stale")
 
 
-def get_lightweight_status_snapshot(series_limit=None):
+def get_lightweight_status_snapshot():
     with status_snapshot_lock:
         previous_lightweight = dict(status_lightweight_cache or {})
     with status_snapshot_lock:
         snapshot = dict(status_snapshot_cache or {})
     if previous_lightweight:
         snapshot.update(previous_lightweight)
-    return build_status_lightweight_snapshot(snapshot, series_limit=series_limit)
+    return build_status_lightweight_snapshot(snapshot)
 
 
 def get_status_snapshot(force=False, refresh_remote_metadata=False):
@@ -2601,11 +2616,9 @@ def parse_status_request_options(params):
     inventory_detail = str(params.get("inventory_detail") or "").strip().lower()
     if inventory_detail not in {"full", "compact"}:
         inventory_detail = "compact"
-    series_limit = normalize_status_series_limit(params.get("series_limit"))
+
     return {
         "tab": tab,
-        "include_series": str(params.get("include_series") or "").strip().lower() in {"1", "true", "yes", "on"},
-        "series_limit": series_limit,
         "include_inventory": str(params.get("include_inventory") or "").strip().lower() in {"1", "true", "yes", "on"},
         "inventory_detail": inventory_detail,
         "include_config": str(params.get("include_config") or "").strip().lower() in {"1", "true", "yes", "on"},
@@ -2740,17 +2753,11 @@ def shape_status_snapshot(snapshot, options=None):
             include_logs=False,
         )
     shaped["benchmarks"] = ensure_benchmark_scores_for_status(shaped.get("benchmarks"))
-    if not options.get("include_series"):
-        shaped.pop("series", None)
-    elif isinstance(shaped.get("series"), list) and len(shaped.get("series") or []) > normalize_status_series_limit(options.get("series_limit")):
-        series = shaped.get("series") or []
-        series_limit = normalize_status_series_limit(options.get("series_limit"))
-        step = max(1, int(math.ceil(len(series) / max(1, series_limit))))
-        shaped["series"] = ([point for index, point in enumerate(series) if index % step == 0] + series[-1:])[-series_limit:]
+    shaped.pop("series", None)
     if not options.get("include_inventory"):
         shaped.pop("runtime_inventory", None)
         shaped.pop("models", None)
-        shaped.pop("variants", None)
+
     else:
         if isinstance(shaped.get("runtime_inventory"), dict):
             try:

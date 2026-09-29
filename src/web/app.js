@@ -5218,6 +5218,8 @@ function activateTab(name, firstRender = false) {
   connectLogs(false);
   scheduleLogCacheRefresh(logViewerVisible() ? LOG_CACHE_REFRESH_MS : 0);
   if (activeTabName === "metrics") {
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    loadMetricsSeriesRange(nowSeconds - metricIntervalSeconds(), nowSeconds).catch(() => {});
     redrawMetricsSoon();
   }
   if (activeTabName === "ai-studio") {
@@ -5280,8 +5282,7 @@ function statusRequestProfile(options = {}) {
   return {
     tab,
     hidden: document.hidden && !popupLogWindowActive() ? "1" : "0",
-    include_series: includeSeries ? "1" : "0",
-    series_limit: includeSeries ? String(options.seriesLimit || STATUS_LIVE_SERIES_LIMIT) : "0",
+
     include_inventory: includeInventory ? "1" : "0",
     inventory_detail: includeInventory ? String(options.inventoryDetail || "compact") : "compact",
     include_config: "1",
@@ -5497,15 +5498,11 @@ function compactStatusForCache(status = {}) {
     "preset_tps_stats",
     "upstream_services",
     "nvlink",
-    "series",
   ];
   const compact = {};
   keys.forEach((key) => {
     if (status[key] !== undefined) compact[key] = status[key];
   });
-  if (Array.isArray(compact.series) && compact.series.length > STATUS_CACHE_SERIES_LIMIT) {
-    compact.series = compact.series.slice(-STATUS_CACHE_SERIES_LIMIT);
-  }
   return compact;
 }
 function readCachedStatusPayload(maxAgeMs = STATUS_CACHE_MAX_AGE_MS) {
@@ -5524,29 +5521,11 @@ function readCachedStatus(maxAgeMs = STATUS_CACHE_MAX_AGE_MS) {
   const payload = readCachedStatusPayload(maxAgeMs);
   return payload?.status && typeof payload.status === "object" ? payload.status : null;
 }
-function cachedStatusSeriesFresh(payload) {
-  if (!payload || !Array.isArray(payload.status?.series) || !payload.status.series.length) {
-    return false;
-  }
-  const savedAt = Number(payload.series_saved_at || 0);
-  return !!savedAt && Date.now() - savedAt <= STATUS_CACHE_SERIES_MAX_AGE_MS;
-}
 function writeStatusCacheFromStatus(status = {}) {
   const compact = compactStatusForCache(status);
   if (!compact) return;
-  const previousPayload = readCachedStatusPayload(0) || {};
-  const previous = previousPayload.status || {};
-  let seriesSavedAt = Number(previousPayload.series_saved_at || 0) || 0;
-  if (Array.isArray(compact.series)) {
-    seriesSavedAt = Date.now();
-  } else if (Array.isArray(previous.series)) {
-    compact.series = previous.series.slice(-STATUS_CACHE_SERIES_LIMIT);
-  }
   try {
-    localStorage.setItem(
-      STATUS_CACHE_KEY,
-      JSON.stringify({ saved_at: Date.now(), series_saved_at: seriesSavedAt, status: compact }),
-    );
+    localStorage.setItem(STATUS_CACHE_KEY, JSON.stringify({ saved_at: Date.now(), status: compact }));
   } catch (e) {}
 }
 function renderStatusSurface(label, projection, render, errors) {
@@ -5584,7 +5563,7 @@ function renderStatusUi(j, previousStatus = null, options = {}) {
     if (typeof syncPowerCoolingBusyState === "function") syncPowerCoolingBusyState();
   }, renderErrors);
   if (activeTabName === "metrics" || popupMetricsWindowOpen()) {
-    renderStatusSurface("metrics", [j.metrics, j.system, j.series], () => renderMetrics(j), renderErrors);
+    renderStatusSurface("metrics", [j.metrics, j.system], () => renderMetrics(j), renderErrors);
   }
   renderStatusSurface("presets", j.presets, () => renderPresetCatalog(j.presets), renderErrors);
   renderStatusSurface("users", j.users, () => renderUsers(j.users || []), renderErrors);
@@ -5636,10 +5615,6 @@ function hydrateCachedStatusForBoot() {
   if (!payload) return false;
   let cached = payload.status;
   if (!cached) return false;
-  if (activeTabName === "metrics" && !cachedStatusSeriesFresh(payload)) {
-    cached = { ...cached };
-    delete cached.series;
-  }
   cached = annotateStatusCache(cached, payload, { connecting: true });
   const previousStatus = lastStatus;
   lastStatus = lastStatus ? { ...cached, ...lastStatus } : cached;
@@ -5718,13 +5693,8 @@ refreshStatus = async function (opts = {}) {
       syncPresetSummaryCacheFromStatus(j);
       hydrateUiState(j.ui_config || {});
       const hydratedProfile = statusRequestProfile(profileOptions);
-      if (
-        (hydratedProfile.include_inventory === "1" && !j.runtime_inventory) ||
-        (hydratedProfile.include_series === "1" && !Array.isArray(j.series))
-      ) {
+      if (hydratedProfile.include_inventory === "1" && !j.runtime_inventory) {
         pendingForcedStatusRefresh = true;
-        pendingForcedStatusRefreshIncludeSeries =
-          pendingForcedStatusRefreshIncludeSeries || hydratedProfile.include_series === "1";
         pendingForcedStatusRefreshIncludeInventory =
           pendingForcedStatusRefreshIncludeInventory || hydratedProfile.include_inventory === "1";
         pendingForcedStatusRefreshIncludeBenchmarkDetails =
@@ -5732,6 +5702,10 @@ refreshStatus = async function (opts = {}) {
         if (hydratedProfile.inventory_detail === "full" || !pendingForcedStatusRefreshInventoryDetail) {
           pendingForcedStatusRefreshInventoryDetail = hydratedProfile.inventory_detail || "";
         }
+      }
+      if (activeTabName === "metrics" || popupMetricsWindowOpen()) {
+        const nowSeconds = Math.floor(Date.now() / 1000);
+        loadMetricsSeriesRange(metricsSeriesState.rangeStart, nowSeconds, { continuation: true }).catch(() => {});
       }
       ensureChatHydrationForActiveTab();
       hydrateSelectedPresetModel();
@@ -10032,6 +10006,8 @@ function promptClearPresetTpsStats(selector) {
   });
 }
 async function clearRecordedMetricsData(options = {}) {
+  clearLoadedMetricsSeries();
+  renderMetrics(lastStatus || {});
   const payload = await post(
     "/admin/metrics-history",
     { action: "clear" },
@@ -10039,7 +10015,6 @@ async function clearRecordedMetricsData(options = {}) {
     { silentSuccess: true },
   );
   if (!lastStatus) lastStatus = {};
-  lastStatus.series = Array.isArray(payload?.series) ? payload.series : [];
   lastStatus.system_metric_peaks =
     payload?.system_metric_peaks && typeof payload.system_metric_peaks === "object"
       ? payload.system_metric_peaks

@@ -127,18 +127,60 @@ function setActiveMetricPaneInDocument(doc, paneId) {
 }
 let metricTimeValue = 5;
 let metricTimeUnit = "m";
+const metricsSeriesState = { points: [], rangeStart: 0, rangeEnd: 0, latestT: 0, loading: false };
 function normalizeMetricTimeValue(value) {
   const parsed = Number.parseInt(String(value ?? "").trim(), 10);
-  return Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, 31536000) : 5;
+  return Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, 1800) : 5;
 }
 function normalizeMetricTimeUnit(value) {
-  return ["s", "m", "d", "w", "mo", "y"].includes(String(value || "")) ? String(value) : "m";
+  return ["s", "m"].includes(String(value || "")) ? String(value) : "m";
 }
 function currentMetricIntervalState() {
   return { value: metricTimeValue, unit: metricTimeUnit };
 }
 function metricIntervalSeconds(value = metricTimeValue, unit = metricTimeUnit) {
-  return normalizeMetricTimeValue(value) * ({ s: 1, m: 60, d: 86400, w: 604800, mo: 2592000, y: 31536000 }[normalizeMetricTimeUnit(unit)] || 60);
+  return Math.min(1800, normalizeMetricTimeValue(value) * ({ s: 1, m: 60 }[normalizeMetricTimeUnit(unit)] || 60));
+}
+
+async function loadMetricsSeriesRange(startT, endT, { continuation = false } = {}) {
+  if (metricsSeriesState.loading) return;
+  metricsSeriesState.loading = true;
+  try {
+    const start = Math.max(Number(startT) || 0, (Number(endT) || 0) - 1800);
+    const end = Number(endT) || Math.floor(Date.now() / 1000);
+    if (!continuation || start !== metricsSeriesState.rangeStart) {
+      metricsSeriesState.points = [];
+      metricsSeriesState.latestT = 0;
+      metricsSeriesState.rangeStart = start;
+      metricsSeriesState.rangeEnd = end;
+    }
+    let more = true;
+    while (more) {
+      const query = new URLSearchParams({ start: String(start), end: String(end), limit: "240" });
+      if (continuation || metricsSeriesState.latestT) query.set("after", String(metricsSeriesState.latestT));
+      const response = await fetch(`/admin/metrics-series?${query}`, { credentials: "same-origin", cache: "no-store" });
+      if (!response.ok) throw new Error(`Metrics series request failed (${response.status})`);
+      const payload = await response.json();
+      const merged = new Map(metricsSeriesState.points.map((point) => [Number(point.t), point]));
+      (payload.series || []).forEach((point) => {
+        const t = Number(point?.t);
+        if (Number.isInteger(t) && t >= start && t <= end) merged.set(t, point);
+      });
+      metricsSeriesState.points = [...merged.values()].sort((a, b) => Number(a.t) - Number(b.t));
+      metricsSeriesState.latestT = metricsSeriesState.points.at(-1)?.t || 0;
+      more = !!payload.has_more && !!payload.next_after && Number(payload.next_after) > Number(query.get("after") || 0);
+      continuation = true;
+    }
+    redrawMetricsSoon();
+  } catch (error) {
+    if (typeof setMsg === "function") setMsg(error.message);
+  } finally {
+    metricsSeriesState.loading = false;
+  }
+}
+function clearLoadedMetricsSeries() {
+  metricsSeriesState.points = [];
+  metricsSeriesState.latestT = 0;
 }
 function syncMetricControls() {
   const docs = [document];
@@ -160,8 +202,11 @@ function setMetricIntervalState(value, unit, options = {}) {
   syncMetricControls();
   if (options.persist !== false && typeof queueUiStateSave === "function") queueUiStateSave();
   if (options.refresh !== false) {
+    if (activeTabName === "metrics" || popupMetricsWindowOpen()) {
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      loadMetricsSeriesRange(nowSeconds - metricIntervalSeconds(), nowSeconds).catch(() => {});
+    }
     redrawMetricsSoon();
-    refreshStatus({ force: true, includeSeries: true }).catch(() => {});
   }
 }
 function metricSourceChanged(paneId) {
@@ -1964,7 +2009,7 @@ function metricsPopupPanelHtml() {
             </select></label>
             <label class="metrics-control"><span>Time interval:</span><input id="metricsTimeValue" type="text" inputmode="numeric" value="5" aria-label="Metrics time interval"></label>
             <select id="metricsTimeUnit" aria-label="Metrics time unit">
-              <option value="s">Seconds</option><option value="m" selected>Minutes</option><option value="d">Days</option><option value="w">Weeks</option><option value="mo">Months</option><option value="y">Years</option>
+              <option value="s">Seconds</option><option value="m" selected>Minutes</option>
             </select>
           </div>
           <div id="mMain" class="metricpane active">
@@ -2774,9 +2819,9 @@ function currentStatusMetricPoint(status = {}) {
 function renderMetrics(j, options = {}) {
   const currentPoint = currentStatusMetricPoint(j);
   const intervalSeconds = metricIntervalSeconds();
-  const windowStart = Number(currentPoint.t || Math.floor(Date.now() / 1000)) - intervalSeconds;
-  const s = ((j.series && j.series.length) ? [...j.series, currentPoint] : [currentPoint])
-    .filter((point) => Number(point?.t || 0) >= windowStart);
+  const windowEnd = Math.floor(Date.now() / 1000);
+  const windowStart = windowEnd - intervalSeconds;
+  const s = metricsSeriesState.points.filter((point) => Number(point?.t || 0) >= windowStart && Number(point?.t || 0) <= windowEnd);
   const systemMemory = j.system?.memory || {};
   const currentRamUsedGib = Number(currentPoint.ram_used_gib || Number(systemMemory.used_mib || 0) / 1024 || 0);
   const currentRamTotalGib = Number(currentPoint.ram_total_gib || Number(systemMemory.total_mib || 0) / 1024 || 0);

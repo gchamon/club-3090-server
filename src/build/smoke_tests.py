@@ -483,9 +483,9 @@ def validate_model_score_description_source(js_text: str) -> list[str]:
         issues.append("Quick ReasonMath descriptions must make it Intelligence-only while Quick Behavior Packs own Competence")
     if (
         'hydratedProfile.include_inventory === "1" && !j.runtime_inventory' not in js_text
-        or 'hydratedProfile.include_series === "1" && !Array.isArray(j.series)' not in js_text
+        or "loadMetricsSeriesRange(metricsSeriesState.rangeStart, nowSeconds, { continuation: true })" not in js_text
     ):
-        issues.append("missing immediate status refetch after persisted tab hydration")
+        issues.append("missing immediate status refetch after persisted tab hydration or Metrics continuation load")
     if 'if (!uiStateHydrated) hydrateUiState({});' not in js_text or 'hydrateUiState({ active_tab: requestedTab })' in js_text:
         issues.append("tab activation must hydrate saved UI state before writing the requested tab")
     if (
@@ -550,10 +550,8 @@ def validate_model_score_description_source(js_text: str) -> list[str]:
         issues.append("admin boot must reveal the hydrated active tab and cached preset cards before the first status response")
     if (
         "const STATUS_CACHE_KEY" not in js_text
-        or "const STATUS_CACHE_SERIES_MAX_AGE_MS" not in js_text
         or "function compactStatusForCache" not in js_text
         or "function readCachedStatusPayload" not in js_text
-        or "function cachedStatusSeriesFresh" not in js_text
         or "function writeStatusCacheFromStatus" not in js_text
         or "function renderStatusUi" not in js_text
         or "function hydrateCachedStatusForBoot" not in js_text
@@ -569,7 +567,6 @@ def validate_model_score_description_source(js_text: str) -> list[str]:
         or "stripStatusCacheMeta(lastStatus)" not in js_text
         or "clearStatusConnectionState()" not in js_text
         or "Reconnected to the remote server." not in js_text
-        or "series_saved_at" not in js_text
         or "writeStatusCacheFromStatus(j);" not in js_text
         or "function hydrateChatStateFromLocalCache" not in js_text
         or "const chatCacheApplied = hydrateChatStateFromLocalCache();" not in js_text
@@ -654,16 +651,14 @@ def validate_model_score_description_source(js_text: str) -> list[str]:
     ):
         issues.append("status payload shaping must compact normal inventory/benchmark payloads, overlay live benchmark rows, and remove duplicated top-level inventory lists")
     if (
-        'CLUB3090_METRICS_HISTORY_STATUS_MAX_POINTS", 480' not in shared_text
-        or "min(480, config_int(\"metrics\", \"history_status_max_points\"" not in shared_text
-        or "const STATUS_LIVE_SERIES_LIMIT = 120" not in js_text
-        or 'series_limit: includeSeries ? String(options.seriesLimit || STATUS_LIVE_SERIES_LIMIT) : "0"' not in js_text
-        or '"series_limit": series_limit' not in system_text
-        or 'get_lightweight_status_snapshot(series_limit=request_options.get("series_limit"))' not in http_text
-        or "def normalize_runtime_config_file_defaults" not in shared_text
-        or "history_status_max_points" not in shared_text
+        "METRICS_SERIES_RETENTION_SECONDS = 30 * 60" not in shared_text
+        or "METRICS_SERIES_MAX_POINTS = 1800" not in shared_text
+        or "def metrics_series_chunk(" not in system_text
+        or 'if path == "/admin/metrics-series":' not in http_text
+        or "include_series" in system_text
+        or "history_status_max_points" in shared_text
     ):
-        issues.append("metrics status responses must cap chart history to a compact live default for fast tab hydration")
+        issues.append("metrics history must use a fixed bounded buffer and dedicated paginated range API")
     if (
         "const includeInventory = !!(opts && opts.includeInventory);" not in js_text
         or "const includeBenchmarkDetails = !!(opts && opts.includeBenchmarkDetails);" not in js_text
@@ -8180,21 +8175,6 @@ config_text = pathlib.Path(module.CONFIG_TOML_FILE).read_text(encoding="utf-8")
 assert "[benchmarks.thermal]" in config_text and "[profiles.benchmark_ready]" in config_text, config_text
 assert "thermal_grace_seconds = 600" in config_text and "thermal_sustained_seconds = 1800" in config_text, config_text
 assert "critical_core_abort_c = 90" in config_text and "critical_junction_abort_c = 108" in config_text and "critical_vram_abort_c = 108" in config_text, config_text
-assert "history_status_max_points = 480" in config_text, config_text
-pathlib.Path(module.CONFIG_TOML_FILE).write_text(
-    config_text.replace("history_status_max_points = 480", "history_status_max_points = 2880"),
-    encoding="utf-8",
-)
-assert module.ensure_runtime_config_file() is True
-config_text = pathlib.Path(module.CONFIG_TOML_FILE).read_text(encoding="utf-8")
-assert "history_status_max_points = 480" in config_text and "history_status_max_points = 2880" not in config_text, config_text
-pathlib.Path(module.CONFIG_TOML_FILE).write_text(
-    config_text.replace("[profiles.benchmark_ready]\\ngpu_active = 220", "[profiles.benchmark_ready]\\ngpu_active = 250"),
-    encoding="utf-8",
-)
-assert module.ensure_runtime_config_file() is True
-config_text = pathlib.Path(module.CONFIG_TOML_FILE).read_text(encoding="utf-8")
-assert "[profiles.benchmark_ready]\\ngpu_active = 220" in config_text and "[profiles.benchmark_ready]\\ngpu_active = 250" not in config_text, config_text
 pathlib.Path(module.CONFIG_TOML_FILE).write_text(
     config_text
     .replace("thermal_grace_seconds = 600", "thermal_grace_seconds = 30")
@@ -9098,26 +9078,53 @@ try:
     module.status_snapshot_cache = {"series": [{"t": 1}], "metrics": {"cpu_pct": 1}, "benchmarks": {"job": {"active": False}}}
     module.status_lightweight_cache = {"series": [{"t": 10}], "metrics": {"cpu_pct": 10}}
     module.status_lightweight_updated_at = module.time.time()
+    now_t = int(module.time.time())
     with module.metrics_lock:
         module.series_points.clear()
-        module.series_points.append({"t": 20, "cpu_pct": 20, "gpu_util": 0.0, "mem_pct": 0.0})
-        module.series_points.append({"t": 21, "cpu_pct": 21, "gpu_util": 0.0, "mem_pct": 0.0})
-        module.series_points.append({"t": 22, "cpu_pct": 22, "gpu_util": 0.0, "mem_pct": 0.0})
+        for timestamp in range(now_t - 1800, now_t + 1):
+            module.series_points.append({"t": timestamp, "cpu_pct": timestamp, "gpu_util": 0.0, "mem_pct": 0.0})
         module.metrics["active_requests"] = 0
-    limited_options = module.parse_status_request_options({"include_series": "1", "series_limit": "2"})
-    assert limited_options["series_limit"] == 2, limited_options
-    lightweight_probe = module.get_lightweight_status_snapshot(series_limit=2)
+    assert len(module.series_points) == 1800 and module.series_points[0]["t"] == now_t - 1799
+    first_page = module.metrics_series_chunk(now_t - 1800, now_t, limit=999)
+    assert len(first_page["series"]) == 240 and first_page["has_more"] is True, first_page
+    assert first_page["series"][0]["t"] == now_t - 1799
+    second_page = module.metrics_series_chunk(now_t - 1800, now_t, after_t=first_page["next_after"], limit=240)
+    assert second_page["series"][0]["t"] == first_page["next_after"] + 1, second_page
+    assert second_page["has_more"] is True
+    all_points = first_page["series"] + second_page["series"]
+    cursor = second_page["next_after"]
+    while second_page["has_more"]:
+        second_page = module.metrics_series_chunk(now_t - 1800, now_t, after_t=cursor, limit=240)
+        all_points.extend(second_page["series"])
+        cursor = second_page["next_after"]
+    assert len(all_points) == 1800 and all_points[-1]["t"] == now_t
+    assert module.metrics_series_chunk("bad", "bad", limit=241)["retention_seconds"] == 1800
+    class MetricsSeriesRouteFixture:
+        path = f"/admin/metrics-series?start={now_t - 1800}&end={now_t}&limit=999"
+        def require_auth(self):
+            return True
+        def send_json(self, payload, code=200):
+            self.response = (code, payload)
+    route_fixture = MetricsSeriesRouteFixture()
+    module.AdminHandler.do_GET(route_fixture)
+    assert route_fixture.response[0] == 200
+    assert set(route_fixture.response[1]) == {"ok", "series", "next_after", "has_more", "earliest_t", "latest_t", "retention_seconds"}
+    assert len(route_fixture.response[1]["series"]) == 240 and route_fixture.response[1]["has_more"] is True
+    empty_series = module.series_points
+    with module.metrics_lock:
+        module.series_points.clear()
+    empty_payload = module.metrics_series_chunk("bad", "bad")
+    assert empty_payload == {"ok": True, "series": [], "next_after": None, "has_more": False, "earliest_t": None, "latest_t": None, "retention_seconds": 1800}
+    with module.metrics_lock:
+        module.series_points.extend(all_points[-1800:])
+    lightweight_probe = module.get_lightweight_status_snapshot()
     assert lightweight_probe.get("script_version") == module.SCRIPT_VERSION, lightweight_probe
-    assert len(lightweight_probe.get("series", [])) <= 2, lightweight_probe
-    assert lightweight_probe["benchmarks"]["scores"]["vllm/status-score"]["full_score"] == 9.1, lightweight_probe["benchmarks"]
-    assert lightweight_probe.get("series", [])[-1]["t"] >= 22, lightweight_probe
-    assert module.status_lightweight_cache.get("series", [])[-1]["t"] >= 22, module.status_lightweight_cache
-    assert "status_error" not in lightweight_probe, lightweight_probe
-    shaped_limited = module.shape_status_snapshot(
-        {"series": [{"t": 1}, {"t": 2}, {"t": 3}], "remote_update": {"large": True}},
-        {"include_series": True, "series_limit": 2},
+    assert "series" not in lightweight_probe and "series" not in module.shape_status_snapshot(
+        {"series": [{"t": 1}], "remote_update": {"large": True}}, {"include_series": True}
     )
-    assert len(shaped_limited.get("series", [])) <= 2 and shaped_limited["series"][-1]["t"] == 3, shaped_limited
+    assert lightweight_probe["benchmarks"]["scores"]["vllm/status-score"]["full_score"] == 9.1, lightweight_probe["benchmarks"]
+    assert "status_error" not in lightweight_probe, lightweight_probe
+    shaped_limited = module.shape_status_snapshot({"remote_update": {"large": True}}, {})
     assert "remote_update" not in shaped_limited, shaped_limited
 finally:
     module.benchmarks_snapshot = saved_benchmarks_snapshot

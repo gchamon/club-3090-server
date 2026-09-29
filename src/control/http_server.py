@@ -383,23 +383,17 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             request_options = parse_status_request_options(params)
             refresh_remote_metadata = str(params.get("refresh_remote_update") or "").strip().lower() in {"1", "true", "yes", "on"}
             started_at = time.time()
-            if (
-                request_options.get("tab") == "metrics"
-                and request_options.get("include_series")
-                and not request_options.get("include_inventory")
-            ):
-                snapshot = get_lightweight_status_snapshot(series_limit=request_options.get("series_limit"))
-            else:
-                snapshot = get_status_snapshot(force=force, refresh_remote_metadata=refresh_remote_metadata)
-            payload = shape_status_snapshot(
-                snapshot,
-                request_options,
-            )
+            snapshot = get_status_snapshot(force=force, refresh_remote_metadata=refresh_remote_metadata)
+            payload = shape_status_snapshot(snapshot, request_options)
             payload["access_hint"] = tailscale_access_hint_for_client(self.client_address[0] if self.client_address else "")
             elapsed = time.time() - started_at
             if elapsed >= 1.0 or payload.get("status_error"):
                 log_control(f"ADMIN status served force={force} elapsed={round(elapsed, 3)}s status_error={bool(payload.get('status_error'))}")
             self.send_json(payload)
+            return
+        if path == "/admin/metrics-series":
+            params = parse_admin_query_params(parsed)
+            self.send_json(metrics_series_chunk(params.get("start"), params.get("end"), params.get("after"), params.get("limit", 240)))
             return
         if path == "/admin/benchmarks":
             params = parse_admin_query_params(parsed)
