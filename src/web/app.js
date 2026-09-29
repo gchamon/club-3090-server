@@ -9798,7 +9798,7 @@ function renderOverviewAIStudioCategories() {
     categories.map(([type, label, rawCount]) => {
       const count = String(rawCount || "0 / 0").replace(/\s*\/\s*/g, "/");
       const [ready, total] = count.split("/");
-      return `<a class="subtab overview-ai-studio-link" href="${escapeHtml(aiStudioCategoryPermalink(type))}" aria-label="Open AI Studio ${escapeHtml(label)}, ${escapeHtml(ready)} of ${escapeHtml(total)} ready"><strong>${escapeHtml(count)}</strong><span>${escapeHtml(label)}</span></a>`;
+      return `<a class="resource-manager-total-card ai-studio-model-type overview-ai-studio-link" href="${escapeHtml(aiStudioCategoryPermalink(type))}" aria-label="Open AI Studio ${escapeHtml(label)}, ${escapeHtml(ready)} of ${escapeHtml(total)} ready"><strong class="resource-manager-total-value">${escapeHtml(count)}</strong><span class="resource-manager-total-label">${escapeHtml(label)}</span></a>`;
     }).join(""),
   );
 }
