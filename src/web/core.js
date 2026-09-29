@@ -44,8 +44,9 @@ const UPDATE_PENDING_TOKEN_KEY = "club3090-update-pending-token";
 const UPDATE_COMPLETED_TOKEN_KEY = "club3090-update-completed-token";
 const UPDATE_PENDING_RETURN_KEY = "club3090-update-pending-return";
 let updateUiLocked = false;
-let updateSignalPollTimer = null;
-let updateSignalPollActive = false;
+let updateSignalEventSource = null;
+let updateSignalReconnectTimer = null;
+let updateSignalConnectionToken = 0;
 let updateAcknowledgedToken = "";
 let lastWindowFocused = typeof document.hasFocus === "function" ? document.hasFocus() : true;
 let lastSwitchNotificationKey = "";
@@ -422,6 +423,7 @@ function abandonPendingUpdateUi(message = "") {
   }
   updateLogVisualMode();
   if (message && typeof setAuditMsg === "function") setAuditMsg(message);
+  startExternalUpdateSignalStream();
 }
 function reconcileUpdateUiFromStatus(status = lastStatus || {}) {
   const update = currentSelfUpdateState(status);
@@ -503,36 +505,59 @@ function scheduleRenderedUpdateAcknowledgement(token = "") {
   }
   setTimeout(callback, 0);
 }
-async function pollExternalUpdateSignal() {
-  if (updateSignalPollActive || updateMonitor.active) return;
-  updateSignalPollActive = true;
-  try {
-    const response = await fetch(`/admin/update-signal?_=${Date.now()}`, { cache: "no-store" });
-    if (!response.ok) return;
-    const payload = await response.json().catch(() => ({}));
-    const update = payload?.self_update || {};
-    const token = String(update?.token || "").trim();
-    if (update?.active && token && storedUpdateToken(UPDATE_COMPLETED_TOKEN_KEY) !== token) {
-      beginUpdateMonitor(
-        {
-          ...update,
-          stream_url: update.stream_url || `/admin/update-stream?token=${encodeURIComponent(token)}&tail=4000`,
-          status_url: update.status_url || `/admin/update-status?token=${encodeURIComponent(token)}`,
-        },
-        update.scope || "controller",
-      );
-    }
-  } catch (e) {
-  } finally {
-    updateSignalPollActive = false;
+function handleExternalUpdateSignal(update = {}) {
+  const token = String(update?.token || "").trim();
+  if (!update?.active || !token || storedUpdateToken(UPDATE_COMPLETED_TOKEN_KEY) === token) return;
+  beginUpdateMonitor(
+    {
+      ...update,
+      stream_url: update.stream_url || `/admin/update-stream?token=${encodeURIComponent(token)}&tail=4000`,
+      status_url: update.status_url || `/admin/update-status?token=${encodeURIComponent(token)}`,
+    },
+    update.scope || "controller",
+  );
+}
+function stopExternalUpdateSignalStream() {
+  updateSignalConnectionToken += 1;
+  if (updateSignalReconnectTimer) {
+    clearTimeout(updateSignalReconnectTimer);
+    updateSignalReconnectTimer = null;
+  }
+  if (updateSignalEventSource) {
+    updateSignalEventSource.close();
+    updateSignalEventSource = null;
   }
 }
-function startExternalUpdateSignalPolling() {
-  if (updateSignalPollTimer) clearInterval(updateSignalPollTimer);
-  updateSignalPollTimer = setInterval(() => {
-    pollExternalUpdateSignal().catch(() => {});
-  }, UPDATE_SIGNAL_POLL_MS);
-  pollExternalUpdateSignal().catch(() => {});
+function startExternalUpdateSignalStream() {
+  if (updateMonitor.active) return;
+  if (updateSignalReconnectTimer) {
+    clearTimeout(updateSignalReconnectTimer);
+    updateSignalReconnectTimer = null;
+  }
+  if (updateSignalEventSource) {
+    updateSignalEventSource.close();
+    updateSignalEventSource = null;
+  }
+  const connectionToken = ++updateSignalConnectionToken;
+  const source = new EventSource("/admin/update-events");
+  updateSignalEventSource = source;
+  source.addEventListener("state", (event) => {
+    if (connectionToken !== updateSignalConnectionToken) return;
+    try {
+      handleExternalUpdateSignal(JSON.parse(event.data));
+    } catch (e) {
+    }
+  });
+  source.onerror = () => {
+    if (connectionToken !== updateSignalConnectionToken) return;
+    source.close();
+    if (updateSignalEventSource === source) updateSignalEventSource = null;
+    if (updateMonitor.active || updateSignalReconnectTimer) return;
+    updateSignalReconnectTimer = setTimeout(() => {
+      updateSignalReconnectTimer = null;
+      if (!updateMonitor.active) startExternalUpdateSignalStream();
+    }, UPDATE_SIGNAL_RECONNECT_MS);
+  };
 }
 function recoverPendingUpdateMonitor(scope = "controller") {
   if (updateMonitor.active || updateMonitor.completed) return false;

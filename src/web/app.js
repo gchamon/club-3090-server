@@ -5764,7 +5764,7 @@ async function bootAdminUi() {
   if (!uiStateHydrated) hydrateUiState({});
   syncActiveTabDisplay();
   recoverPendingUpdateMonitor();
-  startExternalUpdateSignalPolling();
+  startExternalUpdateSignalStream();
   hydratePresetSummaryCache();
   const chatCacheApplied = hydrateChatStateFromLocalCache();
   if (chatCacheApplied && activeTabName === "chat") {
@@ -9789,16 +9789,18 @@ function renderAIStudioRuntimePanel(status = lastStatus) {
   }
   setHtmlIfChanged(host, `<div class="ai-studio-runtime-head"><strong>Inference runtimes</strong></div><div class="ai-studio-runtime-rows">${rows.map((item) => {
     const runtime = runtimes.find((row) => String(row?.id || "").toUpperCase() === String(item.id || "").toUpperCase()) || {};
-    const variant = findVariantBySelector(item.mode) || {};
+    const variant = findVariantBySelector(item.mode);
     const active = !!(runtime.running ?? item.running);
     const starting = !active && !!(runtime.booting ?? item.booting);
     const state = active ? "Running" : starting ? "Starting" : "Stopped";
     const label = variant ? variantDisplayLabel(variant) : item.mode;
-    const engine = runtime.engine_display || runtime.engine || variant.engine_display || variant.engine || "Unknown engine";
     const gpu = (item.gpu_indices || [item.gpu_index]).filter((idx) => idx !== undefined && idx !== null).join(", ");
+    const displayName = String(item.display_name || item.id);
+    const namedGpuIndices = (displayName.match(/\d+/g) || []).join(", ");
+    const gpuLabel = gpu && namedGpuIndices !== gpu ? ` · GPU ${gpu}` : "";
     const disabledStart = active || starting;
     const disabledStop = !active && !starting;
-    return `<article class="ai-studio-runtime-row"><div class="ai-studio-runtime-meta"><strong>${escapeHtml(item.display_name || item.id)}${gpu ? ` · GPU ${escapeHtml(gpu)}` : ""}</strong><span>${escapeHtml(label)}</span><span>${escapeHtml(engine)} · <code>${escapeHtml(item.mode)}</code></span></div><span class="status-badge ${active ? "status-success" : starting ? "status-warning" : "status-info"}">${state}</span><div class="ai-studio-runtime-actions"><button class="btn green" ${disabledStart ? "disabled" : ""} onclick="aiStudioRuntimeAction('${escapeJs(item.id)}','start_instance')">Start</button><button class="btn blue" ${disabledStop ? "disabled" : ""} onclick="aiStudioRuntimeAction('${escapeJs(item.id)}','restart_instance')">Restart</button><button class="btn red" ${disabledStop ? "disabled" : ""} onclick="aiStudioRuntimeAction('${escapeJs(item.id)}','stop_container')">Stop</button><button class="btn" onclick="aiStudioRuntimeAction('${escapeJs(item.id)}','unload_instance')">Unload</button></div></article>`;
+    return `<article class="ai-studio-runtime-row"><div class="ai-studio-runtime-meta"><strong>${escapeHtml(displayName)}${escapeHtml(gpuLabel)}</strong><span>${escapeHtml(label)}</span></div><span class="status-badge ${active ? "status-success" : starting ? "status-warning" : "status-info"}">${state}</span><div class="ai-studio-runtime-actions"><button class="btn green" ${disabledStart ? "disabled" : ""} onclick="aiStudioRuntimeAction('${escapeJs(item.id)}','start_instance')">Start</button><button class="btn blue" ${disabledStop ? "disabled" : ""} onclick="aiStudioRuntimeAction('${escapeJs(item.id)}','restart_instance')">Restart</button><button class="btn rose" ${!active && !starting ? "disabled" : ""} onclick="aiStudioRuntimeAction('${escapeJs(item.id)}','unload_instance')">Unload</button><button class="btn rose" ${!active ? "disabled" : ""} onclick="aiStudioRuntimeAction('${escapeJs(item.id)}','stop_container')">Stop</button></div></article>`;
   }).join("")}</div>`);
 }
 async function aiStudioRuntimeAction(instanceId, action) {

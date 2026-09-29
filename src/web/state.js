@@ -125,7 +125,7 @@ const CHAT_TRANSCRIPT_EXPAND_STEP = 12;
 const STATUS_POLL_FOREGROUND_FAST_MS = 2000;
 const STATUS_POLL_FOREGROUND_SLOW_MS = 5000;
 const STATUS_POLL_BACKGROUND_MS = 15000;
-const UPDATE_SIGNAL_POLL_MS = 250;
+const UPDATE_SIGNAL_RECONNECT_MS = 5000;
 const LOG_CACHE_REFRESH_MS = 15000;
 const CHAT_TRANSCRIPT_NEAR_BOTTOM_PX = 36;
 const CHAT_TRANSCRIPT_DETACH_SCROLL_PX = 18;
@@ -1485,6 +1485,7 @@ function promptStaleUpdateConfirmation(scope, targetCommit = "") {
 function completeUpdateMonitor(payload = {}) {
   markUpdateTokenCompleted(payload?.token || updateMonitor.token);
   endUpdateMonitor();
+  startExternalUpdateSignalStream();
   const returnCode = Number(payload?.return_code || 0);
   triggerAdminPanelReload(
     returnCode === 0
@@ -1564,6 +1565,7 @@ async function pollUpdateMonitorStatus() {
   }
 }
 function beginUpdateMonitor(payload, scope) {
+  stopExternalUpdateSignalStream();
   if (!updateMonitor.returnLogSource || currentLogSource !== "update") {
     updateMonitor.returnLogSource = updateFallbackLogSource(currentLogSource);
   }

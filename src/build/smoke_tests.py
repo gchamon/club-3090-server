@@ -1228,12 +1228,16 @@ def validate_model_score_description_source(js_text: str) -> list[str]:
         or "update.active && (!updateToken || !updateTokenCompleted(updateToken))" not in js_text
         or 'stream_url: update.stream_url || "/admin/update-stream"' not in js_text
         or 'status_url: update.status_url || "/admin/update-status"' not in js_text
-        or "const UPDATE_SIGNAL_POLL_MS = 250" not in js_text
-        or "function pollExternalUpdateSignal()" not in js_text
-        or "function acknowledgeRenderedUpdateMode(" not in js_text
-        or 'fetch("/admin/update-ack"' not in js_text
-        or "scheduleRenderedUpdateAcknowledgement(updateMonitor.token)" not in js_text
-        or 'path == "/admin/update-signal"' not in http_text
+        or "const UPDATE_SIGNAL_RECONNECT_MS = 5000" not in js_text
+        or "function handleExternalUpdateSignal(" not in js_text
+        or "function startExternalUpdateSignalStream(" not in js_text
+        or "function stopExternalUpdateSignalStream(" not in js_text
+        or 'new EventSource("/admin/update-events")' not in js_text
+        or "def stream_update_events(self):" not in http_text
+        or "def update_signal_payload(self):" not in http_text
+        or 'path == "/admin/update-events"' not in http_text
+        or "/admin/update-signal" in js_text
+        or "/admin/update-signal" in http_text
     ):
         issues.append("Update monitor must detect external updates immediately, render and acknowledge its locked Update Logs state, and recover through control-plane restart races")
     if (
@@ -1537,6 +1541,8 @@ const statusPayload = {{
   gpu_count: 0,
   benchmarks: {{ scores: {{}}, running: {{}}, job: {{ active: false }}, counts: {{}} }},
 }};
+const updateEventSources = [];
+const timeoutDelays = [];
 const localStorageData = {{}};
 const context = {{
   console,
@@ -1549,8 +1555,10 @@ const context = {{
   }},
   EventSource: function EventSource(url) {{
     this.url = url;
-    this.addEventListener = () => {{}};
-    this.close = () => {{}};
+    this.listeners = {{}};
+    this.addEventListener = (name, callback) => {{ this.listeners[name] = callback; }};
+    this.close = () => {{ this.closed = true; }};
+    updateEventSources.push(this);
   }},
   fetch: async (url) => {{
     if (String(url).startsWith("/admin/status")) {{
@@ -1586,7 +1594,7 @@ const context = {{
   }},
   setInterval() {{ return 1; }},
   clearInterval() {{}},
-  setTimeout(fn) {{ if (typeof fn === "function") fn(); return 1; }},
+  setTimeout(fn, delay) {{ timeoutDelays.push(delay); if (typeof fn === "function") fn(); return 1; }},
   clearTimeout() {{}},
   alert() {{}},
   confirm() {{ return false; }},
@@ -1625,6 +1633,38 @@ process.on("uncaughtException", (error) => {{
   await Promise.resolve();
   await new Promise((resolve) => setImmediate(resolve));
   if (asyncFailure) throw asyncFailure;
+  vm.runInContext("startExternalUpdateSignalStream();", context);
+  const updateDiscoverySources = updateEventSources.filter((source) => source.url === "/admin/update-events");
+  if (updateDiscoverySources.length !== 1) {{
+    throw new Error("update discovery should open one update-events stream: " + JSON.stringify(updateEventSources.map((source) => source.url)));
+  }}
+  updateDiscoverySources[0].listeners.state({{ data: "not-json" }});
+  updateDiscoverySources[0].listeners.state({{ data: JSON.stringify({{ active: false }}) }});
+  if (vm.runInContext("updateMonitor.active", context)) {{
+    throw new Error("malformed or inactive update state must not start the update monitor");
+  }}
+  updateDiscoverySources[0].listeners.state({{ data: JSON.stringify({{ active: true, token: "external-token" }}) }});
+  if (!vm.runInContext("updateMonitor.active && updateMonitor.streamUrl.includes('token=external-token')", context)) {{
+    throw new Error("active update-events state must hand off to the tokenized update monitor");
+  }}
+  vm.runInContext("updateMonitor.active = false; stopExternalUpdateSignalStream(); startExternalUpdateSignalStream();", context);
+  const reconnectSource = updateEventSources.filter((source) => source.url === "/admin/update-events").at(-1);
+  const sourceCountBeforeError = updateEventSources.filter((source) => source.url === "/admin/update-events").length;
+  const timeoutCountBeforeError = timeoutDelays.length;
+  reconnectSource.onerror();
+  if (updateEventSources.filter((source) => source.url === "/admin/update-events").length !== sourceCountBeforeError + 1) {{
+    throw new Error("update-events error should schedule one reconnect");
+  }}
+  if (timeoutDelays.length !== timeoutCountBeforeError + 1 || timeoutDelays.at(-1) !== 5000) {{
+    throw new Error("update-events reconnect should use a single 5-second delay");
+  }}
+  vm.runInContext("updateMonitor.active = true;", context);
+  const activeErrorSource = updateEventSources.filter((source) => source.url === "/admin/update-events").at(-1);
+  const sourceCountDuringActiveMonitor = updateEventSources.filter((source) => source.url === "/admin/update-events").length;
+  activeErrorSource.onerror();
+  if (updateEventSources.filter((source) => source.url === "/admin/update-events").length !== sourceCountDuringActiveMonitor) {{
+    throw new Error("update-events error must not reconnect while an update monitor is active");
+  }}
   if (code.includes("systemUtilityRow")) throw new Error("legacy systemUtilityRow layout shim should not be present");
   if (typeof context.tab !== "function") throw new Error("tab() was not initialized");
   if (typeof context.refreshStatus !== "function") throw new Error("refreshStatus() was not initialized");
@@ -1678,6 +1718,12 @@ process.on("uncaughtException", (error) => {{
       }},
     ],
   }};
+  vm.runInContext("lastStatus = {{ instances: [{{ id: 'GPU0', display_name: 'GPU0', gpu_index: 0, gpu_indices: [0], mode: 'llamacpp/qwen38-27b-hauhaucs-aggressive-single-iq4xs', running: true }}], running_runtimes: [{{ id: 'GPU0', running: true, engine_display: 'llama.cpp' }}] }}; renderAIStudioRuntimePanel(lastStatus);", context);
+  const runtimeHtml = String(getElement("aiStudioRuntimePanel").innerHTML || "");
+  if (!runtimeHtml.includes("GPU0") || !runtimeHtml.includes("llamacpp/qwen38-27b-hauhaucs-aggressive-single-iq4xs") ||
+      runtimeHtml.includes("llama.cpp") || runtimeHtml.includes("GPU 0")) {{
+    throw new Error("Inference runtime rows should avoid repeating the engine, selector, and GPU index");
+  }}
   vm.runInContext("updateMonitor.active = false; lastStatus = __modelLogStatus; currentLogSource = 'control'; renderLogSourcePanel(); __controlLogConfig = logStreamConfig(); __controlBootstrap = logBootstrapUrlForSource('control');", context);
   if (!String(getElement("logSourcePanel").innerHTML || "").includes("Web UI Server")) {{
     throw new Error("log source controls should expose Web UI Server logs");
@@ -7696,6 +7742,8 @@ def api_contract_smoke_harness() -> str:
 import inspect
 import os
 import pathlib
+import io
+import json
 import sys
 import time
 import types
@@ -7733,6 +7781,89 @@ module.AUDIT_LOG_FILE = str(temp_root / "audit.log")
 module.DEBUG_LOG_FILE = str(temp_root / "debug.log")
 module.UPDATE_LOG_FILE = str(temp_root / "self-update.log")
 module.UPDATE_STATE_FILE = str(temp_root / "self-update-state.json")
+pathlib.Path(module.UPDATE_STATE_FILE).write_text("{}", encoding="utf-8")
+class UpdateSignalPayloadFixture:
+    update_signal_payload = module.AdminHandler.update_signal_payload
+signal_payload_fixture = UpdateSignalPayloadFixture()
+assert signal_payload_fixture.update_signal_payload() == {
+    "active": False, "status": "idle", "scope": "", "token": "", "stream_url": "", "status_url": ""
+}
+pathlib.Path(module.UPDATE_STATE_FILE).write_text(
+    json.dumps({"active": True, "status": "running", "scope": "controller", "token": "signal-token"}),
+    encoding="utf-8",
+)
+active_signal = signal_payload_fixture.update_signal_payload()
+assert set(active_signal) == {"active", "status", "scope", "token", "stream_url", "status_url"}, active_signal
+assert active_signal["active"] is True and active_signal["token"] == "signal-token", active_signal
+class UpdateEventsRouteFixture:
+    path = "/admin/update-events"
+    headers = {"User-Agent": "update-events-contract"}
+    client_address = ("127.0.0.1", 1)
+    events = []
+    headers_sent = []
+    wfile = io.BytesIO()
+    close_connection = False
+    stream_update_events = module.AdminHandler.stream_update_events
+    update_signal_payload = module.AdminHandler.update_signal_payload
+    begin_admin_stream = module.AdminHandler.begin_admin_stream
+    end_admin_stream = module.AdminHandler.end_admin_stream
+    admin_stream_client_key = module.AdminHandler.admin_stream_client_key
+    admin_stream_stopped = module.AdminHandler.admin_stream_stopped
+    def require_auth(self):
+        return True
+    def send_response(self, code):
+        self.response_code = code
+    def send_header(self, key, value):
+        self.headers_sent.append((key, value))
+    def emit_pending_headers(self):
+        pass
+    def end_headers(self):
+        pass
+    def send_sse_event(self, name, payload):
+        self.events.append((name, payload))
+    def send_sse_comment(self, text="ping"):
+        pass
+    def stream_update_events(self):
+        return module.AdminHandler.stream_update_events(self)
+pathlib.Path(module.UPDATE_STATE_FILE).write_text("{}", encoding="utf-8")
+route_fixture = UpdateEventsRouteFixture()
+original_sleep = module.time.sleep
+sleep_count = 0
+def update_events_test_sleep(_seconds):
+    global sleep_count
+    sleep_count += 1
+    if sleep_count == 1:
+        pathlib.Path(module.UPDATE_STATE_FILE).write_text(
+            json.dumps({"active": True, "status": "running", "scope": "controller", "token": "route-token"}),
+            encoding="utf-8",
+        )
+    elif sleep_count == 3:
+        with module.admin_stream_registry_lock:
+            next(iter(module.admin_stream_registry.values())).set()
+module.time.sleep = update_events_test_sleep
+try:
+    module.AdminHandler.do_GET(route_fixture)
+finally:
+    module.time.sleep = original_sleep
+assert [event for event, _payload in route_fixture.events] == ["state", "state"], route_fixture.events
+assert route_fixture.events[0][1]["active"] is False, route_fixture.events
+assert route_fixture.events[1][1]["token"] == "route-token", route_fixture.events
+assert route_fixture.events[1][1]["stream_url"] == "/admin/update-stream?token=route-token&tail=4000", route_fixture.events
+assert ("Content-Type", "text/event-stream") in route_fixture.headers_sent
+assert ("Cache-Control", "no-cache") in route_fixture.headers_sent
+assert ("Connection", "keep-alive") in route_fixture.headers_sent
+class UnauthenticatedUpdateEventsFixture(UpdateEventsRouteFixture):
+    events = []
+    def require_auth(self):
+        self.response_code = 401
+        return False
+    def send_response(self, code):
+        self.response_code = code
+    def send_header(self, key, value):
+        self.headers_sent.append((key, value))
+denied_fixture = UnauthenticatedUpdateEventsFixture()
+module.AdminHandler.do_GET(denied_fixture)
+assert denied_fixture.response_code == 401 and denied_fixture.events == [], denied_fixture.events
 module.PRESET_TPS_STATS_FILE = str(temp_root / "preset_tps_stats.json")
 module.SYSTEM_METRIC_PEAKS_FILE = str(temp_root / "system_metric_peaks.json")
 module.GPU_LAST_SEEN_FILE = str(temp_root / "gpu_last_seen.json")

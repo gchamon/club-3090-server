@@ -318,6 +318,56 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
         self.close_connection = True
     def admin_stream_stopped(self, stop_event):
         return bool(stop_event is not None and stop_event.is_set())
+    def update_signal_payload(self):
+        update_state = read_self_update_state()
+        return {
+            "active": bool(update_state.get("active")),
+            "status": update_state.get("status"),
+            "scope": update_state.get("scope"),
+            "token": update_state.get("token"),
+            "stream_url": update_state.get("stream_url"),
+            "status_url": update_state.get("status_url"),
+        }
+    def stream_update_events(self):
+        stream_key, stop_event = self.begin_admin_stream(f"update-events:{id(self)}")
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.emit_pending_headers()
+        self.end_headers()
+        last_payload = None
+        last_heartbeat = time.monotonic()
+        try:
+            last_payload = self.update_signal_payload()
+            self.send_sse_event("state", last_payload)
+            try:
+                state_stat = os.stat(UPDATE_STATE_FILE)
+                last_signature = (state_stat.st_mtime_ns, state_stat.st_size)
+            except OSError:
+                last_signature = None
+            while not self.admin_stream_stopped(stop_event):
+                time.sleep(0.5)
+                if self.admin_stream_stopped(stop_event):
+                    break
+                try:
+                    state_stat = os.stat(UPDATE_STATE_FILE)
+                    signature = (state_stat.st_mtime_ns, state_stat.st_size)
+                except OSError:
+                    signature = None
+                if signature != last_signature:
+                    last_signature = signature
+                    payload = self.update_signal_payload()
+                    if payload != last_payload:
+                        self.send_sse_event("state", payload)
+                        last_payload = payload
+                        last_heartbeat = time.monotonic()
+                elif time.monotonic() - last_heartbeat >= 15:
+                    self.send_sse_comment()
+                    last_heartbeat = time.monotonic()
+        finally:
+            self.end_admin_stream(stream_key, stop_event)
     def do_GET(self):
         parsed = urlsplit(self.path)
         path = parsed.path
@@ -354,19 +404,8 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             except Exception as e:
                 self.send_json({"ok": False, "error": str(e)}, 400)
             return
-        if path == "/admin/update-signal":
-            update_state = read_self_update_state()
-            self.send_json({
-                "ok": True,
-                "self_update": {
-                    "active": bool(update_state.get("active")),
-                    "status": update_state.get("status"),
-                    "scope": update_state.get("scope"),
-                    "token": update_state.get("token"),
-                    "stream_url": update_state.get("stream_url"),
-                    "status_url": update_state.get("status_url"),
-                },
-            })
+        if path == "/admin/update-events":
+            self.stream_update_events()
             return
         if path == "/":
             self.redirect("/admin")
