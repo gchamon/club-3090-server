@@ -5496,6 +5496,46 @@ details[open] > summary .score-collapse-cue::before {
   outline: 2px solid #8dd2ff;
   outline-offset: 2px;
 }
+.ai-studio-runtime-panel {
+  margin: 0 0 14px;
+  padding: 14px;
+  border: 1px solid #2e4b67;
+  border-radius: 10px;
+  background: rgba(15, 28, 42, 0.72);
+}
+.ai-studio-runtime-empty {
+  color: #b8c8d8;
+}
+.ai-studio-runtime-rows {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+.ai-studio-runtime-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid #294057;
+  border-radius: 8px;
+}
+.ai-studio-runtime-meta {
+  display: grid;
+  flex: 1 1 260px;
+  min-width: 0;
+  gap: 4px;
+  overflow-wrap: anywhere;
+}
+.ai-studio-runtime-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.ai-studio-runtime-panel button:focus-visible {
+  outline: 2px solid #8dd2ff;
+  outline-offset: 2px;
+}
 .ai-studio-lane-card {
   position: relative;
   padding-right: 74px;

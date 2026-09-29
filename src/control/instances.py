@@ -145,10 +145,11 @@ def normalize_instance(raw, used_ids=None, used_ports=None, substitutions=None):
     kind = parsed["kind"]
     gpu_indices = list(parsed["gpu_indices"])
     gpu_index = int(gpu_indices[0])
-    raw_mode = str(raw.get("mode") or (default_dual_mode_selector() if kind == "dual" else default_single_mode_selector())).strip()
-    mode = canonical_mode_selector(raw_mode)
+    raw_mode = str(raw.get("mode") if "mode" in raw else (default_dual_mode_selector() if kind == "dual" else default_single_mode_selector())).strip()
+    mode = canonical_mode_selector(raw_mode) if raw_mode else ""
     valid_modes = DUAL_GPU_MODES if kind == "dual" else SINGLE_GPU_MODES
-    if mode not in valid_modes or not resolve_variant_spec(mode):
+    unloaded = "mode" in raw and not raw_mode
+    if not unloaded and (mode not in valid_modes or not resolve_variant_spec(mode)):
         preferred_model = ""
         preferred_spec = resolve_variant_spec(raw_mode)
         if preferred_spec:
@@ -185,7 +186,7 @@ def normalize_instance(raw, used_ids=None, used_ports=None, substitutions=None):
         "gpu_indices": gpu_indices,
         "gpu_index": gpu_index,
         "mode": mode,
-        "enabled": bool(raw.get("enabled", False)),
+        "enabled": False if unloaded else bool(raw.get("enabled", False)),
         "auto_pair": auto_pair,
         "port": port,
     }
@@ -270,7 +271,8 @@ def write_instances_config(rows):
     return rows
 
 def instance_container_name(instance):
-    return f"club3090-{instance['id'].lower()}-{instance['mode'].replace('/', '-')}"
+    mode = str(instance.get("mode") or "")
+    return f"club3090-{instance['id'].lower()}-{mode.replace('/', '-')}" if mode else ""
 
 def instance_project_name(instance):
     return f"club3090-{instance['id'].lower()}"
@@ -812,11 +814,12 @@ def start_instances_parallel(instances):
     ]
     return {"started": successful, "failed": failed}
 
-
 def start_instance(instance_id, track_switch_job=True):
     instance = get_instance(instance_id)
     if not instance:
         raise ValueError(f"Unknown instance: {instance_id}")
+    if not instance.get("mode"):
+        raise ValueError(f"No preset selected for {instance['id']}")
     try:
         if track_switch_job:
             _set_switch_job(
@@ -832,41 +835,26 @@ def start_instance(instance_id, track_switch_job=True):
         result = _instance_launch(instance)
         _instance_wait_until_ready(instance)
         if track_switch_job:
-            _set_switch_job(
-                active=False,
-                status="success",
-                mode=str(instance.get("mode") or ""),
-                target=str(instance.get("id") or ""),
-                finished_at=int(time.time()),
-                error="",
-            )
+            _set_switch_job(active=False, status="success", mode=str(instance.get("mode") or ""), target=str(instance.get("id") or ""), finished_at=int(time.time()), error="")
         return result
     except Exception as e:
         if track_switch_job:
             current_job = switch_job_snapshot()
-            stopped_by_user = (
-                str(current_job.get("status") or "") == "stopped"
-                and str(current_job.get("mode") or "") == str(instance.get("mode") or "")
-                and str(current_job.get("target") or "") == str(instance.get("id") or "")
-            )
+            stopped_by_user = str(current_job.get("status") or "") == "stopped" and str(current_job.get("mode") or "") == str(instance.get("mode") or "") and str(current_job.get("target") or "") == str(instance.get("id") or "")
             if not stopped_by_user:
                 write_switch_failure(instance["mode"], e)
-                _set_switch_job(
-                    active=False,
-                    status="failed",
-                    mode=str(instance.get("mode") or ""),
-                    target=str(instance.get("id") or ""),
-                    finished_at=int(time.time()),
-                    error=str(e)[-12000:],
-                )
+                _set_switch_job(active=False, status="failed", mode=str(instance.get("mode") or ""), target=str(instance.get("id") or ""), finished_at=int(time.time()), error=str(e)[-12000:])
         else:
             write_switch_failure(instance["mode"], e)
         raise
+
 
 def stop_instance(instance_id):
     instance = get_instance(instance_id)
     if not instance:
         raise ValueError(f"Unknown instance: {instance_id}")
+    if not instance.get("mode"):
+        return 0, "No preset selected."
     cmd = instance_compose_args(instance) + ["down"]
     rc, out = run_cmd(cmd, timeout=600, cwd=instance_compose_project_dir(instance), env=instance_stop_subprocess_env())
     if rc != 0:
@@ -874,7 +862,6 @@ def stop_instance(instance_id):
         out = (out or "") + f"\nmanual rm rc={rc2} {out2}"
     log_control(f"INSTANCE stop {instance['id']} rc={rc}: {out[-4000:]}")
     return rc, out[-4000:]
-
 
 def _configured_scope_targets_for_mode(instance_id="", mode=""):
     selector = canonical_mode_selector(mode) if mode else ""
@@ -955,12 +942,14 @@ def update_instance(instance_id, mode=None, enabled=None):
         if row["id"] != str(instance_id or "").strip().upper():
             continue
         if mode is not None:
-            mode = canonical_mode_selector(mode)
+            mode = canonical_mode_selector(mode) if str(mode).strip() else ""
             valid_modes = DUAL_GPU_MODES if row.get("kind") == "dual" else SINGLE_GPU_MODES
-            if mode not in valid_modes:
+            if mode and mode not in valid_modes:
                 raise ValueError("Selected preset type does not match this instance")
             row["mode"] = mode
-        if enabled is not None:
+            if not mode:
+                row["enabled"] = False
+        if enabled is not None and row.get("mode"):
             row["enabled"] = bool(enabled)
         updated = dict(row)
         break
@@ -970,7 +959,20 @@ def update_instance(instance_id, mode=None, enabled=None):
         rows, _, _ = normalize_enabled_instance_selection(rows, preferred_ids=[updated["id"]])
     write_instances_config(rows)
     return get_instance(updated["id"])
-
+def unload_instance(instance_id):
+    iid = str(instance_id or "").strip().upper()
+    if not iid or iid == "GLOBAL":
+        raise ValueError("Unload requires a named instance")
+    instance = get_instance(iid)
+    if not instance:
+        raise ValueError(f"Unknown instance: {instance_id}")
+    if instance.get("mode"):
+        rc, output = stop_instance(iid)
+        current = get_instance(iid)
+        if rc != 0 or instance_running(current):
+            raise RuntimeError(f"Could not confirm runtime shutdown for {iid}: {output}")
+    unloaded = update_instance(iid, mode="", enabled=False)
+    return instance_snapshot(unloaded)
 def save_pair_instance(gpu_indices, mode=None, enabled=None):
     pair = normalize_pair_indices(gpu_indices)
     if not pair:
@@ -1317,6 +1319,30 @@ def instance_assignment(instance, dual_mode=None):
     }
 
 def instance_snapshot(instance, dual_mode=None):
+    mode = str(instance.get("mode") or "")
+    if not mode:
+        gpu_indices = list(instance.get("gpu_indices") or [instance["gpu_index"]])
+        return {
+            "id": instance["id"],
+            "kind": instance.get("kind", "single"),
+            "gpu_index": instance["gpu_index"],
+            "gpu_indices": gpu_indices,
+            "mode": "",
+            "enabled": False,
+            "auto_pair": bool(instance.get("auto_pair")),
+            "port": int(instance.get("port") or 0),
+            "container": "",
+            "running": False,
+            "booting": False,
+            "container_state": "",
+            "ready_url": "",
+            "proxy_prefix": f"/{instance['id']}",
+            "display_name": instance["id"] if instance.get("kind") != "dual" else f"Pair {', '.join(str(idx) for idx in gpu_indices)}",
+            "assignment_scope": "pair" if instance.get("kind") == "dual" else "per-gpu",
+            "assignment_mode": "",
+            "assignment_text": "No preset selected",
+            "overrides_dual_mode": False,
+        }
     container = instance_runtime_container_name(instance)
     runtime_mode = instance_runtime_mode(instance)
     runtime_port = instance_runtime_port(instance)

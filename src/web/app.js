@@ -9803,8 +9803,46 @@ function selectAIStudioModelType(type) {
     else renderDynamicPresetModels();
   }
 }
+function renderAIStudioRuntimePanel(status = lastStatus) {
+  const host = $("aiStudioRuntimePanel");
+  if (!host) return;
+  const instances = Array.isArray(status?.instances) ? status.instances : [];
+  const runtimes = Array.isArray(status?.running_runtimes) ? status.running_runtimes : [];
+  const rows = instances.filter((item) => String(item?.mode || "").trim());
+  if (!rows.length) {
+    setHtmlIfChanged(host, `<div class="ai-studio-runtime-empty">No inference engine is selected or running.</div>`);
+    return;
+  }
+  setHtmlIfChanged(host, `<div class="ai-studio-runtime-head"><strong>Inference runtimes</strong></div><div class="ai-studio-runtime-rows">${rows.map((item) => {
+    const runtime = runtimes.find((row) => String(row?.id || "").toUpperCase() === String(item.id || "").toUpperCase()) || {};
+    const variant = findVariantBySelector(item.mode) || {};
+    const active = !!(runtime.running ?? item.running);
+    const starting = !active && !!(runtime.booting ?? item.booting);
+    const state = active ? "Running" : starting ? "Starting" : "Stopped";
+    const label = variant ? variantDisplayLabel(variant) : item.mode;
+    const engine = runtime.engine_display || runtime.engine || variant.engine_display || variant.engine || "Unknown engine";
+    const gpu = (item.gpu_indices || [item.gpu_index]).filter((idx) => idx !== undefined && idx !== null).join(", ");
+    const disabledStart = active || starting;
+    const disabledStop = !active && !starting;
+    return `<article class="ai-studio-runtime-row"><div class="ai-studio-runtime-meta"><strong>${escapeHtml(item.display_name || item.id)}${gpu ? ` · GPU ${escapeHtml(gpu)}` : ""}</strong><span>${escapeHtml(label)}</span><span>${escapeHtml(engine)} · <code>${escapeHtml(item.mode)}</code></span></div><span class="status-badge ${active ? "status-success" : starting ? "status-warning" : "status-info"}">${state}</span><div class="ai-studio-runtime-actions"><button class="btn green" ${disabledStart ? "disabled" : ""} onclick="aiStudioRuntimeAction('${escapeJs(item.id)}','start_instance')">Start</button><button class="btn blue" ${disabledStop ? "disabled" : ""} onclick="aiStudioRuntimeAction('${escapeJs(item.id)}','restart_instance')">Restart</button><button class="btn red" ${disabledStop ? "disabled" : ""} onclick="aiStudioRuntimeAction('${escapeJs(item.id)}','stop_container')">Stop</button><button class="btn" onclick="aiStudioRuntimeAction('${escapeJs(item.id)}','unload_instance')">Unload</button></div></article>`;
+  }).join("")}</div>`);
+}
+async function aiStudioRuntimeAction(instanceId, action) {
+  if (typeof benchmarkJobActive === "function" && benchmarkJobActive()) return;
+  const item = (lastStatus?.instances || []).find((row) => String(row.id).toUpperCase() === String(instanceId).toUpperCase());
+  if (!item || !item.mode) return;
+  if (action === "stop_container" && !(await openClubConfirmModal(`Stop ${item.display_name || item.id}?`))) return;
+  if (action === "unload_instance" && !(await openClubConfirmModal(`Stop the selected runtime, clear ${item.display_name || item.id}'s preset slug, disable autoboot, and release its model/VRAM?`))) return;
+  try {
+    await post("/admin/power", { action, instance_id: instanceId });
+    await refreshStatus({ force: true });
+  } catch (e) {
+    alert(e);
+  }
+}
 function renderAIStudioTab() {
   if (activeTabName !== "ai-studio") return;
+  renderAIStudioRuntimePanel();
   const typeHost = $("aiStudioModelTypes");
   const contentHost = $("aiStudioContent");
   const resourceView = $("aiStudioResourceView");

@@ -10799,6 +10799,32 @@ finally:
     module.benchmark_restore_previous_runtimes = original_restore_runtimes
     module.read_benchmark_state = original_finalizing_read
     module.write_benchmark_state = original_finalizing_write
+unloaded_normalized = module.normalize_instance({"id": "GPU0", "gpu_index": 0, "mode": "", "enabled": True})
+assert unloaded_normalized["mode"] == "" and unloaded_normalized["enabled"] is False, unloaded_normalized
+assert 'elif action == "unload_instance"' in control_source_text, "unload power dispatch is missing"
+assert control_source_text.count('elif action == "unload_instance"') == 2, "admin and local unload dispatches must both exist"
+original_read_instances = module.read_instances_config
+original_write_instances = module.write_instances_config
+original_stop_instance = module.stop_instance
+original_instance_running = module.instance_running
+original_instance_snapshot = module.instance_snapshot
+unload_rows = [{"id": "GPU0", "kind": "single", "gpu_index": 0, "gpu_indices": [0], "mode": "vllm/minimal", "enabled": True, "port": 19000}]
+unload_events = []
+module.read_instances_config = lambda: [dict(row) for row in unload_rows]
+module.write_instances_config = lambda rows: (unload_rows.clear(), unload_rows.extend(dict(row) for row in rows), rows)[-1]
+module.stop_instance = lambda iid: (unload_events.append(("stop", iid, unload_rows[0]["mode"])) or (0, "stopped"))
+module.instance_running = lambda _inst: False
+module.instance_snapshot = lambda inst: dict(inst)
+try:
+    unloaded_snapshot = module.unload_instance("GPU0")
+    assert unload_events == [("stop", "GPU0", "vllm/minimal")], unload_events
+    assert unloaded_snapshot["mode"] == "" and unloaded_snapshot["enabled"] is False, unloaded_snapshot
+finally:
+    module.read_instances_config = original_read_instances
+    module.write_instances_config = original_write_instances
+    module.stop_instance = original_stop_instance
+    module.instance_running = original_instance_running
+    module.instance_snapshot = original_instance_snapshot
 local_api_source = control_source_text
 assert 'if path == "/power"' in local_api_source and 'if path == "/profile"' in local_api_source, local_api_source
 assert 'local_api_power_action' in local_api_source and 'local_api_profile' in local_api_source, local_api_source

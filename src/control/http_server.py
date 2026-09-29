@@ -1495,6 +1495,10 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                     else:
                         rc, msg = stop_runtime_scope(instance_id=instance_id, mode=data.get("mode"))
                         out = {"container_stop_rc": rc, "container_stop_output": msg, "cpu": apply_cpu_idle_power(), "gpu": apply_gpu_idle_power()}
+                elif action == "unload_instance":
+                    if not instance_id or str(instance_id).strip().upper() == "GLOBAL":
+                        raise ValueError("Unload requires a named instance")
+                    out = {"instance": unload_instance(instance_id)}
                 elif action == "start_instance":
                     out = global_scope_power_action(action) if str(instance_id or "").strip().upper() == "GLOBAL" else start_instance(instance_id)
                 elif action == "restart_instance":
@@ -2153,6 +2157,10 @@ class LocalApiHandler(CommonMixin, BaseHTTPRequestHandler):
                     else:
                         rc, msg = stop_runtime_scope(instance_id=instance_id, mode=data.get("mode"))
                         out = {"container_stop_rc": rc, "container_stop_output": msg, "cpu": apply_cpu_idle_power(), "gpu": apply_gpu_idle_power()}
+                elif action == "unload_instance":
+                    if not instance_id or str(instance_id).strip().upper() == "GLOBAL":
+                        raise ValueError("Unload requires a named instance")
+                    out = {"instance": unload_instance(instance_id)}
                 elif action == "start_instance":
                     out = global_scope_power_action(action) if str(instance_id or "").strip().upper() == "GLOBAL" else start_instance(instance_id)
                 elif action == "restart_instance":
