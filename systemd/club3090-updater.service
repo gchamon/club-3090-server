@@ -1,0 +1,19 @@
+[Unit]
+Description=Club-3090 Server local update status service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/club3090-server.env
+Environment=CLUB3090_CONTROL_DIR=@CONTROL_DIR@
+Environment=CLUB3090_SCRIPT_VERSION=repository
+WorkingDirectory=@SOURCE_ROOT@/src
+ExecStart=/usr/bin/python3 @SOURCE_ROOT@/src/build/updater.py
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,19 @@
+[Unit]
+Description=Club-3090 Server model scores benchmark worker
+After=network-online.target docker.service club3090-control.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/club3090-server.env
+Environment=CLUB3090_SERVER_DIR=@SOURCE_ROOT@
+Environment=CLUB3090_DIR=@CLUB3090_DIR@
+Environment=CLUB3090_CONTROL_DIR=@CONTROL_DIR@
+WorkingDirectory=@SOURCE_ROOT@/src
+ExecStart=/usr/bin/python3 -m control.runtime --benchmark-worker
+Restart=no
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

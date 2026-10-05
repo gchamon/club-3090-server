@@ -1758,20 +1758,31 @@ def preview_update_target_request_metrics(target_key, preset_name, path, status_
         target_row["last_request_at"] = int(time.time())
         target_request_metrics[target_key] = target_row
 
-HTML_GZIP_BASE64 = ""  # Injected by build.py for shipped outputs.
 _admin_html_cache = None
 
 
 def get_admin_html_template():
     global _admin_html_cache
-    if _admin_html_cache is not None:
-        return _admin_html_cache
-    payload = str(HTML_GZIP_BASE64 or "").strip()
-    if payload:
-        try:
-            _admin_html_cache = gzip.decompress(base64.b64decode(payload.encode("ascii"))).decode("utf-8")
-            return _admin_html_cache
-        except Exception:
-            pass
-    _admin_html_cache = ""
+    if _admin_html_cache is None:
+        web_dir = os.path.join(SOURCE_ROOT, "src", "web")
+        with open(os.path.join(web_dir, "base.html"), "r", encoding="utf-8") as handle:
+            html = handle.read()
+        with open(os.path.join(web_dir, "base.css"), "r", encoding="utf-8") as handle:
+            css = handle.read()
+        js_files = (
+            "core.js", "log_cards.js", "charts.js", "state.js", "layout_users.js",
+            "instances_presets.js", "runtime_state.js", "system.js", "logs.js",
+            "app.js", "chat.js",
+        )
+        js = "\n".join(
+            (Path(web_dir) / name).read_text(encoding="utf-8")
+            for name in js_files
+        )
+        _admin_html_cache = html.replace(
+            "<style>/* injected by build.py from web-ui.css */</style>",
+            "<style>" + css + "</style>",
+        ).replace(
+            "<script>// injected by build.py from web-ui.js</script>",
+            "<script>" + js + "</script>",
+        )
     return _admin_html_cache

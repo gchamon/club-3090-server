@@ -34,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 
-CONTROL_DIR = os.environ.get("CLUB3090_CONTROL_DIR", "/opt/club3090-control")
+CONTROL_DIR = os.environ.get("CLUB3090_CONTROL_DIR", "/var/lib/club3090-control")
 SCRIPT_VERSION = os.environ.get("CLUB3090_SCRIPT_VERSION", "unknown")
 AUDIT_LOG_FILE = os.path.join(CONTROL_DIR, "audit.log")
 UPDATE_LOG_FILE = os.path.join(CONTROL_DIR, "self-update.log")
@@ -300,45 +300,7 @@ def normalized_version(kind, name):
 
 
 def build_update_command(operation, scope_name="controller", target_commit="", version_kind="", version_name=""):
-    operation = str(operation or "").strip().lower()
-    if operation not in {"update", "change_version", "upgrade"}:
-        raise ValueError("Invalid update operation")
-    normalized = "club3090" if str(scope_name or "").strip().lower() == "club3090" else "controller"
-    target_commit = str(target_commit or "").strip()
-    if target_commit and not re.fullmatch(r"[0-9a-fA-F]{7,40}", target_commit):
-        raise ValueError("Invalid migration target commit")
-    source = load_update_source()
-    if operation == "change_version":
-        kind, name = normalized_version(version_kind, version_name)
-        source.update(version_kind=kind, version_name=name)
-        write_update_source(source)
-        return "controller", "Version selection saved", "true", "local", target_commit
-    if operation == "update":
-        kind, name = normalized_version(source["version_kind"], source["version_name"])
-        ref = f"refs/heads/{name}" if kind == "branch" else f"refs/tags/{name}"
-        raw_url = REMOTE_UPDATE_RAW_URL_TEMPLATE
-        command = (
-            "set -euo pipefail; "
-            f"SHA=\"$(git ls-remote {shell_single_quote(REMOTE_UPDATE_REPO_URL)} {shell_single_quote(ref)} | awk 'NR==1{{print $1}}')\"; "
-            "[[ \"${SHA}\" =~ ^[0-9a-fA-F]{40}$ ]] || { echo 'Unable to resolve selected version.' >&2; exit 1; }; "
-            f"URL={shell_single_quote(raw_url)}; URL=\"${{URL//\\{{sha\\}}/${{SHA}}}}\"; "
-            "TMP=\"$(mktemp /tmp/club3090-stage.XXXXXX)\"; trap 'rm -f \"${TMP}\"' EXIT; "
-            "curl -fsSL -H 'Cache-Control: no-cache' -o \"${TMP}\" \"${URL}\"; bash -n \"${TMP}\"; "
-            f"grep -E '^SCRIPT_VERSION=\"[^\"]+\"$' \"${{TMP}}\" >/dev/null || {{ echo 'Installer version missing.' >&2; exit 1; }}; "
-            f"install -m 0755 \"${{TMP}}\" {shell_single_quote(os.path.join(CONTROL_DIR, 'install-club3090-server.sh'))}; "
-            f"VERSION=\"$(sed -n 's/^SCRIPT_VERSION=\"\\([^\"]*\\)\"$/\\1/p' \"${{TMP}}\" | head -n1)\"; "
-            f"python3 -c {shell_single_quote('import json,os,sys,tempfile,time; p='+repr(update_source_file())+'; d=json.load(open(p)) if os.path.exists(p) else {}; d.update(cached_sha=sys.argv[1].lower(),cached_script_version=sys.argv[2],cached_at=int(time.time())); t=p+\".tmp\"; json.dump(d,open(t,\"w\")); os.replace(t,p)')} \"${{SHA}}\" \"${{VERSION}}\""
-        )
-        return "controller", f"Update {kind} {name}", command, "remote", target_commit
-    if not source["cached_sha"] or source["cached_sha"] == source["applied_sha"]:
-        raise ValueError("No pending local update")
-    script = os.path.join(CONTROL_DIR, "install-club3090-server.sh")
-    if not os.path.isfile(script) or not os.access(script, os.X_OK):
-        raise ValueError("Cached installer is unavailable or not executable")
-    mode_flag = "--migrate" if normalized == "club3090" else "--update"
-    extra = f" --club3090-commit {shlex.quote(target_commit)}" if normalized == "club3090" and target_commit else ""
-    command = f"CLUB3090_ASSUME_YES=1 bash {shell_single_quote(script)} {mode_flag}{extra}"
-    return normalized, "club-3090 migration" if normalized == "club3090" else "admin script upgrade", command, "local cache", target_commit
+    raise ValueError("Automatic updates are disabled. Update the checked-out repository with git, then run sudo ./install.sh.")
 
 
 def wait_for_systemd_unit(unit_name, timeout=120):

@@ -5602,7 +5602,6 @@ def benchmark_artifact_path_allowed(path, include_global_results=False):
     roots = [
         os.path.abspath(BENCHMARKS_DIR),
         os.path.abspath(CONTROL_DIR),
-        "/opt/club3090-control",
     ]
     if include_global_results:
         roots.append(os.path.abspath(BENCHMARK_GLOBAL_RESULTS_DIR))

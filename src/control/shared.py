@@ -51,8 +51,9 @@ try:
 except Exception:
     tomllib = None
 
-CLUB3090_DIR = os.environ.get("CLUB3090_DIR", "/opt/ai/club-3090")
-CONTROL_DIR = "/opt/club3090-control"
+SOURCE_ROOT = str(Path(__file__).resolve().parents[2])
+CLUB3090_DIR = os.path.abspath(os.environ.get("CLUB3090_DIR", os.path.join(SOURCE_ROOT, "club-3090")))
+CONTROL_DIR = os.path.abspath(os.environ.get("CLUB3090_CONTROL_DIR", "/var/lib/club3090-control"))
 SCRIPT_VERSION = os.environ.get("CLUB3090_SCRIPT_VERSION", "unknown")
 SCRIPT_CLUB3090_COMPAT = {}
 _SCRIPT_VERSION_MATCH = re.search(r"v(\d+)\.(\d+)\.(\d+)([a-z]*)\s*$", str(SCRIPT_VERSION or ""))
@@ -442,9 +443,7 @@ CHAT_STATE_FILE = os.path.join(CHAT_CONVERSATIONS_DIR, "state.json")
 CHAT_ATTACHMENTS_DIR = os.path.join(CHAT_CONVERSATIONS_DIR, "attachments")
 CHAT_STATE_BACKUP_DIR = os.path.join(CHAT_CONVERSATIONS_DIR, "backups")
 CHAT_STREAM_STATE_DIR = os.path.join(CHAT_CONVERSATIONS_DIR, "stream-state")
-CODE_SYNTAX_CONFIG_FILE = os.path.join(CONTROL_DIR, "code_syntax.json")
-CODE_SYNTAX_CONFIG_GZIP_BASE64 = ""  # Injected by build.py for shipped outputs.
-MCP_PROTOCOL_VERSION = "2025-03-26"
+CODE_SYNTAX_CONFIG_FILE = os.path.join(SOURCE_ROOT, "src", "web", "code_syntax.json")
 LOCAL_API_TOKEN_FILE = os.path.join(CONTROL_DIR, "local_api_token")
 INSTANCES_DIR = os.path.join(CONTROL_DIR, "instances")
 GENERATED_COMPOSE_OVERRIDES_DIR = os.path.join(CONTROL_DIR, "compose-overrides")
@@ -464,7 +463,6 @@ PROXY_BIND_PORT = int(os.environ.get("CLUB3090_PROXY_BIND_PORT", str(PROXY_PORT)
 UPDATER_BIND_HOST = config_str("network", "updater_bind_host", _env_str("CLUB3090_UPDATER_BIND_HOST", "127.0.0.1"))
 UPDATER_BIND_PORT = config_int("network", "updater_bind_port", _env_int("CLUB3090_UPDATER_BIND_PORT", 18010))
 SELF_UPDATE_SECRET_FILE = os.path.join(CONTROL_DIR, "self-update-secret")
-LOCAL_INSTALLER_SCRIPT_FILE = os.path.join(CONTROL_DIR, "install-club3090-server.sh")
 REMOTE_UPDATE_REPO_URL = os.environ.get(
     "CLUB3090_SELF_UPDATE_REPO_URL",
     "__CLUB3090_SELF_UPDATE_REPO_URL__",
@@ -571,40 +569,6 @@ chat_stream_state_lock = threading.Lock()
 admin_chat_stream_control_lock = threading.Lock()
 runtime_ready_probe_cache = {}
 runtime_bootstrap_marker_cache = {}
-docker_log_path_cache = {}
-chat_audit_context = threading.local()
-auth_cache = {}
-auth_failure_cache = {}
-auth_inflight_locks = {}
-auth_lock = threading.Lock()
-AUTH_CACHE_SECONDS = 120
-AUTH_FAILURE_CACHE_SECONDS = int(os.environ.get("CLUB3090_ADMIN_AUTH_FAILURE_CACHE_SECONDS", "30"))
-AUTH_CACHE_MAX_ENTRIES = int(os.environ.get("CLUB3090_ADMIN_AUTH_CACHE_MAX_ENTRIES", "256"))
-ADMIN_SESSION_COOKIE_NAME = "club3090_admin_session"
-ADMIN_SESSION_TTL_SECONDS = int(os.environ.get("CLUB3090_ADMIN_SESSION_TTL_SECONDS", "86400"))
-ADMIN_SESSIONS_FILE = os.path.join(CONTROL_DIR, "admin_sessions.json")
-ADMIN_AUTH_DENIAL_LOG_WINDOW_SECONDS = int(os.environ.get("CLUB3090_ADMIN_AUTH_DENIAL_LOG_WINDOW_SECONDS", "30"))
-startup_time = time.time()
-recent_requests = collections.deque(maxlen=120)
-series_points = collections.deque(maxlen=METRICS_SERIES_MAX_POINTS)
-request_queue = collections.deque(maxlen=50)
-metrics = {"total_requests":0,"active_requests":0,"completed_requests":0,"failed_requests":0,"streaming_requests":0,"queued_requests":0,"cold_starts":0,"failovers":0,"last_latency_s":None,"last_ttft_s":None,"last_tokens_per_second":None,"last_estimated_tokens":None,"last_preset":None,"last_path":None,"last_status":None}
-LOG_BOOTSTRAP_MARKER = os.environ.get("CLUB3090_LOG_BOOTSTRAP_MARKER", "Application startup complete")
-LOG_TAIL_MAX_BYTES = int(os.environ.get("CLUB3090_LOG_TAIL_MAX_BYTES", "102400"))
-LOG_INITIAL_TAIL_LINES = int(os.environ.get("CLUB3090_LOG_INITIAL_TAIL_LINES", "250"))
-LOG_INITIAL_SNAPSHOT_TIMEOUT_SECONDS = float(os.environ.get("CLUB3090_LOG_INITIAL_TIMEOUT_SECONDS", "15"))
-DOCKER_LOG_RETENTION_DAYS = int(os.environ.get("CLUB3090_DOCKER_LOG_RETENTION_DAYS", "7"))
-DOCKER_LOGROTATE_REFRESH_SECONDS = int(os.environ.get("CLUB3090_DOCKER_LOGROTATE_REFRESH_SECONDS", "21600"))
-runtime_log_watchers = {}
-runtime_log_watchers_lock = threading.Lock()
-admin_stream_registry = {}
-admin_stream_registry_lock = threading.Lock()
-latest_gpu_rows = []
-latest_system_snapshot = {"memory": {}, "cpu": {"cores": []}, "disks": [], "network": {}, "info": {}}
-latest_metrics_collected_at = 0.0
-gpu_session_peaks = {}
-system_metric_peaks_cache = None
-gpu_last_seen_cache = {"value": None, "time": 0.0, "write_time": 0.0}
 metrics_history_cache = {"loaded": False, "write_time": 0.0}
 disk_stats_cache = {"value": [], "time": 0.0}
 system_info_cache = {"value": {}, "time": 0.0}
@@ -5897,47 +5861,15 @@ def clear_switch_failure(mode=""):
     except Exception:
         pass
 
-
-def decode_embedded_code_syntax_config():
-    payload = str(CODE_SYNTAX_CONFIG_GZIP_BASE64 or "").strip()
-    if not payload:
-        return ""
-    try:
-        raw = gzip.decompress(base64.b64decode(payload.encode("ascii")))
-        text = raw.decode("utf-8")
-        parsed = json.loads(text)
-        if not isinstance(parsed, dict):
-            return ""
-        return json.dumps(parsed, ensure_ascii=False, indent=2) + "\n"
-    except Exception:
-        return ""
-
-
 def ensure_code_syntax_config_file():
-    os.makedirs(CONTROL_DIR, exist_ok=True)
-    rendered = decode_embedded_code_syntax_config()
-    if not rendered:
-        return CODE_SYNTAX_CONFIG_FILE if os.path.exists(CODE_SYNTAX_CONFIG_FILE) else ""
-    try:
-        with open(CODE_SYNTAX_CONFIG_FILE, "r", encoding="utf-8") as handle:
-            existing = handle.read()
-        if existing == rendered:
-            return CODE_SYNTAX_CONFIG_FILE
-    except Exception:
-        pass
-    with open(CODE_SYNTAX_CONFIG_FILE, "w", encoding="utf-8", newline="\n") as handle:
-        handle.write(rendered)
-    return CODE_SYNTAX_CONFIG_FILE
+    return CODE_SYNTAX_CONFIG_FILE if os.path.isfile(CODE_SYNTAX_CONFIG_FILE) else ""
 
 
 def read_effective_code_syntax_config_bytes():
-    syntax_path = ensure_code_syntax_config_file()
-    if not syntax_path or not os.path.exists(syntax_path):
-        return b""
     try:
-        with open(syntax_path, "rb") as handle:
+        with open(CODE_SYNTAX_CONFIG_FILE, "rb") as handle:
             return handle.read()
-    except Exception:
+    except OSError:
         return b""
 
 
@@ -7277,20 +7209,18 @@ def parse_remote_build_metadata(metadata_text):
 
 
 def read_local_installer_metadata():
-    for path in (LOCAL_INSTALLER_SCRIPT_FILE, os.path.join(os.path.dirname(__file__), "base.sh")):
-        try:
-            if os.path.exists(path):
-                with open(path, "r", encoding="utf-8", errors="replace") as handle:
-                    return parse_installer_script_metadata(handle.read())
-        except Exception:
-            pass
-    return {
-        "script_version": SCRIPT_VERSION,
-        "change_log_latest": "",
-        "change_log_release": "",
-        "change_log_icons": {},
-        "club_3090_version": {},
-    }
+    metadata_path = os.path.join(SOURCE_ROOT, "metadata.json")
+    try:
+        with open(metadata_path, "r", encoding="utf-8") as handle:
+            return parse_remote_build_metadata(handle.read())
+    except Exception:
+        return {
+            "script_version": SCRIPT_VERSION,
+            "change_log_latest": "",
+            "change_log_release": "",
+            "change_log_icons": {},
+            "club_3090_version": {},
+        }
 
 
 def read_self_update_state():

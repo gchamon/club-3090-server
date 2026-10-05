@@ -3,7 +3,6 @@
 SCRIPT_RUNS_DIR = os.path.join(CONTROL_DIR, "script-runs")
 SCRIPT_STATE_FILE = os.path.join(SCRIPT_RUNS_DIR, "state.json")
 SCRIPT_LOG_TAIL_LINES = 500
-AI_STUDIO_EXTENSION_PAYLOAD_GZIP_BASE64 = ""  # Injected by build.py for shipped outputs.
 RIG_REPORT_OUTPUT_PATHS = [
     os.path.join(CLUB3090_DIR, "results", "my-rig.md"),
     os.path.join(CONTROL_DIR, "artifacts", "my-rig.md"),
@@ -571,37 +570,17 @@ def script_command_for(row, args):
     return f"{base} {suffix}".strip()
 
 def image_studio_extension_install_snippet():
-    payload = str(AI_STUDIO_EXTENSION_PAYLOAD_GZIP_BASE64 or "")
-    if not payload:
-        return """
-echo "[ai-studio] ERROR: AI Studio extension payload is missing from the control backend" >&2
-exit 1
-"""
-    quoted_payload = shlex.quote(payload)
+    source = shlex.quote(os.path.join(SOURCE_ROOT, "extensions", "comfyui-club3090-preview"))
     return f"""
-echo "[ai-studio] installing Club-3090 ComfyUI workflow preview extension"
-CLUB3090_CONTROL_DIR="${{CLUB3090_CONTROL_DIR:-/opt/club3090-control}}"
-AI_STUDIO_EXTENSION_ROOT="$CLUB3090_CONTROL_DIR/extensions"
-sudo mkdir -p "$AI_STUDIO_EXTENSION_ROOT"
-sudo env AI_STUDIO_EXTENSION_PAYLOAD={quoted_payload} python3 - "$AI_STUDIO_EXTENSION_ROOT" <<'PYEXT'
-import base64, gzip, json, os, sys
-root = os.path.abspath(sys.argv[1])
-payload = os.environ.get("AI_STUDIO_EXTENSION_PAYLOAD", "")
-files = json.loads(gzip.decompress(base64.b64decode(payload.encode("ascii"))).decode("utf-8"))
-for rel, text in files.items():
-    rel = rel.replace("\\\\", "/").lstrip("/")
-    if not rel or ".." in rel.split("/"):
-        raise SystemExit(f"unsafe extension path: {{rel}}")
-    target = os.path.abspath(os.path.join(root, rel))
-    if not target.startswith(root + os.sep):
-        raise SystemExit(f"extension path escaped root: {{rel}}")
-    os.makedirs(os.path.dirname(target), exist_ok=True)
-    with open(target, "w", encoding="utf-8", newline="\\n") as handle:
-        handle.write(text)
-PYEXT
+echo "[ai-studio] installing the repository's Club-3090 ComfyUI workflow preview extension"
+AI_STUDIO_EXTENSION_SOURCE={source}
+if [ ! -d "$AI_STUDIO_EXTENSION_SOURCE" ]; then
+  echo "[ai-studio] extension source is missing from this repository checkout" >&2
+  exit 1
+fi
 sudo mkdir -p /mnt/models/comfyui/ComfyUI/custom_nodes
 sudo rm -rf /mnt/models/comfyui/ComfyUI/custom_nodes/club3090_workflow_preview
-sudo cp -a "$AI_STUDIO_EXTENSION_ROOT/comfyui-club3090-preview" /mnt/models/comfyui/ComfyUI/custom_nodes/club3090_workflow_preview
+sudo cp -a "$AI_STUDIO_EXTENSION_SOURCE" /mnt/models/comfyui/ComfyUI/custom_nodes/club3090_workflow_preview
 sudo chmod -R a+rX /mnt/models/comfyui/ComfyUI/custom_nodes/club3090_workflow_preview
 """
 
@@ -667,7 +646,7 @@ apply_ai_studio_director_healthcheck_override() {
   if ! sudo docker inspect studio-director >/dev/null 2>&1; then
     return 0
   fi
-  local override_dir="/opt/club3090-control/compose-overrides"
+  local override_dir="${CLUB3090_CONTROL_DIR:-/var/lib/club3090-control}/compose-overrides"
   local override_file="$override_dir/studio-director-healthcheck.override.yml"
   sudo mkdir -p "$override_dir"
   sudo tee "$override_file" >/dev/null <<'YAML'
@@ -716,8 +695,8 @@ require_compose_docker_pull_space() {
   local compose_file="$3"
   local may_build="${4:-0}"
   shift 4 || true
-  local control_py="${CONTROL_PY:-/opt/club3090-control/control.py}"
-  sudo env HOME="$HOME" PATH="$PATH" "$@" python3 "$control_py" --docker-compose-pull-space-preflight "$label" "$compose_dir" "$may_build" "$compose_file"
+  local source_dir="${CLUB3090_SERVER_DIR:-$(dirname "$0")/..}/src"
+  sudo env HOME="$HOME" PATH="$PATH" PYTHONPATH="$source_dir" "$@" python3 -m control.runtime --docker-compose-pull-space-preflight "$label" "$compose_dir" "$may_build" "$compose_file"
 }
 """
 
