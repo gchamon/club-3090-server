@@ -1,0 +1,21 @@
+[Unit]
+Description=Club-3090 console Docker log follower
+ConditionKernelCommandLine=club3090.server=1
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+EnvironmentFile=-@ENV_FILE@
+ExecStart=@SOURCE_ROOT@/scripts/club3090-server/follow-vllm-log.sh
+Restart=always
+RestartSec=5
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/tty1
+TTYReset=no
+TTYVHangup=no
+TTYVTDisallocate=no
+
+[Install]
+WantedBy=multi-user.target

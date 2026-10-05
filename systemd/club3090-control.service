@@ -5,10 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-EnvironmentFile=-/etc/club3090-server.env
-Environment=CLUB3090_SERVER_DIR=@SOURCE_ROOT@
-Environment=CLUB3090_DIR=@CLUB3090_DIR@
-Environment=CLUB3090_CONTROL_DIR=@CONTROL_DIR@
+EnvironmentFile=-@ENV_FILE@
 WorkingDirectory=@SOURCE_ROOT@/src
 ExecStart=/usr/bin/python3 -m control.http_server
 Restart=always

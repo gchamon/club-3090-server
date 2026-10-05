@@ -1,6 +1,6 @@
 # Configuration
 
-The services read `/etc/club3090-server.env` for runtime settings; a new file contains the selected admin and proxy ports. The systemd units record the resolved source checkout, upstream checkout, and runtime-data paths. Set installer environment overrides before running `sudo ./install.sh`; the installer does not install packages or modify shell profiles.
+The services read `/etc/club3090-server.env` for runtime settings. It records the resolved server, upstream, and runtime-data paths, admin/proxy ports and bind hosts, `DEFAULT_MODE`, and the optional temperature-helper flag. Existing values are preserved on reinstall unless the matching environment override is supplied. The checkout itself is used directly; the installer does not install packages or modify shell profiles.
 
 ## Checkout and state boundaries
 
@@ -13,16 +13,18 @@ Runtime state includes server-managed settings, sessions, logs, and generated op
 
 ## Ports and installer overrides
 
-The default admin interface is `http://HOST:8008/admin`; the OpenAI-compatible proxy is `http://HOST:8009/v1`. `CLUB3090_ADMIN_PORT` and `CLUB3090_PROXY_PORT` set initial port values when the environment file is first created. Existing environment-file values are preserved on reinstall.
+The default admin interface is `http://HOST:8008/admin`; the OpenAI-compatible proxy is `http://HOST:8009/v1`. `CLUB3090_ADMIN_PORT` and `CLUB3090_PROXY_PORT` set ports in the service environment file. Existing values remain unchanged on reinstall unless the corresponding override is supplied.
 
 | Variable | Effect |
 | --- | --- |
 | `CLUB3090_DIR` | Select the existing upstream `club-3090` checkout. |
 | `CLUB3090_CONTROL_DIR` | Select mutable server runtime data; default `/var/lib/club3090-control`. |
-| `CLUB3090_ADMIN_PORT` / `CLUB3090_PROXY_PORT` | Set initial ports in a newly created environment file. |
+| `CLUB3090_ADMIN_BIND_HOST` / `CLUB3090_PROXY_BIND_HOST` | Set service bind hosts; defaults to `0.0.0.0`. |
+| `DEFAULT_MODE` | Set the preferred runtime mode for startup helpers. |
+| `CLUB3090_ADMIN_PORT` / `CLUB3090_PROXY_PORT` | Set the ports; values are preserved on reinstall unless overridden. |
 | `CLUB3090_SERVER_ENV_FILE` | Select an alternate service environment-file path. |
 | `CLUB3090_ENABLE_EXTRA_TEMPS=1` | Opt in to compiling the optional GPU temperature helper; see [Installation](INSTALL.md). |
 
 ## Feature configuration
 
-Set `DEFAULT_MODE` and supported runtime feature variables in `/etc/club3090-server.env`. `CLUB3090_ENABLE_EXTRA_TEMPS=1` is an installer-only opt-in; it is not stored in the service environment file. Optional features also require their host dependencies to be installed and configured.
+`CLUB3090_ENABLE_EXTRA_TEMPS=1` is an installer opt-in and is recorded in the service environment file. Optional features also require their host dependencies to be installed and configured.

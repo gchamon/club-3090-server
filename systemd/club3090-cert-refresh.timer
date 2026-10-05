@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily Club-3090 certificate refresh
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1d
+Persistent=true
+RandomizedDelaySec=15min
+Unit=club3090-cert-refresh.service
+
+[Install]
+WantedBy=timers.target

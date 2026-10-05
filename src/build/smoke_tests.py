@@ -102,6 +102,8 @@ def run_repository_install_smoke_test(root: Path) -> tuple[bool, str]:
             CLUB3090_TEST_MUTATION_LOG=str(forbidden_log),
             CLUB3090_TEST_REAL_GIT=real_git,
         )
+        for key in ("CLUB3090_ADMIN_PORT", "CLUB3090_PROXY_PORT", "CLUB3090_ADMIN_BIND_HOST", "CLUB3090_PROXY_BIND_HOST", "DEFAULT_MODE", "CLUB3090_ENABLE_EXTRA_TEMPS"):
+            env.pop(key, None)
         result = subprocess.run(
             [str(root / "install.sh")], cwd=str(root), env=env,
             capture_output=True, text=True, check=False, timeout=60,
@@ -116,26 +118,67 @@ def run_repository_install_smoke_test(root: Path) -> tuple[bool, str]:
             return False, "control service WorkingDirectory does not point at the checkout"
         if "ExecStart=/usr/bin/python3 -m control.http_server" not in control_unit:
             return False, "control service does not execute the direct HTTP server module"
-        if "EnvironmentFile=-/etc/club3090-server.env" not in control_unit:
-            return False, "control service omits its environment file"
-        if f"CLUB3090_DIR={upstream}" not in control_unit:
-            return False, "control service upstream checkout path is incorrect"
+        if f"EnvironmentFile=-{env_file}" not in control_unit:
+            return False, "control service omits its configured environment file"
         if "/opt/club3090-control/control.py" in control_unit or "CONTROL_PAYLOAD" in control_unit:
             return False, "control service references an installed/embedded application payload"
-        if f"CLUB3090_CONTROL_DIR={state_dir}" not in control_unit:
-            return False, "control service runtime-data path is incorrect"
         benchmark_unit = (unit_dir / "club3090-benchmarks.service").read_text(encoding="utf-8")
         if f"WorkingDirectory={root}/src" not in benchmark_unit or "ExecStart=/usr/bin/python3 -m control.http_server --benchmark-worker" not in benchmark_unit:
             return False, "benchmark service does not execute the source-tree worker module"
         updater_unit = (unit_dir / "club3090-updater.service").read_text(encoding="utf-8")
         if f"WorkingDirectory={root}/src" not in updater_unit or "ExecStart=/usr/bin/python3 -m build.updater" not in updater_unit:
             return False, "updater service does not execute its package module"
-        if not env_file.is_file() or "CLUB3090_ADMIN_PORT=8008" not in env_file.read_text(encoding="utf-8"):
-            return False, "default service configuration was not written"
+        for unit_name, helper_name in (
+            ("club3090-headless-x.service", "prepare-headless-x.sh"),
+            ("club3090-console-log.service", "follow-vllm-log.sh"),
+            ("club3090-vllm.service", "start-vllm-last-mode.sh"),
+            ("club3090-cert-refresh.service", "refresh-ip-certificate.sh"),
+        ):
+            unit_text = (unit_dir / unit_name).read_text(encoding="utf-8")
+            if f"ExecStart={root}/scripts/club3090-server/{helper_name}" not in unit_text:
+                return False, f"{unit_name} does not execute its checkout-owned helper"
+            if f"EnvironmentFile=-{env_file}" not in unit_text:
+                return False, f"{unit_name} omits its configured environment file"
+        if any(path.suffix in {".py", ".sh", ".html", ".css", ".js", ".c", ".h"} for path in state_dir.rglob("*") if path.is_file()):
+            return False, "installer copied application source files into mutable runtime state"
+        if not env_file.is_file():
+            return False, "service configuration file was not written"
+        config_text = env_file.read_text(encoding="utf-8")
+        for expected in (
+            f"CLUB3090_SERVER_DIR={root}",
+            f"CLUB3090_DIR={upstream}",
+            f"CLUB3090_CONTROL_DIR={state_dir}",
+            "CLUB3090_ADMIN_PORT=8008",
+            "CLUB3090_PROXY_PORT=8009",
+            "CLUB3090_ADMIN_BIND_HOST=0.0.0.0",
+            "CLUB3090_PROXY_BIND_HOST=0.0.0.0",
+        ):
+            if expected not in config_text:
+                return False, f"service configuration omits {expected}"
+        env_file.write_text(config_text + "OPERATOR_CUSTOM=preserve\\n", encoding="utf-8")
+        override_env = dict(env)
+        override_env.update(CLUB3090_ADMIN_PORT="8101", DEFAULT_MODE="vllm/default")
+        rerun = subprocess.run(
+            [str(root / "install.sh")], cwd=str(root), env=override_env,
+            capture_output=True, text=True, check=False, timeout=60,
+        )
+        if rerun.returncode:
+            return False, rerun.stderr.strip() or "idempotent installer rerun failed"
+        config_text = env_file.read_text(encoding="utf-8")
+        if "CLUB3090_ADMIN_PORT=8101" not in config_text or "DEFAULT_MODE=vllm/default" not in config_text or "OPERATOR_CUSTOM=preserve" not in config_text:
+            return False, "installer did not apply supplied overrides while preserving operator settings"
+        rerun = subprocess.run(
+            [str(root / "install.sh")], cwd=str(root), env=env,
+            capture_output=True, text=True, check=False, timeout=60,
+        )
+        if rerun.returncode:
+            return False, rerun.stderr.strip() or "installer rerun without overrides failed"
+        if "CLUB3090_ADMIN_PORT=8101" not in env_file.read_text(encoding="utf-8"):
+            return False, "installer overwrote a configured port without an override"
         if forbidden_log.exists():
             return False, "installer invoked a package manager or mutated repository state"
         systemctl_calls = systemctl_log.read_text(encoding="utf-8")
-        expected_enable = "enable club3090-control.service club3090-benchmarks.service club3090-updater.service"
+        expected_enable = "enable club3090-control.service club3090-benchmarks.service club3090-updater.service club3090-console-log.service club3090-vllm.service"
         if expected_enable not in systemctl_calls:
             return False, "installer did not enable the expected repository-native services"
         return True, "installer registered source-tree services without package-manager or git mutation"
@@ -160,6 +203,11 @@ def run_repository_uninstall_smoke_test(root: Path) -> tuple[bool, str]:
             "club3090-control.service",
             "club3090-benchmarks.service",
             "club3090-updater.service",
+            "club3090-headless-x.service",
+            "club3090-console-log.service",
+            "club3090-vllm.service",
+            "club3090-cert-refresh.service",
+            "club3090-cert-refresh.timer",
         )
         for unit in units:
             (unit_dir / unit).write_text("[Unit]\n", encoding="utf-8")

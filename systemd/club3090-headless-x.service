@@ -1,0 +1,15 @@
+[Unit]
+Description=Club-3090 headless Xorg for NVIDIA fan control
+After=multi-user.target
+
+[Service]
+Type=simple
+EnvironmentFile=-@ENV_FILE@
+ExecStart=@SOURCE_ROOT@/scripts/club3090-server/prepare-headless-x.sh
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

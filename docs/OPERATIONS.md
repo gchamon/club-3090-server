@@ -20,13 +20,13 @@ Use systemd's journal to inspect service output, for example `journalctl -u club
 
 ## Updating
 
-The upstream `club-3090` repository is separate and operator-owned. To update code, update the appropriate checkout deliberately, then re-run `sudo ./install.sh` from the server repository to refresh service registration. Review changes before updating; the installer does not fetch or update either repository itself.
+The updater reports the checked-out server revision and does not perform self-updates. For a reviewed update, run `git pull` in the server repository, then `sudo ./install.sh` from that checkout to refresh service registration. Update the separate upstream `club-3090` checkout deliberately when needed; the installer never fetches or updates either repository.
 
 ## Troubleshooting
 
 - If installation reports missing prerequisites, install the named commands/modules with your distribution package manager, then run `sudo ./install.sh` again.
 - If the upstream checkout is not found, set `CLUB3090_DIR` to its existing absolute path.
-- Check `systemctl cat club3090-control.service` to verify the service points to the expected checkout and `/etc/club3090-server.env`.
+- Check `systemctl cat club3090-control.service` to verify the service points to the expected checkout and configured environment file (default `/etc/club3090-server.env`).
 - Check the service journal and confirm the configured mutable data directory is writable and has sufficient space.
 
 ## Uninstallation
