@@ -713,7 +713,7 @@ start_ai_studio_production_service() {
   local pidfile="$output_root/studio-production.pid"
   local logfile="$output_root/studio-production.log"
   local unit="club3090-studio-production.service"
-  local patch_dir="/opt/club3090-control/studio-production-patches"
+  local patch_dir="${CLUB3090_CONTROL_DIR:-/var/lib/club3090-control}/studio-production-patches"
   local production_pythonpath="$patch_dir:$PWD${PYTHONPATH:+:$PYTHONPATH}"
   sudo mkdir -p "$output_root"
   sudo mkdir -p "$patch_dir"
@@ -1314,8 +1314,7 @@ if [ -z "${HOME:-}" ]; then
   HOME="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6 || true)"
 fi
 export HOME="${HOME:-/tmp}"
-HF_CLI_VENV="/opt/club3090-control/hf-cli-venv"
-export PATH="$HF_CLI_VENV/bin:$HOME/.local/bin:$PATH"
+export PATH="$HOME/.local/bin:$PATH"
 if [ ! -e /opt/ai/github/club-3090 ] || [ "$(readlink /opt/ai/github/club-3090 2>/dev/null || true)" != "$PWD" ]; then
   sudo mkdir -p /opt/ai/github
   if [ -L /opt/ai/github/club-3090 ] || [ ! -e /opt/ai/github/club-3090 ]; then
@@ -1323,10 +1322,8 @@ if [ ! -e /opt/ai/github/club-3090 ] || [ "$(readlink /opt/ai/github/club-3090 2
   fi
 fi
 if ! command -v hf >/dev/null 2>&1; then
-  echo "[ai-studio] installing huggingface_hub CLI into $HF_CLI_VENV"
-  sudo python3 -m venv "$HF_CLI_VENV"
-  sudo chown -R "$(id -u):$(id -g)" "$HF_CLI_VENV"
-  "$HF_CLI_VENV/bin/python" -m pip install -U pip huggingface_hub
+  echo "[ai-studio] missing prerequisite: hf CLI; install it with your OS package manager" >&2
+  exit 1
 fi
 export ASSUME_YES=1
 export LANIP="${LANIP:-127.0.0.1}"
@@ -2044,12 +2041,10 @@ if [ -z "${{HOME:-}}" ]; then
   HOME="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6 || true)"
 fi
 export HOME="${{HOME:-/tmp}}"
-HF_CLI_VENV="/opt/club3090-control/hf-cli-venv"
-export PATH="$HF_CLI_VENV/bin:$HOME/.local/bin:$PATH"
+export PATH="$HOME/.local/bin:$PATH"
 if ! command -v hf >/dev/null 2>&1; then
-  sudo python3 -m venv "$HF_CLI_VENV"
-  sudo chown -R "$(id -u):$(id -g)" "$HF_CLI_VENV"
-  "$HF_CLI_VENV/bin/python" -m pip install -U pip huggingface_hub
+  echo "[ai-studio] missing prerequisite: hf CLI; install it with your OS package manager" >&2
+  exit 1
 fi
 export MODEL_DIR="${{MODEL_DIR:-$PWD/models-cache}}"
 export AI_STUDIO_MODELS_ROOT="${{AI_STUDIO_MODELS_ROOT:-$PWD/ai-studio-models}}"
@@ -2081,9 +2076,8 @@ echo "[ai-studio] {label} asset download complete"
         f'echo "[ai-studio] downloading {key} assets"',
         'if [ -z "${HOME:-}" ]; then HOME="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6 || true)"; fi',
         'export HOME="${HOME:-/tmp}"',
-        'HF_CLI_VENV="/opt/club3090-control/hf-cli-venv"',
-        'export PATH="$HF_CLI_VENV/bin:$HOME/.local/bin:$PATH"',
-        'if ! command -v hf >/dev/null 2>&1; then sudo python3 -m venv "$HF_CLI_VENV"; sudo chown -R "$(id -u):$(id -g)" "$HF_CLI_VENV"; "$HF_CLI_VENV/bin/python" -m pip install -U pip huggingface_hub; fi',
+        'export PATH="$HOME/.local/bin:$PATH"',
+        'if ! command -v hf >/dev/null 2>&1; then echo "[ai-studio] missing prerequisite: hf CLI; install it with your OS package manager" >&2; exit 1; fi',
         'export AI_STUDIO_MODELS_ROOT="${AI_STUDIO_MODELS_ROOT:-$PWD/ai-studio-models}"',
         'export MODEL_DIR="${MODEL_DIR:-$PWD/models-cache}"',
         'export COMFYUI_MODELS_ROOT="${COMFYUI_MODELS_ROOT:-$AI_STUDIO_MODELS_ROOT/comfyui}"',

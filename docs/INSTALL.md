@@ -15,7 +15,7 @@ sudo apt-get update
 sudo apt-get install git python3 python3-yaml docker.io docker-compose-plugin sudo curl openssl pamtester
 ```
 
-Enable and configure Docker as required by your distribution; installation does not configure the host's package manager or Docker daemon. Optional features may require Caddy and Tailscale, Xorg and `nvidia-settings` for fan control, `cpupower`, `ntfs-3g`, and compiler/libpci dependencies for the temperature helper. Install only the dependencies for features you intend to use.
+Enable and configure Docker as required by your distribution; installation does not configure the host's package manager or Docker daemon. Optional features may require Caddy and Tailscale, Xorg and `nvidia-settings` for fan control, `cpupower`, `ntfs-3g`, compiler/libpci dependencies for the temperature helper, and the externally installed Hugging Face `hf` CLI for AI Studio downloads. Install only the dependencies for features you intend to use.
 To opt in to junction/VRAM temperature telemetry, install `gcc`, the libpci development package, and the NVIDIA Management Library linker package using your distribution package manager, then run `sudo env CLUB3090_ENABLE_EXTRA_TEMPS=1 ./install.sh`. The helper is compiled from `src/build/vendor/gputemps.c` and `src/build/vendor/nvml.h` into the runtime data directory; no source is copied out of this checkout. The installer does not edit bootloader configuration. If the helper reports that its readings require `iomem=relaxed`, configure that kernel option manually and reboot.
 
 ## Install
