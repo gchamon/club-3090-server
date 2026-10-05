@@ -45,8 +45,13 @@ if [[ "${CLUB3090_ENABLE_EXTRA_TEMPS:-0}" == "1" ]]; then
   fi
 fi
 
-[[ -f "${ROOT}/src/control/runtime.py" && -f "${ROOT}/src/web/base.html" ]] || fail "run this script from a complete Club-3090 Server checkout"
-[[ -f "${UPSTREAM}/scripts/switch.sh" && -f "${UPSTREAM}/scripts/setup.sh" && -d "${UPSTREAM}/models" ]] || fail "upstream checkout not found or incomplete at ${UPSTREAM}; see docs/INSTALL.md"
+[[ -f "${ROOT}/src/control/http_server.py" && -f "${ROOT}/src/web/base.html" ]] || fail "run this script from a complete Club-3090 Server checkout"
+git_top="$(git -C "${ROOT}" rev-parse --show-toplevel 2>/dev/null)" || fail "installer must run from a git checkout"
+[[ "${git_top}" == "${ROOT}" ]] || fail "run install.sh from the root of the git checkout"
+if ! git -C "${UPSTREAM}" rev-parse --show-toplevel >/dev/null 2>&1; then
+  fail "upstream checkout is not a git repository at ${UPSTREAM}; expected scripts/switch.sh, scripts/setup.sh, and models/. See docs/INSTALL.md"
+fi
+[[ -f "${UPSTREAM}/scripts/switch.sh" && -f "${UPSTREAM}/scripts/setup.sh" && -d "${UPSTREAM}/models" ]] || fail "upstream checkout incomplete at ${UPSTREAM}; expected scripts/switch.sh, scripts/setup.sh, and models/. See docs/INSTALL.md"
 for value in "${ROOT}" "${UPSTREAM}" "${STATE}"; do
   [[ "${value}" != *[$'\t\n ']* ]] || fail "repository, upstream, and state paths cannot contain whitespace: ${value}"
 done

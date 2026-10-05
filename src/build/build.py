@@ -9,6 +9,9 @@ from smoke_tests import (
     run_control_subprocess_timeout_smoke_test,
     run_repository_install_smoke_test,
     run_repository_uninstall_smoke_test,
+    run_installer_preflight_smoke_test,
+    run_updater_status_smoke_test,
+    run_control_module_smoke_test,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -17,6 +20,9 @@ SMOKE_TESTS = {
     "control_subprocess_timeout_smoke": "Require timeouts for control subprocess calls",
     "repository_install_smoke": "Install services from a checkout without package/git mutation",
     "repository_uninstall_smoke": "Remove service registrations while preserving runtime data",
+    "installer_preflight_smoke": "Reject missing prerequisites before writing files",
+    "updater_status_smoke": "Run updater module status and report checkout revision",
+    "control_module_smoke": "Run HTTP, benchmark-worker, and web-assets source paths with isolated state",
 }
 
 
@@ -26,7 +32,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--smoke-tests", action="append", default=[],
-        help="Select source_runtime, control_subprocess_timeout_smoke, repository_install_smoke, or repository_uninstall_smoke (comma-separated).",
+        help="Select source_runtime, control_subprocess_timeout_smoke, control_module_smoke, installer_preflight_smoke, repository_install_smoke, repository_uninstall_smoke, or updater_status_smoke (comma-separated).",
     )
     parser.add_argument("--list-smoke-tests", action="store_true", help="List source/runtime smoke checks and exit.")
     args = parser.parse_args(argv)
@@ -49,8 +55,11 @@ def main(argv: list[str] | None = None) -> int:
         print("source_runtime: " + ("failed" if failures else "passed - source modules compiled in memory"))
     checks = {
         "control_subprocess_timeout_smoke": run_control_subprocess_timeout_smoke_test,
+        "installer_preflight_smoke": lambda: run_installer_preflight_smoke_test(ROOT),
         "repository_install_smoke": lambda: run_repository_install_smoke_test(ROOT),
         "repository_uninstall_smoke": lambda: run_repository_uninstall_smoke_test(ROOT),
+        "updater_status_smoke": lambda: run_updater_status_smoke_test(ROOT),
+        "control_module_smoke": lambda: run_control_module_smoke_test(ROOT),
     }
     for name, check in checks.items():
         if name not in selected:

@@ -10,10 +10,11 @@ import subprocess
 import tempfile
 import threading
 import time
+import sys
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlsplit
+from pathlib import Path
 
 
 def write_json_atomic(path, payload):
@@ -56,6 +57,7 @@ UPDATER_BIND_PORT = int(os.environ.get("CLUB3090_UPDATER_BIND_PORT", "18010") or
 CONTROL_ADMIN_BIND_PORT = int(os.environ.get("CLUB3090_ADMIN_BIND_PORT", "8008") or "8008")
 HTTPS_ENABLED = str(os.environ.get("CLUB3090_HTTPS_ENABLED", "")).strip().lower() in {"1", "true", "yes", "on"}
 SERVER_CONFIG_FILE = os.path.join(CONTROL_DIR, "server_config.json")
+SERVER_DIR = Path(os.environ.get("CLUB3090_SERVER_DIR") or Path(__file__).resolve().parents[2]).resolve()
 
 state_lock = threading.Lock()
 state = {
@@ -120,7 +122,10 @@ def sync_state_from_disk():
 def snapshot_state():
     sync_state_from_disk()
     with state_lock:
-        return redact_state(dict(state))
+        snapshot = redact_state(dict(state))
+    snapshot["repository_revision"] = repository_revision()
+    snapshot["update_instructions"] = f"cd {shlex.quote(str(SERVER_DIR))} && git pull && sudo ./install.sh"
+    return snapshot
 
 
 def set_state(**changes):
@@ -145,6 +150,15 @@ def read_json_file(path, default):
         return payload if isinstance(payload, type(default)) else default
     except Exception:
         return default
+def repository_revision():
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(SERVER_DIR), "rev-parse", "--short=12", "HEAD"],
+            capture_output=True, text=True, check=False, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "unavailable"
+    return result.stdout.strip() if result.returncode == 0 else "unavailable"
 
 
 def read_systemd_unit_environment(unit_name):
@@ -300,7 +314,8 @@ def normalized_version(kind, name):
 
 
 def build_update_command(operation, scope_name="controller", target_commit="", version_kind="", version_name=""):
-    raise ValueError("Automatic updates are disabled. Update the checked-out repository with git, then run sudo ./install.sh.")
+    raise ValueError(f"Automatic updates are disabled. Update the checkout manually: cd {shlex.quote(str(SERVER_DIR))} && git pull && sudo ./install.sh")
+
 
 
 def wait_for_systemd_unit(unit_name, timeout=120):
@@ -576,12 +591,18 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--status":
+        print(json.dumps({
+            "repository_revision": repository_revision(),
+            "update_instructions": f"cd {shlex.quote(str(SERVER_DIR))} && git pull && sudo ./install.sh",
+            "automatic_updates": False,
+        }, ensure_ascii=False))
+        return
     ensure_dir()
     ensure_secret()
     load_state()
     server = ThreadingHTTPServer((UPDATER_BIND_HOST, UPDATER_BIND_PORT), Handler)
     server.serve_forever()
-
 
 if __name__ == "__main__":
     main()

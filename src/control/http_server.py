@@ -1,3 +1,7 @@
+import control as _control
+globals().update({name: value for name, value in vars(_control).items() if not name.startswith("__")})
+del _control
+
 class CommonMixin:
     def log_message(self, fmt, *args):
         return

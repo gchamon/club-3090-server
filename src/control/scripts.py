@@ -696,7 +696,7 @@ require_compose_docker_pull_space() {
   local may_build="${4:-0}"
   shift 4 || true
   local source_dir="${CLUB3090_SERVER_DIR:-$(dirname "$0")/..}/src"
-  sudo env HOME="$HOME" PATH="$PATH" PYTHONPATH="$source_dir" "$@" python3 -m control.runtime --docker-compose-pull-space-preflight "$label" "$compose_dir" "$may_build" "$compose_file"
+  sudo env HOME="$HOME" PATH="$PATH" PYTHONPATH="$source_dir" "$@" python3 -m control.http_server --docker-compose-pull-space-preflight "$label" "$compose_dir" "$may_build" "$compose_file"
 }
 """
 

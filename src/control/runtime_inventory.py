@@ -8,64 +8,8 @@ import importlib.util
 import subprocess
 from types import ModuleType
 
-try:
-    from control.shared import *  # type: ignore
-    import control.shared as _club3090_shared_module  # type: ignore
-except Exception:
-    if "CLUB3090_DIR" not in globals():
-        _CONTROL_DIR = os.path.dirname(os.path.abspath(__file__))
-        if _CONTROL_DIR not in sys.path:
-            sys.path.insert(0, _CONTROL_DIR)
-        from shared import *  # type: ignore
-        import shared as _club3090_shared_module  # type: ignore
-
-try:
-    _preset_tps_selector_key
-    _read_preset_tps_stats_unlocked
-    _sanitize_preset_tps_row
-    _write_preset_tps_stats_unlocked
-    _monitor_plan_from_variant_install
-except NameError:
-    try:
-        from control.shared import (  # type: ignore
-            _monitor_plan_from_variant_install,
-            _preset_tps_selector_key,
-            _read_preset_tps_stats_unlocked,
-            _sanitize_preset_tps_row,
-            _write_preset_tps_stats_unlocked,
-        )
-    except Exception:
-        from shared import (  # type: ignore
-            _monitor_plan_from_variant_install,
-            _preset_tps_selector_key,
-            _read_preset_tps_stats_unlocked,
-            _sanitize_preset_tps_row,
-            _write_preset_tps_stats_unlocked,
-        )
-
-try:
-    preset_builtin_launch_env_overrides
-    preset_launch_env_overrides
-    read_server_config
-    write_server_config
-except NameError:
-    try:
-        if globals().get("__package__"):
-            from control.services_config import (  # type: ignore
-                preset_builtin_launch_env_overrides,
-                preset_launch_env_overrides,
-                read_server_config,
-                write_server_config,
-            )
-        else:
-            from services_config import (  # type: ignore
-                preset_builtin_launch_env_overrides,
-                preset_launch_env_overrides,
-                read_server_config,
-                write_server_config,
-            )
-    except Exception:
-        pass
+from control.shared import *  # type: ignore
+import control.shared as _club3090_shared_module  # type: ignore
 
 def _format_model_display_name(model_id):
     if not model_id:

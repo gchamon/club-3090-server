@@ -7,9 +7,10 @@ Wants=network-online.target
 Type=simple
 EnvironmentFile=-/etc/club3090-server.env
 Environment=CLUB3090_CONTROL_DIR=@CONTROL_DIR@
+Environment=CLUB3090_SERVER_DIR=@SOURCE_ROOT@
 Environment=CLUB3090_SCRIPT_VERSION=repository
 WorkingDirectory=@SOURCE_ROOT@/src
-ExecStart=/usr/bin/python3 @SOURCE_ROOT@/src/build/updater.py
+ExecStart=/usr/bin/python3 -m build.updater
 Restart=always
 RestartSec=3
 StandardOutput=journal
