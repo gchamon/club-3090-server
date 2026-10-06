@@ -210,6 +210,8 @@ progress "Reloading systemd unit definitions"
 "${SUDO[@]}" systemctl daemon-reload
 progress "Enabling control, benchmark, updater, and inference services"
 "${SUDO[@]}" systemctl enable club3090-control.service club3090-benchmarks.service club3090-updater.service club3090-vllm.service
+progress "Stopping control, updater, and inference services before applying the installed configuration"
+"${SUDO[@]}" systemctl stop club3090-control.service club3090-updater.service club3090-vllm.service
 progress "Starting control, updater, and inference services; systemd may wait for startup"
 "${SUDO[@]}" systemctl start club3090-control.service club3090-updater.service club3090-vllm.service
 progress "Installation complete"

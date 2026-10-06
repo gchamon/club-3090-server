@@ -5,17 +5,58 @@ Club-3090 Server is the management layer for the upstream [club-3090](https://gi
 ## Quickstart
 
 Install the base prerequisites manually before cloning. The installer checks dependencies but does not install packages. Docker must be enabled and configured according to your distribution.
+Use Docker's official [Ubuntu](https://docs.docker.com/engine/install/ubuntu/), [Debian](https://docs.docker.com/engine/install/debian/), or [Fedora](https://docs.docker.com/engine/install/fedora/) repository instructions below. The installer only checks that `docker` and Compose commands are available.
 
 ```bash
 # Arch Linux
 sudo pacman -S --needed git python python-yaml docker docker-compose sudo curl openssl pamtester
+```
 
-# Ubuntu/Debian
-sudo apt-get update
-sudo apt-get install git python3 python3-yaml docker.io docker-compose-plugin sudo curl openssl pamtester
+```bash
+# Ubuntu: add Docker's official apt repository, then install Engine and Compose.
+sudo apt update
+sudo apt install ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+sudo tee /etc/apt/sources.list.d/docker.sources <<EOF
+Types: deb
+URIs: https://download.docker.com/linux/ubuntu
+Suites: $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+Components: stable
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
+sudo apt update
+sudo apt install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin git python3 python3-yaml sudo openssl pamtester
+sudo systemctl enable --now docker
+```
 
-# Fedora
-sudo dnf install git python3 python3-PyYAML moby-engine docker-compose sudo curl openssl pamtester
+```bash
+# Debian: use Docker's Debian apt repository (not Ubuntu's).
+sudo apt update
+sudo apt install ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+sudo tee /etc/apt/sources.list.d/docker.sources <<EOF
+Types: deb
+URIs: https://download.docker.com/linux/debian
+Suites: $(. /etc/os-release && echo "$VERSION_CODENAME")
+Components: stable
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
+sudo apt update
+sudo apt install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin git python3 python3-yaml sudo openssl pamtester
+sudo systemctl enable --now docker
+```
+
+```bash
+# Fedora: add Docker's official RPM repository, then install Engine and Compose.
+sudo dnf config-manager addrepo --from-repofile https://download.docker.com/linux/fedora/docker-ce.repo
+sudo dnf install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin git python3 python3-pyyaml sudo curl openssl pamtester
+sudo systemctl enable --now docker
 ```
 
 Clone both repositories, placing the upstream checkout at `club-3090` beside this repository, or set `CLUB3090_DIR` to its location:

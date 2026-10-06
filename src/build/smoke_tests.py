@@ -216,9 +216,12 @@ def run_repository_install_smoke_test(root: Path) -> tuple[bool, str]:
         expected_enable = "enable club3090-control.service club3090-benchmarks.service club3090-updater.service club3090-vllm.service"
         if expected_enable not in systemctl_calls:
             return False, "installer did not enable the expected repository-native services"
+        expected_stop = "stop club3090-control.service club3090-updater.service club3090-vllm.service"
         expected_start = "start club3090-control.service club3090-updater.service club3090-vllm.service"
-        if expected_start not in systemctl_calls or systemctl_calls.index(expected_start) < systemctl_calls.index(expected_enable):
-            return False, "installer did not start the deployment services after enabling units"
+        if expected_stop not in systemctl_calls or expected_start not in systemctl_calls:
+            return False, "installer did not stop and start the deployment services"
+        if not systemctl_calls.index(expected_enable) < systemctl_calls.index(expected_stop) < systemctl_calls.index(expected_start):
+            return False, "installer did not stop and restart deployment services after enabling units"
         return True, "installer registered source-tree services without package-manager or git mutation"
 
 
@@ -397,6 +400,13 @@ def run_control_module_smoke_test(root: Path) -> tuple[bool, str]:
                 "token=control.create_admin_session('127.0.0.1'); "
                 "assert control.admin_session_ok({'Cookie': f'{control.ADMIN_SESSION_COOKIE_NAME}={token}'}, '127.0.0.1'); "
                 "assert not control.admin_session_ok({'Cookie': f'{control.ADMIN_SESSION_COOKIE_NAME}={token}'}, '10.0.0.2'); "
+                "exec(\"class _Stop(Exception): pass\\n"
+                "control.refresh_docker_logrotate_config=lambda: None\\n"
+                "def _stop(delay): raise _Stop(delay)\\n"
+                "control.time.sleep=_stop\\n"
+                "try:\\n control.docker_logrotate_refresher()\\n"
+                "except _Stop as stopped:\\n assert stopped.args[0] >= 300\\n"
+                "else:\\n raise AssertionError('logrotate refresher returned')\"); "
                 "html=control.get_admin_html_template(); "
                 "assert 'renderAIStudioLaneActions' in html; "
                 "assert 'Start this inference runtime automatically at boot' in html; "
