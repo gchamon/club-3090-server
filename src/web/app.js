@@ -9839,7 +9839,7 @@ function renderAIStudioRuntimePanel(status = lastStatus) {
     const gpuLabel = gpu && namedGpuIndices !== gpu ? ` · GPU ${gpu}` : "";
     const disabledStart = active || starting;
     const disabledStop = !active && !starting;
-    return `<article class="ai-studio-runtime-row"><div class="ai-studio-runtime-meta"><strong>${escapeHtml(displayName)}${escapeHtml(gpuLabel)}</strong><span>${escapeHtml(label)}</span></div><span class="status-badge ${active ? "status-success" : starting ? "status-warning" : "status-info"}">${state}</span><div class="ai-studio-runtime-actions"><button class="btn green" ${disabledStart ? "disabled" : ""} onclick="aiStudioRuntimeAction('${escapeJs(item.id)}','start_instance')">Start</button><button class="btn blue" ${disabledStop ? "disabled" : ""} onclick="aiStudioRuntimeAction('${escapeJs(item.id)}','restart_instance')">Restart</button><button class="btn rose" ${!active && !starting ? "disabled" : ""} onclick="aiStudioRuntimeAction('${escapeJs(item.id)}','unload_instance')">Unload</button><button class="btn rose" ${!active ? "disabled" : ""} onclick="aiStudioRuntimeAction('${escapeJs(item.id)}','stop_container')">Stop</button></div></article>`;
+    return `<article class="ai-studio-runtime-row"><div class="ai-studio-runtime-meta"><strong>${escapeHtml(displayName)}${escapeHtml(gpuLabel)}</strong><span>${escapeHtml(label)}</span><label><input type="checkbox" ${item.enabled ? "checked" : ""} ${typeof benchmarkJobActive === "function" && benchmarkJobActive() ? "disabled" : ""} onchange="aiStudioRuntimeAutostart('${escapeJs(item.id)}', this.checked)"> Start this inference runtime automatically at boot</label></div><span class="status-badge ${active ? "status-success" : starting ? "status-warning" : "status-info"}">${state}</span><div class="ai-studio-runtime-actions"><button class="btn green" ${disabledStart ? "disabled" : ""} onclick="aiStudioRuntimeAction('${escapeJs(item.id)}','start_instance')">Start</button><button class="btn blue" ${disabledStop ? "disabled" : ""} onclick="aiStudioRuntimeAction('${escapeJs(item.id)}','restart_instance')">Restart</button><button class="btn rose" ${!active && !starting ? "disabled" : ""} onclick="aiStudioRuntimeAction('${escapeJs(item.id)}','unload_instance')">Unload</button><button class="btn rose" ${!active ? "disabled" : ""} onclick="aiStudioRuntimeAction('${escapeJs(item.id)}','stop_container')">Stop</button></div></article>`;
   }).join("")}</div>`);
 }
 async function aiStudioRuntimeAction(instanceId, action) {
@@ -9852,6 +9852,16 @@ async function aiStudioRuntimeAction(instanceId, action) {
     await post("/admin/power", { action, instance_id: instanceId });
     await refreshStatus({ force: true });
   } catch (e) {
+    alert(e);
+  }
+}
+async function aiStudioRuntimeAutostart(instanceId, enabled) {
+  if (typeof benchmarkJobActive === "function" && benchmarkJobActive()) return;
+  try {
+    await post("/admin/power", { action: "toggle_enabled", instance_id: instanceId, enabled: !!enabled });
+    await refreshStatus({ force: true });
+  } catch (e) {
+    await refreshStatus({ force: true });
     alert(e);
   }
 }

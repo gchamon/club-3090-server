@@ -4,7 +4,19 @@ Club-3090 Server is the management layer for the upstream [club-3090](https://gi
 
 ## Quickstart
 
-See [Installation](docs/INSTALL.md) for prerequisite packages and [the documentation index](docs/README.md) for configuration, networking, and operations details. Install prerequisites manually; the installer does not install packages.
+Install the base prerequisites manually before cloning. The installer checks dependencies but does not install packages. Docker must be enabled and configured according to your distribution.
+
+```bash
+# Arch Linux
+sudo pacman -S --needed git python python-yaml docker docker-compose sudo curl openssl pamtester
+
+# Ubuntu/Debian
+sudo apt-get update
+sudo apt-get install git python3 python3-yaml docker.io docker-compose-plugin sudo curl openssl pamtester
+
+# Fedora
+sudo dnf install git python3 python3-PyYAML moby-engine docker-compose sudo curl openssl pamtester
+```
 
 Clone both repositories, placing the upstream checkout at `club-3090` beside this repository, or set `CLUB3090_DIR` to its location:
 
@@ -12,12 +24,18 @@ Clone both repositories, placing the upstream checkout at `club-3090` beside thi
 git clone https://github.com/noonghunna/club-3090-server.git
 cd club-3090-server
 git clone https://github.com/noonghunna/club-3090.git
-# If upstream is elsewhere, export CLUB3090_DIR=/absolute/path/to/club-3090
 sudo ./install.sh
-sudo systemctl start club3090-control.service
-systemctl cat club3090-control.service
-curl http://HOST:8009/v1/models
 ```
+
+To provision a model during installation, use:
+
+```bash
+sudo env CLUB3090_SETUP_MODEL=qwen3.6-27b HF_TOKEN=hf_xxx ./install.sh
+```
+
+Without `CLUB3090_SETUP_MODEL`, installation registers the server without downloading model assets. With it, the installer invokes the existing upstream `scripts/setup.sh` from the supplied checkout; upstream variables such as `MODEL_DIR`, `WEIGHTS`, and `WITH_DFLASH_DRAFT=1` pass through unchanged. The installer never installs packages or clones/updates either checkout, and does not embed or copy application code.
+
+Successful installation starts the control, updater, and vLLM services. In AI Studio, use each inference runtime row's **Start this inference runtime automatically at boot** checkbox to control whether that runtime starts on subsequent boots. Verify service state with `systemctl is-active club3090-control.service`, `systemctl is-active club3090-updater.service`, and `systemctl is-active club3090-vllm.service`; inspect the installed control unit with `systemctl cat club3090-control.service` and test the proxy with `curl http://HOST:8009/v1/models`.
 
 Open `http://HOST:8008/admin` in a browser, substituting the server host for `HOST`. The services execute code and assets directly from this checkout; keep it in place while installed. `/etc/club3090-server.env` contains service configuration and `${CLUB3090_CONTROL_DIR:-/var/lib/club3090-control}` is the mutable runtime-data location.
 

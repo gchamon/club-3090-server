@@ -66,9 +66,12 @@ def run_repository_install_smoke_test(root: Path) -> tuple[bool, str]:
         state_dir = temp / "state"
         systemctl_log = temp / "systemctl.log"
         forbidden_log = temp / "forbidden-mutations.log"
-        for relative in ("scripts/switch.sh", "scripts/setup.sh"):
+        for relative in ("scripts/switch.sh", "scripts/setup.sh", "scripts/preflight.sh", "scripts/launch.sh"):
             script = upstream / relative
-            script.write_text('#!/bin/sh\nprintf "%s\\n" "upstream script invoked: $0" >> "$CLUB3090_TEST_MUTATION_LOG"\nexit 99\n', encoding="utf-8")
+            if relative == "scripts/setup.sh":
+                script.write_text('#!/bin/sh\nprintf "%s\\n%s\\n%s\\n%s\\n%s\\n" "$PWD" "$#" "$1" "${MODEL_DIR:-}" "${WEIGHTS:-}|${WITH_DFLASH_DRAFT:-}" >> "$CLUB3090_TEST_SETUP_LOG"\nexit 0\n', encoding="utf-8")
+            else:
+                script.write_text('#!/bin/sh\nprintf "%s\\n" "upstream script invoked: $0" >> "$CLUB3090_TEST_MUTATION_LOG"\nexit 99\n', encoding="utf-8")
             script.chmod(0o755)
         mutation_wrapper = '#!/bin/sh\nif [ "$1" = "-C" ] && [ "$3" = "rev-parse" ]; then exec "$CLUB3090_TEST_REAL_GIT" "$@"; fi\nprintf "%s\\n" "$*" >> "$CLUB3090_TEST_MUTATION_LOG"\nexit 99\n'
         wrappers = {
@@ -100,6 +103,7 @@ def run_repository_install_smoke_test(root: Path) -> tuple[bool, str]:
             CLUB3090_SYSTEMD_UNIT_DIR=str(unit_dir),
             CLUB3090_TEST_SYSTEMCTL_LOG=str(systemctl_log),
             CLUB3090_TEST_MUTATION_LOG=str(forbidden_log),
+            CLUB3090_TEST_SETUP_LOG=str(temp / "upstream-setup.log"),
             CLUB3090_TEST_REAL_GIT=real_git,
         )
         for key in ("CLUB3090_ADMIN_PORT", "CLUB3090_PROXY_PORT", "CLUB3090_ADMIN_BIND_HOST", "CLUB3090_PROXY_BIND_HOST", "DEFAULT_MODE", "CLUB3090_ENABLE_EXTRA_TEMPS"):
@@ -110,6 +114,23 @@ def run_repository_install_smoke_test(root: Path) -> tuple[bool, str]:
         )
         if result.returncode:
             return False, result.stderr.strip() or result.stdout.strip() or "install.sh failed"
+        if (temp / "upstream-setup.log").exists():
+            return False, "installer unexpectedly invoked upstream model setup without a selector"
+        for name in ("nvidia-smi", "sha256sum", "hf"):
+            wrapper = bin_dir / name
+            wrapper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            wrapper.chmod(0o755)
+        setup_env = dict(env)
+        setup_env.update(CLUB3090_SETUP_MODEL="qwen3.6-27b", MODEL_DIR="/models/test", WEIGHTS="4bit", WITH_DFLASH_DRAFT="1")
+        setup_result = subprocess.run(
+            [str(root / "install.sh")], cwd=str(root), env=setup_env,
+            capture_output=True, text=True, check=False, timeout=60,
+        )
+        if setup_result.returncode:
+            return False, setup_result.stderr.strip() or "selected-model installer run failed"
+        setup_lines = (temp / "upstream-setup.log").read_text(encoding="utf-8").splitlines()
+        if setup_lines != [str(upstream), "1", "qwen3.6-27b", "/models/test", "4bit|1"]:
+            return False, f"upstream setup did not receive expected checkout, model, and environment: {setup_lines!r}"
         control_unit_path = unit_dir / "club3090-control.service"
         if not control_unit_path.is_file():
             return False, "installer did not write the control service"
@@ -139,6 +160,11 @@ def run_repository_install_smoke_test(root: Path) -> tuple[bool, str]:
                 return False, f"{unit_name} does not execute its checkout-owned helper"
             if f"EnvironmentFile=-{env_file}" not in unit_text:
                 return False, f"{unit_name} omits its configured environment file"
+        vllm_unit = (unit_dir / "club3090-vllm.service").read_text(encoding="utf-8")
+        if "ConditionKernelCommandLine=" in vllm_unit:
+            return False, "vLLM unit retains a boot-mode condition"
+        if "Wants=network-online.target club3090-control.service" not in vllm_unit or "After=docker.service network-online.target club3090-control.service" not in vllm_unit:
+            return False, "vLLM unit does not order itself after and pull in the control service"
         if any(path.suffix in {".py", ".sh", ".html", ".css", ".js", ".c", ".h"} for path in state_dir.rglob("*") if path.is_file()):
             return False, "installer copied application source files into mutable runtime state"
         if not env_file.is_file():
@@ -178,9 +204,12 @@ def run_repository_install_smoke_test(root: Path) -> tuple[bool, str]:
         if forbidden_log.exists():
             return False, "installer invoked a package manager or mutated repository state"
         systemctl_calls = systemctl_log.read_text(encoding="utf-8")
-        expected_enable = "enable club3090-control.service club3090-benchmarks.service club3090-updater.service club3090-console-log.service club3090-vllm.service"
+        expected_enable = "enable club3090-control.service club3090-benchmarks.service club3090-updater.service club3090-vllm.service"
         if expected_enable not in systemctl_calls:
             return False, "installer did not enable the expected repository-native services"
+        expected_start = "start club3090-control.service club3090-updater.service club3090-vllm.service"
+        if expected_start not in systemctl_calls or systemctl_calls.index(expected_start) < systemctl_calls.index(expected_enable):
+            return False, "installer did not start the deployment services after enabling units"
         return True, "installer registered source-tree services without package-manager or git mutation"
 
 
@@ -280,6 +309,32 @@ def run_installer_preflight_smoke_test(root: Path) -> tuple[bool, str]:
             return False, "installer did not report the missing pamtester prerequisite"
         if unit_dir.exists():
             return False, "installer wrote a unit directory before prerequisite checks passed"
+        for name in ("pamtester", "nvidia-smi", "sha256sum"):
+            wrapper = bin_dir / name
+            wrapper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            wrapper.chmod(0o755)
+        missing_hf_env = dict(env)
+        marker = temp / "upstream-setup.log"
+        missing_hf_env.update(
+            CLUB3090_SETUP_MODEL="qwen3.6-27b",
+            CLUB3090_CONTROL_DIR=str(temp / "model-state"),
+            CLUB3090_SERVER_ENV_FILE=str(temp / "model-etc" / "club3090-server.env"),
+            CLUB3090_SYSTEMD_UNIT_DIR=str(temp / "model-units"),
+            CLUB3090_TEST_SETUP_LOG=str(marker),
+        )
+        missing_hf = subprocess.run(
+            [str(root / "install.sh")], cwd=str(root), env=missing_hf_env,
+            capture_output=True, text=True, check=False, timeout=30,
+        )
+        if missing_hf.returncode == 0 or "Hugging Face CLI" not in missing_hf.stderr:
+            return False, "selected-model preflight did not report missing Hugging Face CLI"
+        if any(path.exists() for path in (
+            Path(missing_hf_env["CLUB3090_CONTROL_DIR"]),
+            Path(missing_hf_env["CLUB3090_SERVER_ENV_FILE"]).parent,
+            Path(missing_hf_env["CLUB3090_SYSTEMD_UNIT_DIR"]),
+            marker,
+        )):
+            return False, "selected-model dependency failure wrote state, service registration, or invoked upstream setup"
         return True, "installer reports missing prerequisites before filesystem writes"
 
 def run_control_module_smoke_test(root: Path) -> tuple[bool, str]:
@@ -320,7 +375,9 @@ def run_control_module_smoke_test(root: Path) -> tuple[bool, str]:
             [
                 sys.executable, "-c",
                 "import control; html=control.get_admin_html_template(); "
-                "assert 'renderAIStudioLaneActions' in html; print(len(html))",
+                "assert 'renderAIStudioLaneActions' in html; "
+                "assert 'Start this inference runtime automatically at boot' in html; "
+                "assert 'toggle_enabled' in html; print(len(html))",
             ],
             cwd=str(root / "src"), env=env, capture_output=True,
             text=True, check=False, timeout=30,

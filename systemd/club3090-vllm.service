@@ -1,9 +1,9 @@
 [Unit]
 Description=Club-3090 enabled inference instances
-ConditionKernelCommandLine=club3090.server=1
-After=docker.service network-online.target
+After=docker.service network-online.target club3090-control.service
 Requires=docker.service
-Wants=network-online.target
+Wants=network-online.target club3090-control.service
+
 
 [Service]
 Type=oneshot

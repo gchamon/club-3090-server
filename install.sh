@@ -32,6 +32,8 @@ PROXY_BIND_HOST="${PROXY_BIND_HOST:-0.0.0.0}"
 DEFAULT_MODE="${DEFAULT_MODE:-$(read_config_value DEFAULT_MODE)}"
 EXTRA_TEMPS="${CLUB3090_ENABLE_EXTRA_TEMPS:-$(read_config_value CLUB3090_ENABLE_EXTRA_TEMPS)}"
 EXTRA_TEMPS="${EXTRA_TEMPS:-0}"
+SETUP_MODEL="${CLUB3090_SETUP_MODEL-}"
+SETUP_MODEL_SET="${CLUB3090_SETUP_MODEL+x}"
 
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || missing+=("$1"); }
@@ -51,6 +53,14 @@ fi
 if ! python3 -c 'import yaml' >/dev/null 2>&1; then
   missing+=("Python PyYAML module")
 fi
+if [[ "${SETUP_MODEL_SET}" == "x" ]]; then
+  [[ -n "${SETUP_MODEL}" && "${SETUP_MODEL}" != *[$'\t\n ']* ]] || fail "CLUB3090_SETUP_MODEL must be a non-empty, whitespace-free model identifier"
+  need nvidia-smi
+  need sha256sum
+  if ! command -v hf >/dev/null 2>&1 && ! command -v huggingface-cli >/dev/null 2>&1; then
+    missing+=("Hugging Face CLI (hf or huggingface-cli)")
+  fi
+fi
 if ((${#missing[@]})); then
   printf 'Missing prerequisites (install them with your OS package manager, then rerun):\n' >&2
   printf '  - %s\n' "${missing[@]}" >&2
@@ -65,8 +75,8 @@ if [[ "${EXTRA_TEMPS}" == "1" ]]; then
     missing+=("libpci development library")
   fi
   if ((${#missing[@]})); then
-    printf 'Missing optional temperature-helper prerequisites:\\n' >&2
-    printf '  - %s\\n' "${missing[@]}" >&2
+    printf 'Missing optional temperature-helper prerequisites:\n' >&2
+    printf '  - %s\n' "${missing[@]}" >&2
     exit 1
   fi
 fi
@@ -80,11 +90,11 @@ for unit in club3090-control.service club3090-benchmarks.service club3090-update
 done
 git_top="$(git -C "${ROOT}" rev-parse --show-toplevel 2>/dev/null)" || fail "installer must run from a git checkout"
 [[ "${git_top}" == "${ROOT}" ]] || fail "run install.sh from the root of the git checkout"
-[[ -d "${UPSTREAM}" ]] || fail "upstream checkout not found at ${UPSTREAM}; expected scripts/switch.sh, scripts/setup.sh, and models/. See docs/INSTALL.md"
+[[ -d "${UPSTREAM}" ]] || fail "upstream checkout not found at ${UPSTREAM}; expected scripts/preflight.sh, scripts/setup.sh, scripts/switch.sh, scripts/launch.sh, and models/. See docs/INSTALL.md"
 UPSTREAM="$(cd -- "${UPSTREAM}" && pwd -P)"
-upstream_git_top="$(git -C "${UPSTREAM}" rev-parse --show-toplevel 2>/dev/null)" || fail "upstream checkout is not a git repository at ${UPSTREAM}; expected scripts/switch.sh, scripts/setup.sh, and models/. See docs/INSTALL.md"
+upstream_git_top="$(git -C "${UPSTREAM}" rev-parse --show-toplevel 2>/dev/null)" || fail "upstream checkout is not a git repository at ${UPSTREAM}; expected scripts/preflight.sh, scripts/setup.sh, scripts/switch.sh, scripts/launch.sh, and models/. See docs/INSTALL.md"
 [[ "${upstream_git_top}" == "${UPSTREAM}" ]] || fail "CLUB3090_DIR must name the root of an upstream git checkout at ${UPSTREAM}; see docs/INSTALL.md"
-[[ -f "${UPSTREAM}/scripts/switch.sh" && -f "${UPSTREAM}/scripts/setup.sh" && -d "${UPSTREAM}/models" ]] || fail "upstream checkout incomplete at ${UPSTREAM}; expected scripts/switch.sh, scripts/setup.sh, and models/. See docs/INSTALL.md"
+[[ -f "${UPSTREAM}/scripts/preflight.sh" && -f "${UPSTREAM}/scripts/setup.sh" && -f "${UPSTREAM}/scripts/switch.sh" && -f "${UPSTREAM}/scripts/launch.sh" && -d "${UPSTREAM}/models" ]] || fail "upstream checkout incomplete at ${UPSTREAM}; expected scripts/preflight.sh, scripts/setup.sh, scripts/switch.sh, scripts/launch.sh, and models/. See docs/INSTALL.md"
 for value in "${ROOT}" "${UPSTREAM}" "${STATE}"; do
   [[ "${value}" != *[$'\t\n ']* ]] || fail "repository, upstream, and state paths cannot contain whitespace: ${value}"
 done
@@ -95,6 +105,10 @@ done
 for value in "${ADMIN_BIND_HOST}" "${PROXY_BIND_HOST}" "${DEFAULT_MODE}" "${EXTRA_TEMPS}"; do
   [[ "${value}" != *[$'\t\n ']* ]] || fail "service settings cannot contain whitespace: ${value}"
 done
+
+if [[ "${SETUP_MODEL_SET}" == "x" ]]; then
+  (cd -- "${UPSTREAM}" && bash "${UPSTREAM}/scripts/setup.sh" "${SETUP_MODEL}")
+fi
 
 if [[ "${EUID}" -eq 0 ]]; then SUDO=(); else SUDO=(sudo); fi
  "${SUDO[@]}" install -d -m 0700 "${STATE}"
@@ -181,7 +195,8 @@ install_unit club3090-vllm.service club3090-vllm.service
 install_unit club3090-cert-refresh.service club3090-cert-refresh.service
 install_unit club3090-cert-refresh.timer club3090-cert-refresh.timer
 "${SUDO[@]}" systemctl daemon-reload
-"${SUDO[@]}" systemctl enable club3090-control.service club3090-benchmarks.service club3090-updater.service club3090-console-log.service club3090-vllm.service
+"${SUDO[@]}" systemctl enable club3090-control.service club3090-benchmarks.service club3090-updater.service club3090-vllm.service
+"${SUDO[@]}" systemctl start club3090-control.service club3090-updater.service club3090-vllm.service
 
 printf 'Installed Club-3090 Server services from %s\n' "${ROOT}"
 printf 'Upstream runtime: %s\nMutable state: %s\nConfiguration: %s\n' "${UPSTREAM}" "${STATE}" "${ENV_FILE}"

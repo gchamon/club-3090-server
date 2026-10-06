@@ -4,19 +4,23 @@
 
 Club-3090 Server is the management/control layer; [club-3090](https://github.com/noonghunna/club-3090) is the separate upstream inference runtime. The upstream checkout is operator-owned. Place it at `club-3090` inside this repository, or provide its absolute path in `CLUB3090_DIR`.
 
-Install prerequisites manually before installing this service. Base requirements include `git`, Python 3 with PyYAML, Docker with Compose, systemd, `sudo`, `curl`, `openssl`, and `pamtester`. Example base-package commands are:
+Install prerequisites manually before installing. Base requirements include `git`, Python 3 with PyYAML, Docker with Compose, systemd, `sudo`, `curl`, `openssl`, and `pamtester`. The installer verifies these requirements but never installs packages. Docker must be enabled/configured for your distribution.
 
 ```bash
 # Arch Linux
 sudo pacman -S --needed git python python-yaml docker docker-compose sudo curl openssl pamtester
 
-# Debian/Ubuntu
+# Ubuntu/Debian
 sudo apt-get update
 sudo apt-get install git python3 python3-yaml docker.io docker-compose-plugin sudo curl openssl pamtester
+
+# Fedora
+sudo dnf install git python3 python3-PyYAML moby-engine docker-compose sudo curl openssl pamtester
 ```
 
-Enable and configure Docker as required by your distribution; installation does not configure the host's package manager or Docker daemon. Optional features may require Caddy and Tailscale, Xorg and `nvidia-settings` for fan control, `cpupower`, `ntfs-3g`, compiler/libpci dependencies for the temperature helper, and the externally installed Hugging Face `hf` CLI for AI Studio downloads. Install only the dependencies for features you intend to use.
-To opt in to junction/VRAM temperature telemetry, install `gcc`, the libpci development package, and the NVIDIA Management Library linker package using your distribution package manager, then run `sudo env CLUB3090_ENABLE_EXTRA_TEMPS=1 ./install.sh`. The helper is compiled from `src/build/vendor/gputemps.c` and `src/build/vendor/nvml.h` into the runtime data directory; no source is copied out of this checkout. The installer does not edit bootloader configuration. If the helper reports that its readings require `iomem=relaxed`, configure that kernel option manually and reboot.
+For explicit model setup, also provide a working NVIDIA driver exposed through `nvidia-smi`, `sha256sum`, and an externally installed `hf` or `huggingface-cli`. These are checked only when `CLUB3090_SETUP_MODEL` is supplied. Optional features may require Caddy and Tailscale, Xorg and `nvidia-settings` for fan control, `cpupower`, `ntfs-3g`, compiler/libpci dependencies for the temperature helper, and Hugging Face CLI for AI Studio downloads. Install only dependencies for features you use.
+
+To opt in to junction/VRAM temperature telemetry, install `gcc`, the libpci development package, and NVIDIA Management Library linker package using your distribution package manager, then run `sudo env CLUB3090_ENABLE_EXTRA_TEMPS=1 ./install.sh`. The helper is compiled from `src/build/vendor/gputemps.c` and `src/build/vendor/nvml.h` into the runtime data directory; no source is copied out of this checkout. The installer does not edit bootloader configuration. If the helper reports that its readings require `iomem=relaxed`, configure that kernel option manually and reboot.
 
 ## Install
 
@@ -29,6 +33,14 @@ git clone https://github.com/noonghunna/club-3090.git
 sudo ./install.sh
 ```
 
+To provision a model during installation:
+
+```bash
+sudo env CLUB3090_SETUP_MODEL=qwen3.6-27b HF_TOKEN=hf_xxx ./install.sh
+```
+
+This invokes the existing upstream `scripts/setup.sh` from the supplied checkout. Upstream setup variables such as `MODEL_DIR`, `WEIGHTS`, and `WITH_DFLASH_DRAFT=1` pass through unchanged. The installer never installs packages, clones or updates either checkout, or embeds/copies application code.
+
 For an upstream checkout at another path:
 
 ```bash
@@ -37,14 +49,7 @@ sudo env CLUB3090_DIR=/absolute/path/to/club-3090 ./install.sh
 
 The checkout must remain at the installed path: systemd services execute the Python modules, scripts, and web assets directly from it. The installer registers systemd units and stores the service environment in `/etc/club3090-server.env`; mutable runtime data defaults to `/var/lib/club3090-control` and can be redirected with `CLUB3090_CONTROL_DIR`.
 
-Start the management service explicitly and inspect its installed unit:
-
-```bash
-sudo systemctl start club3090-control.service
-systemctl cat club3090-control.service
-```
-
-The installer does not automatically start an inference runtime. For service operations see [Operations](OPERATIONS.md).
+Successful installation starts the control, updater, and vLLM services. In AI Studio, each inference runtime row's **Start this inference runtime automatically at boot** checkbox controls whether that runtime starts on subsequent boots. Verify with `systemctl is-active club3090-control.service`, `systemctl is-active club3090-updater.service`, and `systemctl is-active club3090-vllm.service`; inspect the installed unit with `systemctl cat club3090-control.service`. For service operations see [Operations](OPERATIONS.md).
 
 ## Uninstall
 
