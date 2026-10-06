@@ -604,6 +604,41 @@ runtime_log_metric_memory = {}
 nvlink_status_cache = {"value": {}, "time": 0.0}
 tailscale_access_hint_cache = {"value": {}, "time": 0.0}
 target_request_metrics = {}
+startup_time = time.time()
+recent_requests = collections.deque(maxlen=120)
+series_points = collections.deque(maxlen=METRICS_SERIES_MAX_POINTS)
+request_queue = collections.deque(maxlen=50)
+metrics = {
+    "total_requests": 0,
+    "active_requests": 0,
+    "completed_requests": 0,
+    "failed_requests": 0,
+    "streaming_requests": 0,
+    "queued_requests": 0,
+    "cold_starts": 0,
+    "failovers": 0,
+    "last_latency_s": None,
+    "last_ttft_s": None,
+    "last_tokens_per_second": None,
+    "last_estimated_tokens": None,
+    "last_preset": None,
+    "last_path": None,
+    "last_status": None,
+}
+LOG_BOOTSTRAP_MARKER = os.environ.get("CLUB3090_LOG_BOOTSTRAP_MARKER", "Application startup complete")
+LOG_TAIL_MAX_BYTES = _env_int("CLUB3090_LOG_TAIL_MAX_BYTES", 102400)
+LOG_INITIAL_TAIL_LINES = _env_int("CLUB3090_LOG_INITIAL_TAIL_LINES", 250)
+LOG_INITIAL_SNAPSHOT_TIMEOUT_SECONDS = _env_float("CLUB3090_LOG_INITIAL_TIMEOUT_SECONDS", 15)
+runtime_log_watchers = {}
+runtime_log_watchers_lock = threading.Lock()
+admin_stream_registry = {}
+admin_stream_registry_lock = threading.Lock()
+latest_gpu_rows = []
+latest_system_snapshot = {"memory": {}, "cpu": {"cores": []}, "disks": [], "network": {}, "info": {}}
+latest_metrics_collected_at = 0.0
+gpu_session_peaks = {}
+system_metric_peaks_cache = None
+gpu_last_seen_cache = {"value": None, "time": 0.0, "write_time": 0.0}
 admin_chat_stream_states = {}
 admin_chat_stream_controls = {}
 runtime_inventory_lock = threading.Lock()

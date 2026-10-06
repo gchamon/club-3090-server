@@ -8,7 +8,6 @@ UNITS=(
   club3090-headless-x.service
   club3090-console-log.service
   club3090-vllm.service
-  club3090-caddy.service
   club3090-cert-refresh.service
   club3090-cert-refresh.timer
 )

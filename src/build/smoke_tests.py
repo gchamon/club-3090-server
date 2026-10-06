@@ -305,6 +305,8 @@ def run_repository_uninstall_smoke_test(root: Path) -> tuple[bool, str]:
         for unit in units:
             if f"disable --now {unit}" not in systemctl_calls:
                 return False, f"uninstaller did not stop/disable {unit}"
+        if "club3090-caddy.service" in systemctl_calls:
+            return False, "uninstaller attempted to stop/disable the operator-managed Caddy unit"
         return True, "uninstaller removed service registration and configuration while preserving runtime data"
 def run_installer_preflight_smoke_test(root: Path) -> tuple[bool, str]:
     root = Path(root).resolve()
@@ -505,6 +507,17 @@ def run_control_module_smoke_test(root: Path) -> tuple[bool, str]:
                 "try:\\n control.docker_logrotate_refresher()\\n"
                 "except _Stop as stopped:\\n assert stopped.args[0] >= 300\\n"
                 "else:\\n raise AssertionError('logrotate refresher returned')\"); "
+                "control.startup_time=1000.0; "
+                "warming=control.build_status_stale_overlay_snapshot({}, 'status snapshot is warming up'); "
+                "assert isinstance(warming['control_started_at'], int) and warming['uptime_seconds'] >= 0 and isinstance(warming['metrics'], dict); "
+                "error=control.build_status_error_snapshot('smoke failure'); "
+                "assert isinstance(error['control_started_at'], int) and error['uptime_seconds'] >= 0 and isinstance(error['metrics'], dict) and error['status_error'] == 'smoke failure'; "
+                "control.admin_stream_registry.clear(); "
+                "import control.http_server as server; handler=object.__new__(server.AdminHandler); handler.headers={'X-Forwarded-For':'192.0.2.8','User-Agent':'smoke'}; handler.client_address=('127.0.0.1',1234); "
+                "key,first=handler.begin_admin_stream('status'); replacement_key,second=handler.begin_admin_stream('status'); "
+                "assert key == replacement_key and first.is_set() and control.admin_stream_registry[key] is second; "
+                "handler.end_admin_stream(key,first); assert control.admin_stream_registry[key] is second; "
+                "handler.end_admin_stream(key,second); assert key not in control.admin_stream_registry; control.admin_stream_registry.clear(); "
                 "html=control.get_admin_html_template(); "
                 "assert 'renderAIStudioLaneActions' in html; "
                 "assert 'Start this inference runtime automatically at boot' in html; "
