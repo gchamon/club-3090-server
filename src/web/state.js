@@ -1517,16 +1517,16 @@ function beginUpdateMonitor(payload, scope) {
   updateLogVisualMode();
   setAuditMsg(
     scope === "club3090"
-      ? "Club-3090 migration is running through the separate updater service. The orange log stream will stay live while the control plane restarts."
+      ? "System Update is running through the separate updater service. Update Logs will stay selected while the control plane restarts."
       : "Admin script update is running through the separate updater service. The orange log stream will stay live while the control plane restarts.",
   );
   scheduleRenderedUpdateAcknowledgement(updateMonitor.token);
 }
 function beginPendingUpdateUi(scope) {
-  updateMonitor.returnTab = normalizeTabName(activeTabName || "overview");
-  updateMonitor.returnScrollTop = Math.max(0, Number(currentPageScrollTop() || 0));
+  updateMonitor.returnTab = "logs";
+  updateMonitor.returnScrollTop = 0;
   updateMonitor.returnLogSource = updateFallbackLogSource(currentLogSource);
-  rememberPendingUpdateReturn(updateMonitor.returnTab, updateMonitor.returnScrollTop);
+  rememberPendingUpdateReturn("logs", 0);
   updateMonitor.completed = false;
   updateMonitor.startedAt = Date.now();
   updateMonitor.reloadScheduled = false;
@@ -1537,7 +1537,7 @@ function beginPendingUpdateUi(scope) {
   updateLogVisualMode();
   setAuditMsg(
     scope === "club3090"
-      ? "Starting Club-3090 migration. The orange update log will remain selected while the control plane restarts."
+      ? "Starting System Update. Update Logs will remain selected while the control plane restarts."
       : "Starting admin script update. The orange update log will remain selected while the control plane restarts.",
   );
 }
