@@ -5,8 +5,8 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 ENV_FILE="${CLUB3090_SERVER_ENV_FILE:-/etc/club3090-server.env}"
 UNIT_DIR="${CLUB3090_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
 read_config_value() {
-  local wanted="$1" line key value found=""
-  [[ -r "${ENV_FILE}" ]] || return 0
+  local wanted="$1" file="${2:-${ENV_FILE}}" line key value found=""
+  [[ -r "${file}" ]] || return 0
   while IFS= read -r line || [[ -n "${line}" ]]; do
     [[ "${line}" == *=* ]] || continue
     key="${line%%=*}"
@@ -14,10 +14,11 @@ read_config_value() {
     value="${line#*=}"
     if [[ "${value}" == '"'*"'" ]]; then value="${value:1:${#value}-2}"; fi
     found="${value%$'\r'}"
-  done < "${ENV_FILE}"
+  done < "${file}"
   printf '%s' "${found}"
 }
-UPSTREAM="${CLUB3090_DIR:-$(read_config_value CLUB3090_DIR)}"
+UPSTREAM="${CLUB3090_DIR:-$(read_config_value CLUB3090_DIR "${ROOT}/.env")}"
+UPSTREAM="${UPSTREAM:-$(read_config_value CLUB3090_DIR)}"
 UPSTREAM="${UPSTREAM:-${ROOT}/club-3090}"
 STATE="${CLUB3090_CONTROL_DIR:-$(read_config_value CLUB3090_CONTROL_DIR)}"
 STATE="${STATE:-/var/lib/club3090-control}"

@@ -82,13 +82,13 @@ sudo env CLUB3090_SETUP_MODEL=qwen3.6-27b HF_TOKEN=hf_xxx ./install.sh
 
 This invokes the existing upstream `scripts/setup.sh` from the supplied checkout. Upstream setup variables such as `MODEL_DIR`, `WEIGHTS`, and `WITH_DFLASH_DRAFT=1` pass through unchanged. The installer never installs packages, clones or updates either checkout, or embeds/copies application code.
 
-For an upstream checkout at another path:
+For an upstream checkout at another path, set `CLUB3090_DIR` in the repository-root `.env` file or in the installer environment. The installer uses this precedence: explicit environment variable, repository `.env`, installed `/etc/club3090-server.env`, then the `club-3090` subdirectory inside the server checkout.
 
 ```bash
-sudo env CLUB3090_DIR=/absolute/path/to/club-3090 ./install.sh
+CLUB3090_DIR=/absolute/path/to/club-3090 ./install.sh
 ```
 
-The checkout must remain at the installed path: systemd services execute the Python modules, scripts, and web assets directly from it. The installer registers systemd units and stores the service environment in `/etc/club3090-server.env`; mutable runtime data defaults to `/var/lib/club3090-control` and can be redirected with `CLUB3090_CONTROL_DIR`.
+Run the installer as the checkout owner; it uses `sudo` for system changes. The checkout must remain at the installed path: systemd services execute the Python modules, scripts, and web assets directly from it. The installer registers systemd units and stores the service environment in `/etc/club3090-server.env`; mutable runtime data defaults to `/var/lib/club3090-control` and can be redirected with `CLUB3090_CONTROL_DIR`.
 
 Successful installation starts the control, updater, and vLLM services, then waits up to 60 seconds for all three to report `active` through systemd; a timeout reports inactive units. In AI Studio, each inference runtime row's **Start this inference runtime automatically at boot** checkbox controls whether that runtime starts on subsequent boots. Verify with `systemctl is-active club3090-control.service`, `systemctl is-active club3090-updater.service`, and `systemctl is-active club3090-vllm.service`; inspect the installed unit with `systemctl cat club3090-control.service`. For service operations see [Operations](OPERATIONS.md).
 

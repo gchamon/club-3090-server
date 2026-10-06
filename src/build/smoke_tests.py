@@ -73,7 +73,7 @@ def run_repository_install_smoke_test(root: Path) -> tuple[bool, str]:
             else:
                 script.write_text('#!/bin/sh\nprintf "%s\\n" "upstream script invoked: $0" >> "$CLUB3090_TEST_MUTATION_LOG"\nexit 99\n', encoding="utf-8")
             script.chmod(0o755)
-        mutation_wrapper = '#!/bin/sh\nif [ "$1" = "-C" ] && [ "$3" = "rev-parse" ]; then exec "$CLUB3090_TEST_REAL_GIT" "$@"; fi\nprintf "%s\\n" "$*" >> "$CLUB3090_TEST_MUTATION_LOG"\nexit 99\n'
+        mutation_wrapper = '#!/bin/sh\nif [ "$1" = "-C" ] && [ "$3" = "rev-parse" ]; then if [ -n "${CLUB3090_TEST_SERVER_DIR:-}" ] && [ "$2" = "$CLUB3090_TEST_SERVER_DIR" ]; then printf "%s\\n" "$2"; exit 0; fi; exec "$CLUB3090_TEST_REAL_GIT" "$@"; fi\nprintf "%s\\n" "$*" >> "$CLUB3090_TEST_MUTATION_LOG"\nexit 99\n'
         wrappers = {
             "sudo": '#!/bin/sh\nexec "$@"\n',
             "systemctl": '#!/bin/sh\nprintf "%s\\n" "$*" >> "$CLUB3090_TEST_SYSTEMCTL_LOG"\nif [ "$1" = "is-active" ] && [ "${CLUB3090_TEST_HEALTH_DELAY:-}" = "1" ]; then marker="${CLUB3090_TEST_SYSTEMCTL_LOG}.$3"; if [ ! -e "$marker" ]; then : > "$marker"; exit 1; fi; fi\nexit 0\n',
@@ -253,7 +253,30 @@ def run_repository_install_smoke_test(root: Path) -> tuple[bool, str]:
             return False, "updater-owned install did not restart control and vLLM services"
         if "is-active --quiet club3090-updater.service" not in updater_calls:
             return False, "updater-owned install did not health-check the still-running updater service"
-        return True, "installer registered source-tree services without package-manager or git mutation"
+        dotenv_root = temp / "dotenv-server"
+        dotenv_root.mkdir()
+        shutil.copy2(root / "install.sh", dotenv_root / "install.sh")
+        for name in ("src", "scripts", "systemd"):
+            (dotenv_root / name).symlink_to(root / name, target_is_directory=True)
+        dotenv_root.joinpath(".env").write_text(f"CLUB3090_DIR={upstream}\n", encoding="utf-8")
+        dotenv_env_file = temp / "dotenv-etc" / "club3090-server.env"
+        dotenv_env = dict(env)
+        dotenv_env.pop("CLUB3090_DIR", None)
+        dotenv_env.update(
+            CLUB3090_CONTROL_DIR=str(temp / "dotenv-state"),
+            CLUB3090_SERVER_ENV_FILE=str(dotenv_env_file),
+            CLUB3090_SYSTEMD_UNIT_DIR=str(temp / "dotenv-units"),
+            CLUB3090_TEST_SERVER_DIR=str(dotenv_root),
+        )
+        dotenv_result = subprocess.run(
+            [str(dotenv_root / "install.sh")], cwd=str(dotenv_root), env=dotenv_env,
+            capture_output=True, text=True, check=False, timeout=60,
+        )
+        if dotenv_result.returncode:
+            return False, dotenv_result.stderr.strip() or "installer did not accept the repository .env upstream path"
+        if f"CLUB3090_DIR={upstream}" not in dotenv_env_file.read_text(encoding="utf-8"):
+            return False, "installer did not persist CLUB3090_DIR from the repository .env file"
+        return True, "installer honors repository .env upstream path and updater-owned service lifecycle"
 
 
 def run_repository_uninstall_smoke_test(root: Path) -> tuple[bool, str]:
