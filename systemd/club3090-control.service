@@ -1,0 +1,17 @@
+[Unit]
+Description=Club-3090 Server admin and inference proxy
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-@ENV_FILE@
+WorkingDirectory=@SOURCE_ROOT@/src
+ExecStart=/usr/bin/python3 -m control.http_server
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

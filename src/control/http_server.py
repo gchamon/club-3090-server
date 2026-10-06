@@ -1,3 +1,7 @@
+import control as _control
+globals().update({name: value for name, value in vars(_control).items() if not name.startswith("__")})
+del _control
+
 class CommonMixin:
     def log_message(self, fmt, *args):
         return
@@ -243,7 +247,7 @@ self.addEventListener("fetch", (event) => {{
   const request = event.request;
   if (!request || request.method !== "GET" || request.mode !== "navigate") return;
   const url = new URL(request.url);
-  if (!url.pathname.startsWith("/admin") || url.pathname === "/admin/sw.js") return;
+  if (!(url.pathname === "/admin" || url.pathname.startsWith("/admin/")) || url.pathname === "/admin/sw.js") return;
   event.respondWith(networkFirstAdminNavigation(request));
 }});
 """.strip() + "\n"
@@ -318,6 +322,56 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
         self.close_connection = True
     def admin_stream_stopped(self, stop_event):
         return bool(stop_event is not None and stop_event.is_set())
+    def update_signal_payload(self):
+        update_state = read_self_update_state()
+        return {
+            "active": bool(update_state.get("active")),
+            "status": update_state.get("status"),
+            "scope": update_state.get("scope"),
+            "token": update_state.get("token"),
+            "stream_url": update_state.get("stream_url"),
+            "status_url": update_state.get("status_url"),
+        }
+    def stream_update_events(self):
+        stream_key, stop_event = self.begin_admin_stream(f"update-events:{id(self)}")
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.emit_pending_headers()
+        self.end_headers()
+        last_payload = None
+        last_heartbeat = time.monotonic()
+        try:
+            last_payload = self.update_signal_payload()
+            self.send_sse_event("state", last_payload)
+            try:
+                state_stat = os.stat(UPDATE_STATE_FILE)
+                last_signature = (state_stat.st_mtime_ns, state_stat.st_size)
+            except OSError:
+                last_signature = None
+            while not self.admin_stream_stopped(stop_event):
+                time.sleep(0.5)
+                if self.admin_stream_stopped(stop_event):
+                    break
+                try:
+                    state_stat = os.stat(UPDATE_STATE_FILE)
+                    signature = (state_stat.st_mtime_ns, state_stat.st_size)
+                except OSError:
+                    signature = None
+                if signature != last_signature:
+                    last_signature = signature
+                    payload = self.update_signal_payload()
+                    if payload != last_payload:
+                        self.send_sse_event("state", payload)
+                        last_payload = payload
+                        last_heartbeat = time.monotonic()
+                elif time.monotonic() - last_heartbeat >= 15:
+                    self.send_sse_comment()
+                    last_heartbeat = time.monotonic()
+        finally:
+            self.end_admin_stream(stream_key, stop_event)
     def do_GET(self):
         parsed = urlsplit(self.path)
         path = parsed.path
@@ -354,24 +408,23 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             except Exception as e:
                 self.send_json({"ok": False, "error": str(e)}, 400)
             return
-        if path == "/admin/update-signal":
-            update_state = read_self_update_state()
-            self.send_json({
-                "ok": True,
-                "self_update": {
-                    "active": bool(update_state.get("active")),
-                    "status": update_state.get("status"),
-                    "scope": update_state.get("scope"),
-                    "token": update_state.get("token"),
-                    "stream_url": update_state.get("stream_url"),
-                    "status_url": update_state.get("status_url"),
-                },
-            })
+        if path == "/admin/update-events":
+            self.stream_update_events()
             return
         if path == "/":
             self.redirect("/admin")
             return
-        if path == "/admin":
+        if path in {
+            "/admin",
+            "/admin/system",
+            "/admin/ai-studio",
+            "/admin/benchmarks",
+            "/admin/metrics",
+            "/admin/users",
+            "/admin/scripts",
+            "/admin/logs",
+            "/admin/chat",
+        }:
             html = get_admin_html_template().replace("__SCRIPT_VERSION__", SCRIPT_VERSION).replace(":8008/admin", f":{ADMIN_PORT}/admin").replace(":8009", f":{PROXY_PORT}")
             self.queue_header("Cache-Control", "no-store, no-cache, must-revalidate")
             self.queue_header("Pragma", "no-cache")
@@ -383,25 +436,19 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             request_options = parse_status_request_options(params)
             refresh_remote_metadata = str(params.get("refresh_remote_update") or "").strip().lower() in {"1", "true", "yes", "on"}
             started_at = time.time()
-            if (
-                request_options.get("tab") == "metrics"
-                and request_options.get("include_series")
-                and not request_options.get("include_inventory")
-            ):
-                snapshot = get_lightweight_status_snapshot(series_limit=request_options.get("series_limit"))
-            else:
-                snapshot = get_status_snapshot(force=force, refresh_remote_metadata=refresh_remote_metadata)
-            payload = shape_status_snapshot(
-                snapshot,
-                request_options,
-            )
+            snapshot = get_status_snapshot(force=force, refresh_remote_metadata=refresh_remote_metadata)
+            payload = shape_status_snapshot(snapshot, request_options)
             payload["access_hint"] = tailscale_access_hint_for_client(self.client_address[0] if self.client_address else "")
             elapsed = time.time() - started_at
             if elapsed >= 1.0 or payload.get("status_error"):
                 log_control(f"ADMIN status served force={force} elapsed={round(elapsed, 3)}s status_error={bool(payload.get('status_error'))}")
             self.send_json(payload)
             return
-        if path == "/admin/benchmarks":
+        if path == "/admin/metrics-series":
+            params = parse_admin_query_params(parsed)
+            self.send_json(metrics_series_chunk(params.get("start"), params.get("end"), params.get("after"), params.get("limit", 240)))
+            return
+        if path == "/admin/benchmarks/status":
             params = parse_admin_query_params(parsed)
             live_only = str(params.get("live") or "").strip().lower() in {"1", "true", "yes", "on"}
             inventory_flags = [params.get("full"), params.get("inventory"), params.get("include_inventory")]
@@ -416,17 +463,46 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             else:
                 self.send_json({"ok": True, "benchmarks": benchmarks_snapshot(include_logs=include_logs, include_scores=include_scores)})
             return
-        if path == "/admin/scripts":
+        if path == "/admin/scripts/list":
             params = parse_admin_query_params(parsed)
             include_internal = str(params.get("include_internal") or "").strip().lower() in {"1", "true", "yes", "on"}
-            self.send_json({"ok": True, "scripts": discover_upstream_scripts(include_internal=include_internal), "include_internal": include_internal, "job": script_job_snapshot()})
+            self.send_json({"ok": True, "scripts": discover_upstream_scripts(include_internal=include_internal, include_validation=True), "include_internal": include_internal, "job": script_job_snapshot()})
             return
         if path == "/admin/scripts/jobs":
             self.send_json({"ok": True, "job": script_job_snapshot()})
             return
+        if path == "/admin/scripts/log/raw":
+            params = parse_admin_query_params(parsed)
+            job_id = str(params.get("job_id") or "").strip()
+            state = read_script_job_state()
+            row = script_queue_job(state, job_id)
+            log_file = script_current_log_file(job_id) if row else ""
+            if not row or not log_file or not os.path.isfile(log_file):
+                self.send_bytes(b"No script log found for that job.\n", content_type="text/plain; charset=utf-8", code=404)
+                return
+            self.send_stream(log_file, "text/plain; charset=utf-8")
+            return
         if path == "/admin/scripts/log":
             params = parse_admin_query_params(parsed)
             self.send_json({"ok": True, **script_log_snapshot(job_id=params.get("job_id") or "", tail_lines=parse_tail_lines_param(params, 500))})
+            return
+        if path == "/admin/scripts/report":
+            params = parse_admin_query_params(parsed)
+            markdown, report_path = latest_rig_report_content()
+            download = str(params.get("download") or "").strip().lower() in {"1", "true", "yes", "on"}
+            if download:
+                if not markdown:
+                    self.send_bytes(b"No rig report generated yet. Run the Full Rig Report validation preset first.\n", content_type="text/plain; charset=utf-8", code=404)
+                    return
+                self.send_bytes(markdown.encode("utf-8"), content_type="text/markdown; charset=utf-8", code=200, download_name="my-rig.md")
+                return
+            self.send_json({
+                "ok": True,
+                "has_report": bool(markdown),
+                "markdown": markdown,
+                "path": report_path,
+                "filename": "my-rig.md",
+            })
             return
         if path == "/admin/benchmarks/detail":
             params = parse_admin_query_params(parsed)
@@ -441,10 +517,43 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             instance_id = str(params.get("instance") or "").strip().upper()
             service_id = str(params.get("service") or "").strip().lower()
             tail_lines = parse_tail_lines_param(params, 250)
-            payload = read_selected_log_snapshot(source=source, instance_id=instance_id, service_id=service_id, tail_lines=tail_lines)
+            payload = read_selected_log_snapshot(source=source, instance_id=instance_id, service_id=service_id, tail_lines=tail_lines, job_id=params.get("job_id") or "")
             self.send_json({"ok": True, **payload})
             return
-        if path == "/admin/logs":
+        if path == "/admin/logs/archive":
+            archive_name = f"club3090-logs-{time.strftime('%Y%m%d-%H%M%S')}.zip"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".zip", dir=CONTROL_DIR) as handle:
+                archive_path = handle.name
+            try:
+                with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
+                    for root, directories, files in os.walk(CONTROL_DIR, followlinks=False):
+                        directories[:] = sorted(
+                            directory
+                            for directory in directories
+                            if not os.path.islink(os.path.join(root, directory))
+                        )
+                        for file_name in sorted(files):
+                            if not file_name.lower().endswith(".log"):
+                                continue
+                            file_path = os.path.join(root, file_name)
+                            if os.path.islink(file_path) or not os.path.isfile(file_path):
+                                continue
+                            archive.write(file_path, os.path.relpath(file_path, CONTROL_DIR))
+            except Exception as e:
+                try:
+                    os.remove(archive_path)
+                except OSError:
+                    pass
+                self.send_json({"ok": False, "error": str(e)}, 500)
+                return
+            self.send_stream(
+                archive_path,
+                content_type="application/zip",
+                download_name=archive_name,
+                cleanup_path=archive_path,
+            )
+            return
+        if path == "/admin/log-stream":
             params = parse_admin_query_params(parsed)
             if str(params.get("source") or "").strip().lower() == "benchmarks":
                 stream_key, stop_event = self.begin_admin_stream("logs:benchmarks")
@@ -542,7 +651,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
         if path == "/admin/instances":
             self.send_json({"ok": True, "instances": instances_snapshot(), "single_gpu_modes": list(SINGLE_GPU_MODES), "dual_gpu_modes": list(DUAL_GPU_MODES), "running_dual_instances": running_dual_instance_snapshots()})
             return
-        if path == "/admin/users":
+        if path == "/admin/users/list":
             self.send_json({"ok": True, "users": list_users_public(), "groups": list_groups_public(), "server_config": read_server_config()})
             return
         if path == "/admin/groups":
@@ -843,21 +952,6 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             except Exception as e:
                 self.send_json({"ok": False, "error": str(e)}, 500)
             return
-        if path == "/admin/model-updates/check":
-            try:
-                summary = start_model_update_check("manual")
-                inventory = enrich_inventory_model_update_state(enrich_runtime_inventory_cache_sizes(load_runtime_inventory(force=True)))
-                self.send_json({
-                    "ok": True,
-                    "model_updates": summary,
-                    "runtime_inventory": inventory,
-                    "models": inventory.get("models") or [],
-                    "variants": inventory.get("variants") or [],
-                    "focus_log_source": "audit",
-                })
-            except Exception as e:
-                self.send_json({"ok": False, "error": str(e)}, 500)
-            return
         if path == "/admin/model-update":
             try:
                 data = self.read_json_body()
@@ -923,22 +1017,6 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                     result = delete_model_resource_paths_and_caches(data.get("paths") or [], data.get("selectors") or [])
                 else:
                     result = delete_preset_resources_and_caches(data.get("selector"), data.get("variant_id"))
-                inventory = enrich_runtime_inventory_cache_sizes(load_runtime_inventory(force=True))
-                self.send_json({
-                    **result,
-                    "runtime_inventory": inventory,
-                    "models": inventory.get("models") or [],
-                    "variants": inventory.get("variants") or [],
-                    "focus_log_source": "audit",
-                }, 200 if result.get("ok") else 500)
-            except Exception as e:
-                self.send_json({"ok": False, "error": str(e)}, 500)
-            return
-        if path == "/admin/model-cache/delete":
-            try:
-                ensure_benchmark_idle("Model cache deletion")
-                data = self.read_json_body()
-                result = delete_model_cache_paths(data.get("paths") or [])
                 inventory = enrich_runtime_inventory_cache_sizes(load_runtime_inventory(force=True))
                 self.send_json({
                     **result,
@@ -1140,7 +1218,28 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
         if path == "/admin/scripts/cancel":
             try:
                 data = self.read_json_body()
-                self.send_json({"ok": True, "script_job": cancel_script_job(data.get("job_id") or ""), "focus_log_source": "script"})
+                self.send_json({"ok": True, "script_job": cancel_script_jobs(data.get("job_ids") or []), "focus_log_source": "script"})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path == "/admin/scripts/retry":
+            try:
+                data = self.read_json_body()
+                self.send_json({"ok": True, "script_job": retry_script_jobs(data.get("job_ids") or []), "focus_log_source": "script"})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path == "/admin/scripts/reorder":
+            try:
+                data = self.read_json_body()
+                self.send_json({"ok": True, "script_job": reorder_script_jobs(data.get("job_ids") or [], data.get("position")), "focus_log_source": "script"})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, 500)
+            return
+        if path == "/admin/scripts/bulk-remove":
+            try:
+                data = self.read_json_body()
+                self.send_json({"ok": True, "script_job": remove_script_jobs(data.get("job_ids") or []), "focus_log_source": "script"})
             except Exception as e:
                 self.send_json({"ok": False, "error": str(e)}, 500)
             return
@@ -1154,16 +1253,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
         if path == "/admin/update":
             try:
                 data = self.read_json_body()
-                scope_name = _selector_token(data.get("scope"))
-                benchmark_active = benchmark_job_active()
-                if scope_name == "club3090" and benchmark_active:
-                    message = "Stop Model Scores benchmarking before migrating Club-3090."
-                    append_audit_text_line(f"Rejected Club-3090 migration while Model Scores benchmarking is active.")
-                    self.send_json({"ok": False, "error": message}, 409)
-                    return
-                if benchmark_active:
-                    append_audit_text_line("Self-update requested while Model Scores benchmarking is active; leaving benchmark queue and runtimes untouched.")
-                result = start_self_update_job(scope_name or data.get("scope"), data.get("target_commit"))
+                result = start_self_update_job(data.get("operation"), data.get("scope"))
                 self.send_json(result)
             except Exception as e:
                 self.send_json({"ok": False, "error": str(e)}, 500)
@@ -1443,6 +1533,10 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                     else:
                         rc, msg = stop_runtime_scope(instance_id=instance_id, mode=data.get("mode"))
                         out = {"container_stop_rc": rc, "container_stop_output": msg, "cpu": apply_cpu_idle_power(), "gpu": apply_gpu_idle_power()}
+                elif action == "unload_instance":
+                    if not instance_id or str(instance_id).strip().upper() == "GLOBAL":
+                        raise ValueError("Unload requires a named instance")
+                    out = {"instance": unload_instance(instance_id)}
                 elif action == "start_instance":
                     out = global_scope_power_action(action) if str(instance_id or "").strip().upper() == "GLOBAL" else start_instance(instance_id)
                 elif action == "restart_instance":
@@ -2101,6 +2195,10 @@ class LocalApiHandler(CommonMixin, BaseHTTPRequestHandler):
                     else:
                         rc, msg = stop_runtime_scope(instance_id=instance_id, mode=data.get("mode"))
                         out = {"container_stop_rc": rc, "container_stop_output": msg, "cpu": apply_cpu_idle_power(), "gpu": apply_gpu_idle_power()}
+                elif action == "unload_instance":
+                    if not instance_id or str(instance_id).strip().upper() == "GLOBAL":
+                        raise ValueError("Unload requires a named instance")
+                    out = {"instance": unload_instance(instance_id)}
                 elif action == "start_instance":
                     out = global_scope_power_action(action) if str(instance_id or "").strip().upper() == "GLOBAL" else start_instance(instance_id)
                 elif action == "restart_instance":

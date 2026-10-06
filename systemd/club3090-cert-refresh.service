@@ -1,0 +1,10 @@
+[Unit]
+Description=Club-3090 HTTPS certificate renewal
+After=network-online.target club3090-caddy.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-@ENV_FILE@
+ExecStart=@SOURCE_ROOT@/scripts/club3090-server/refresh-ip-certificate.sh
+TimeoutStartSec=240

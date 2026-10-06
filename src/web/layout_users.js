@@ -5,8 +5,9 @@ function ensureV413Layout() {
   const logsBtn = tabs && tabs.querySelector('.tab[onclick*=\"logs\"]');
   if (auditBtn) auditBtn.remove();
   if (tabs && logsBtn) tabs.appendChild(logsBtn);
+  const chatBtn = tabs && tabs.querySelector("#chatLaunchBtn");
+  if (tabs && chatBtn) tabs.appendChild(chatBtn);
   const system = $("system");
-  const presets = $("presets");
   const logs = $("logs");
   const audit = $("audit");
   if (system && audit) {
@@ -34,7 +35,7 @@ function ensureV413Layout() {
     );
     if (openUsers) openUsers.remove();
   }
-  const singleCard = [...document.querySelectorAll("#presets .panel")].find(
+  const singleCard = [...document.querySelectorAll("#aiStudioTextModels .panel")].find(
     (panel) => {
       const h = panel.querySelector(".panel-head h2,h2");
       return (
@@ -50,7 +51,7 @@ function ensureV413Layout() {
     if (title) title.textContent = "Model Presets";
   }
   const customTitle = [
-    ...document.querySelectorAll("#presets .panel .panel-head h2"),
+    ...document.querySelectorAll("#aiStudioTextModels .panel .panel-head h2"),
   ].find((h) => (h.textContent || "").trim() === "Custom Preset Templates");
   if (customTitle) customTitle.textContent = "Custom Configuration Endpoints";
   if ($("presetScopePanel")) $("presetScopePanel").remove();

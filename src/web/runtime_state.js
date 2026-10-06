@@ -17,30 +17,44 @@ function writeCachedUiState(data) {
     localStorage.setItem(UI_STATE_KEY, JSON.stringify(data || {}));
   } catch (e) {}
 }
-function readUiStateFromLocationHash() {
+function normalizeUiLogSource(source) {
+  const value = String(source || "").trim();
+  return ["audit", "debug", "docker", "benchmarks", "script", "control", "update"].includes(value) ||
+      value.startsWith("model:") || value.startsWith("service:")
+    ? value
+    : "docker";
+}
+function readUiStateFromLocationPath(pathname) {
   try {
-    const raw = String(window.location.hash || "").replace(/^#/, "");
-    if (!raw) return {};
-    const params = new URLSearchParams(raw);
-    const tab = params.has("tab") ? normalizeTabName(params.get("tab") || "") : "";
-    const scroll = Number(params.get("scroll") || "");
-    const state = {};
-    if (tab) state.active_tab = tab;
-    if (tab && Number.isFinite(scroll) && scroll > 0) {
-      state.tab_scroll_positions = { [tab]: Math.max(0, scroll) };
-    }
-    return state;
+    const path = String(pathname || window.location.pathname || "/admin");
+    if (path === "/admin") return { active_tab: "overview" };
+    if (!path.startsWith("/admin/")) return {};
+    const tab = path.slice("/admin/".length);
+    if (!["system", "ai-studio", "benchmarks", "metrics", "users", "scripts", "logs", "chat"].includes(tab)) return {};
+    return { active_tab: normalizeTabName(tab) };
   } catch (e) {
     return {};
   }
 }
-function readUiStateFromLocationSearch() {
+function normalizeAIStudioModelType(type) {
+  const value = String(type || "").trim().toLowerCase();
+  return ["text", "image", "audio", "speech", "video"].includes(value) ? value : "";
+}
+function readUiStateFromLocationSearch(search, activeTab = "") {
   try {
-    const params = new URLSearchParams(window.location.search || "");
-    const tab = params.has("ui_tab") ? normalizeTabName(params.get("ui_tab") || "") : "";
-    const scroll = Number(params.get("ui_scroll") || "");
+    const locationLike =
+      (typeof window !== "undefined" && window.location) ||
+      (typeof location !== "undefined" ? location : null) ||
+      {};
+    const params = new URLSearchParams(search === undefined ? locationLike.search || "" : search);
+    const tab = normalizeTabName(activeTab || readUiStateFromLocationPath(locationLike.pathname).active_tab || "overview");
+    const scroll = Number(params.get("scroll") || "");
+    const modelType = normalizeAIStudioModelType(params.get("ui_ai_studio_category"));
     const state = {};
-    if (tab) state.active_tab = tab;
+    if (tab === "logs" && params.has("log_source")) {
+      state.current_log_source = normalizeUiLogSource(params.get("log_source"));
+    }
+    if (tab === "ai-studio" && modelType) state.ai_studio_model_type = modelType;
     if (tab && Number.isFinite(scroll) && scroll > 0) {
       state.tab_scroll_positions = { [tab]: Math.max(0, scroll) };
     }
@@ -54,31 +68,18 @@ function readUiStateFromLocationNow() {
     (typeof window !== "undefined" && window.location) ||
     (typeof location !== "undefined" ? location : null) ||
     {};
-  const restoreParams = new URLSearchParams(locationLike.search || "");
-  const rawRestoreTab = String(restoreParams.get("restore_tab") || "").trim();
-  const restoreTab = rawRestoreTab ? normalizeTabName(rawRestoreTab) : "";
-  const restoreScroll = Number(
-    restoreParams.get("restore_scroll") || "",
-  );
-  const hashState = readUiStateFromLocationHash();
-  const searchState = readUiStateFromLocationSearch();
-  const state = { ...searchState, ...hashState };
-  if (restoreTab) {
-    state.active_tab = restoreTab;
-    if (Number.isFinite(restoreScroll) && restoreScroll > 0) {
-      state.tab_scroll_positions = {
-        ...(state.tab_scroll_positions || {}),
-        [restoreTab]: Math.max(0, restoreScroll),
-      };
-    }
-  }
-  return state;
+  const pathState = readUiStateFromLocationPath(locationLike.pathname);
+  const searchState = readUiStateFromLocationSearch(locationLike.search || "", pathState.active_tab);
+  return { ...pathState, ...searchState };
 }
 function applyLocationUiStateOverride() {
   const state = readUiStateFromLocationNow();
   const rawTab = String(state.active_tab || "").trim();
   const tab = rawTab ? normalizeTabName(rawTab) : "";
+  const modelType = normalizeAIStudioModelType(state.ai_studio_model_type);
   if (tab && tab !== activeTabName) activeTabName = tab;
+  if (modelType) aiStudioModelType = modelType;
+  if (state.current_log_source) currentLogSource = normalizeUiLogSource(state.current_log_source);
   if (state.tab_scroll_positions && typeof state.tab_scroll_positions === "object") {
     Object.entries(state.tab_scroll_positions).forEach(([name, value]) => {
       const key = normalizeTabName(name);
@@ -86,26 +87,29 @@ function applyLocationUiStateOverride() {
     });
   }
 }
-function writeUiStateToLocationHash(data = {}) {
-  try {
-    const tab = normalizeTabName(data.active_tab || activeTabName || "overview");
-    const scroll = Math.max(0, Number((data.tab_scroll_positions || {})[tab] || 0));
-    const params = new URLSearchParams();
-    params.set("tab", tab);
-    if (scroll > 0) params.set("scroll", String(Math.round(scroll)));
-    const nextHash = `#${params.toString()}`;
-    const nextUrl = `${window.location.pathname || ""}${window.location.search || ""}${nextHash}`;
-    if (window.location.hash !== nextHash) window.history.replaceState(null, "", nextUrl);
-  } catch (e) {}
+function buildUiStateUrl(data = {}, baseUrl = "") {
+  const tab = normalizeTabName(data.active_tab || activeTabName || "overview");
+  const nextUrl = new URL(baseUrl || window.location.href);
+  ["tab", "log_source", "scroll", "ui_tab", "ui_scroll", "ui_ai_studio_category", "restore_tab", "restore_scroll", "_"].forEach((key) => {
+    nextUrl.searchParams.delete(key);
+  });
+  if (tab === "logs") {
+    nextUrl.searchParams.set("log_source", normalizeUiLogSource(data.current_log_source || currentLogSource));
+  } else if (tab === "ai-studio") {
+    const modelType = normalizeAIStudioModelType(data.ai_studio_model_type || aiStudioModelType);
+    if (modelType) nextUrl.searchParams.set("ui_ai_studio_category", modelType);
+  }
+  const scroll = Math.max(0, Number((data.tab_scroll_positions || {})[tab] || 0));
+  if (scroll > 0) nextUrl.searchParams.set("scroll", String(Math.round(scroll)));
+  nextUrl.pathname = tab === "overview" ? "/admin" : `/admin/${tab}`;
+  nextUrl.hash = "";
+  return `${nextUrl.pathname}${nextUrl.search}`;
 }
-function writeUiStateToLocationSearch(data = {}) {
+function writeUiStateToLocation(data = {}) {
   try {
-    const nextUrl = new URL(window.location.href);
-    nextUrl.searchParams.delete("ui_tab");
-    nextUrl.searchParams.delete("ui_scroll");
-    const nextPath = `${nextUrl.pathname}${nextUrl.search}${nextUrl.hash}`;
+    const nextPath = buildUiStateUrl(data);
     const currentPath = `${window.location.pathname || ""}${window.location.search || ""}${window.location.hash || ""}`;
-    if (nextPath !== currentPath) window.history.replaceState(null, "", nextPath);
+    if (nextPath !== currentPath) window.history.replaceState(window.history.state, "", nextPath);
   } catch (e) {}
 }
 function readJsonCache(key, fallback) {
@@ -570,25 +574,23 @@ function persistChatConversationState() {
 }
 function normalizeTabName(name) {
   if (name === "audit") return "logs";
-  return ["overview", "system", "presets", "metrics", "users", "logs", "chat"].includes(
-    name,
-  )
+  return ["overview", "system", "ai-studio", "benchmarks", "metrics", "users", "scripts", "logs", "chat"].includes(name)
     ? name
     : "overview";
 }
 function currentUiState() {
+  const metricInterval = typeof currentMetricIntervalState === "function"
+    ? currentMetricIntervalState()
+    : { value: 5, unit: "m" };
   return {
     active_tab: normalizeTabName(activeTabName),
     active_metric_pane: typeof activeMetricPaneId === "function" ? activeMetricPaneId(document) : "mMain",
+    metric_time_value: Number(metricInterval.value || 5),
+    metric_time_unit: String(metricInterval.unit || "m"),
     tab_scroll_positions: { ...tabScrollPositions, [normalizeTabName(activeTabName)]: currentPageScrollTop() },
     selected_scope: selectedScope || "GLOBAL",
-    current_log_source:
-      currentLogSource === "audit" ||
-      currentLogSource === "debug" ||
-      currentLogSource === "docker" ||
-      String(currentLogSource || "").startsWith("service:")
-        ? currentLogSource
-        : "docker",
+    ai_studio_model_type: normalizeAIStudioModelType(aiStudioModelType) || "image",
+    current_log_source: normalizeUiLogSource(currentLogSource),
     selected_log_instance_id: String(selectedLogInstanceId || ""),
     show_global_logs: !!showGlobalLogs,
     show_global_logs_by_source: { ...showGlobalLogSources },
@@ -629,40 +631,25 @@ function syncHeaderChatButtonAlignment() {
 function hydrateUiState(cfg) {
   if (uiStateHydrated) return;
   const cached = readCachedUiState(),
-    hashState = readUiStateFromLocationHash(),
-    searchState = readUiStateFromLocationSearch(),
-    restoreTab = normalizeTabName(urlParams.get("restore_tab") || ""),
-    restoreScroll = Number(urlParams.get("restore_scroll") || ""),
-    state = { ...(cfg || {}), ...searchState, ...cached, ...hashState };
+    pathState = readUiStateFromLocationPath(),
+    searchState = readUiStateFromLocationSearch(undefined, pathState.active_tab),
+    state = { ...(cfg || {}), ...cached, ...pathState, ...searchState };
+  const locationModelType = normalizeAIStudioModelType(searchState.ai_studio_model_type);
+  if (locationModelType) state.ai_studio_model_type = locationModelType;
   if (state.tab_scroll_positions && typeof state.tab_scroll_positions === "object") {
     Object.entries(state.tab_scroll_positions).forEach(([name, value]) => {
       const key = normalizeTabName(name);
       tabScrollPositions[key] = Math.max(0, Number(value || 0));
     });
   }
-  activeTabName = normalizeTabName(state.active_tab || activeTabName);
   if (typeof setActiveMetricPaneInDocument === "function") {
     setActiveMetricPaneInDocument(document, state.active_metric_pane || "mMain");
   }
-  if (restoreTab) {
-    activeTabName = restoreTab;
-    if (Number.isFinite(restoreScroll) && restoreScroll > 0) {
-      tabScrollPositions[restoreTab] = Math.max(0, restoreScroll);
-    }
+  if (typeof setMetricIntervalState === "function") {
+    setMetricIntervalState(state.metric_time_value, state.metric_time_unit, { persist: false, refresh: false });
   }
-  currentLogSource =
-    state.current_log_source === "audit" ||
-    state.current_log_source === "debug" ||
-    state.current_log_source === "docker" ||
-    state.current_log_source === "benchmarks" ||
-    state.current_log_source === "script" ||
-    state.current_log_source === "control" ||
-    state.current_log_source === "update" ||
-    String(state.current_log_source || "").startsWith("model:") ||
-    String(state.current_log_source || "").startsWith("service:")
-      ? String(state.current_log_source)
-      : "docker";
-  selectedLogInstanceId = String(state.selected_log_instance_id || selectedLogInstanceId || "");
+  aiStudioModelType = normalizeAIStudioModelType(state.ai_studio_model_type) || aiStudioModelType;
+  currentLogSource = normalizeUiLogSource(state.current_log_source);
   showGlobalLogs =
     typeof state.show_global_logs === "boolean"
       ? state.show_global_logs
@@ -692,6 +679,7 @@ function hydrateUiState(cfg) {
       nextUrl.searchParams.delete("ui_tab");
       nextUrl.searchParams.delete("ui_scroll");
       nextUrl.searchParams.delete("_");
+      nextUrl.hash = "";
       history.replaceState({}, document.title, `${nextUrl.pathname}${nextUrl.search}${nextUrl.hash}`);
     } catch (e) {}
   }

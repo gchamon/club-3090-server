@@ -269,8 +269,7 @@ renderPresetScopeTabs = function () {
     .join("");
   setHtmlIfChanged(tabs, tabsHtml);
   if (scopeIsGlobal()) {
-    summary.textContent =
-      "Global scope fans single-GPU presets out across every GPU, dual presets across every two-GPU pair, and multi-GPU presets into the shared runtime.";
+    summary.textContent = "";
   } else {
     const current = currentScopeInstance(true) || currentScopeInstance(false);
     summary.textContent = current

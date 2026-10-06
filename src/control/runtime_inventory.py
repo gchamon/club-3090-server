@@ -8,64 +8,8 @@ import importlib.util
 import subprocess
 from types import ModuleType
 
-try:
-    from control.shared import *  # type: ignore
-    import control.shared as _club3090_shared_module  # type: ignore
-except Exception:
-    if "CLUB3090_DIR" not in globals():
-        _CONTROL_DIR = os.path.dirname(os.path.abspath(__file__))
-        if _CONTROL_DIR not in sys.path:
-            sys.path.insert(0, _CONTROL_DIR)
-        from shared import *  # type: ignore
-        import shared as _club3090_shared_module  # type: ignore
-
-try:
-    _preset_tps_selector_key
-    _read_preset_tps_stats_unlocked
-    _sanitize_preset_tps_row
-    _write_preset_tps_stats_unlocked
-    _monitor_plan_from_variant_install
-except NameError:
-    try:
-        from control.shared import (  # type: ignore
-            _monitor_plan_from_variant_install,
-            _preset_tps_selector_key,
-            _read_preset_tps_stats_unlocked,
-            _sanitize_preset_tps_row,
-            _write_preset_tps_stats_unlocked,
-        )
-    except Exception:
-        from shared import (  # type: ignore
-            _monitor_plan_from_variant_install,
-            _preset_tps_selector_key,
-            _read_preset_tps_stats_unlocked,
-            _sanitize_preset_tps_row,
-            _write_preset_tps_stats_unlocked,
-        )
-
-try:
-    preset_builtin_launch_env_overrides
-    preset_launch_env_overrides
-    read_server_config
-    write_server_config
-except NameError:
-    try:
-        if globals().get("__package__"):
-            from control.services_config import (  # type: ignore
-                preset_builtin_launch_env_overrides,
-                preset_launch_env_overrides,
-                read_server_config,
-                write_server_config,
-            )
-        else:
-            from services_config import (  # type: ignore
-                preset_builtin_launch_env_overrides,
-                preset_launch_env_overrides,
-                read_server_config,
-                write_server_config,
-            )
-    except Exception:
-        pass
+from control.shared import *  # type: ignore
+import control.shared as _club3090_shared_module  # type: ignore
 
 def _format_model_display_name(model_id):
     if not model_id:
@@ -402,9 +346,28 @@ def _selector_engine_display(selector="", compose_path=""):
 
 
 def _weight_recipe_from_model_variant(model_id, weights_variant):
-    reader = _load_upstream_weights_reader()
     model_text = str(model_id or "").strip()
     variant_text = _normalize_weight_variant_key(weights_variant)
+    if model_text == QWEN38_MODEL_PROFILE["id"]:
+        weight = next(
+            (row for row in QWEN38_WEIGHT_VARIANTS if row["variant"] == variant_text),
+            None,
+        )
+        if weight:
+            return {
+                "WEIGHT_KEY": f"{model_text}:{variant_text}",
+                "WEIGHT_VARIANT": variant_text,
+                "WEIGHT_LABEL": weight["name"],
+                "WEIGHT_MODEL": model_text,
+                "WEIGHT_KIND": "gguf",
+                "WEIGHT_REPO": weight["repo"],
+                "WEIGHT_SUBDIR": weight["subdir"],
+                "WEIGHT_FILES": f"{weight['model_file']} {weight['mmproj_file']}",
+                "WEIGHT_SIZE_GB": weight["size_gb"] + weight["mmproj_size_gb"],
+                "WEIGHT_FORMAT": "gguf",
+                "WEIGHT_STATUS": "experimental",
+            }
+    reader = _load_upstream_weights_reader()
     if reader is None or not model_text or not variant_text:
         return {}
     cache = getattr(_weight_recipe_from_model_variant, "_cache", None)
@@ -2523,60 +2486,6 @@ def migrate_missing_custom_presets_from_backup(backup_dir):
     }
 
 
-def _load_repo_env_map():
-    env_path = os.path.join(CLUB3090_DIR, ".env")
-    result = {}
-    try:
-        with open(env_path, "r", encoding="utf-8", errors="replace") as f:
-            for raw_line in f:
-                line = str(raw_line or "").strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, value = line.split("=", 1)
-                key = str(key or "").strip()
-                if not key:
-                    continue
-                value = str(value or "").strip().strip("'").strip('"')
-                result[key] = value
-    except Exception:
-        result = {}
-    if not any(str(result.get(key) or "").strip() for key in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN")):
-        token_candidates = []
-        hf_home = str(os.environ.get("HF_HOME") or "").strip()
-        home = str(os.environ.get("HOME") or "").strip()
-        if hf_home:
-            token_candidates.append(os.path.join(hf_home, "token"))
-        if home:
-            token_candidates.extend([
-                os.path.join(home, ".cache", "huggingface", "token"),
-                os.path.join(home, ".huggingface", "token"),
-            ])
-        token_candidates.extend([
-            "/root/.cache/huggingface/token",
-            "/root/.huggingface/token",
-            *glob.glob("/home/*/.cache/huggingface/token"),
-            *glob.glob("/home/*/.huggingface/token"),
-        ])
-        for token_path in token_candidates:
-            try:
-                with open(token_path, "r", encoding="utf-8", errors="replace") as token_file:
-                    token = token_file.read(4096).strip()
-            except Exception:
-                continue
-            if token.startswith("hf_"):
-                result["HF_TOKEN"] = token
-                break
-    return result
-
-
-def _repo_subprocess_env():
-    env = os.environ.copy()
-    for key, value in _load_repo_env_map().items():
-        if key:
-            env[str(key)] = str(value)
-    if str(os.environ.get("CLUB3090_RESTART") or "").strip():
-        env["CLUB3090_RESTART"] = str(os.environ.get("CLUB3090_RESTART") or "").strip()
-    return env
 
 
 def _resolve_variant_model_dir_root(variant=None):
@@ -4399,10 +4308,23 @@ def _detect_variant_install_state(variant, model_dir_root):
             or str((variant or {}).get("mmproj_path") or "").strip()
         )
         if host_model_dir and _path_has_model_assets(host_model_dir):
+            has_explicit_resources = any(
+                _container_model_subpath((variant or {}).get(key))
+                for key in ("model_path", "draft_model_path", "mmproj_path")
+            )
+            resource_plan = variant_resource_plan_from_row(variant) if has_explicit_resources else {}
+            if not has_explicit_resources or _install_state_satisfied_by_resource_roles({**dict(variant or {}), **resource_plan}):
+                return {
+                    "install_state": "ready",
+                    "install_command": "",
+                    "install_reason": "",
+                }
+        explicit_install_command = str((variant or {}).get("install_command") or "").strip()
+        if explicit_install_command:
             return {
-                "install_state": "ready",
-                "install_command": "",
-                "install_reason": "",
+                "install_state": "requires_download",
+                "install_command": explicit_install_command,
+                "install_reason": str((variant or {}).get("install_reason") or "").strip(),
             }
         if not compose_backed:
             return {
@@ -4887,6 +4809,7 @@ def rebuild_runtime_inventory():
     compose_registry = _load_upstream_compose_registry()
     if _migration_normalize_migrated_public_name_collisions(compose_registry, tag_by_compose=tag_by_compose):
         custom_model_rows = read_custom_model_registry()
+    custom_model_rows.extend(qwen38_builtin_custom_model_rows())
     migrated_selector_by_source_compose = {}
     for row in custom_model_rows:
         source_rel_path = _normalize_compose_rel_path(row.get("source_compose_rel_path"))
@@ -4925,7 +4848,7 @@ def rebuild_runtime_inventory():
         "models": [],
         "variants": [],
         "profile_likes": [],
-        "custom_models": custom_model_rows,
+        "custom_models": [row for row in custom_model_rows if str(row.get("inventory_origin") or "").strip().lower() != "control_catalog"],
     }
     model_rows = {}
     registry_variant_keys = set()
@@ -4956,6 +4879,8 @@ def rebuild_runtime_inventory():
         )
         if display_name:
             row["display_name"] = display_name
+        if model_id == QWEN38_MODEL_PROFILE["id"]:
+            row["profile"] = dict(QWEN38_MODEL_PROFILE)
         if str(source_kind or "").strip().lower() == "custom":
             row["source_kind"] = "custom"
             row["inventory_origin"] = inventory_origin or row.get("inventory_origin") or "custom_registry"
@@ -4964,6 +4889,8 @@ def rebuild_runtime_inventory():
 
     def append_variant(variant, force_install_state=None):
         entry = _apply_builtin_launch_setting_defaults(variant)
+        entry["install_on_bootstrap"] = bool(entry.get("install_on_bootstrap", True))
+        entry["requires_hf_approval"] = bool(entry.get("requires_hf_approval", False))
         selector = _mode_selector_for_variant(entry)
         variant_id = str(entry.get("variant_id") or "").strip()
         if not selector and not variant_id:
@@ -5233,7 +5160,7 @@ def rebuild_runtime_inventory():
             or "/ik-llama/" in compose_hint
         ):
             engine_family = "llamacpp"
-        engine_display = _selector_engine_display(profile_like or str(row.get("selector") or ""), compose_rel_path or compose_hint)
+        engine_display = "llama.cpp" if profile_engine == "llama-cpp-local" else _selector_engine_display(profile_like or str(row.get("selector") or ""), compose_rel_path or compose_hint)
         runtime_tp = int((runtime_meta.get("tp") or runtime_meta.get("tensor_parallel") or registry_entry.get("tp") or 1) or 1)
         topology = _infer_topology_from_compose_path(
             str(registry_entry.get("compose_path") or compose_rel_path or row.get("selector") or row.get("slug") or ""),
@@ -5298,19 +5225,19 @@ def rebuild_runtime_inventory():
             "service_image": runtime_meta.get("service_image") or "",
             "default_port": int(runtime_meta.get("port") or runtime_meta.get("default_port") or registry_entry.get("default_port") or 0),
             "served_model_name": runtime_meta.get("served_model_name") or str((row.get("compose_meta") or {}).get("served_model_name") or "").strip(),
-            "max_model_len": int((runtime_meta.get("max_model_len") or (row.get("compose_meta") or {}).get("max_model_len") or registry_entry.get("max_ctx") or 0) or 0),
+            "max_model_len": int((runtime_meta.get("max_model_len") or (row.get("compose_meta") or {}).get("max_model_len") or row.get("max_ctx") or registry_entry.get("max_ctx") or 0) or 0),
             "max_num_seqs": int((row.get("compose_meta") or {}).get("max_num_seqs") or registry_entry.get("max_num_seqs") or 0),
             "mem_util": (row.get("compose_meta") or {}).get("gpu_memory_utilization") or registry_entry.get("mem_util"),
             "model_path": runtime_meta.get("model_path") or str((row.get("compose_meta") or {}).get("container_model_dir") or "").strip(),
             "mmproj_path": runtime_meta.get("mmproj_path") or "",
             "draft_model_path": runtime_meta.get("draft_model_path") or "",
-            "drafter": str(registry_entry.get("drafter") or "").strip(),
+            "drafter": str(row.get("profile_drafter_id") or registry_entry.get("drafter") or "").strip(),
             "drafter_profile": str(row.get("profile_drafter_id") or registry_entry.get("drafter") or "").strip(),
-            "weights_variant": str(registry_entry.get("weights_variant") or "").strip(),
+            "weights_variant": str(row.get("weights_variant") or registry_entry.get("weights_variant") or "").strip(),
             "workload_id": str(row.get("profile_workload_id") or registry_entry.get("workload") or "").strip(),
             "profile_like": str(row.get("profile_like") or "").strip(),
-            "kv_format": str((row.get("compose_meta") or {}).get("kv_format") or registry_entry.get("kv_format") or "").strip(),
-            "vision": "",
+            "kv_format": str((row.get("compose_meta") or {}).get("kv_format") or row.get("kv_format") or registry_entry.get("kv_format") or "").strip(),
+            "vision": str(row.get("vision") or "").strip(),
             "genesis": "",
             "status_raw": status_text,
             "status_kind": _normalize_status_kind(status_text),
@@ -5319,8 +5246,8 @@ def rebuild_runtime_inventory():
             "quality_summary": str(row.get("quality_summary") or "").strip(),
             "speculative_method": runtime_meta.get("speculative_method"),
             "drafted_tokens": runtime_meta.get("drafted_tokens"),
-            "requires_min_vram_gb": 0,
-            "requires_min_gpu_count": required_gpu_count,
+            "requires_min_vram_gb": int(row.get("requires_min_vram_gb") or 0),
+            "requires_min_gpu_count": max(required_gpu_count, int(row.get("requires_min_gpu_count") or 0)),
             "tensor_parallel": runtime_tp,
             "requires_sm": str(registry_entry.get("required_sm") or "").strip(),
             "requires_nvlink": bool(custom_nvlink_mode == "required"),
@@ -5345,6 +5272,10 @@ def rebuild_runtime_inventory():
             "derived_compose_path": compose_abs_path,
             "compat_status": str(row.get("compat_status") or gate_terminal or "").strip(),
             "compat_reason_summary": str(row.get("compat_reason_summary") or "").strip(),
+            "install_on_bootstrap": bool(row.get("install_on_bootstrap", True)),
+            "requires_hf_approval": bool(row.get("requires_hf_approval", False)),
+            "install_command": str(row.get("install_command") or "").strip(),
+            "install_reason": str(row.get("install_reason") or "").strip(),
             "compose_environment": runtime_meta.get("compose_environment") or [],
             "compose_volumes": runtime_meta.get("compose_volumes") or [],
             "compose_volume_targets": runtime_meta.get("compose_volume_targets") or [],

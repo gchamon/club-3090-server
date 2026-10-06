@@ -4,15 +4,7 @@ import re
 import sys
 import time
 
-try:
-    from control.shared import *  # type: ignore
-except Exception:
-    if "CLUB3090_DIR" not in globals():
-        _CONTROL_DIR = os.path.dirname(os.path.abspath(__file__))
-        if _CONTROL_DIR not in sys.path:
-            sys.path.insert(0, _CONTROL_DIR)
-        from shared import *  # type: ignore
-
+from control.shared import *  # type: ignore
 
 def _service_display_name(service_id):
     mapping = {

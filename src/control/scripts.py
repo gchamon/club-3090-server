@@ -3,7 +3,71 @@
 SCRIPT_RUNS_DIR = os.path.join(CONTROL_DIR, "script-runs")
 SCRIPT_STATE_FILE = os.path.join(SCRIPT_RUNS_DIR, "state.json")
 SCRIPT_LOG_TAIL_LINES = 500
-AI_STUDIO_EXTENSION_PAYLOAD_GZIP_BASE64 = ""  # Injected by build.py for shipped outputs.
+RIG_REPORT_OUTPUT_PATHS = [
+    os.path.join(CLUB3090_DIR, "results", "my-rig.md"),
+    os.path.join(CONTROL_DIR, "artifacts", "my-rig.md"),
+    os.path.join(SCRIPT_RUNS_DIR, "my-rig.md"),
+]
+
+
+def clean_rig_report_markdown(raw_text):
+    lines = str(raw_text or "").splitlines()
+    start_idx = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith("# club-3090 rig report"):
+            start_idx = i
+            break
+    if start_idx is None:
+        return ""
+    report_lines = []
+    for line in lines[start_idx:]:
+        if line.strip().startswith("[script] finished rc="):
+            break
+        report_lines.append(line)
+    return "\n".join(report_lines).strip() + "\n"
+
+
+def save_clean_rig_report(content):
+    clean = clean_rig_report_markdown(content)
+    if not clean:
+        return ""
+    for path in RIG_REPORT_OUTPUT_PATHS:
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(clean)
+        except Exception:
+            pass
+    return clean
+
+
+def latest_rig_report_content():
+    for path in RIG_REPORT_OUTPUT_PATHS:
+        try:
+            if os.path.isfile(path) and os.path.getsize(path) > 100:
+                with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                    text = handle.read()
+                    if "# club-3090 rig report" in text:
+                        return text, path
+        except Exception:
+            pass
+    state = read_script_job_state()
+    for row in reversed(state.get("queue") or []):
+        cmd = str(row.get("command") or "")
+        sid = str(row.get("script_id") or "")
+        if "report.sh" in cmd or "validation-rig-report" in sid:
+            log_file = str(row.get("log_file") or "")
+            if log_file and os.path.isfile(log_file):
+                try:
+                    with open(log_file, "r", encoding="utf-8", errors="replace") as handle:
+                        clean = clean_rig_report_markdown(handle.read())
+                        if clean:
+                            return clean, log_file
+                except Exception:
+                    pass
+    return "", ""
+
+
 
 script_job_lock = threading.RLock()
 script_worker_thread = None
@@ -60,6 +124,19 @@ def write_script_job_state(state):
     write_json_file(SCRIPT_STATE_FILE, payload)
     return payload
 
+def script_job_active():
+    with script_job_lock:
+        if script_process is not None:
+            return True
+        state = read_script_job_state()
+        if bool(state.get("active")):
+            return True
+        for row in state.get("queue") or []:
+            if str((row or {}).get("status") or "").lower() == "running":
+                return True
+        return False
+
+
 
 def script_job_snapshot():
     state = reconcile_script_job_state(read_script_job_state(), persist=True)
@@ -88,15 +165,37 @@ def script_current_log_file(job_id=""):
     return os.path.join(SCRIPT_RUNS_DIR, "script.log")
 
 
+def script_log_tail_snapshot(path, tail_lines):
+    from collections import deque
+
+    try:
+        limit = max(0, int(tail_lines))
+        lines = deque(maxlen=limit)
+        total = 0
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                total += 1
+                if limit:
+                    lines.append(line)
+        returned = len(lines)
+        return "".join(lines), total, returned, max(0, total - returned)
+    except (OSError, ValueError, TypeError):
+        return "no script output yet; waiting...\n", 0, 0, 0
+
+
 def script_log_snapshot(job_id="", tail_lines=500):
     state = read_script_job_state()
     requested = str(job_id or "").strip()
     row = script_queue_job(state, requested) or state
     log_file = script_current_log_file(requested)
+    text, line_count, returned_count, truncated_count = script_log_tail_snapshot(log_file, tail_lines)
     return {
         "source": "script",
         "signature": f"script:{requested or row.get('job_id') or 'latest'}",
-        "text": query_text_log_file(log_file, tail_lines=tail_lines) if log_file and os.path.exists(log_file) else "no script output yet; waiting...\n",
+        "text": text,
+        "line_count": line_count,
+        "returned_line_count": returned_count,
+        "truncated_line_count": truncated_count,
         "label": str(row.get("label") or row.get("script_id") or "Script"),
         "script_id": str(row.get("script_id") or ""),
         "job_id": str(row.get("job_id") or requested),
@@ -320,41 +419,117 @@ def script_discovery_row(root, path, internal=False):
         "internal": bool(internal),
     }
 
+def validation_preset_definitions():
+    report_script = os.path.join(CLUB3090_DIR, "scripts", "report.sh")
+    quality_script = os.path.join(CLUB3090_DIR, "scripts", "quality-test.sh")
+    sandbox_script = os.path.join(CLUB3090_DIR, "benchlocal-cli", "tools", "build-sandboxes.sh")
+    return [
+        {
+            "id": "validation-rig-report",
+            "name": "report.sh",
+            "label": "Full Rig Report (my-rig.md)",
+            "path": report_script,
+            "relative_path": "scripts/report.sh",
+            "description": "Captures hardware, OS, GPU, PCIe topology, P2P verdicts, and runs all validation stages to generate a paste-ready my-rig.md report for GitHub issues.",
+            "command_template": "bash scripts/report.sh --full",
+            "options": [
+                {"name": "--full", "description": "Run all validation stages (verify + stress + soak + bench + agentic)."},
+                {"name": "--verify", "description": "Run fast operational verification smoke only (~2 min)."},
+                {"name": "--stress", "description": "Run boundary and stress tests incl. needle recall (~10-20 min)."},
+            ],
+            "docs": script_doc_candidates(report_script),
+            "kind": "shell",
+            "category": "validation",
+            "internal": False,
+        },
+        {
+            "id": "validation-benchlocal-setup",
+            "name": "build-sandboxes.sh",
+            "label": "Setup / Update benchlocal-cli & Sandboxes",
+            "path": sandbox_script,
+            "relative_path": "benchlocal-cli/tools/build-sandboxes.sh",
+            "description": "Clones or updates benchlocal-cli, installs it into Python, and builds Docker sandboxes for quality pack evaluation.",
+            "command_template": "if [ -d benchlocal-cli ]; then git -C benchlocal-cli pull; else git clone https://github.com/noonghunna/benchlocal-cli.git; fi && pip install -e ./benchlocal-cli && bash benchlocal-cli/tools/build-sandboxes.sh",
+            "options": [],
+            "docs": [],
+            "kind": "shell",
+            "category": "validation",
+            "internal": False,
+        },
+        {
+            "id": "validation-quality-8pack-thinking",
+            "name": "quality-test.sh",
+            "label": "Quality 8-pack (Leg B · Thinking ON / Shipped)",
+            "path": quality_script,
+            "relative_path": "scripts/quality-test.sh",
+            "description": "Runs the complete 8-pack behavioral quality evaluation with thinking/reasoning enabled (shipped configuration for reasoning models).",
+            "command_template": "bash scripts/quality-test.sh --full --enable-thinking",
+            "options": [
+                {"name": "--full", "description": "Run all 8 behavioral quality packs (requires Docker sandboxes)."},
+                {"name": "--enable-thinking", "description": "Enable thinking / reasoning mode during evaluation."},
+            ],
+            "docs": script_doc_candidates(quality_script),
+            "kind": "shell",
+            "category": "validation",
+            "internal": False,
+        },
+        {
+            "id": "validation-quality-8pack-no-thinking",
+            "name": "quality-test.sh",
+            "label": "Quality 8-pack (Leg A · Thinking OFF / Baseline)",
+            "path": quality_script,
+            "relative_path": "scripts/quality-test.sh",
+            "description": "Runs the complete 8-pack behavioral quality evaluation with thinking disabled (baseline comparison for reasoning models).",
+            "command_template": "bash scripts/quality-test.sh --full --no-thinking",
+            "options": [
+                {"name": "--full", "description": "Run all 8 behavioral quality packs (requires Docker sandboxes)."},
+                {"name": "--no-thinking", "description": "Disable thinking / reasoning mode during evaluation."},
+            ],
+            "docs": script_doc_candidates(quality_script),
+            "kind": "shell",
+            "category": "validation",
+            "internal": False,
+        },
+    ]
 
-def discover_upstream_scripts(include_internal=False):
+
+
+def discover_upstream_scripts(include_internal=False, include_validation=False):
     root = script_discovery_root()
     rows = []
-    if not os.path.isdir(root):
-        return rows
-    seen = set()
-    for name in sorted(os.listdir(root)):
-        if name.startswith(".") or not name.lower().endswith(".sh"):
-            continue
-        path = os.path.join(root, name)
-        if not os.path.isfile(path):
-            continue
-        rows.append(script_discovery_row(root, path, internal=False))
-        seen.add(os.path.normpath(path))
-    if include_internal:
-        for dirpath, dirs, files in os.walk(root):
-            dirs[:] = [name for name in dirs if not name.startswith(".") and name not in {"__pycache__", "node_modules"}]
-            for name in sorted(files):
-                lower = name.lower()
-                if not lower.endswith((".sh", ".py")):
-                    continue
-                path = os.path.normpath(os.path.join(dirpath, name))
-                if path in seen:
-                    continue
-                rows.append(script_discovery_row(root, path, internal=True))
-                seen.add(path)
-    rows.sort(key=lambda row: (1 if row.get("internal") else 0, str(row.get("label") or row.get("name") or row.get("relative_path") or "").lower(), str(row.get("relative_path") or "").lower()))
-    return rows
-
+    if os.path.isdir(root):
+        seen = set()
+        for name in sorted(os.listdir(root)):
+            if name.startswith(".") or not name.lower().endswith(".sh"):
+                continue
+            path = os.path.join(root, name)
+            if not os.path.isfile(path):
+                continue
+            rows.append(script_discovery_row(root, path, internal=False))
+            seen.add(os.path.normpath(path))
+        if include_internal:
+            for dirpath, dirs, files in os.walk(root):
+                dirs[:] = [name for name in dirs if not name.startswith(".") and name not in {"__pycache__", "node_modules"}]
+                for name in sorted(files):
+                    lower = name.lower()
+                    if not lower.endswith((".sh", ".py")):
+                        continue
+                    path = os.path.normpath(os.path.join(dirpath, name))
+                    if path in seen:
+                        continue
+                    rows.append(script_discovery_row(root, path, internal=True))
+                    seen.add(path)
+        rows.sort(key=lambda row: (1 if row.get("internal") else 0, str(row.get("label") or row.get("name") or row.get("relative_path") or "").lower(), str(row.get("relative_path") or "").lower()))
+    presets = [dict(r) for r in validation_preset_definitions()] if include_validation else []
+    return presets + rows
 
 def resolve_upstream_script(script_id):
     wanted = str(script_id or "").strip().replace("\\", "/")
     if not wanted:
         raise ValueError("script_id is required")
+    for row in validation_preset_definitions():
+        if row.get("id") == wanted:
+            return dict(row)
     for row in discover_upstream_scripts(include_internal=True):
         if row.get("id") == wanted:
             return row
@@ -378,48 +553,34 @@ def script_runtime_context(instance_id=""):
 
 
 def script_command_for(row, args):
+    template = str(row.get("command_template") or "").strip()
+    norm_args = normalize_script_args(args)
+    if template:
+        if norm_args:
+            suffix = " ".join(shlex.quote(str(arg)) for arg in norm_args)
+            return f"{template} {suffix}".strip()
+        return template
     path = str(row.get("path") or "")
     quoted_path = shlex.quote(path)
-    suffix = " ".join(shlex.quote(str(arg)) for arg in normalize_script_args(args))
+    suffix = " ".join(shlex.quote(str(arg)) for arg in norm_args)
     if row.get("kind") == "python":
         base = f"python3 {quoted_path}"
     else:
         base = f"bash {quoted_path}"
     return f"{base} {suffix}".strip()
 
-
 def image_studio_extension_install_snippet():
-    payload = str(AI_STUDIO_EXTENSION_PAYLOAD_GZIP_BASE64 or "")
-    if not payload:
-        return """
-echo "[ai-studio] ERROR: AI Studio extension payload is missing from the control backend" >&2
-exit 1
-"""
-    quoted_payload = shlex.quote(payload)
+    source = shlex.quote(os.path.join(SOURCE_ROOT, "extensions", "comfyui-club3090-preview"))
     return f"""
-echo "[ai-studio] installing Club-3090 ComfyUI workflow preview extension"
-CLUB3090_CONTROL_DIR="${{CLUB3090_CONTROL_DIR:-/opt/club3090-control}}"
-AI_STUDIO_EXTENSION_ROOT="$CLUB3090_CONTROL_DIR/extensions"
-sudo mkdir -p "$AI_STUDIO_EXTENSION_ROOT"
-sudo env AI_STUDIO_EXTENSION_PAYLOAD={quoted_payload} python3 - "$AI_STUDIO_EXTENSION_ROOT" <<'PYEXT'
-import base64, gzip, json, os, sys
-root = os.path.abspath(sys.argv[1])
-payload = os.environ.get("AI_STUDIO_EXTENSION_PAYLOAD", "")
-files = json.loads(gzip.decompress(base64.b64decode(payload.encode("ascii"))).decode("utf-8"))
-for rel, text in files.items():
-    rel = rel.replace("\\\\", "/").lstrip("/")
-    if not rel or ".." in rel.split("/"):
-        raise SystemExit(f"unsafe extension path: {{rel}}")
-    target = os.path.abspath(os.path.join(root, rel))
-    if not target.startswith(root + os.sep):
-        raise SystemExit(f"extension path escaped root: {{rel}}")
-    os.makedirs(os.path.dirname(target), exist_ok=True)
-    with open(target, "w", encoding="utf-8", newline="\\n") as handle:
-        handle.write(text)
-PYEXT
+echo "[ai-studio] installing the repository's Club-3090 ComfyUI workflow preview extension"
+AI_STUDIO_EXTENSION_SOURCE={source}
+if [ ! -d "$AI_STUDIO_EXTENSION_SOURCE" ]; then
+  echo "[ai-studio] extension source is missing from this repository checkout" >&2
+  exit 1
+fi
 sudo mkdir -p /mnt/models/comfyui/ComfyUI/custom_nodes
 sudo rm -rf /mnt/models/comfyui/ComfyUI/custom_nodes/club3090_workflow_preview
-sudo cp -a "$AI_STUDIO_EXTENSION_ROOT/comfyui-club3090-preview" /mnt/models/comfyui/ComfyUI/custom_nodes/club3090_workflow_preview
+sudo cp -a "$AI_STUDIO_EXTENSION_SOURCE" /mnt/models/comfyui/ComfyUI/custom_nodes/club3090_workflow_preview
 sudo chmod -R a+rX /mnt/models/comfyui/ComfyUI/custom_nodes/club3090_workflow_preview
 """
 
@@ -485,7 +646,7 @@ apply_ai_studio_director_healthcheck_override() {
   if ! sudo docker inspect studio-director >/dev/null 2>&1; then
     return 0
   fi
-  local override_dir="/opt/club3090-control/compose-overrides"
+  local override_dir="${CLUB3090_CONTROL_DIR:-/var/lib/club3090-control}/compose-overrides"
   local override_file="$override_dir/studio-director-healthcheck.override.yml"
   sudo mkdir -p "$override_dir"
   sudo tee "$override_file" >/dev/null <<'YAML'
@@ -534,8 +695,8 @@ require_compose_docker_pull_space() {
   local compose_file="$3"
   local may_build="${4:-0}"
   shift 4 || true
-  local control_py="${CONTROL_PY:-/opt/club3090-control/control.py}"
-  sudo env HOME="$HOME" PATH="$PATH" "$@" python3 "$control_py" --docker-compose-pull-space-preflight "$label" "$compose_dir" "$may_build" "$compose_file"
+  local source_dir="${CLUB3090_SERVER_DIR:-$(dirname "$0")/..}/src"
+  sudo env HOME="$HOME" PATH="$PATH" PYTHONPATH="$source_dir" "$@" python3 -m control.http_server --docker-compose-pull-space-preflight "$label" "$compose_dir" "$may_build" "$compose_file"
 }
 """
 
@@ -552,7 +713,7 @@ start_ai_studio_production_service() {
   local pidfile="$output_root/studio-production.pid"
   local logfile="$output_root/studio-production.log"
   local unit="club3090-studio-production.service"
-  local patch_dir="/opt/club3090-control/studio-production-patches"
+  local patch_dir="${CLUB3090_CONTROL_DIR:-/var/lib/club3090-control}/studio-production-patches"
   local production_pythonpath="$patch_dir:$PWD${PYTHONPATH:+:$PYTHONPATH}"
   sudo mkdir -p "$output_root"
   sudo mkdir -p "$patch_dir"
@@ -1092,9 +1253,48 @@ stop_ai_studio_production_service() {
 """
 
 
+def ai_studio_required_assets_snippet():
+    voice_assets = IMAGE_STUDIO_OPTIONAL_MODEL_PATHS.get("voice", ())
+    voice_label = IMAGE_STUDIO_LANES.get("voice", {}).get("label", "voice")
+    entries = "\n".join(
+        f'  check_asset "{IMAGE_STUDIO_LANES.get(lane, {}).get("label", lane)}" "{relative}"'
+        for lane, assets in IMAGE_STUDIO_OPTIONAL_MODEL_PATHS.items()
+        if lane != "voice"
+        for relative in assets
+    )
+    voice_entries = "\n".join(
+        f'    check_asset "{voice_label}" "{relative}"'
+        for relative in voice_assets
+    )
+    return r"""
+verify_ai_studio_required_assets() {
+  local missing=""
+  check_asset() {
+    local label="$1"
+    local relative="$2"
+    if [ ! -e "$COMFYUI_MODELS_DIR/$relative" ]; then
+      missing="${missing}${label}: ${relative}"$'\n'
+    fi
+  }
+""" + entries + r"""
+  if [ "${WITH_VOICE:-0}" != "1" ]; then
+    :
+  else
+""" + voice_entries + r"""
+  fi
+  if [ -n "$missing" ]; then
+    printf '[ai-studio] ERROR: required AI Studio assets are missing:\n%s' "$missing" >&2
+    return 1
+  fi
+  echo "[ai-studio] verified required AI Studio assets"
+}
+"""
+
+
 def image_studio_setup_command():
     return r"""
 set -euo pipefail
+trap 'rc=$?; trap - ERR; printf "[ai-studio] ERROR: setup aborted (rc=%s); an upstream “models — done” banner does not prove every asset downloaded. Inspect the denied or missing download above.\n" "$rc" >&2; exit "$rc"' ERR
 echo "[ai-studio] starting full setup"
 studio_setup_script="scripts/setup-ai-studio.sh"
 if [ ! -x "$studio_setup_script" ] && [ ! -f "$studio_setup_script" ]; then
@@ -1114,8 +1314,7 @@ if [ -z "${HOME:-}" ]; then
   HOME="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6 || true)"
 fi
 export HOME="${HOME:-/tmp}"
-HF_CLI_VENV="/opt/club3090-control/hf-cli-venv"
-export PATH="$HF_CLI_VENV/bin:$HOME/.local/bin:$PATH"
+export PATH="$HOME/.local/bin:$PATH"
 if [ ! -e /opt/ai/github/club-3090 ] || [ "$(readlink /opt/ai/github/club-3090 2>/dev/null || true)" != "$PWD" ]; then
   sudo mkdir -p /opt/ai/github
   if [ -L /opt/ai/github/club-3090 ] || [ ! -e /opt/ai/github/club-3090 ]; then
@@ -1123,10 +1322,8 @@ if [ ! -e /opt/ai/github/club-3090 ] || [ "$(readlink /opt/ai/github/club-3090 2
   fi
 fi
 if ! command -v hf >/dev/null 2>&1; then
-  echo "[ai-studio] installing huggingface_hub CLI into $HF_CLI_VENV"
-  sudo python3 -m venv "$HF_CLI_VENV"
-  sudo chown -R "$(id -u):$(id -g)" "$HF_CLI_VENV"
-  "$HF_CLI_VENV/bin/python" -m pip install -U pip huggingface_hub
+  echo "[ai-studio] missing prerequisite: hf CLI; install it with your OS package manager" >&2
+  exit 1
 fi
 export ASSUME_YES=1
 export LANIP="${LANIP:-127.0.0.1}"
@@ -1178,9 +1375,9 @@ fi
 run_image_studio_step() {
   sudo env HOME="$HOME" PATH="$PATH" HF_TOKEN="$HF_TOKEN" HF_HUB_DISABLE_XET="$HF_HUB_DISABLE_XET" SKIP_BUILD="$SKIP_BUILD" SKIP_DOWNLOAD="$SKIP_DOWNLOAD" WITH_VOICE="$WITH_VOICE" ASSUME_YES="$ASSUME_YES" LANIP="$LANIP" MODEL_DIR="$MODEL_DIR" AI_STUDIO_MODELS_ROOT="$AI_STUDIO_MODELS_ROOT" COMFYUI_MODELS_ROOT="$COMFYUI_MODELS_ROOT" COMFYUI_MODELS_DIR="$COMFYUI_MODELS_DIR" "$@"
 }
-""" + ai_studio_docker_headroom_snippet() + ai_studio_production_service_snippet() + ai_studio_runtime_compat_snippet() + r"""
-echo "[ai-studio] running upstream $studio_setup_script --yes"
+""" + ai_studio_docker_headroom_snippet() + ai_studio_production_service_snippet() + ai_studio_runtime_compat_snippet() + ai_studio_required_assets_snippet() + r"""
 run_image_studio_step bash "$studio_setup_script" --yes
+verify_ai_studio_required_assets
 apply_ai_studio_director_healthcheck_override
 if [ -z "${SKIP_DOWNLOAD:-}" ] && [ -f services/comfyui/download_hidream_o1.sh ]; then
   echo "[ai-studio] downloading HiDream-O1 assets not covered by the upstream all-models script"
@@ -1523,6 +1720,13 @@ def execute_script_job(job):
         env["MODEL"] = str(context.get("served_model_name") or "")
     if context.get("engine"):
         env["ENGINE_KIND"] = str(context.get("engine") or "")
+    env["PYTHONUNBUFFERED"] = "1"
+    try:
+        wake_fn = globals().get("ensure_default_runtime_power")
+        if callable(wake_fn):
+            wake_fn("script_job", force=True)
+    except Exception:
+        pass
     rc = 999
     try:
         with open(log_file, "a", encoding="utf-8", newline="\n") as handle:
@@ -1559,11 +1763,17 @@ def execute_script_job(job):
                         break
                 state["queue"] = queue
                 write_script_job_state(script_state_mirror_job(state, job))
+            captured_lines = []
+            is_report_run = "report.sh" in command or "validation-rig-report" in str(job.get("script_id") or "")
             for line in process.stdout:
                 handle.write(line)
                 handle.flush()
+                if is_report_run:
+                    captured_lines.append(line)
             rc = int(process.wait())
             handle.write(f"\n[script] finished rc={rc}\n")
+            if is_report_run and captured_lines:
+                save_clean_rig_report("".join(captured_lines))
     except Exception as exc:
         try:
             with open(log_file, "a", encoding="utf-8", newline="\n") as handle:
@@ -1831,12 +2041,10 @@ if [ -z "${{HOME:-}}" ]; then
   HOME="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6 || true)"
 fi
 export HOME="${{HOME:-/tmp}}"
-HF_CLI_VENV="/opt/club3090-control/hf-cli-venv"
-export PATH="$HF_CLI_VENV/bin:$HOME/.local/bin:$PATH"
+export PATH="$HOME/.local/bin:$PATH"
 if ! command -v hf >/dev/null 2>&1; then
-  sudo python3 -m venv "$HF_CLI_VENV"
-  sudo chown -R "$(id -u):$(id -g)" "$HF_CLI_VENV"
-  "$HF_CLI_VENV/bin/python" -m pip install -U pip huggingface_hub
+  echo "[ai-studio] missing prerequisite: hf CLI; install it with your OS package manager" >&2
+  exit 1
 fi
 export MODEL_DIR="${{MODEL_DIR:-$PWD/models-cache}}"
 export AI_STUDIO_MODELS_ROOT="${{AI_STUDIO_MODELS_ROOT:-$PWD/ai-studio-models}}"
@@ -1868,9 +2076,8 @@ echo "[ai-studio] {label} asset download complete"
         f'echo "[ai-studio] downloading {key} assets"',
         'if [ -z "${HOME:-}" ]; then HOME="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6 || true)"; fi',
         'export HOME="${HOME:-/tmp}"',
-        'HF_CLI_VENV="/opt/club3090-control/hf-cli-venv"',
-        'export PATH="$HF_CLI_VENV/bin:$HOME/.local/bin:$PATH"',
-        'if ! command -v hf >/dev/null 2>&1; then sudo python3 -m venv "$HF_CLI_VENV"; sudo chown -R "$(id -u):$(id -g)" "$HF_CLI_VENV"; "$HF_CLI_VENV/bin/python" -m pip install -U pip huggingface_hub; fi',
+        'export PATH="$HOME/.local/bin:$PATH"',
+        'if ! command -v hf >/dev/null 2>&1; then echo "[ai-studio] missing prerequisite: hf CLI; install it with your OS package manager" >&2; exit 1; fi',
         'export AI_STUDIO_MODELS_ROOT="${AI_STUDIO_MODELS_ROOT:-$PWD/ai-studio-models}"',
         'export MODEL_DIR="${MODEL_DIR:-$PWD/models-cache}"',
         'export COMFYUI_MODELS_ROOT="${COMFYUI_MODELS_ROOT:-$AI_STUDIO_MODELS_ROOT/comfyui}"',
@@ -1930,29 +2137,147 @@ def terminate_script_process(process):
             pass
 
 
-def remove_script_job(job_id=""):
+def _script_job_ids(job_ids):
+    if isinstance(job_ids, (str, bytes)):
+        job_ids = [job_ids]
+    return {str(job_id or "").strip() for job_id in (job_ids or []) if str(job_id or "").strip()}
+
+
+def cancel_script_jobs(job_ids):
     global script_process
+    wanted = _script_job_ids(job_ids)
     process = None
     with script_job_lock:
         state = read_script_job_state()
-        wanted = str(job_id or state.get("job_id") or "").strip()
-        queue = list(state.get("queue") or [])
-        target = next((dict(row) for row in queue if str((row or {}).get("job_id") or "") == wanted), {})
-        if not target:
+        queue = [dict(row) for row in (state.get("queue") or [])]
+        live_ids = {str(row.get("job_id") or "") for row in queue}
+        targets = wanted & live_ids
+        if not targets:
             return script_job_snapshot()
-        running = str(target.get("status") or "") in {"running", "cancelling"}
-        queue = [row for row in queue if str((row or {}).get("job_id") or "") != wanted]
+        running_id = next(
+            (str(row.get("job_id") or "") for row in queue if str(row.get("status") or "") == "running"),
+            "",
+        )
+        changed = False
+        for index, row in enumerate(queue):
+            job_id = str(row.get("job_id") or "")
+            status = str(row.get("status") or "")
+            if job_id not in targets or status not in {"queued", "running", "cancelling"}:
+                continue
+            row = dict(row)
+            if status == "queued":
+                row.update({
+                    "status": "cancelled",
+                    "summary": f"{row.get('label') or 'Script'} cancelled",
+                    "finished_at": benchmark_utc_now(),
+                    "return_code": 130,
+                })
+            elif job_id == running_id:
+                row["status"] = "cancelling"
+                row["summary"] = f"{row.get('label') or 'Script'} cancelling"
+                process = script_process
+            queue[index] = row
+            changed = True
+        if changed:
+            state["queue"] = queue
+            current = next((row for row in queue if str(row.get("job_id") or "") == str(state.get("job_id") or "")), {})
+            if current:
+                state = script_state_mirror_job(state, current)
+                state["queue"] = queue
+            write_script_job_state(state)
+    if process is not None:
+        terminate_script_process(process)
+    ensure_script_queue_worker()
+    return script_job_snapshot()
+
+
+def retry_script_jobs(job_ids):
+    wanted = _script_job_ids(job_ids)
+    with script_job_lock:
+        state = read_script_job_state()
+        queue = [dict(row) for row in (state.get("queue") or [])]
+        existing_ids = {str(row.get("job_id") or "") for row in queue}
+        sources = [row for row in queue if str(row.get("job_id") or "") in wanted and str(row.get("status") or "") in {"success", "failed", "cancelled"}]
+        if not sources:
+            return script_job_snapshot()
+        copies = []
+        for source in sources:
+            source_id = str(source.get("job_id") or "")
+            token = _selector_token(source_id)
+            base_id = time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + f"-{time.time_ns() % 1000000:06d}-{token}"
+            job_id = base_id
+            suffix = 1
+            while job_id in existing_ids:
+                job_id = f"{base_id}-{suffix}"
+                suffix += 1
+            existing_ids.add(job_id)
+            job = dict(source)
+            job.update({
+                "job_id": job_id,
+                "status": "queued",
+                "summary": f"{source.get('label') or 'Script'} queued",
+                "queued_at": benchmark_utc_now(),
+                "started_at": "",
+                "finished_at": "",
+                "return_code": None,
+                "log_file": os.path.join(SCRIPT_RUNS_DIR, job_id, "script.log"),
+                "log_tail": [],
+                "retry_of": source_id,
+            })
+            for key in ("process_id", "process_group_id", "progress"):
+                job.pop(key, None)
+            copies.append(job)
+        queue.extend(copies)
+        state["queue"] = queue[-50:]
+        if not state.get("job_id") or str(state.get("status") or "") in {"success", "failed", "cancelled"}:
+            state = script_state_mirror_job(state, copies[-1])
+        write_script_job_state(state)
+    ensure_script_queue_worker()
+    return script_job_snapshot()
+
+
+def reorder_script_jobs(job_ids, position):
+    position = str(position or "")
+    if position not in {"front", "end"}:
+        raise ValueError("position must be 'front' or 'end'")
+    wanted = _script_job_ids(job_ids)
+    with script_job_lock:
+        state = read_script_job_state()
+        queue = [dict(row) for row in (state.get("queue") or [])]
+        moving = [row for row in queue if str(row.get("job_id") or "") in wanted and str(row.get("status") or "") == "queued"]
+        if not moving:
+            return script_job_snapshot()
+        moving_ids = {str(row.get("job_id") or "") for row in moving}
+        remaining = [row for row in queue if str(row.get("job_id") or "") not in moving_ids]
+        state["queue"] = moving + remaining if position == "front" else remaining + moving
+        write_script_job_state(state)
+    return script_job_snapshot()
+
+
+def remove_script_jobs(job_ids):
+    global script_process
+    wanted = _script_job_ids(job_ids)
+    process = None
+    with script_job_lock:
+        state = read_script_job_state()
+        queue = [dict(row) for row in (state.get("queue") or [])]
+        targets = {str(row.get("job_id") or "") for row in queue} & wanted
+        if not targets:
+            return script_job_snapshot()
+        removed = [row for row in queue if str(row.get("job_id") or "") in targets]
+        running = next((row for row in removed if str(row.get("status") or "") in {"running", "cancelling"}), {})
+        queue = [row for row in queue if str(row.get("job_id") or "") not in targets]
         state["queue"] = queue
         if running:
             state.update({
                 "active": False,
                 "status": "cancelled",
-                "summary": f"{target.get('label') or 'Script'} cancelled",
+                "summary": f"{running.get('label') or 'Script'} cancelled",
                 "finished_at": benchmark_utc_now(),
                 "return_code": 130,
             })
             process = script_process
-        elif str(state.get("job_id") or "") == wanted:
+        elif str(state.get("job_id") or "") in targets:
             replacement = next((dict(row) for row in reversed(queue)), {})
             state = script_state_mirror_job(state, replacement) if replacement else default_script_job_state()
             state["queue"] = queue
@@ -1963,8 +2288,16 @@ def remove_script_job(job_id=""):
     return script_job_snapshot()
 
 
+def remove_script_job(job_id=""):
+    wanted = str(job_id or "").strip()
+    if not wanted:
+        with script_job_lock:
+            wanted = str(read_script_job_state().get("job_id") or "").strip()
+    return remove_script_jobs([wanted] if wanted else [])
+
+
 def cancel_script_job(job_id=""):
-    return remove_script_job(job_id)
+    return cancel_script_jobs([job_id] if job_id else [])
 
 
 def recover_script_queue():

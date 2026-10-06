@@ -1,0 +1,19 @@
+[Unit]
+Description=Club-3090 enabled inference instances
+After=docker.service network-online.target club3090-control.service
+Requires=docker.service
+Wants=network-online.target club3090-control.service
+
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-@ENV_FILE@
+WorkingDirectory=@SOURCE_ROOT@/src
+ExecStart=@SOURCE_ROOT@/scripts/club3090-server/start-vllm-last-mode.sh
+TimeoutStartSec=1800
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

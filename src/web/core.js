@@ -21,7 +21,8 @@ let showGlobalLogs = true;
 let showGlobalLogSources =
   window.showGlobalLogSources || (window.showGlobalLogSources = Object.create(null));
 let currentLogSource = "docker";
-const knownLogSources = new Set(["docker", "audit", "debug", "benchmarks"]);
+let selectedScriptLogJobId = "";
+const knownLogSources = new Set(["docker", "audit", "debug", "benchmarks", "script"]);
 window.logPopupStates = window.logPopupStates || Object.create(null);
 var LOG_POPUP_WIDTH = 980;
 var LOG_POPUP_HEIGHT = 720;
@@ -43,8 +44,9 @@ const UPDATE_PENDING_TOKEN_KEY = "club3090-update-pending-token";
 const UPDATE_COMPLETED_TOKEN_KEY = "club3090-update-completed-token";
 const UPDATE_PENDING_RETURN_KEY = "club3090-update-pending-return";
 let updateUiLocked = false;
-let updateSignalPollTimer = null;
-let updateSignalPollActive = false;
+let updateSignalEventSource = null;
+let updateSignalReconnectTimer = null;
+let updateSignalConnectionToken = 0;
 let updateAcknowledgedToken = "";
 let lastWindowFocused = typeof document.hasFocus === "function" ? document.hasFocus() : true;
 let lastSwitchNotificationKey = "";
@@ -120,6 +122,125 @@ function popupLogWindowActive(signature = "") {
 function effectiveShowGlobalLogs() {
   return currentLogGlobalEnabled() && !currentLogSourceDetached();
 }
+function escapeHtml(value) {
+  return String(value || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+function stripAnsiCodes(text) {
+  if (!text) return "";
+  return String(text)
+    .replace(/(?:\x1b\[|\u001b\[)[0-9;?]*[a-zA-Z]/g, "")
+    .replace(/\[([0-9;]+)m/g, "");
+}
+function renderAnsiHtml(text) {
+  if (!text) return "";
+  const raw = String(text);
+  const tokenRegex = /(?:\x1b\[|\u001b\[|\[)([0-9;]+)m/g;
+  let result = "";
+  let lastIndex = 0;
+  const activeClasses = new Set();
+  let activeStyles = {};
+  const fgMap = {
+    "30": "ansi-black", "31": "ansi-red", "32": "ansi-green", "33": "ansi-yellow",
+    "34": "ansi-blue", "35": "ansi-magenta", "36": "ansi-cyan", "37": "ansi-white",
+    "90": "ansi-bright-black", "91": "ansi-bright-red", "92": "ansi-bright-green", "93": "ansi-bright-yellow",
+    "94": "ansi-bright-blue", "95": "ansi-bright-magenta", "96": "ansi-bright-cyan", "97": "ansi-bright-white"
+  };
+  const bgMap = {
+    "40": "ansi-bg-black", "41": "ansi-bg-red", "42": "ansi-bg-green", "43": "ansi-bg-yellow",
+    "44": "ansi-bg-blue", "45": "ansi-bg-magenta", "46": "ansi-bg-cyan", "47": "ansi-bg-white",
+    "100": "ansi-bg-bright-black", "101": "ansi-bg-bright-red", "102": "ansi-bg-bright-green", "103": "ansi-bg-bright-yellow",
+    "104": "ansi-bg-bright-blue", "105": "ansi-bg-bright-magenta", "106": "ansi-bg-bright-cyan", "107": "ansi-bg-bright-white"
+  };
+  let openSpan = false;
+  function closeSpan() {
+    if (openSpan) {
+      result += "</span>";
+      openSpan = false;
+    }
+  }
+  function startSpan() {
+    closeSpan();
+    if (activeClasses.size > 0 || Object.keys(activeStyles).length > 0) {
+      const cls = Array.from(activeClasses).join(" ");
+      const styleStr = Object.entries(activeStyles).map(([k, v]) => `${k}:${v}`).join(";");
+      const attrCls = cls ? ` class="${cls}"` : "";
+      const attrStyle = styleStr ? ` style="${styleStr}"` : "";
+      result += `<span${attrCls}${attrStyle}>`;
+      openSpan = true;
+    }
+  }
+  let match;
+  while ((match = tokenRegex.exec(raw)) !== null) {
+    const textChunk = raw.slice(lastIndex, match.index);
+    if (textChunk) {
+      result += escapeHtml(textChunk);
+    }
+    lastIndex = tokenRegex.lastIndex;
+    const codes = match[1].split(";");
+    for (let i = 0; i < codes.length; i++) {
+      const code = codes[i];
+      if (code === "" || code === "0") {
+        activeClasses.clear();
+        activeStyles = {};
+      } else if (code === "1") {
+        activeClasses.add("ansi-bold");
+      } else if (code === "2") {
+        activeClasses.add("ansi-dim");
+      } else if (code === "3") {
+        activeClasses.add("ansi-italic");
+      } else if (code === "4") {
+        activeClasses.add("ansi-underline");
+      } else if (code === "22") {
+        activeClasses.delete("ansi-bold");
+        activeClasses.delete("ansi-dim");
+      } else if (code === "23") {
+        activeClasses.delete("ansi-italic");
+      } else if (code === "24") {
+        activeClasses.delete("ansi-underline");
+      } else if (code === "39") {
+        for (const c of Object.values(fgMap)) activeClasses.delete(c);
+        delete activeStyles["color"];
+      } else if (code === "49") {
+        for (const c of Object.values(bgMap)) activeClasses.delete(c);
+        delete activeStyles["background-color"];
+      } else if (fgMap[code]) {
+        for (const c of Object.values(fgMap)) activeClasses.delete(c);
+        delete activeStyles["color"];
+        activeClasses.add(fgMap[code]);
+      } else if (bgMap[code]) {
+        for (const c of Object.values(bgMap)) activeClasses.delete(c);
+        delete activeStyles["background-color"];
+        activeClasses.add(bgMap[code]);
+      } else if (code === "38" && codes[i + 1] === "5" && codes[i + 2]) {
+        const colorIdx = parseInt(codes[i + 2], 10);
+        for (const c of Object.values(fgMap)) activeClasses.delete(c);
+        activeStyles["color"] = `var(--ansi-256-${colorIdx}, inherit)`;
+        i += 2;
+      } else if (code === "38" && codes[i + 1] === "2" && codes[i + 4]) {
+        const r = parseInt(codes[i + 2], 10), g = parseInt(codes[i + 3], 10), b = parseInt(codes[i + 4], 10);
+        for (const c of Object.values(fgMap)) activeClasses.delete(c);
+        activeStyles["color"] = `rgb(${r},${g},${b})`;
+        i += 4;
+      }
+    }
+    startSpan();
+  }
+  const remaining = raw.slice(lastIndex);
+  if (remaining) {
+    result += escapeHtml(remaining);
+  }
+  closeSpan();
+  return result;
+}
+window.renderAnsiHtml = renderAnsiHtml;
+window.stripAnsiCodes = stripAnsiCodes;
+window.escapeHtml = escapeHtml;
+
 function $(id) {
   return currentUiDocument().getElementById(id);
 }
@@ -137,25 +258,6 @@ function setHtmlIfChanged(node, html) {
 }
 function setMsg(t) {
   $("msg").textContent = t || "";
-}
-function updateBannerDismissKey(startedAt, remoteKey = "") {
-  return `club3090-update-banner-dismissed:${String(startedAt || "0")}:${String(remoteKey || "")}`;
-}
-function currentUpdateBannerRemoteKey(status = lastStatus || {}) {
-  const remote = status?.remote_update || {};
-  return String(remote.commit_sha || remote.script_version || "none").trim() || "none";
-}
-function readUpdateBannerDismissed(startedAt, remoteKey = "") {
-  try {
-    return localStorage.getItem(updateBannerDismissKey(startedAt, remoteKey)) === "1";
-  } catch (e) {
-    return false;
-  }
-}
-function writeUpdateBannerDismissed(startedAt, remoteKey = "") {
-  try {
-    localStorage.setItem(updateBannerDismissKey(startedAt, remoteKey), "1");
-  } catch (e) {}
 }
 function currentSelfUpdateState(status = lastStatus || {}) {
   const update = status?.self_update;
@@ -277,6 +379,7 @@ function pendingUpdateUiCanBeAbandoned(update = {}) {
   return Date.now() - Number(updateMonitor.startedAt || 0) > 3000;
 }
 function abandonPendingUpdateUi(message = "") {
+  const restoreLogSource = updateUiLocked || currentLogSource === "update";
   if (updateMonitor.statusTimer) {
     clearInterval(updateMonitor.statusTimer);
     updateMonitor.statusTimer = null;
@@ -288,10 +391,13 @@ function abandonPendingUpdateUi(message = "") {
   updateMonitor.token = "";
   updateAcknowledgedToken = "";
   setUpdateUiLocked(false);
-  if (currentLogSource === "update") {
+  if (restoreLogSource) {
     currentLogSource = updateFallbackLogSource(updateMonitor.returnLogSource);
     if (typeof noteKnownLogSource === "function") noteKnownLogSource(currentLogSource);
     if (typeof applyLogVisibility === "function") applyLogVisibility();
+    if (typeof writeUiStateToLocation === "function") {
+      writeUiStateToLocation({ active_tab: activeTabName, current_log_source: currentLogSource });
+    }
     if (typeof queueUiStateSave === "function") {
       queueUiStateSave({ current_log_source: currentLogSource });
     }
@@ -302,6 +408,7 @@ function abandonPendingUpdateUi(message = "") {
   }
   updateLogVisualMode();
   if (message && typeof setAuditMsg === "function") setAuditMsg(message);
+  startExternalUpdateSignalStream();
 }
 function reconcileUpdateUiFromStatus(status = lastStatus || {}) {
   const update = currentSelfUpdateState(status);
@@ -359,7 +466,6 @@ async function acknowledgeRenderedUpdateMode(token = "") {
   if (
     !updateMonitor.active ||
     !updateUiLocked ||
-    currentLogSource !== "update" ||
     activeTabName !== "logs" ||
     !document.body.classList.contains("update-lock-active")
   ) {
@@ -383,36 +489,59 @@ function scheduleRenderedUpdateAcknowledgement(token = "") {
   }
   setTimeout(callback, 0);
 }
-async function pollExternalUpdateSignal() {
-  if (updateSignalPollActive || updateMonitor.active) return;
-  updateSignalPollActive = true;
-  try {
-    const response = await fetch(`/admin/update-signal?_=${Date.now()}`, { cache: "no-store" });
-    if (!response.ok) return;
-    const payload = await response.json().catch(() => ({}));
-    const update = payload?.self_update || {};
-    const token = String(update?.token || "").trim();
-    if (update?.active && token && storedUpdateToken(UPDATE_COMPLETED_TOKEN_KEY) !== token) {
-      beginUpdateMonitor(
-        {
-          ...update,
-          stream_url: update.stream_url || `/admin/update-stream?token=${encodeURIComponent(token)}&tail=4000`,
-          status_url: update.status_url || `/admin/update-status?token=${encodeURIComponent(token)}`,
-        },
-        update.scope || "controller",
-      );
-    }
-  } catch (e) {
-  } finally {
-    updateSignalPollActive = false;
+function handleExternalUpdateSignal(update = {}) {
+  const token = String(update?.token || "").trim();
+  if (!update?.active || !token || storedUpdateToken(UPDATE_COMPLETED_TOKEN_KEY) === token) return;
+  beginUpdateMonitor(
+    {
+      ...update,
+      stream_url: update.stream_url || `/admin/update-stream?token=${encodeURIComponent(token)}&tail=4000`,
+      status_url: update.status_url || `/admin/update-status?token=${encodeURIComponent(token)}`,
+    },
+    update.scope || "controller",
+  );
+}
+function stopExternalUpdateSignalStream() {
+  updateSignalConnectionToken += 1;
+  if (updateSignalReconnectTimer) {
+    clearTimeout(updateSignalReconnectTimer);
+    updateSignalReconnectTimer = null;
+  }
+  if (updateSignalEventSource) {
+    updateSignalEventSource.close();
+    updateSignalEventSource = null;
   }
 }
-function startExternalUpdateSignalPolling() {
-  if (updateSignalPollTimer) clearInterval(updateSignalPollTimer);
-  updateSignalPollTimer = setInterval(() => {
-    pollExternalUpdateSignal().catch(() => {});
-  }, UPDATE_SIGNAL_POLL_MS);
-  pollExternalUpdateSignal().catch(() => {});
+function startExternalUpdateSignalStream() {
+  if (updateMonitor.active) return;
+  if (updateSignalReconnectTimer) {
+    clearTimeout(updateSignalReconnectTimer);
+    updateSignalReconnectTimer = null;
+  }
+  if (updateSignalEventSource) {
+    updateSignalEventSource.close();
+    updateSignalEventSource = null;
+  }
+  const connectionToken = ++updateSignalConnectionToken;
+  const source = new EventSource("/admin/update-events");
+  updateSignalEventSource = source;
+  source.addEventListener("state", (event) => {
+    if (connectionToken !== updateSignalConnectionToken) return;
+    try {
+      handleExternalUpdateSignal(JSON.parse(event.data));
+    } catch (e) {
+    }
+  });
+  source.onerror = () => {
+    if (connectionToken !== updateSignalConnectionToken) return;
+    source.close();
+    if (updateSignalEventSource === source) updateSignalEventSource = null;
+    if (updateMonitor.active || updateSignalReconnectTimer) return;
+    updateSignalReconnectTimer = setTimeout(() => {
+      updateSignalReconnectTimer = null;
+      if (!updateMonitor.active) startExternalUpdateSignalStream();
+    }, UPDATE_SIGNAL_RECONNECT_MS);
+  };
 }
 function recoverPendingUpdateMonitor(scope = "controller") {
   if (updateMonitor.active || updateMonitor.completed) return false;
@@ -430,13 +559,10 @@ function recoverPendingUpdateMonitor(scope = "controller") {
 }
 function minimizeSurfacesForUpdateMode() {
   try {
-    if (typeof collapseBenchmarkAllModal === "function" && $("benchmarkAllModal") && !$("benchmarkAllModal").classList.contains("hidden")) {
-      collapseBenchmarkAllModal();
-    } else {
-      $("benchmarkAllModal")?.classList.add("hidden");
-    }
+    if (typeof minimizeBenchmarksPage === "function") minimizeBenchmarksPage();
+    else $("benchmarkMiniWindow")?.remove();
   } catch (e) {
-    $("benchmarkAllModal")?.classList.add("hidden");
+    $("benchmarkMiniWindow")?.remove();
   }
   try {
     if (typeof minimizeStorageEditorModal === "function") minimizeStorageEditorModal();
@@ -447,7 +573,6 @@ function minimizeSurfacesForUpdateMode() {
   [
     "presetScoresModal",
     "storageBrowserModal",
-    "runScriptModal",
     "presetActionModal",
     "actionChoiceModal",
     "presetLaunchSettingsModal",

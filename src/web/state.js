@@ -125,7 +125,7 @@ const CHAT_TRANSCRIPT_EXPAND_STEP = 12;
 const STATUS_POLL_FOREGROUND_FAST_MS = 2000;
 const STATUS_POLL_FOREGROUND_SLOW_MS = 5000;
 const STATUS_POLL_BACKGROUND_MS = 15000;
-const UPDATE_SIGNAL_POLL_MS = 250;
+const UPDATE_SIGNAL_RECONNECT_MS = 5000;
 const LOG_CACHE_REFRESH_MS = 15000;
 const CHAT_TRANSCRIPT_NEAR_BOTTOM_PX = 36;
 const CHAT_TRANSCRIPT_DETACH_SCROLL_PX = 18;
@@ -958,14 +958,6 @@ let chatTranscriptRenderPendingForceFollow = false;
 let chatTranscriptRenderPendingReason = "update";
 let chatTranscriptRenderLastAt = 0;
 let statusPollNonce = 0;
-function escapeHtml(value) {
-  return String(value || "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
-}
 function svgIcon(name) {
   if (name === "close")
     return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" fill="none"/></svg>';
@@ -1277,47 +1269,18 @@ function setAuditMsg(t) {
 function renderUpdateNotices(status = {}) {
   const host = $("updateNoticeHost");
   if (!host) return;
-  const remote = status.remote_update || {};
   const compat = status.club3090_compat || {};
-  const supported = compat.supported || {};
-  const updateActive = selfUpdateActive(status);
-  const benchmarkActive =
-    typeof benchmarkJobActive === "function" ? benchmarkJobActive(status) : false;
-  const startedAt = Number(status.control_started_at || 0);
-  const remoteKey = currentUpdateBannerRemoteKey(status);
-  const hasUpdate = !!remote.update_available && remote.script_version;
-  const dismissed = readUpdateBannerDismissed(startedAt, remoteKey);
-  const greenBar =
-    hasUpdate && !dismissed && !updateActive
-      ? `<div class="update-notice-bar update-notice-bar-green"><button class="update-notice-dismiss" onclick="dismissUpdateNotice()" aria-label="Dismiss update notice">✕</button><button class="update-notice-message" onclick="openUpdateNoticeModal()">${escapeHtml(`A new update is Available (${remote.script_version})!`)} — Click here to update now</button><span class="update-notice-spacer"></span></div>`
-      : "";
-  const compatButton = updateActive
-    ? '<button class="update-notice-link" type="button" disabled aria-disabled="true">Compatible migration unavailable while an update is running.</button>'
-    : benchmarkActive
-      ? '<button class="update-notice-link" type="button" disabled aria-disabled="true">Stop Model Scores before migrating.</button>'
-      : '<button class="update-notice-link" onclick="startCompatibleMigration()">Click here to migrate to a compatible version!</button>';
-  const redBar = compat.local_repo_newer_than_supported
-    ? `<div class="update-notice-bar update-notice-bar-red"><span class="update-notice-spacer"></span><div class="update-notice-message">The local Club-3090 commit is newer than supported by this script and may cause unforeseen issues. ${compatButton}</div><span class="update-notice-spacer"></span></div>`
+  host.innerHTML = compat.local_repo_newer_than_supported
+    ? '<div class="update-notice-bar update-notice-bar-red"><span class="update-notice-spacer"></span><div class="update-notice-message">The local Club-3090 commit is newer than supported by this script and may cause unforeseen issues. Run System Update only after confirming both checkouts are clean.</div><span class="update-notice-spacer"></span></div>'
     : "";
-  host.innerHTML = `${greenBar}${redBar}`;
-}
-function dismissUpdateNotice() {
-  if (!lastStatus) return;
-  writeUpdateBannerDismissed(lastStatus.control_started_at, currentUpdateBannerRemoteKey(lastStatus));
-  renderUpdateNotices(lastStatus);
-}
-function openUpdateNoticeModal() {
-  const host = $("updateNoticeHost");
-  if (host) host.innerHTML = "";
-  promptUpdateRun();
 }
 function renderUpdateButton(status = {}) {
   const button = $("systemUpdateBtn");
   if (!button) return;
   const updateActive = selfUpdateActive(status);
-  const hasUpdate = !!(status.remote_update && status.remote_update.update_available);
-  button.textContent = updateActive ? "Update Running..." : hasUpdate ? "⚠️ UPDATE AVAILABLE!" : "Update";
-  button.className = hasUpdate ? "btn blue btn-update-available" : "btn blue";
+  button.textContent = updateActive ? "Update Running..." : "System Update";
+  button.title = "Fast-forward both clean tracking checkouts, rebuild Model DB, then restart services";
+  button.className = "btn blue";
   button.disabled = updateActive;
 }
 function parseClientScriptVersionTuple(value) {
@@ -1423,14 +1386,22 @@ function triggerAdminPanelReload(message = "Reloading the admin panel...", delay
   setAuditMsg(message);
   const startedAt = Date.now();
   const navigate = () => {
-    const query = new URLSearchParams({ _: String(Date.now()) });
     const savedReturn = readPendingUpdateReturn();
     const restoreTab = normalizeTabName(updateMonitor.returnTab || savedReturn?.tab || activeTabName || "overview");
     const restoreScroll = Math.max(0, Number(updateMonitor.returnScrollTop || savedReturn?.scrollTop || 0));
-    if (restoreTab) query.set("restore_tab", restoreTab);
-    if (restoreScroll > 0) query.set("restore_scroll", String(restoreScroll));
-    const target = `/admin?${query.toString()}`;
-    window.location.href = target;
+    const target = new URL(
+      buildUiStateUrl(
+        {
+          active_tab: restoreTab,
+          current_log_source: currentLogSource,
+          tab_scroll_positions: { [restoreTab]: restoreScroll },
+        },
+        window.location.href,
+      ),
+      window.location.href,
+    );
+    target.searchParams.set("_", String(Date.now()));
+    window.location.href = `${target.pathname}${target.search}`;
   };
   const tryReload = async () => {
     if (Date.now() - startedAt > 30000) {
@@ -1450,46 +1421,10 @@ function triggerAdminPanelReload(message = "Reloading the admin panel...", delay
   };
   window.setTimeout(tryReload, Math.max(0, Number(delayMs || 0)));
 }
-function currentRemoteUpdateVersionInfo() {
-  const remote = (lastStatus && lastStatus.remote_update) || {};
-  const runningVersion = String(lastStatus?.script_version || "").trim();
-  const remoteVersion = String(remote.script_version || "").trim();
-  const comparable =
-    !!runningVersion &&
-    !!remoteVersion &&
-    !!parseClientScriptVersionTuple(runningVersion) &&
-    !!parseClientScriptVersionTuple(remoteVersion);
-  const comparison = comparable
-    ? compareClientScriptVersions(remoteVersion, runningVersion)
-    : null;
-  return {
-    runningVersion,
-    remoteVersion,
-    comparable,
-    comparison,
-    needsConfirmation: comparable && comparison !== null && comparison <= 0,
-  };
-}
-function promptStaleUpdateConfirmation(scope, targetCommit = "") {
-  const versionInfo = currentRemoteUpdateVersionInfo();
-  const remoteVersion = versionInfo.remoteVersion || "unknown";
-  const runningVersion = versionInfo.runningVersion || "unknown";
-  const sameVersion = Number(versionInfo.comparison || 0) === 0;
-  openPresetActionModal({
-    title: sameVersion ? "Confirm Same-Version Update" : "Confirm Downgrade",
-    body: sameVersion
-      ? `The remote installer currently resolves to <code>${escapeHtml(remoteVersion)}</code>, which matches the running admin script version <code>${escapeHtml(runningVersion)}</code>. This usually means the remote cache is still stale. Continue anyway?`
-      : `The remote installer currently resolves to <code>${escapeHtml(remoteVersion)}</code>, which is older than the running admin script version <code>${escapeHtml(runningVersion)}</code>. Continue only if you intentionally want to downgrade or test a stale remote copy.`,
-    confirmLabel: sameVersion ? "Continue Anyway" : "Downgrade Anyway",
-    confirmClass: "orange",
-    onConfirm: async () => {
-      await startUpdateFlow(scope, targetCommit, { skipVersionGuard: true });
-    },
-  });
-}
 function completeUpdateMonitor(payload = {}) {
   markUpdateTokenCompleted(payload?.token || updateMonitor.token);
   endUpdateMonitor();
+  startExternalUpdateSignalStream();
   const returnCode = Number(payload?.return_code || 0);
   triggerAdminPanelReload(
     returnCode === 0
@@ -1498,17 +1433,12 @@ function completeUpdateMonitor(payload = {}) {
     400,
   );
 }
-async function startCompatibleMigration() {
-  const compat = (lastStatus && lastStatus.club3090_compat) || {};
-  const supported = compat.supported || {};
-  const targetCommit = String(supported.commit || "").trim();
-  if (!targetCommit) throw new Error("No compatible Club-3090 commit is recorded in this script.");
-  await startUpdateFlow("club3090-compatible", targetCommit);
-}
 function updateLogVisualMode() {
   const box = $("log");
-  if (!box) return;
-  box.classList.toggle("log-update", currentLogSource === "update");
+  const renderBox = $("logRender");
+  const isUpdate = currentLogSource === "update";
+  if (box) box.classList.toggle("log-update", isUpdate);
+  if (renderBox) renderBox.classList.toggle("log-update", isUpdate);
 }
 function endUpdateMonitor() {
   updateMonitor.active = false;
@@ -1567,7 +1497,8 @@ async function pollUpdateMonitorStatus() {
   }
 }
 function beginUpdateMonitor(payload, scope) {
-  if (!updateMonitor.returnLogSource || currentLogSource !== "update") {
+  stopExternalUpdateSignalStream();
+  if (!updateMonitor.returnLogSource) {
     updateMonitor.returnLogSource = updateFallbackLogSource(currentLogSource);
   }
   updateMonitor.active = true;
@@ -1587,34 +1518,34 @@ function beginUpdateMonitor(payload, scope) {
   updateMonitor.statusTimer = setInterval(() => {
     pollUpdateMonitorStatus().catch(() => {});
   }, 2000);
-  currentLogSource = "update";
+  currentLogSource = "audit";
   setUpdateUiLocked(true);
   activateTab("logs", true);
   connectLogs(true);
   updateLogVisualMode();
   setAuditMsg(
     scope === "club3090"
-      ? "Club-3090 migration is running through the separate updater service. The orange log stream will stay live while the control plane restarts."
+      ? "System Update is running through the separate updater service. Audit Logs will stay selected while the control plane restarts."
       : "Admin script update is running through the separate updater service. The orange log stream will stay live while the control plane restarts.",
   );
   scheduleRenderedUpdateAcknowledgement(updateMonitor.token);
 }
 function beginPendingUpdateUi(scope) {
-  updateMonitor.returnTab = normalizeTabName(activeTabName || "overview");
-  updateMonitor.returnScrollTop = Math.max(0, Number(currentPageScrollTop() || 0));
+  updateMonitor.returnTab = "logs";
+  updateMonitor.returnScrollTop = 0;
   updateMonitor.returnLogSource = updateFallbackLogSource(currentLogSource);
-  rememberPendingUpdateReturn(updateMonitor.returnTab, updateMonitor.returnScrollTop);
+  rememberPendingUpdateReturn("logs", 0);
   updateMonitor.completed = false;
   updateMonitor.startedAt = Date.now();
   updateMonitor.reloadScheduled = false;
-  currentLogSource = "update";
+  currentLogSource = "audit";
   setUpdateUiLocked(true);
   activateTab("logs", true);
   connectLogs(true);
   updateLogVisualMode();
   setAuditMsg(
     scope === "club3090"
-      ? "Starting Club-3090 migration. The orange update log will remain selected while the control plane restarts."
+      ? "Starting System Update. Audit Logs will remain selected while the control plane restarts."
       : "Starting admin script update. The orange update log will remain selected while the control plane restarts.",
   );
 }

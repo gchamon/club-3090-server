@@ -15,7 +15,7 @@ function renderLogSourcePanel() {
       { id: "debug", label: "Debug" },
       ...modelSources,
       { id: "benchmarks", label: "Benchmarks" },
-      ...(scriptActive ? [{ id: "script", label: "Script" }] : []),
+      { id: "script", label: "Script" },
       ...(updateActive || currentLogSource === "update"
         ? [{ id: "update", label: "Update" }]
         : []),
@@ -32,6 +32,7 @@ function renderLogSourcePanel() {
       .join("")}</div><div class="value smallgap" id="logsSourceSummary">-</div>`;
   }
   renderDebugLogCommandUi();
+  if (currentLogSource === "script" && typeof renderScriptRunnerUi === "function") renderScriptRunnerUi();
   if (!$("logsSourceSummary")) return;
   if (currentLogSource === "update") {
     $("logsSourceSummary").innerHTML =
@@ -64,13 +65,14 @@ function renderLogSourcePanel() {
   if (currentLogSource === "script") {
     const job = lastStatus?.script_job || {};
     $("logsSourceSummary").innerHTML =
-      `Script selected. ${escapeHtml(job.summary || "The live viewer follows the active upstream script output.")}${job.label ? ` <code>${escapeHtml(job.label)}</code>` : ""}`;
+      `Script runner selected. Execute validation suites, AI Studio setup, and diagnostic scripts with live terminal output.${job.label ? ` Active: <code>${escapeHtml(job.label)}</code>` : ""}`;
+    if (typeof renderScriptRunnerUi === "function") renderScriptRunnerUi();
     return;
   }
   if (String(currentLogSource || "").startsWith("model:")) {
     const modelSource = modelLogSourceFromSource(currentLogSource);
     $("logsSourceSummary").innerHTML = modelSource
-      ? `${escapeHtml(modelSource.label)} selected. The live viewer follows container <code>${escapeHtml(modelSource.container || modelSource.instanceId)}</code>.`
+      ? `${escapeHtml(modelSource.preset || modelSource.scope || modelSource.instanceId)}${modelSource.scope && modelSource.scope !== modelSource.preset ? ` · ${escapeHtml(modelSource.scope)}` : ""} selected. The live viewer follows container <code>${escapeHtml(modelSource.container || modelSource.instanceId)}</code>.`
       : "Model service log source selected.";
     return;
   }
@@ -110,9 +112,11 @@ function modelLogSourceEntries() {
       const scope = String(row.display_name || instanceId).trim();
       return {
         id: `model:${instanceId}`,
-        label: `Model: ${preset}${scope ? ` · ${scope}` : ""}`,
+        label: "Model",
         instanceId,
         selector,
+        preset,
+        scope,
         container: String(row.container || "").trim(),
       };
     })
@@ -896,29 +900,43 @@ function currentLogSourceDetached() {
 function logViewerVisible() {
   return !currentLogSourceDetached() && (activeTabName === "logs" || effectiveShowGlobalLogs());
 }
-function logIsNearBottom(box = $("log")) {
+function logIsNearBottom(box = $("logRender") || $("log")) {
   if (!box) return true;
   return box.scrollHeight - (box.scrollTop + box.clientHeight) <= 28;
 }
-function scrollLogToBottom(box = $("log")) {
+function scrollLogToBottom(box = $("logRender") || $("log")) {
   if (!box) return;
   box.scrollTop = box.scrollHeight;
+  const other = box.id === "logRender" ? $("log") : $("logRender");
+  if (other) other.scrollTop = box.scrollTop;
 }
 function logCacheEntry(signature) {
-  if (!logCache[signature]) logCache[signature] = { text: "", loaded: false };
+  if (!logCache[signature]) logCache[signature] = { text: "", loaded: false, truncatedLineCount: 0 };
   return logCache[signature];
 }
 function renderCurrentLog(signature, options = {}) {
   const box = $("log");
+  const renderBox = $("logRender");
   const entry = logCacheEntry(signature);
-  const nextValue = entry.loaded ? collapseRepeatedLogText(entry.text) : "Connecting...\n";
-  const changed = !!box && box.value !== nextValue;
-  if (box) {
-    if (changed) box.value = nextValue;
+  const notice =
+    currentLogSource === "script" &&
+    String(signature || "").startsWith("script:") &&
+    Number(entry.truncatedLineCount || 0) > 0
+      ? `… ${Number(entry.truncatedLineCount)} earlier log lines omitted — select Show raw log to view all output.\n`
+      : "";
+  const nextValue = entry.loaded ? collapseRepeatedLogText(notice + entry.text) : "Connecting...\n";
+  const changed = (!!box && box.value !== nextValue) || (!!renderBox && renderBox.dataset.renderedSig !== `${signature}:${nextValue.length}`);
+  if (box && changed) box.value = nextValue;
+  if (renderBox && changed) {
+    renderBox.innerHTML = renderAnsiHtml(nextValue);
+    renderBox.dataset.renderedSig = `${signature}:${nextValue.length}`;
+  }
+  $("scriptLogActions")?.classList.toggle("hidden", currentLogSource !== "script");
+  if (changed) {
     if (searchState.active) {
-      if (changed) recalculateMatches(true);
-    } else if (changed && options.follow && $("autoscroll") && $("autoscroll").checked) {
-      scrollLogToBottom(box);
+      recalculateMatches(true);
+    } else if (options.follow && $("autoscroll") && $("autoscroll").checked) {
+      scrollLogToBottom(renderBox || box);
     }
   }
   flushPendingLogJump();
@@ -1041,14 +1059,18 @@ function logStreamConfig() {
   if (currentLogSource === "debug")
     return { signature: "debug", url: "/admin/debug-stream?tail=4000" };
   if (currentLogSource === "benchmarks")
-    return { signature: "benchmarks", url: "/admin/logs?source=benchmarks&tail=4000" };
-  if (currentLogSource === "script")
-    return { signature: `script:${lastStatus?.script_job?.job_id || "latest"}`, url: "/admin/logs?source=script&tail=4000" };
+    return { signature: "benchmarks", url: "/admin/log-stream?source=benchmarks&tail=4000" };
+  if (currentLogSource === "script") {
+    const selectedId = String(selectedScriptLogJobId || "");
+    const streamId = selectedId || lastStatus?.script_job?.job_id || "latest";
+    const url = `/admin/log-stream?source=script&tail=4000${selectedId ? `&job_id=${encodeURIComponent(selectedId)}` : ""}`;
+    return { signature: `script:${streamId}`, url };
+  }
   if (String(currentLogSource || "").startsWith("service:")) {
     const serviceId = String(currentLogSource).split(":", 2)[1] || "";
     return {
       signature: `service:${serviceId}`,
-      url: `/admin/logs?source=service&service=${encodeURIComponent(serviceId)}`,
+      url: `/admin/log-stream?source=service&service=${encodeURIComponent(serviceId)}`,
     };
   }
   if (String(currentLogSource || "").startsWith("model:")) {
@@ -1056,7 +1078,7 @@ function logStreamConfig() {
     const instanceId = modelSource?.instanceId || "";
     return {
       signature: `model:${instanceId || "primary"}`,
-      url: `/admin/logs${instanceId ? `?instance=${encodeURIComponent(instanceId)}` : ""}`,
+      url: `/admin/log-stream${instanceId ? `?instance=${encodeURIComponent(instanceId)}` : ""}`,
     };
   }
   const explicit = selectedDockerLogInstanceId();
@@ -1073,7 +1095,7 @@ function logStreamConfig() {
       : target && target.id;
   return {
     signature: `docker:${instanceId || "primary"}`,
-    url: `/admin/logs${instanceId ? `?instance=${encodeURIComponent(instanceId)}` : ""}`,
+    url: `/admin/log-stream${instanceId ? `?instance=${encodeURIComponent(instanceId)}` : ""}`,
   };
 }
 function noteKnownLogSource(source) {
@@ -1108,7 +1130,10 @@ function logBootstrapUrlForSource(source) {
   if (normalized === "control") return "/admin/log-bootstrap?source=control&tail=250";
   if (normalized === "debug") return "/admin/log-bootstrap?source=debug&tail=250";
   if (normalized === "benchmarks") return "/admin/log-bootstrap?source=benchmarks&tail=250";
-  if (normalized === "script") return "/admin/log-bootstrap?source=script&tail=250";
+  if (normalized === "script") {
+    const jobId = String(selectedScriptLogJobId || lastStatus?.script_job?.job_id || "");
+    return `/admin/log-bootstrap?source=script&tail=1000${jobId ? `&job_id=${encodeURIComponent(jobId)}` : ""}`;
+  }
   if (String(normalized).startsWith("service:")) {
     const serviceId = String(normalized).split(":", 2)[1] || "";
     return `/admin/log-bootstrap?source=service&service=${encodeURIComponent(serviceId)}&tail=250`;
@@ -1143,7 +1168,59 @@ async function refreshLogCacheSnapshot(source, options = {}) {
   if (!response.ok) return;
   const payload = await response.json();
   const signature = payload?.signature || options.signature || logSignatureForSource(source);
+  const entry = logCacheEntry(signature);
+  entry.truncatedLineCount = Number(payload?.truncated_line_count || 0);
   replaceLogBuffer(signature, String(payload?.text || ""));
+}
+function scriptRawLogUrl() {
+  const jobId = String(selectedScriptLogJobId || lastStatus?.script_job?.job_id || "");
+  return `/admin/scripts/log/raw?job_id=${encodeURIComponent(jobId)}`;
+}
+function showRawScriptLog() {
+  const url = scriptRawLogUrl();
+  if (!selectedScriptLogJobId && !lastStatus?.script_job?.job_id) {
+    const message = "No script job is selected.";
+    if ($("scriptLogActionMsg")) $("scriptLogActionMsg").textContent = message;
+    return;
+  }
+  const opened = window.open(url, "_blank");
+  if (opened) opened.opener = null;
+  if (!opened && $("scriptLogActionMsg")) $("scriptLogActionMsg").textContent = `Popup blocked. Open ${url}`;
+}
+async function copyAllScriptLog() {
+  const message = $("scriptLogActionMsg");
+  try {
+    const response = await fetch(scriptRawLogUrl(), { cache: "no-store" });
+    if (!response.ok) throw new Error((await response.text()) || `Request failed (${response.status})`);
+    const copied = await copyTextValue(await response.text());
+    if (!copied) throw new Error("Copy failed on this browser.");
+    if (message) message.textContent = "Copied all script logs.";
+  } catch (error) {
+    if (message) message.textContent = String(error?.message || "Unable to load the full script log.");
+  }
+}
+async function copyCurrentLog() {
+  const message = $("logActionMsg");
+  try {
+    const text = String($("log")?.value || "");
+    if (!text) throw new Error("There is no displayed log to copy.");
+    if (!(await copyTextValue(text))) throw new Error("Copy failed on this browser.");
+    if (message) message.textContent = `Copied the displayed ${currentLogHeading()} log.`;
+  } catch (error) {
+    if (message) message.textContent = String(error?.message || "Unable to copy the displayed log.");
+  }
+}
+async function downloadAllLogs() {
+  const message = $("logActionMsg");
+  try {
+    const response = await fetch("/admin/logs/archive", { cache: "no-store" });
+    if (!response.ok) throw new Error((await response.text()) || `Request failed (${response.status})`);
+    const fileName = parseDownloadNameFromHeaders(response.headers.get("Content-Disposition")) || "club3090-logs.zip";
+    triggerBrowserDownload(await response.blob(), fileName);
+    if (message) message.textContent = "Downloaded the log archive.";
+  } catch (error) {
+    if (message) message.textContent = String(error?.message || "Unable to download the log archive.");
+  }
 }
 async function refreshBackgroundLogCaches() {
   const currentSource = String(currentLogSource || "docker");
@@ -1691,7 +1768,7 @@ connectLogs = function (force = false) {
     scheduleLogStreamReconnect(5000);
   };
 };
-setCurrentLogSource = function (source) {
+setCurrentLogSource = function (source, options = {}) {
   const nextSource =
     source === "audit" ||
     source === "debug" ||
@@ -1704,11 +1781,13 @@ setCurrentLogSource = function (source) {
     String(source || "").startsWith("service:")
       ? String(source)
       : "docker";
+  if (nextSource === "script") selectedScriptLogJobId = String(options.scriptJobId || "");
+  else selectedScriptLogJobId = "";
   if (selfUpdateActive(lastStatus) && nextSource !== "update") return;
   currentLogSource = nextSource;
   noteKnownLogSource(currentLogSource);
   applyLogVisibility();
-  queueUiStateSave({ current_log_source: currentLogSource });
+  if (typeof writeUiStateToLocation === "function") writeUiStateToLocation({ active_tab: activeTabName, current_log_source: currentLogSource });
   connectLogs(true);
   scheduleLogCacheRefresh(LOG_CACHE_REFRESH_MS);
   updateLogVisualMode();
@@ -1750,9 +1829,17 @@ function focusBenchmarkLogs() {
   if (currentLogSource !== "benchmarks") setCurrentLogSource("benchmarks");
   activateTab("logs", true);
 }
-function focusScriptLogs() {
-  if (currentLogSource !== "script") setCurrentLogSource("script");
+function focusScriptLogs(jobId = "") {
+  if (typeof closeRunScriptModal === "function") closeRunScriptModal();
+  selectedScriptLogJobId = String(jobId || "");
+  setCurrentLogSource("script", { scriptJobId: selectedScriptLogJobId });
   activateTab("logs", true);
+  if (typeof loadRunScripts === "function") loadRunScripts().catch(() => {});
+  if (typeof renderScriptRunnerUi === "function") renderScriptRunnerUi();
+  setTimeout(() => {
+    const card = $("logCard");
+    if (card) card.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, 50);
 }
 function clearActiveLogJump() {
   pendingLogJump = null;
@@ -1880,11 +1967,7 @@ post = async function (path, obj, label = "", options = {}) {
   }
 };
 metricTab = function (e, n) {
-  setActiveMetricPaneInDocument(document, n);
-  writeCachedUiState(currentUiState());
-  queueUiStateSave();
-  redrawMetricsSoon();
-  refreshStatus({ force: true }).catch(() => {});
+  metricSourceChanged(n);
 };
 togglePowerOptimizations = async function () {
   const enable =
