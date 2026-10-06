@@ -729,12 +729,19 @@ def run_updater_status_smoke_test(root: Path) -> tuple[bool, str]:
             return False, f"System Update stages did not run in order: {trace_lines!r}"
         for repo in (server_dir, upstream_dir):
             repo_uid = os.stat(repo).st_uid
+            passwd = subprocess.run(
+                ["getent", "passwd", str(repo_uid)],
+                capture_output=True, text=True, check=False, timeout=5,
+            )
+            if passwd.returncode or not passwd.stdout.strip():
+                return False, f"no passwd entry for fixture owner uid {repo_uid}"
+            repo_user = passwd.stdout.split(":", 1)[0]
             if not any(
-                line.startswith(f"runuser --user {repo_uid} -- env HOME=")
+                line.startswith(f"runuser --user {repo_user} -- env HOME=")
                 and f"git -C {repo}" in line
                 for line in trace_lines
             ):
-                return False, f"System Update did not run Git as worktree owner uid {repo_uid}: {trace_lines!r}"
+                return False, f"System Update did not run Git as worktree owner {repo_user} (uid {repo_uid}): {trace_lines!r}"
         trace.write_text("", encoding="utf-8")
         dirty_env = dict(command_env)
         dirty_env["CLUB3090_TEST_DIRTY"] = str(upstream_dir)

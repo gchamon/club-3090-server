@@ -273,12 +273,14 @@ UPSTREAM_DIR={quoted_upstream}
 CONTROL_DIR={quoted_control}
 command -v runuser >/dev/null 2>&1 || {{ echo "System Update requires runuser to access Git worktrees as their owners" >&2; exit 1; }}
 git_as_repo_owner() {{
-  local repo="$1" repo_uid passwd_entry repo_home
+  local repo="$1" repo_uid passwd_entry repo_user repo_home
   shift
   repo_uid="$(stat -c '%u' -- "$repo")" || {{ echo "Unable to determine Git worktree owner: $repo" >&2; return 1; }}
   passwd_entry="$(getent passwd "$repo_uid")" || {{ echo "No account found for Git worktree owner uid $repo_uid ($repo)" >&2; return 1; }}
+  repo_user="${{passwd_entry%%:*}}"
   repo_home="$(printf '%s\\n' "$passwd_entry" | cut -d: -f6)"
-  runuser --user "$repo_uid" -- env HOME="$repo_home" git -C "$repo" "$@"
+  [[ -n "$repo_user" && -n "$repo_home" ]] || {{ echo "Incomplete account entry for Git worktree owner uid $repo_uid ($repo)" >&2; return 1; }}
+  runuser --user "$repo_user" -- env HOME="$repo_home" git -C "$repo" "$@"
 }}
 for repo in "$SERVER_DIR" "$UPSTREAM_DIR"; do
   git_as_repo_owner "$repo" rev-parse --show-toplevel >/dev/null || {{
