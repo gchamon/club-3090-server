@@ -448,6 +448,26 @@ def proxy_running_target_for_selector(selector, instance_id=None):
     if not spec:
         return None, None
     target_id = str(instance_id or "").strip().upper()
+    if str(spec.get("engine") or spec.get("engine_family") or "").strip().lower() == "strata":
+        candidates = []
+        if target_id and target_id != "GLOBAL":
+            instance = get_instance(target_id)
+            if instance:
+                candidates.append(instance)
+        elif not target_id or target_id == "GLOBAL":
+            try:
+                candidates = visible_instances(read_instances_config())
+            except Exception:
+                candidates = []
+        for instance in candidates:
+            if canonical_mode_selector(instance.get("mode")) != selected or not instance_running(instance):
+                continue
+            port = instance_runtime_port(instance)
+            container = instance_runtime_container_name(instance)
+            ready = strata_runtime_ready(container, f"http://127.0.0.1:{int(port)}/")
+            if ready:
+                return dict(instance), spec
+        return None, spec
     if target_id and target_id != "GLOBAL":
         instance = get_instance(target_id)
         if instance and canonical_mode_selector(instance.get("mode")) == selected and instance_running(instance):

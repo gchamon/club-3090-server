@@ -1,3 +1,89 @@
+STRATA_COMPILED_COMPUTE_CAPABILITIES = frozenset({"7.5", "8.0", "8.6", "8.9", "12.0"})
+
+
+def is_strata_variant(spec):
+    row = spec if isinstance(spec, dict) else {}
+    return str(row.get("engine_id") or row.get("profile_engine_id") or row.get("engine_profile") or row.get("engine") or "").strip().lower() == "strata"
+
+
+def evaluate_strata_hardware(assigned_gpu_indices=None):
+    """Return deterministic host/GPU prerequisites for the pinned Strata image."""
+    if platform.system().lower() != "linux":
+        return {"hardware_blocked": True, "hardware_block_reason": "Strata requires a Linux host."}
+    docker = shutil.which("docker")
+    if not docker:
+        return {"hardware_blocked": True, "hardware_block_reason": "Docker is unavailable."}
+    docker_rc, runtimes = run_cmd([docker, "info", "--format", "{{json .Runtimes}}"], timeout=8)
+    if docker_rc != 0:
+        return {"hardware_blocked": True, "hardware_block_reason": "Docker is unavailable."}
+    try:
+        runtime_map = json.loads(str(runtimes or "").strip())
+    except Exception:
+        runtime_map = {}
+    if not isinstance(runtime_map, dict) or "nvidia" not in runtime_map:
+        return {"hardware_blocked": True, "hardware_block_reason": "Docker does not have the NVIDIA runtime."}
+    nvidia_smi = shutil.which("nvidia-smi")
+    if not nvidia_smi:
+        return {"hardware_blocked": True, "hardware_block_reason": "nvidia-smi is unavailable; no usable NVIDIA GPU can be reported."}
+    rc, output = run_cmd(
+        [nvidia_smi, "--query-gpu=index,compute_cap,driver_version", "--format=csv,noheader,nounits"],
+        timeout=8,
+    )
+    if rc != 0 or not str(output or "").strip():
+        return {"hardware_blocked": True, "hardware_block_reason": "nvidia-smi cannot report a usable assigned GPU."}
+    gpus = {}
+    driver_versions = []
+    for line in str(output or "").splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 3:
+            continue
+        try:
+            index = int(parts[0])
+        except Exception:
+            continue
+        if not parts[1] or parts[1].lower() in {"n/a", "[not supported]"}:
+            continue
+        gpus[index] = parts[1]
+        driver_versions.append(parts[2])
+    if not gpus or not driver_versions:
+        return {"hardware_blocked": True, "hardware_block_reason": "nvidia-smi cannot report a usable assigned GPU."}
+
+    def version_tuple(text):
+        match = re.match(r"^\s*(\d+)(?:\.(\d+))?", str(text or ""))
+        return tuple(int(part or 0) for part in match.groups()) if match else ()
+
+    if any(not version_tuple(version) or version_tuple(version) < (580, 0) for version in driver_versions):
+        return {"hardware_blocked": True, "hardware_block_reason": "NVIDIA driver 580 or newer is required."}
+    if assigned_gpu_indices is None:
+        candidates = list(gpus.values())
+    else:
+        try:
+            indices = [int(index) for index in assigned_gpu_indices]
+        except Exception:
+            indices = []
+        candidates = [gpus[index] for index in indices if index in gpus]
+        if len(candidates) != len(indices) or not candidates:
+            return {"hardware_blocked": True, "hardware_block_reason": "nvidia-smi cannot report the assigned GPU."}
+    if not any(capability in STRATA_COMPILED_COMPUTE_CAPABILITIES for capability in candidates):
+        return {
+            "hardware_blocked": True,
+            "hardware_block_reason": "No assigned GPU has a Strata-supported compute capability (7.5, 8.0, 8.6, 8.9, or 12.0).",
+        }
+    return {"hardware_blocked": False, "hardware_block_reason": ""}
+
+
+def enrich_strata_hardware_rows(rows):
+    result = []
+    hardware = None
+    for source in rows or []:
+        row = dict(source or {})
+        if is_strata_variant(row):
+            if hardware is None:
+                hardware = evaluate_strata_hardware()
+            row.update(hardware)
+        result.append(row)
+    return result
+
 def _normalize_ratio_percent(value):
     number = safe_float(value)
     if number <= 1.0:
@@ -2193,6 +2279,8 @@ def build_status_snapshot(refresh_remote_metadata=False):
         recent = list(recent_requests)
 
     runtime_inventory = enrich_inventory_model_update_state(load_runtime_inventory())
+    runtime_inventory["variants"] = enrich_strata_hardware_rows(runtime_inventory.get("variants") or [])
+    runtime_inventory["models"] = enrich_strata_hardware_rows(runtime_inventory.get("models") or [])
     local_installer_metadata = read_local_installer_metadata()
     self_update_state = read_self_update_state()
     remote_update_metadata = cached_remote_script_metadata(refresh=refresh_remote_metadata)
@@ -4460,6 +4548,47 @@ def _container_boot_failure_reason(container_name):
     return "\n".join(unique[-4:])
 
 
+def strata_runtime_ready(container_name, base_url, timeout=1.5):
+    """Return true only when Strata's public health and authenticated API are ready."""
+    root = str(base_url or "").strip().rstrip("/")
+    if not root:
+        return False
+    if root.endswith("/v1/models"):
+        root = root[:-len("/v1/models")]
+    try:
+        health = urllib.request.Request(
+            f"{root}/health",
+            headers={"Accept": "application/json", "User-Agent": "club3090-control/ready-probe"},
+            method="GET",
+        )
+        with urllib.request.urlopen(health, timeout=timeout) as response:
+            if not 200 <= int(getattr(response, "status", 0) or 0) < 300:
+                return False
+        api_key = ensure_strata_api_key()
+        if not api_key:
+            return False
+        models = urllib.request.Request(
+            f"{root}/v1/models",
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {api_key}",
+                "User-Agent": "club3090-control/ready-probe",
+            },
+            method="GET",
+        )
+        with urllib.request.urlopen(models, timeout=timeout) as response:
+            return 200 <= int(getattr(response, "status", 0) or 0) < 300
+    except Exception:
+        return False
+
+
+def _runtime_engine_ready_once(container_name, ready_url, engine_family):
+    engine = str(engine_family or "").strip().lower()
+    if engine == "strata":
+        return strata_runtime_ready(container_name, ready_url)
+    return _runtime_models_available_once(container_name, ready_url, min_interval=(15 if engine == "vllm" else 2))
+
+
 def _runtime_models_available_once(container_name, ready_url, min_interval=15):
     target_url = str(ready_url or "").strip()
     if not target_url:
@@ -4525,10 +4654,10 @@ def wait_for_runtime_ready(container_name, ready_url, timeout=900, engine_family
                 )
         elif seen_container:
             raise RuntimeError(f"Container {name} disappeared before reaching ready state.")
-        api_ready = _runtime_models_available_once(name, target_url, min_interval=(15 if engine == "vllm" else 2))
+        api_ready = _runtime_engine_ready_once(name, target_url, engine)
         bootstrap_ready = _container_bootstrap_complete(name) if engine == "vllm" else False
-        port_ready = _ready_url_port_open(target_url, timeout=0.4) if engine and engine != "vllm" else False
-        if not name or api_ready or bootstrap_ready or port_ready:
+        port_ready = _ready_url_port_open(target_url, timeout=0.4) if engine and engine not in {"vllm", "strata"} else False
+        if (not name and engine != "strata") or api_ready or bootstrap_ready or port_ready:
             return True
         time.sleep(1)
     if name and not seen_container:

@@ -4876,6 +4876,8 @@ def _find_runtime_variant_for_resources(selector="", variant_id=""):
 
 def preset_resource_delete_plan(selector="", variant_id=""):
     row = _find_runtime_variant_for_resources(selector, variant_id)
+    if str(row.get("engine") or "").strip().lower() == "strata":
+        raise ValueError("Strata model data is managed by the runtime; generic resource deletion is disabled.")
     plan = variant_resource_plan_from_row(row, include_missing=False)
     return {
         "variant_id": str(row.get("variant_id") or ""),
@@ -5142,6 +5144,8 @@ def _preset_cache_path_allowed(path, row):
 
 def preset_cache_delete_plan(selector="", variant_id=""):
     row = _find_runtime_variant_for_resources(selector, variant_id)
+    if str(row.get("engine") or "").strip().lower() == "strata":
+        raise ValueError("Strata data and caches are managed by the runtime; generic cache deletion is disabled.")
     cache_root = variant_persistent_cache_host_root(row)
     caches = []
     candidates = []
@@ -5516,6 +5520,21 @@ def delete_model_resource_paths(paths):
     if not requested_paths:
         raise ValueError("Choose at least one resource path to delete.")
     inventory = load_runtime_inventory(force=True)
+    strata_paths = [
+        os.path.realpath(os.path.abspath(str(variant.get(field) or "").strip()))
+        for variant in (inventory.get("variants") or [])
+        if str(variant.get("engine") or "").strip().lower() == "strata"
+        for field in ("strata_data_path", "strata_source_path")
+        if str(variant.get(field) or "").strip()
+    ]
+    for requested in requested_paths:
+        for reserved in strata_paths:
+            try:
+                common = os.path.commonpath([reserved, requested])
+            except Exception:
+                continue
+            if common in {reserved, requested}:
+                raise ValueError("Generic model resource deletion cannot target Strata source or persistent data.")
     affected_variants = []
     for variant in inventory.get("variants") or []:
         resources = variant_resource_plan_from_row(variant, include_missing=True).get("resources") or []
@@ -6229,8 +6248,38 @@ def _run_model_install_job(job_id, model_id, variant_id, install_command, update
             append_audit_text_line(f"{prefix} {message}")
             raise RuntimeError(message)
         setup_install = _parse_setup_install_command(install_command)
-        shell_command = str(install_command or "").strip()
-        used_builtin_downloads = False
+        if str(variant.get("engine") or "").strip().lower() == "strata":
+            if update_mode:
+                raise RuntimeError("Strata presets do not support model update actions")
+            source = os.path.abspath(str(variant.get("strata_source_path") or ""))
+            source_parent = os.path.dirname(source)
+            expected_commit = str(variant.get("strata_commit") or "")
+            image = str(variant.get("strata_image") or "")
+            if not source_parent or not _path_is_within(os.path.join(CONTROL_DIR, "builtin-models"), source):
+                raise RuntimeError("Strata source path is outside the controller-owned builtin-models directory")
+            os.makedirs(source_parent, exist_ok=True)
+            for row in inventory.get("variants") or []:
+                if str(row.get("engine") or "").strip().lower() == "strata":
+                    os.makedirs(str(row.get("strata_data_path") or ""), exist_ok=True)
+            quoted_source = shlex.quote(source)
+            quoted_parent = shlex.quote(source_parent)
+            quoted_commit = shlex.quote(expected_commit)
+            quoted_image = shlex.quote(image)
+            shell_command = (
+                f"rebuild=0; "
+                f"if [ ! -d {quoted_source}/.git ]; then "
+                f"if [ -e {quoted_source} ]; then rm -rf -- {quoted_source}; fi; "
+                f"git clone https://github.com/Niko1221/Strata.git {quoted_source} || exit $?; rebuild=1; "
+                f"elif [ \"$(git -C {quoted_source} rev-parse HEAD 2>/dev/null)\" != {quoted_commit} ]; then rebuild=1; fi; "
+                f"git -C {quoted_source} fetch --depth 1 origin {quoted_commit} && "
+                f"git -C {quoted_source} checkout --detach {quoted_commit} && "
+                f"test \"$(git -C {quoted_source} rev-parse HEAD)\" = {quoted_commit} && "
+                f"if [ \"$rebuild\" = 1 ] || ! docker image inspect {quoted_image} >/dev/null 2>&1; "
+                f"then docker build -t {quoted_image} {quoted_source}; fi"
+            )
+            install_command = "strata-image-build"
+        else:
+            shell_command = str(install_command or "").strip()
         if plan and _parse_simple_hf_download_plan(install_command):
             _run_hf_download_plan(job_id, prefix, plan, env_map, force_download=bool(update_mode))
             used_builtin_downloads = True
@@ -6376,6 +6425,8 @@ def start_model_update_job(model_id="", variant_id="", resource_key=""):
             ),
             None,
         )
+    if variant and str(variant.get("engine") or "").strip().lower() == "strata":
+        raise ValueError("Strata runtime data is pinned; generic model updates are disabled.")
     if not variant:
         raise ValueError("Unknown model update target")
     return _start_model_download_job(

@@ -14,6 +14,7 @@ from smoke_tests import (
     run_control_module_smoke_test,
     run_control_runtime_globals_smoke_test,
     run_admin_path_routing_smoke_test,
+    run_strata_preset_smoke_test,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -27,6 +28,7 @@ SMOKE_TESTS = {
     "control_module_smoke": "Run HTTP, benchmark-worker, and web-assets source paths with isolated state",
     "control_runtime_globals_smoke": "Resolve global loads in assembled controller callables",
     "admin_path_routing_smoke": "Exercise canonical admin shell routes and relocated GET APIs",
+    "strata_preset_smoke": "Verify Strata preset inventory, pinned install metadata, and isolated artifacts",
 }
 
 
@@ -36,7 +38,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--smoke-tests", action="append", default=[],
-        help="Select source_runtime, control_subprocess_timeout_smoke, control_module_smoke, admin_path_routing_smoke, control_runtime_globals_smoke, installer_preflight_smoke, repository_install_smoke, repository_uninstall_smoke, or updater_status_smoke (comma-separated).",
+        help="Select source_runtime, control_subprocess_timeout_smoke, control_module_smoke, admin_path_routing_smoke, control_runtime_globals_smoke, installer_preflight_smoke, repository_install_smoke, repository_uninstall_smoke, updater_status_smoke, or strata_preset_smoke (comma-separated).",
     )
     parser.add_argument("--list-smoke-tests", action="store_true", help="List source/runtime smoke checks and exit.")
     args = parser.parse_args(argv)
@@ -66,6 +68,7 @@ def main(argv: list[str] | None = None) -> int:
         "control_module_smoke": lambda: run_control_module_smoke_test(ROOT),
         "control_runtime_globals_smoke": lambda: run_control_runtime_globals_smoke_test(ROOT),
         "admin_path_routing_smoke": lambda: run_admin_path_routing_smoke_test(ROOT),
+        "strata_preset_smoke": lambda: run_strata_preset_smoke_test(ROOT),
     }
     for name, check in checks.items():
         if name not in selected:

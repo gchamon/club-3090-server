@@ -895,3 +895,254 @@ def run_updater_status_smoke_test(root: Path) -> tuple[bool, str]:
         if dubious.returncode == 0 or "detected dubious ownership" not in dubious.stderr or any(" fetch " in line or " merge " in line for line in dubious_lines):
             return False, f"System Update hid a Git ownership failure or mutated before preflight: rc={dubious.returncode} stderr={dubious.stderr!r} trace={dubious_lines!r}"
         return True, "updater runs Git as checkout owner and guards clean, dirty, and ownership failures"
+
+def run_strata_preset_smoke_test(root: Path) -> tuple[bool, str]:
+    root = Path(root).resolve()
+    with tempfile.TemporaryDirectory(prefix="club3090-strata-preset-") as temp_raw:
+        temp = Path(temp_raw)
+        state_dir = temp / "state"
+        upstream = temp / "upstream"
+        upstream.mkdir()
+        env = dict(os.environ)
+        env.update(
+            CLUB3090_CONTROL_DIR=str(state_dir),
+            CLUB3090_DIR=str(upstream),
+            CLUB3090_SERVER_DIR=str(root),
+            PYTHONPATH=str(root / "src"),
+            PYTHONDONTWRITEBYTECODE="1",
+        )
+        rebuild = subprocess.run(
+            [sys.executable, "-m", "control.http_server", "--rebuild-inventory"],
+            cwd=str(root / "src"), env=env, capture_output=True,
+            text=True, check=False, timeout=30,
+        )
+        if rebuild.returncode:
+            return False, rebuild.stderr.strip() or "Strata inventory rebuild failed"
+        inventory_path = state_dir / "runtime_inventory.json"
+        if not inventory_path.is_file():
+            return False, "Strata inventory rebuild did not write isolated inventory"
+        try:
+            inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            return False, f"Strata inventory was not valid JSON: {exc}"
+        expected = {
+            "strata/qwen3.8-flash-next-q2-0": ("Q2_0", 37.6),
+            "strata/qwen3.8-flash-next-iq2-xs": ("IQ2_XS", 39.2),
+            "strata/qwen3.8-flash-next-iq3-xxs": ("IQ3_XXS", 47.0),
+            "strata/qwen3.8-flash-next-iq3-s": ("IQ3_S", 54.8),
+        }
+        rows = {
+            row.get("selector") or row.get("upstream_tag"): row
+            for row in inventory.get("variants", [])
+            if (row.get("selector") or row.get("upstream_tag")) in expected
+        }
+        if set(rows) != set(expected):
+            return False, f"Strata inventory selectors differ: {sorted(rows)}"
+        compose_paths, data_paths = set(), set()
+        for selector, (model_token, guidance) in expected.items():
+            row = rows[selector]
+            compose = Path(row.get("compose_abs_path") or row.get("compose_path") or "")
+            data = Path(row.get("strata_data_path") or row.get("data_path") or "")
+            compose_paths.add(str(compose))
+            data_paths.add(str(data))
+            if row.get("strata_model_token") != model_token:
+                return False, f"{selector} has wrong Strata MODEL token"
+            if (
+                row.get("model_id") != "qwen3.8-flash-next"
+                or row.get("engine") != "strata"
+                or row.get("engine_display") != "Strata"
+                or row.get("profile_engine_id") != "strata"
+                or row.get("topology") != "single"
+                or row.get("requires_min_gpu_count") != 1
+                or row.get("requires_sm") != "75+"
+            ):
+                return False, f"{selector} lost its Strata model, engine, topology, or hardware identity"
+            if float(row.get("recommended_combined_memory_gb") or 0) != guidance:
+                return False, f"{selector} lost advisory combined-memory guidance"
+            if row.get("hardware_blocked") not in (False, None):
+                return False, f"{selector} was unexpectedly hardware-blocked in the inventory fixture"
+            if not compose.is_file() or not data.is_dir():
+                return False, f"{selector} does not have its isolated Compose/data paths"
+            compose_text = compose.read_text(encoding="utf-8")
+            if (
+                f"MODEL: {model_token}" not in compose_text
+                or "${PORT}:8080" not in compose_text
+                or 'PORT: "8080"' not in compose_text
+                or "/data" not in compose_text
+                or "memlock:" not in compose_text
+                or "driver: nvidia" not in compose_text
+                or 'API_KEY: "${STRATA_API_KEY}"' not in compose_text
+                or "start_period: 600s" not in compose_text
+            ):
+                return False, f"{selector} Compose contract is incomplete"
+        if len(compose_paths) != 4 or len(data_paths) != 4:
+            return False, "Strata selectors do not have distinct Compose and data directories"
+        source_paths = {row.get("strata_source_path") for row in rows.values()}
+        images = {row.get("strata_image") for row in rows.values()}
+        commits = {row.get("strata_commit") for row in rows.values()}
+        expected_source = str(state_dir / "builtin-models" / "strata" / "source")
+        if source_paths != {expected_source} or images != {"club3090-strata:v0.1.40.1"}:
+            return False, "Strata variants do not share the pinned source and image contract"
+        evaluator = r'''
+import json
+import os
+from unittest.mock import patch
+import control
+system = control
+
+expected = set(json.loads(os.environ["STRATA_SMOKE_EXPECTED"]))
+rows = {
+    row.get("selector") or row.get("upstream_tag"): row
+    for row in json.loads(os.environ["STRATA_SMOKE_ROWS"])
+}
+
+def evaluate(*, host="Linux", docker="/usr/bin/docker", nvidia="/usr/bin/nvidia-smi",
+             runtime=True, gpu_output="0, 8.6, 580.1", gpu_rc=0, assigned=None):
+    def run_cmd(command, timeout=None):
+        if "info" in command:
+            return (0, json.dumps({"nvidia": {}} if runtime else {"runc": {}}))
+        return (gpu_rc, gpu_output)
+    with patch.object(system.platform, "system", return_value=host), \
+         patch.object(system.shutil, "which",
+                      side_effect=lambda name: docker if name == "docker" else nvidia), \
+         patch.object(system, "run_cmd", side_effect=run_cmd):
+        return system.evaluate_strata_hardware(assigned)
+
+def blocked(result, phrase):
+    assert result["hardware_blocked"] is True, result
+    assert phrase.lower() in result["hardware_block_reason"].lower(), result
+
+blocked(evaluate(host="Darwin"), "Linux")
+blocked(evaluate(docker=None), "Docker")
+blocked(evaluate(runtime=False), "NVIDIA runtime")
+blocked(evaluate(nvidia=None), "nvidia-smi")
+blocked(evaluate(gpu_rc=1, gpu_output=""), "nvidia-smi")
+blocked(evaluate(gpu_output="0, 8.6, 579.99"), "580")
+blocked(evaluate(gpu_output="0, 9.9, 580.1"), "compute capability")
+
+# The table evaluates all visible GPUs; a selected instance evaluates only
+# its assigned GPU, even when another visible GPU is compatible.
+mixed = "0, 9.9, 580.1\n1, 8.9, 580.1"
+assert evaluate(gpu_output=mixed)["hardware_blocked"] is False
+blocked(evaluate(gpu_output=mixed, assigned=[0]), "compute capability")
+assert evaluate(gpu_output=mixed, assigned=[1])["hardware_blocked"] is False
+assert evaluate(gpu_output=mixed, assigned=[0, 1])["hardware_blocked"] is False
+
+# Every supported architecture is accepted, and enrichment returns independent
+# row copies while preserving the install projection and all four selectors.
+for capability in ("7.5", "8.0", "8.6", "8.9", "12.0"):
+    assert evaluate(gpu_output=f"0, {capability}, 580.1")["hardware_blocked"] is False
+source_rows = []
+for index, row in enumerate(rows.values()):
+    enriched_source = dict(row)
+    enriched_source["install_state"] = f"state-{index}"
+    enriched_source["install_reason"] = f"reason-{index}"
+    source_rows.append(enriched_source)
+with patch.object(system, "evaluate_strata_hardware",
+                  return_value={"hardware_blocked": True, "hardware_block_reason": "fixture blocked"}):
+    enriched = system.enrich_strata_hardware_rows(source_rows)
+assert len(enriched) == 4, len(enriched)
+assert {row.get("selector") or row.get("upstream_tag") for row in enriched} == set(expected)
+for index, (original, result) in enumerate(zip(source_rows, enriched)):
+    assert result is not original
+    assert original.get("hardware_blocked") is not True
+    assert result["hardware_blocked"] is True
+    assert result["hardware_block_reason"] == "fixture blocked"
+    assert result["install_state"] == original["install_state"] == f"state-{index}"
+    assert result["install_reason"] == original["install_reason"] == f"reason-{index}"
+control.load_runtime_inventory(force=True)
+for selector, row in rows.items():
+    for operation in (
+        lambda selector=selector: control.preset_resource_delete_plan(selector),
+        lambda selector=selector: control.preset_cache_delete_plan(selector),
+        lambda selector=selector: control.start_model_update_job(variant_id=selector),
+        lambda path=row["strata_data_path"]: control.delete_model_resource_paths([path]),
+    ):
+        try:
+            operation()
+        except ValueError as exc:
+            assert "Strata" in str(exc), exc
+        else:
+            raise AssertionError(f"generic resource action was allowed for {selector}")
+
+blocked_row = next(iter(rows.values()))
+instance = {"id": "GPU0", "kind": "single", "gpu_index": 0, "gpu_indices": [0],
+            "mode": blocked_row["selector"], "port": 19450}
+with patch.object(control, "instance_variant_spec", return_value=blocked_row), \
+     patch.object(control, "evaluate_strata_hardware",
+                  return_value={"hardware_blocked": True, "hardware_block_reason": "fixture incompatible"}), \
+     patch.object(control, "ensure_variant_install_ready", side_effect=AssertionError("install preflight ran")), \
+     patch.object(control, "preflight_instance_docker_images", side_effect=AssertionError("image preflight ran")):
+    try:
+        control._instance_launch(instance)
+    except RuntimeError as exc:
+        assert "fixture incompatible" in str(exc), exc
+    else:
+        raise AssertionError("hardware-blocked Strata assignment launched")
+
+with patch.object(control, "instance_variant_spec", return_value=blocked_row), \
+     patch.object(control, "resolve_variant_launch_env", return_value={}):
+    artifact_paths = control.write_instance_artifacts(instance)
+env_text = open(artifact_paths["env"], encoding="utf-8").read()
+override_text = open(artifact_paths["override"], encoding="utf-8").read()
+assert "GPU=0" in env_text and "STRATA_API_KEY=" in env_text
+assert all(name not in env_text + override_text for name in
+           ("VLLM_CACHE_ROOT", "TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR"))
+assert os.stat(artifact_paths["env"]).st_mode & 0o777 == 0o600
+assert os.stat(artifact_paths["override"]).st_mode & 0o777 == 0o600
+selector = blocked_row["selector"]
+proxy_instance = {"id": "GPU0", "mode": selector, "gpu_index": 0,
+                  "gpu_indices": [0], "port": 19450}
+for path in (f"/v1/{selector}/models", f"/{selector}/models"):
+    upstream, parsed_selector, _cap = control.parse_preset_path(path)
+    assert parsed_selector == selector and upstream == "/v1/models", (path, upstream, parsed_selector)
+with patch.object(control, "resolve_variant_spec", return_value=blocked_row), \
+     patch.object(control, "visible_instances", return_value=[proxy_instance]), \
+     patch.object(control, "instance_running", return_value=True), \
+     patch.object(control, "instance_runtime_port", return_value=19450), \
+     patch.object(control, "instance_runtime_container_name", return_value="club3090-gpu0"), \
+     patch.object(control, "strata_runtime_ready", return_value=True), \
+     patch.object(control, "vllm_container_names", side_effect=AssertionError("global vLLM lookup ran")):
+    target, target_spec = control.proxy_running_target_for_selector(selector)
+    assert target and target["id"] == "GPU0" and target_spec["engine"] == "strata"
+with patch.object(control, "resolve_variant_spec", return_value=blocked_row), \
+     patch.object(control, "visible_instances", return_value=[proxy_instance]), \
+     patch.object(control, "instance_running", return_value=True), \
+     patch.object(control, "instance_runtime_port", return_value=19450), \
+     patch.object(control, "instance_runtime_container_name", return_value="club3090-gpu0"), \
+     patch.object(control, "strata_runtime_ready", return_value=False):
+    target, _target_spec = control.proxy_running_target_for_selector(selector)
+    assert target is None, target
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import threading
+api_key = control.ensure_strata_api_key()
+class ReadyHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        authorized = self.path == "/v1/models" and self.headers.get("Authorization") == f"Bearer {api_key}"
+        status = 200 if self.path == "/health" or authorized else 401
+        self.send_response(status)
+        self.end_headers()
+        self.wfile.write(b"{}")
+    def log_message(self, *args):
+        pass
+server = ThreadingHTTPServer(("127.0.0.1", 0), ReadyHandler)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+try:
+    root_url = f"http://127.0.0.1:{server.server_port}/"
+    assert system.strata_runtime_ready("fixture", root_url)
+    with patch.object(control, "ensure_strata_api_key", return_value="invalid"):
+        assert not system.strata_runtime_ready("fixture", root_url)
+finally:
+    server.shutdown()
+'''
+        evaluator_env = dict(env)
+        evaluator_env["STRATA_SMOKE_EXPECTED"] = json.dumps(sorted(expected))
+        evaluator_env["STRATA_SMOKE_ROWS"] = json.dumps(list(rows.values()))
+        evaluator_run = subprocess.run(
+            [sys.executable, "-c", evaluator],
+            cwd=str(root / "src"), env=evaluator_env, capture_output=True,
+            text=True, check=False, timeout=30,
+        )
+        if evaluator_run.returncode:
+            return False, f"Strata hardware evaluator smoke failed: {evaluator_run.stderr.strip() or evaluator_run.stdout.strip()}"
+        return True, "four Strata variants preserve exact tokens, isolated data/Compose paths, shared pinned install metadata, and hardware evaluator semantics"

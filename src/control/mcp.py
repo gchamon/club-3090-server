@@ -423,3 +423,23 @@ def ensure_local_api_token():
         return ""
 
 
+
+STRATA_API_KEY_FILE = os.path.join(CONTROL_DIR, "strata_api_key")
+
+
+def ensure_strata_api_key():
+    try:
+        if os.path.exists(STRATA_API_KEY_FILE):
+            token = open(STRATA_API_KEY_FILE, "r", encoding="utf-8").read().strip()
+            if token:
+                os.chmod(STRATA_API_KEY_FILE, 0o600)
+                return token
+        token = secrets.token_urlsafe(32)
+        os.makedirs(CONTROL_DIR, exist_ok=True)
+        with open(STRATA_API_KEY_FILE, "w", encoding="utf-8") as handle:
+            handle.write(token + "\n")
+        os.chmod(STRATA_API_KEY_FILE, 0o600)
+        return token
+    except Exception:
+        return ""
+

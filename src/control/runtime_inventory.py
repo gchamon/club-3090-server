@@ -4298,6 +4298,19 @@ def _container_model_subpath(model_path):
 
 
 def _detect_variant_install_state(variant, model_dir_root):
+    if str((variant or {}).get("engine") or "").strip().lower() == "strata":
+        image = str((variant or {}).get("strata_image") or STRATA_IMAGE)
+        source = str((variant or {}).get("strata_source_path") or os.path.join(CONTROL_DIR, "builtin-models", "strata", "source"))
+        try:
+            commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True, stderr=subprocess.DEVNULL, timeout=5).strip()
+        except Exception:
+            commit = ""
+        try:
+            image_exists = subprocess.run(["docker", "image", "inspect", image], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8).returncode == 0
+        except Exception:
+            image_exists = False
+        ready = commit == STRATA_COMMIT and image_exists
+        return {"install_state": "ready" if ready else "requires_download", "install_command": "strata-image-build", "install_reason": "" if ready else "Pinned Strata source and runtime image are not installed."}
     model_id = str((variant or {}).get("model_id") or "").strip()
     if str((variant or {}).get("source_kind") or "").strip().lower() == "custom":
         host_model_dir = str((variant or {}).get("host_model_dir") or "").strip()
@@ -4691,6 +4704,14 @@ def _rebuild_runtime_mode_tables(inventory):
             "install_state": str(entry.get("install_state") or "").strip(),
             "install_command": str(entry.get("install_command") or "").strip(),
             "install_reason": str(entry.get("install_reason") or "").strip(),
+            "hardware_blocked": bool(entry.get("hardware_blocked")),
+            "hardware_block_reason": str(entry.get("hardware_block_reason") or "").strip(),
+            "strata_model_token": str(entry.get("strata_model_token") or ""),
+            "strata_source_path": str(entry.get("strata_source_path") or ""),
+            "strata_data_path": str(entry.get("strata_data_path") or ""),
+            "strata_image": str(entry.get("strata_image") or ""),
+            "strata_commit": str(entry.get("strata_commit") or ""),
+            "recommended_combined_memory_gb": entry.get("recommended_combined_memory_gb"),
             "speculative_method": entry.get("speculative_method"),
             "drafted_tokens": entry.get("drafted_tokens"),
             "requires_min_vram_gb": int(entry.get("requires_min_vram_gb") or 0),
@@ -4809,6 +4830,7 @@ def rebuild_runtime_inventory():
     compose_registry = _load_upstream_compose_registry()
     if _migration_normalize_migrated_public_name_collisions(compose_registry, tag_by_compose=tag_by_compose):
         custom_model_rows = read_custom_model_registry()
+    custom_model_rows.extend(strata_builtin_custom_model_rows())
     custom_model_rows.extend(qwen38_builtin_custom_model_rows())
     migrated_selector_by_source_compose = {}
     for row in custom_model_rows:
@@ -5150,7 +5172,7 @@ def rebuild_runtime_inventory():
         profile_like = str(row.get("profile_like") or "").strip()
         registry_entry = compose_registry.get(profile_like) or {}
         profile_engine = str(row.get("profile_engine_id") or registry_entry.get("engine") or "").strip()
-        engine_family = _normalize_engine("vllm")
+        engine_family = _normalize_engine(row.get("engine") or "vllm")
         profile_like_lower = profile_like.lower()
         compose_hint = str(registry_entry.get("compose_path") or compose_rel_path).replace("\\", "/").lower()
         if (
@@ -5160,7 +5182,7 @@ def rebuild_runtime_inventory():
             or "/ik-llama/" in compose_hint
         ):
             engine_family = "llamacpp"
-        engine_display = "llama.cpp" if profile_engine == "llama-cpp-local" else _selector_engine_display(profile_like or str(row.get("selector") or ""), compose_rel_path or compose_hint)
+        engine_display = str(row.get("engine_display") or ("Strata" if engine_family == "strata" else ("llama.cpp" if profile_engine == "llama-cpp-local" else _selector_engine_display(profile_like or str(row.get("selector") or ""), compose_rel_path or compose_hint))))
         runtime_tp = int((runtime_meta.get("tp") or runtime_meta.get("tensor_parallel") or registry_entry.get("tp") or 1) or 1)
         topology = _infer_topology_from_compose_path(
             str(registry_entry.get("compose_path") or compose_rel_path or row.get("selector") or row.get("slug") or ""),
@@ -5214,7 +5236,7 @@ def rebuild_runtime_inventory():
             "custom_preset": bool(custom_preset),
             "engine": engine_family,
             "engine_display": engine_display or engine_family,
-            "engine_profile": str(row.get("profile_engine_id") or registry_entry.get("engine") or "vllm-nightly-clean").strip(),
+            "engine_profile": str(row.get("engine_profile") or row.get("profile_engine_id") or registry_entry.get("engine") or "vllm-nightly-clean").strip(),
             "topology": topology,
             "compose_rel_path": compose_rel_path,
             "compose_abs_path": compose_abs_path,
@@ -5249,7 +5271,7 @@ def rebuild_runtime_inventory():
             "requires_min_vram_gb": int(row.get("requires_min_vram_gb") or 0),
             "requires_min_gpu_count": max(required_gpu_count, int(row.get("requires_min_gpu_count") or 0)),
             "tensor_parallel": runtime_tp,
-            "requires_sm": str(registry_entry.get("required_sm") or "").strip(),
+            "requires_sm": str(row.get("requires_sm") or registry_entry.get("required_sm") or "").strip(),
             "requires_nvlink": bool(custom_nvlink_mode == "required"),
             "nvlink_mode": custom_nvlink_mode,
             "source_kind": "custom",
@@ -5276,6 +5298,12 @@ def rebuild_runtime_inventory():
             "requires_hf_approval": bool(row.get("requires_hf_approval", False)),
             "install_command": str(row.get("install_command") or "").strip(),
             "install_reason": str(row.get("install_reason") or "").strip(),
+            "strata_model_token": str(row.get("strata_model_token") or ""),
+            "strata_source_path": str(row.get("strata_source_path") or ""),
+            "strata_data_path": str(row.get("strata_data_path") or ""),
+            "strata_image": str(row.get("strata_image") or ""),
+            "strata_commit": str(row.get("strata_commit") or ""),
+            "recommended_combined_memory_gb": row.get("recommended_combined_memory_gb"),
             "compose_environment": runtime_meta.get("compose_environment") or [],
             "compose_volumes": runtime_meta.get("compose_volumes") or [],
             "compose_volume_targets": runtime_meta.get("compose_volume_targets") or [],

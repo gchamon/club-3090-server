@@ -6699,6 +6699,10 @@ function variantHardwareSummary(variant) {
   const engineProfile = String(variant?.engine_profile || "").trim();
   const nvlinkMode = variantNvlinkMode(variant);
   const parts = [];
+  const recommendedCombinedMemory = Number(variant?.recommended_combined_memory_gb || 0);
+  if (recommendedCombinedMemory > 0) {
+    parts.push(`${recommendedCombinedMemory} GB combined RAM+VRAM fit guidance (advisory)`);
+  }
   if (minVram > 0) {
     parts.push(
       minGpuCount > 1 ? `${minGpuCount}x ${minVram} GB minimum` : `${minVram} GB minimum`,
@@ -10096,6 +10100,7 @@ function rigSummaryText() {
   return `${base} | ${nvlink.present ? "NVLink active" : "NVLink inactive"}`;
 }
 function variantFitsCurrentRig(variant) {
+  if (variant?.hardware_blocked) return false;
   const rows = Array.isArray(lastStatus?.gpus) ? lastStatus.gpus.filter((row) => row && !row.error) : [];
   if (!rows.length) return true;
   const minGpuCount = Number(variant?.requires_min_gpu_count || 0);
@@ -10117,6 +10122,8 @@ function variantFitsCurrentRig(variant) {
   return true;
 }
 function variantRigBlockReason(variant) {
+  const serverReason = String(variant?.hardware_block_reason || "").trim();
+  if (variant?.hardware_blocked) return serverReason || "Hardware prerequisites are not satisfied on this host.";
   const rows = Array.isArray(lastStatus?.gpus) ? lastStatus.gpus.filter((row) => row && !row.error) : [];
   const minGpuCount = Number(variant?.requires_min_gpu_count || 0);
   const minVramGb = Number(variant?.requires_min_vram_gb || 0);
@@ -10155,7 +10162,9 @@ function variantEffectiveStatusKind(variant) {
   return rawKind || "unknown";
 }
 function variantEffectiveInstallState(variant) {
-  return variantRigBlockReason(variant) ? "hardware_blocked" : String(variant?.install_state || "unknown");
+  return variant?.hardware_blocked || variantRigBlockReason(variant)
+    ? "hardware_blocked"
+    : String(variant?.install_state || "unknown");
 }
 function variantDisplayGroupKey(variant) {
   if (variantNvlinkMode(variant) === "required") return "nvlink";
@@ -11087,6 +11096,8 @@ function dynamicPresetModelsRenderSignature() {
   const variantState = inventoryVariants().map((variant) => [
     variantSelector(variant),
     variant?.install_state,
+    variant?.hardware_blocked,
+    variant?.hardware_block_reason,
     variant?.status,
     variant?.status_kind,
     variant?.resource_size_bytes,
