@@ -652,7 +652,9 @@ def run_updater_status_smoke_test(root: Path) -> tuple[bool, str]:
             "printf 'git %s\\n' \"$*\" >> \"$CLUB3090_TEST_TRACE\"\n"
             "repo=$2; shift 2\n"
             "case \"$1\" in\n"
-            "  rev-parse) if [ \"$2\" = \"--show-toplevel\" ]; then printf '%s\\n' \"$repo\"; "
+            "  rev-parse) if [ \"$2\" = \"--show-toplevel\" ]; then "
+            "if [ \"$CLUB3090_TEST_DUBIOUS\" = \"$repo\" ]; then printf 'fatal: detected dubious ownership\\n' >&2; exit 1; fi; "
+            "printf '%s\\n' \"$repo\"; "
             "elif [ \"$CLUB3090_TEST_DIRTY\" = \"$repo\" ] && [ \"$2\" = \"--abbrev-ref\" ]; then exit 1; "
             "else printf 'origin/main\\n'; fi ;;\n"
             "  status) if [ \"$CLUB3090_TEST_DIRTY\" = \"$repo\" ]; then printf ' M file\\n'; fi ;;\n"
@@ -662,6 +664,18 @@ def run_updater_status_smoke_test(root: Path) -> tuple[bool, str]:
             encoding="utf-8",
         )
         git_wrapper.chmod(0o755)
+        runuser_wrapper = bin_dir / "runuser"
+        runuser_wrapper.write_text(
+            "#!/bin/sh\n"
+            "printf 'runuser %s\\n' \"$*\" >> \"$CLUB3090_TEST_TRACE\"\n"
+            "[ \"$1\" = \"--user\" ] || exit 2\n"
+            "shift 2\n"
+            "[ \"$1\" = \"--\" ] || exit 2\n"
+            "shift\n"
+            "exec \"$@\"\n",
+            encoding="utf-8",
+        )
+        runuser_wrapper.chmod(0o755)
         python_wrapper = bin_dir / "python3"
         python_wrapper.write_text(
             "#!/bin/sh\nprintf 'python %s\\n' \"$*\" >> \"$CLUB3090_TEST_TRACE\"\nexit 0\n",
@@ -713,6 +727,14 @@ def run_updater_status_smoke_test(root: Path) -> tuple[bool, str]:
         positions = [next((index for index, line in enumerate(trace_lines) if milestone in line), -1) for milestone in milestones]
         if any(position < 0 for position in positions) or positions != sorted(positions):
             return False, f"System Update stages did not run in order: {trace_lines!r}"
+        for repo in (server_dir, upstream_dir):
+            repo_uid = os.stat(repo).st_uid
+            if not any(
+                line.startswith(f"runuser --user {repo_uid} -- env HOME=")
+                and f"git -C {repo}" in line
+                for line in trace_lines
+            ):
+                return False, f"System Update did not run Git as worktree owner uid {repo_uid}: {trace_lines!r}"
         trace.write_text("", encoding="utf-8")
         dirty_env = dict(command_env)
         dirty_env["CLUB3090_TEST_DIRTY"] = str(upstream_dir)
@@ -723,4 +745,14 @@ def run_updater_status_smoke_test(root: Path) -> tuple[bool, str]:
         dirty_lines = trace.read_text(encoding="utf-8").splitlines()
         if dirty.returncode == 0 or "local changes" not in dirty.stderr or any(" fetch " in line or " merge " in line for line in dirty_lines):
             return False, f"System Update did not stop before mutating a dirty checkout: rc={dirty.returncode} stderr={dirty.stderr!r} trace={dirty_lines!r}"
-        return True, "updater reports System Update and clean/dirty checkout behavior is guarded"
+        trace.write_text("", encoding="utf-8")
+        dubious_env = dict(command_env)
+        dubious_env["CLUB3090_TEST_DUBIOUS"] = str(server_dir)
+        dubious = subprocess.run(
+            ["/bin/bash", "-c", command], cwd=str(root), env=dubious_env,
+            capture_output=True, text=True, check=False, timeout=15,
+        )
+        dubious_lines = trace.read_text(encoding="utf-8").splitlines()
+        if dubious.returncode == 0 or "detected dubious ownership" not in dubious.stderr or any(" fetch " in line or " merge " in line for line in dubious_lines):
+            return False, f"System Update hid a Git ownership failure or mutated before preflight: rc={dubious.returncode} stderr={dubious.stderr!r} trace={dubious_lines!r}"
+        return True, "updater runs Git as checkout owner and guards clean, dirty, and ownership failures"

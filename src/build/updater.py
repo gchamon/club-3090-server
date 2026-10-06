@@ -271,25 +271,41 @@ def build_update_command(operation, scope_name="controller"):
 SERVER_DIR={quoted_server}
 UPSTREAM_DIR={quoted_upstream}
 CONTROL_DIR={quoted_control}
+command -v runuser >/dev/null 2>&1 || {{ echo "System Update requires runuser to access Git worktrees as their owners" >&2; exit 1; }}
+git_as_repo_owner() {{
+  local repo="$1" repo_uid passwd_entry repo_home
+  shift
+  repo_uid="$(stat -c '%u' -- "$repo")" || {{ echo "Unable to determine Git worktree owner: $repo" >&2; return 1; }}
+  passwd_entry="$(getent passwd "$repo_uid")" || {{ echo "No account found for Git worktree owner uid $repo_uid ($repo)" >&2; return 1; }}
+  repo_home="$(printf '%s\\n' "$passwd_entry" | cut -d: -f6)"
+  runuser --user "$repo_uid" -- env HOME="$repo_home" git -C "$repo" "$@"
+}}
 for repo in "$SERVER_DIR" "$UPSTREAM_DIR"; do
-  git -C "$repo" rev-parse --show-toplevel >/dev/null 2>&1 || {{ echo "Not a Git worktree: $repo" >&2; exit 1; }}
+  git_as_repo_owner "$repo" rev-parse --show-toplevel >/dev/null || {{
+    echo "Not a Git worktree or inaccessible as its owner: $repo" >&2
+    exit 1
+  }}
 done
 for repo in "$SERVER_DIR" "$UPSTREAM_DIR"; do
-  if [[ -n "$(git -C "$repo" status --porcelain)" ]]; then
+  if ! worktree_status="$(git_as_repo_owner "$repo" status --porcelain)"; then
+    echo "Unable to inspect Git worktree status: $repo" >&2
+    exit 1
+  fi
+  if [[ -n "$worktree_status" ]]; then
     echo "Refusing System Update: checkout has local changes: $repo" >&2
     exit 1
   fi
-  git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name '@{{u}}' >/dev/null 2>&1 || {{
+  git_as_repo_owner "$repo" rev-parse --abbrev-ref --symbolic-full-name '@{{u}}' >/dev/null || {{
     echo "Refusing System Update: checkout has no upstream tracking branch: $repo" >&2
     exit 1
   }}
 done
 echo "[system-update] Fast-forwarding Club-3090 Server checkout"
-git -C "$SERVER_DIR" fetch --prune origin
-git -C "$SERVER_DIR" merge --ff-only '@{{u}}'
+git_as_repo_owner "$SERVER_DIR" fetch --prune origin
+git_as_repo_owner "$SERVER_DIR" merge --ff-only '@{{u}}'
 echo "[system-update] Fast-forwarding upstream Club-3090 checkout"
-git -C "$UPSTREAM_DIR" fetch --prune origin
-git -C "$UPSTREAM_DIR" merge --ff-only '@{{u}}'
+git_as_repo_owner "$UPSTREAM_DIR" fetch --prune origin
+git_as_repo_owner "$UPSTREAM_DIR" merge --ff-only '@{{u}}'
 echo "[system-update] Rebuilding Model DB"
 cd "$SERVER_DIR/src"
 CLUB3090_CONTROL_DIR="$CONTROL_DIR" CLUB3090_DIR="$UPSTREAM_DIR" PYTHONPATH="$SERVER_DIR/src" python3 -m control.http_server --rebuild-inventory

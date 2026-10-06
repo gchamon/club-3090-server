@@ -20,9 +20,9 @@ Use systemd's journal to inspect service output, for example `journalctl -u club
 
 ## Updating
 
-Use **System Update** in the admin panel to fast-forward both the Club-3090 Server checkout and the configured upstream `club-3090` checkout. The updater requires both worktrees to be clean and on branches with configured upstreams; it stops before fetching or merging if either checkout has local changes or is not tracking a branch. It never resets or stashes user changes. Resolve local changes or configure the missing Git upstream, then retry.
+Use **System Update** in the admin panel to fast-forward both the Club-3090 Server checkout and the configured upstream `club-3090` checkout. The updater requires both worktrees to be clean and on branches with configured upstreams; it stops before fetching or merging if either checkout has local changes or is not tracking a branch. It never resets or stashes user changes. For a rejected dirty checkout, inspect it with `git -C /path/to/checkout status`, resolve the changes or commit/stash them locally, then retry.
 
-The updater fetches both origins, merges only with `--ff-only`, rebuilds the Model DB from the updated server and upstream sources, then runs `install.sh` to refresh service registration and restart services. System Update is not an automatic background update. Monitor its output in Update Logs; completion requires the control service and admin HTTP endpoint to become ready.
+The updater runs Git as each worktree's filesystem owner, preserving that account's Git and SSH configuration. It fetches both origins, merges only with `--ff-only`, rebuilds the Model DB from the updated server and upstream sources, then runs `install.sh` to refresh service registration and restart services. System Update is not an automatic background update. Monitor its output in Update Logs; completion requires the control service and admin HTTP endpoint to become ready.
 
 ## Troubleshooting
 
