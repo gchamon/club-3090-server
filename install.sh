@@ -35,9 +35,11 @@ EXTRA_TEMPS="${EXTRA_TEMPS:-0}"
 SETUP_MODEL="${CLUB3090_SETUP_MODEL-}"
 SETUP_MODEL_SET="${CLUB3090_SETUP_MODEL+x}"
 
+progress() { printf '[install] %s\n' "$*" >&2; }
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || missing+=("$1"); }
 
+progress "Checking host dependencies"
 missing=()
 need python3
 need systemctl
@@ -67,6 +69,7 @@ if ((${#missing[@]})); then
   exit 1
 fi
 if [[ "${EXTRA_TEMPS}" == "1" ]]; then
+progress "Checking optional temperature-helper dependencies"
   need gcc
   if ! ldconfig -p 2>/dev/null | grep -q 'libnvidia-ml\.so'; then
     missing+=("NVIDIA Management Library development/runtime linker")
@@ -81,6 +84,7 @@ if [[ "${EXTRA_TEMPS}" == "1" ]]; then
   fi
 fi
 
+progress "Validating server and upstream checkouts"
 [[ -x "${ROOT}/install.sh" && -f "${ROOT}/src/control/http_server.py" && -f "${ROOT}/src/web/base.html" ]] || fail "run this script from a complete Club-3090 Server checkout"
 for helper in prepare-headless-x.sh start-vllm-last-mode.sh follow-vllm-log.sh refresh-ip-certificate.sh; do
   [[ -x "${ROOT}/scripts/club3090-server/${helper}" ]] || fail "missing executable checkout helper: ${ROOT}/scripts/club3090-server/${helper}"
@@ -107,14 +111,20 @@ for value in "${ADMIN_BIND_HOST}" "${PROXY_BIND_HOST}" "${DEFAULT_MODE}" "${EXTR
 done
 
 if [[ "${SETUP_MODEL_SET}" == "x" ]]; then
+  progress "Running upstream model setup for ${SETUP_MODEL} from ${UPSTREAM}"
   (cd -- "${UPSTREAM}" && bash "${UPSTREAM}/scripts/setup.sh" "${SETUP_MODEL}")
+  progress "Upstream model setup completed"
+else
+  progress "No model selected; skipping upstream model setup"
 fi
 
 if [[ "${EUID}" -eq 0 ]]; then SUDO=(); else SUDO=(sudo); fi
+progress "Creating mutable state and service configuration directories"
  "${SUDO[@]}" install -d -m 0700 "${STATE}"
  "${SUDO[@]}" install -d -m 0755 "$(dirname "${ENV_FILE}")"
  "${SUDO[@]}" install -d -m 0755 "${UNIT_DIR}"
 if [[ "${EXTRA_TEMPS}" == "1" ]]; then
+  progress "Compiling optional temperature helper"
   temporary_binary="$(mktemp)"
   trap 'rm -f "${temporary_binary:-}"' EXIT
   gcc -O3 -I"${ROOT}/src/build/vendor" "${ROOT}/src/build/vendor/gputemps.c" -o "${temporary_binary}" -lnvidia-ml -lpci
@@ -122,6 +132,7 @@ if [[ "${EXTRA_TEMPS}" == "1" ]]; then
   rm -f "${temporary_binary}"
   trap - EXIT
 fi
+progress "Writing service configuration to ${ENV_FILE}"
  "${SUDO[@]}" env \
   CLUB3090_SERVER_DIR="${ROOT}" \
   CLUB3090_DIR="${UPSTREAM}" \
@@ -175,6 +186,7 @@ PY
 install_unit() {
   local source="$1" target="$2" line
   local rendered="$(mktemp)"
+  progress "Rendering and installing ${target}"
   while IFS= read -r line || [[ -n "${line}" ]]; do
     line="${line//@SOURCE_ROOT@/${ROOT}}"
     line="${line//@ENV_FILE@/${ENV_FILE}}"
@@ -186,6 +198,7 @@ install_unit() {
   rm -f "${rendered}"
 }
 
+progress "Rendering systemd service units into ${UNIT_DIR}"
 install_unit club3090-control.service club3090-control.service
 install_unit club3090-benchmarks.service club3090-benchmarks.service
 install_unit club3090-updater.service club3090-updater.service
@@ -194,10 +207,14 @@ install_unit club3090-console-log.service club3090-console-log.service
 install_unit club3090-vllm.service club3090-vllm.service
 install_unit club3090-cert-refresh.service club3090-cert-refresh.service
 install_unit club3090-cert-refresh.timer club3090-cert-refresh.timer
+progress "Reloading systemd unit definitions"
 "${SUDO[@]}" systemctl daemon-reload
+progress "Enabling control, benchmark, updater, and inference services"
 "${SUDO[@]}" systemctl enable club3090-control.service club3090-benchmarks.service club3090-updater.service club3090-vllm.service
+progress "Starting control, updater, and inference services; systemd may wait for startup"
 "${SUDO[@]}" systemctl start club3090-control.service club3090-updater.service club3090-vllm.service
+progress "Installation complete"
 
 printf 'Installed Club-3090 Server services from %s\n' "${ROOT}"
 printf 'Upstream runtime: %s\nMutable state: %s\nConfiguration: %s\n' "${UPSTREAM}" "${STATE}" "${ENV_FILE}"
-printf 'Start the admin service with: sudo systemctl start club3090-control.service\n'
+printf 'Admin panel: http://%s:%s/admin\nOpenAI-compatible API: http://%s:%s/v1\n' "${ADMIN_BIND_HOST}" "${ADMIN_PORT}" "${PROXY_BIND_HOST}" "${PROXY_PORT}"

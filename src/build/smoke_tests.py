@@ -128,6 +128,17 @@ def run_repository_install_smoke_test(root: Path) -> tuple[bool, str]:
         )
         if setup_result.returncode:
             return False, setup_result.stderr.strip() or "selected-model installer run failed"
+        installer_output = setup_result.stdout + setup_result.stderr
+        for message in (
+            "[install] Checking host dependencies",
+            "[install] Running upstream model setup for qwen3.6-27b",
+            "[install] Upstream model setup completed",
+            "[install] Rendering systemd service units",
+            "[install] Starting control, updater, and inference services",
+            "[install] Installation complete",
+        ):
+            if message not in installer_output:
+                return False, f"installer omitted progress message {message!r}"
         setup_lines = (temp / "upstream-setup.log").read_text(encoding="utf-8").splitlines()
         if setup_lines != [str(upstream), "1", "qwen3.6-27b", "/models/test", "4bit|1"]:
             return False, f"upstream setup did not receive expected checkout, model, and environment: {setup_lines!r}"
