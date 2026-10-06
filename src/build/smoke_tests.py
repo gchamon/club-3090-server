@@ -76,7 +76,7 @@ def run_repository_install_smoke_test(root: Path) -> tuple[bool, str]:
         mutation_wrapper = '#!/bin/sh\nif [ "$1" = "-C" ] && [ "$3" = "rev-parse" ]; then exec "$CLUB3090_TEST_REAL_GIT" "$@"; fi\nprintf "%s\\n" "$*" >> "$CLUB3090_TEST_MUTATION_LOG"\nexit 99\n'
         wrappers = {
             "sudo": '#!/bin/sh\nexec "$@"\n',
-            "systemctl": '#!/bin/sh\nprintf "%s\\n" "$*" >> "$CLUB3090_TEST_SYSTEMCTL_LOG"\nexit 0\n',
+            "systemctl": '#!/bin/sh\nprintf "%s\\n" "$*" >> "$CLUB3090_TEST_SYSTEMCTL_LOG"\nif [ "$1" = "is-active" ] && [ "${CLUB3090_TEST_HEALTH_DELAY:-}" = "1" ]; then marker="${CLUB3090_TEST_SYSTEMCTL_LOG}.$3"; if [ ! -e "$marker" ]; then : > "$marker"; exit 1; fi; fi\nexit 0\n',
             "docker": '#!/bin/sh\nif [ "$1 $2 $3" = "compose version" ]; then exit 0; fi\nexit 0\n',
             "git": mutation_wrapper,
             "apt": mutation_wrapper,
@@ -121,7 +121,13 @@ def run_repository_install_smoke_test(root: Path) -> tuple[bool, str]:
             wrapper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             wrapper.chmod(0o755)
         setup_env = dict(env)
-        setup_env.update(CLUB3090_SETUP_MODEL="qwen3.6-27b", MODEL_DIR="/models/test", WEIGHTS="4bit", WITH_DFLASH_DRAFT="1")
+        setup_env.update(
+            CLUB3090_SETUP_MODEL="qwen3.6-27b",
+            MODEL_DIR="/models/test",
+            WEIGHTS="4bit",
+            WITH_DFLASH_DRAFT="1",
+            CLUB3090_TEST_HEALTH_DELAY="1",
+        )
         setup_result = subprocess.run(
             [str(root / "install.sh")], cwd=str(root), env=setup_env,
             capture_output=True, text=True, check=False, timeout=60,
@@ -136,6 +142,9 @@ def run_repository_install_smoke_test(root: Path) -> tuple[bool, str]:
             "[install] Rendering systemd service units",
             "[install] Starting control, updater, and inference services",
             "[install] Installation complete",
+            "[install] Checking service health with systemd (up to 60s)",
+            "[install] Healthy: all managed services report active",
+            "[install] Waiting for active services:",
         ):
             if message not in installer_output:
                 return False, f"installer omitted progress message {message!r}"
@@ -222,6 +231,10 @@ def run_repository_install_smoke_test(root: Path) -> tuple[bool, str]:
             return False, "installer did not stop and start the deployment services"
         if not systemctl_calls.index(expected_enable) < systemctl_calls.index(expected_stop) < systemctl_calls.index(expected_start):
             return False, "installer did not stop and restart deployment services after enabling units"
+        for service in ("club3090-control.service", "club3090-updater.service", "club3090-vllm.service"):
+            health_check = f"is-active --quiet {service}"
+            if health_check not in systemctl_calls or systemctl_calls.index(health_check) < systemctl_calls.index(expected_start):
+                return False, f"installer did not check health for {service} after starting services"
         return True, "installer registered source-tree services without package-manager or git mutation"
 
 

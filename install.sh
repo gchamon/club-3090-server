@@ -213,8 +213,31 @@ progress "Enabling control, benchmark, updater, and inference services"
 progress "Stopping control, updater, and inference services before applying the installed configuration"
 "${SUDO[@]}" systemctl stop club3090-control.service club3090-updater.service club3090-vllm.service
 progress "Starting control, updater, and inference services; systemd may wait for startup"
-"${SUDO[@]}" systemctl start club3090-control.service club3090-updater.service club3090-vllm.service
+wait_for_services_healthy() {
+  local timeout_seconds=60 deadline service
+  local -a services=(club3090-control.service club3090-updater.service club3090-vllm.service)
+  local -a inactive=()
+  deadline=$((SECONDS + timeout_seconds))
+  progress "Checking service health with systemd (up to ${timeout_seconds}s)"
+  while ((SECONDS < deadline)); do
+    inactive=()
+    for service in "${services[@]}"; do
+      "${SUDO[@]}" systemctl is-active --quiet "${service}" || inactive+=("${service}")
+    done
+    if ((${#inactive[@]} == 0)); then
+      progress "Healthy: all managed services report active"
+      return 0
+    fi
+    progress "Waiting for active services: ${inactive[*]}"
+    sleep 2
+  done
+  fail "service health check timed out after ${timeout_seconds}s; inactive: ${inactive[*]}. Inspect with journalctl -u <service>"
+}
+if ! "${SUDO[@]}" systemctl start club3090-control.service club3090-updater.service club3090-vllm.service; then
+  progress "systemd start returned a failure; checking final service states"
+fi
 progress "Installation complete"
+wait_for_services_healthy
 
 printf 'Installed Club-3090 Server services from %s\n' "${ROOT}"
 printf 'Upstream runtime: %s\nMutable state: %s\nConfiguration: %s\n' "${UPSTREAM}" "${STATE}" "${ENV_FILE}"
