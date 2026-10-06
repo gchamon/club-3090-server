@@ -20,8 +20,27 @@ def evaluate_strata_hardware(assigned_gpu_indices=None):
         runtime_map = json.loads(str(runtimes or "").strip())
     except Exception:
         runtime_map = {}
-    if not isinstance(runtime_map, dict) or "nvidia" not in runtime_map:
-        return {"hardware_blocked": True, "hardware_block_reason": "Docker does not have the NVIDIA runtime."}
+    runtime_available = isinstance(runtime_map, dict) and "nvidia" in runtime_map
+    if not runtime_available:
+        cdi_rc, cdi_output = run_cmd(
+            [docker, "info", "--format", "{{json .DiscoveredDevices}}"],
+            timeout=8,
+        )
+        try:
+            cdi_devices = json.loads(str(cdi_output or "").strip()) if cdi_rc == 0 else []
+        except Exception:
+            cdi_devices = []
+        cdi_available = isinstance(cdi_devices, list) and any(
+            isinstance(device, dict)
+            and device.get("Source") == "cdi"
+            and str(device.get("ID") or "").startswith("nvidia.com/gpu=")
+            for device in cdi_devices
+        )
+        if not cdi_available:
+            return {
+                "hardware_blocked": True,
+                "hardware_block_reason": "Docker has neither the NVIDIA runtime nor a discovered NVIDIA CDI GPU device.",
+            }
     nvidia_smi = shutil.which("nvidia-smi")
     if not nvidia_smi:
         return {"hardware_blocked": True, "hardware_block_reason": "nvidia-smi is unavailable; no usable NVIDIA GPU can be reported."}

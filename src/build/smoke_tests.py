@@ -997,8 +997,11 @@ rows = {
 }
 
 def evaluate(*, host="Linux", docker="/usr/bin/docker", nvidia="/usr/bin/nvidia-smi",
-             runtime=True, gpu_output="0, 8.6, 580.1", gpu_rc=0, assigned=None):
+             runtime=True, cdi=False, gpu_output="0, 8.6, 580.1", gpu_rc=0, assigned=None):
     def run_cmd(command, timeout=None):
+        if any("DiscoveredDevices" in argument for argument in command):
+            devices = [{"Source": "cdi", "ID": "nvidia.com/gpu=0"}] if cdi else []
+            return (0, json.dumps(devices))
         if "info" in command:
             return (0, json.dumps({"nvidia": {}} if runtime else {"runc": {}}))
         return (gpu_rc, gpu_output)
@@ -1014,7 +1017,8 @@ def blocked(result, phrase):
 
 blocked(evaluate(host="Darwin"), "Linux")
 blocked(evaluate(docker=None), "Docker")
-blocked(evaluate(runtime=False), "NVIDIA runtime")
+blocked(evaluate(runtime=False), "neither the NVIDIA runtime nor")
+assert evaluate(runtime=False, cdi=True)["hardware_blocked"] is False, evaluate(runtime=False, cdi=True)
 blocked(evaluate(nvidia=None), "nvidia-smi")
 blocked(evaluate(gpu_rc=1, gpu_output=""), "nvidia-smi")
 blocked(evaluate(gpu_output="0, 8.6, 579.99"), "580")

@@ -22,7 +22,7 @@ Use systemd's journal to inspect service output, for example `journalctl -u club
 
 The Model DB lists four instance-scoped Strata presets for Qwen3.8-Flash-Next (`Q2_0`, `IQ2_XS`, `IQ3_XXS`, and `IQ3_S`). Install the pinned Strata runtime from the preset card, then select and start a preset in **Instances**. The shared runtime image and source checkout are installed once; each size keeps its own persistent data directory. Stop or remove an instance from **Instances**; generic model-resource and cache deletion do not apply to Strata.
 
-Strata requires Linux, Docker with the NVIDIA runtime, a working `nvidia-smi`, NVIDIA driver 580 or newer, and a GPU with compute capability 7.5, 8.0, 8.6, 8.9, or 12.0. The hardware-blocked preset list reports failed prerequisites. Combined RAM+VRAM figures on the cards are upstream fit guidance, not launch thresholds.
+Strata requires Linux, Docker with either the NVIDIA runtime or a discovered NVIDIA CDI GPU device, a working `nvidia-smi`, NVIDIA driver 580 or newer, and a GPU with compute capability 7.5, 8.0, 8.6, 8.9, or 12.0. The hardware-blocked preset list reports failed prerequisites. Combined RAM+VRAM figures on the cards are upstream fit guidance, not launch thresholds.
 
 OpenAI-compatible requests can target a running Strata preset with `http://HOST:8009/v1/strata/<preset>/models` or `http://HOST:8009/strata/<preset>/models`; Chat Completions use the same prefixes. A Strata request returns HTTP 503 when no ready matching instance is running. Start it from **Instances**.
 
