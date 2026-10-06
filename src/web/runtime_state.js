@@ -126,9 +126,16 @@ function writeUiStateToLocationSearch(data = {}) {
   try {
     const nextUrl = new URL(window.location.href);
     const modelType = normalizeAIStudioModelType(data.ai_studio_model_type);
+    const completingAuditUpdate =
+      window.sessionStorage.getItem("club3090_system_update_audit_reload") === "1" &&
+      normalizeTabName(data.active_tab) === "logs" &&
+      normalizeUiLogSource(data.current_log_source) === "audit";
+    if (completingAuditUpdate) {
+      window.sessionStorage.removeItem("club3090_system_update_audit_reload");
+    }
     nextUrl.searchParams.delete("ui_tab");
     nextUrl.searchParams.delete("ui_scroll");
-    if (modelType) nextUrl.searchParams.set("ui_ai_studio_category", modelType);
+    if (modelType && !completingAuditUpdate) nextUrl.searchParams.set("ui_ai_studio_category", modelType);
     else nextUrl.searchParams.delete("ui_ai_studio_category");
     const nextPath = `${nextUrl.pathname}${nextUrl.search}${nextUrl.hash}`;
     const currentPath = `${window.location.pathname || ""}${window.location.search || ""}${window.location.hash || ""}`;

@@ -1392,8 +1392,14 @@ function triggerAdminPanelReload(message = "Reloading the admin panel...", delay
     const restoreScroll = Math.max(0, Number(updateMonitor.returnScrollTop || savedReturn?.scrollTop || 0));
     if (restoreTab) query.set("restore_tab", restoreTab);
     if (restoreScroll > 0) query.set("restore_scroll", String(restoreScroll));
-    const target = `/admin?${query.toString()}`;
-    window.location.href = target;
+    if (restoreTab === "logs" && currentLogSource === "audit") {
+      try {
+        window.sessionStorage.setItem("club3090_system_update_audit_reload", "1");
+      } catch (e) {}
+      window.location.reload();
+      return;
+    }
+    window.location.href = `/admin?${query.toString()}`;
   };
   const tryReload = async () => {
     if (Date.now() - startedAt > 30000) {
@@ -1490,7 +1496,7 @@ async function pollUpdateMonitorStatus() {
 }
 function beginUpdateMonitor(payload, scope) {
   stopExternalUpdateSignalStream();
-  if (!updateMonitor.returnLogSource || currentLogSource !== "update") {
+  if (!updateMonitor.returnLogSource) {
     updateMonitor.returnLogSource = updateFallbackLogSource(currentLogSource);
   }
   updateMonitor.active = true;
@@ -1510,14 +1516,14 @@ function beginUpdateMonitor(payload, scope) {
   updateMonitor.statusTimer = setInterval(() => {
     pollUpdateMonitorStatus().catch(() => {});
   }, 2000);
-  currentLogSource = "update";
+  currentLogSource = "audit";
   setUpdateUiLocked(true);
   activateTab("logs", true);
   connectLogs(true);
   updateLogVisualMode();
   setAuditMsg(
     scope === "club3090"
-      ? "System Update is running through the separate updater service. Update Logs will stay selected while the control plane restarts."
+      ? "System Update is running through the separate updater service. Audit Logs will stay selected while the control plane restarts."
       : "Admin script update is running through the separate updater service. The orange log stream will stay live while the control plane restarts.",
   );
   scheduleRenderedUpdateAcknowledgement(updateMonitor.token);
@@ -1530,14 +1536,14 @@ function beginPendingUpdateUi(scope) {
   updateMonitor.completed = false;
   updateMonitor.startedAt = Date.now();
   updateMonitor.reloadScheduled = false;
-  currentLogSource = "update";
+  currentLogSource = "audit";
   setUpdateUiLocked(true);
   activateTab("logs", true);
   connectLogs(true);
   updateLogVisualMode();
   setAuditMsg(
     scope === "club3090"
-      ? "Starting System Update. Update Logs will remain selected while the control plane restarts."
+      ? "Starting System Update. Audit Logs will remain selected while the control plane restarts."
       : "Starting admin script update. The orange update log will remain selected while the control plane restarts.",
   );
 }

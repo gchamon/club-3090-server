@@ -7818,7 +7818,8 @@ async function startUpdateFlow() {
       "/admin/update update club3090",
       { silentFailure: true },
     );
-    setAuditMsg("System Update started. Output is streaming to Update Logs.");
+    window.history.replaceState(window.history.state, "", "/admin#tab=logs&log_source=audit");
+    setAuditMsg("System Update started. Output is streaming to Audit Logs.");
   } catch (error) {
     abandonPendingUpdateUi("System Update failed before the updater handoff. Restored normal logs.");
     throw error;

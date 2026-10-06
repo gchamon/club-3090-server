@@ -379,6 +379,7 @@ function pendingUpdateUiCanBeAbandoned(update = {}) {
   return Date.now() - Number(updateMonitor.startedAt || 0) > 3000;
 }
 function abandonPendingUpdateUi(message = "") {
+  const restoreLogSource = updateUiLocked || currentLogSource === "update";
   if (updateMonitor.statusTimer) {
     clearInterval(updateMonitor.statusTimer);
     updateMonitor.statusTimer = null;
@@ -390,7 +391,7 @@ function abandonPendingUpdateUi(message = "") {
   updateMonitor.token = "";
   updateAcknowledgedToken = "";
   setUpdateUiLocked(false);
-  if (currentLogSource === "update") {
+  if (restoreLogSource) {
     currentLogSource = updateFallbackLogSource(updateMonitor.returnLogSource);
     if (typeof noteKnownLogSource === "function") noteKnownLogSource(currentLogSource);
     if (typeof applyLogVisibility === "function") applyLogVisibility();
@@ -462,7 +463,6 @@ async function acknowledgeRenderedUpdateMode(token = "") {
   if (
     !updateMonitor.active ||
     !updateUiLocked ||
-    currentLogSource !== "update" ||
     activeTabName !== "logs" ||
     !document.body.classList.contains("update-lock-active")
   ) {
