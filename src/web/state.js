@@ -1269,50 +1269,18 @@ function setAuditMsg(t) {
 function renderUpdateNotices(status = {}) {
   const host = $("updateNoticeHost");
   if (!host) return;
-  const remote = status.remote_update || {};
   const compat = status.club3090_compat || {};
-  const supported = compat.supported || {};
-  const updateActive = selfUpdateActive(status);
-  const benchmarkActive =
-    typeof benchmarkJobActive === "function" ? benchmarkJobActive(status) : false;
-  const startedAt = Number(status.control_started_at || 0);
-  const remoteKey = currentUpdateBannerRemoteKey(status);
-  const source = status.self_update_source || {};
-  const hasUpdate = !!source.pending_upgrade;
-  const dismissed = readUpdateBannerDismissed(startedAt, remoteKey);
-  const greenBar =
-    hasUpdate && !dismissed && !updateActive
-      ? `<div class="update-notice-bar update-notice-bar-green"><button class="update-notice-dismiss" onclick="dismissUpdateNotice()" aria-label="Dismiss update notice">✕</button><button class="update-notice-message" onclick="openUpdateNoticeModal()">Upgrade ${escapeHtml(source.cached_script_version || "cached installer")} from local cache (${escapeHtml(String(source.cached_sha || "").slice(0, 12))})</button><span class="update-notice-spacer"></span></div>`
-      : "";
-  const compatButton = updateActive
-    ? '<button class="update-notice-link" type="button" disabled aria-disabled="true">Compatible migration unavailable while an update is running.</button>'
-    : benchmarkActive
-      ? '<button class="update-notice-link" type="button" disabled aria-disabled="true">Stop Model Scores before migrating.</button>'
-      : '<button class="update-notice-link" onclick="startCompatibleMigration()">Click here to migrate to a compatible version!</button>';
-  const redBar = compat.local_repo_newer_than_supported
-    ? `<div class="update-notice-bar update-notice-bar-red"><span class="update-notice-spacer"></span><div class="update-notice-message">The local Club-3090 commit is newer than supported by this script and may cause unforeseen issues. ${compatButton}</div><span class="update-notice-spacer"></span></div>`
+  host.innerHTML = compat.local_repo_newer_than_supported
+    ? '<div class="update-notice-bar update-notice-bar-red"><span class="update-notice-spacer"></span><div class="update-notice-message">The local Club-3090 commit is newer than supported by this script and may cause unforeseen issues. Run System Update only after confirming both checkouts are clean.</div><span class="update-notice-spacer"></span></div>'
     : "";
-  host.innerHTML = `${greenBar}${redBar}`;
-}
-function dismissUpdateNotice() {
-  if (!lastStatus) return;
-  writeUpdateBannerDismissed(lastStatus.control_started_at, currentUpdateBannerRemoteKey(lastStatus));
-  renderUpdateNotices(lastStatus);
-}
-function openUpdateNoticeModal() {
-  const host = $("updateNoticeHost");
-  if (host) host.innerHTML = "";
-  promptUpdateRun();
 }
 function renderUpdateButton(status = {}) {
   const button = $("systemUpdateBtn");
   if (!button) return;
   const updateActive = selfUpdateActive(status);
-  const source = status.self_update_source || {};
-  const pending = !!source.pending_upgrade;
-  button.textContent = updateActive ? "Update Running..." : pending ? "Update Available in Cache" : "Update";
-  button.title = `Selected ${source.version_kind || "branch"}:${source.version_name || "master"} · Cached ${source.cached_script_version || "none"}${pending ? " · Upgrade pending" : ""}`;
-  button.className = pending ? "btn blue btn-update-available" : "btn blue";
+  button.textContent = updateActive ? "Update Running..." : "System Update";
+  button.title = "Fast-forward both clean tracking checkouts, rebuild Model DB, then restart services";
+  button.className = "btn blue";
   button.disabled = updateActive;
 }
 function parseClientScriptVersionTuple(value) {
@@ -1445,43 +1413,6 @@ function triggerAdminPanelReload(message = "Reloading the admin panel...", delay
   };
   window.setTimeout(tryReload, Math.max(0, Number(delayMs || 0)));
 }
-function currentRemoteUpdateVersionInfo() {
-  const remote = (lastStatus && lastStatus.remote_update) || {};
-  const runningVersion = String(lastStatus?.script_version || "").trim();
-  const remoteVersion = String(remote.script_version || "").trim();
-  const comparable =
-    !!runningVersion &&
-    !!remoteVersion &&
-    !!parseClientScriptVersionTuple(runningVersion) &&
-    !!parseClientScriptVersionTuple(remoteVersion);
-  const comparison = comparable
-    ? compareClientScriptVersions(remoteVersion, runningVersion)
-    : null;
-  return {
-    runningVersion,
-    remoteVersion,
-    comparable,
-    comparison,
-    needsConfirmation: comparable && comparison !== null && comparison <= 0,
-  };
-}
-function promptStaleUpdateConfirmation(scope, targetCommit = "") {
-  const versionInfo = currentRemoteUpdateVersionInfo();
-  const remoteVersion = versionInfo.remoteVersion || "unknown";
-  const runningVersion = versionInfo.runningVersion || "unknown";
-  const sameVersion = Number(versionInfo.comparison || 0) === 0;
-  openPresetActionModal({
-    title: sameVersion ? "Confirm Same-Version Update" : "Confirm Downgrade",
-    body: sameVersion
-      ? `The remote installer currently resolves to <code>${escapeHtml(remoteVersion)}</code>, which matches the running admin script version <code>${escapeHtml(runningVersion)}</code>. This usually means the remote cache is still stale. Continue anyway?`
-      : `The remote installer currently resolves to <code>${escapeHtml(remoteVersion)}</code>, which is older than the running admin script version <code>${escapeHtml(runningVersion)}</code>. Continue only if you intentionally want to downgrade or test a stale remote copy.`,
-    confirmLabel: sameVersion ? "Continue Anyway" : "Downgrade Anyway",
-    confirmClass: "orange",
-    onConfirm: async () => {
-      await startUpdateFlow(scope, targetCommit, { skipVersionGuard: true });
-    },
-  });
-}
 function completeUpdateMonitor(payload = {}) {
   markUpdateTokenCompleted(payload?.token || updateMonitor.token);
   endUpdateMonitor();
@@ -1493,13 +1424,6 @@ function completeUpdateMonitor(payload = {}) {
       : `Update finished with status ${payload?.status || "failed"}. Reloading the admin panel...`,
     400,
   );
-}
-async function startCompatibleMigration() {
-  const compat = (lastStatus && lastStatus.club3090_compat) || {};
-  const supported = compat.supported || {};
-  const targetCommit = String(supported.commit || "").trim();
-  if (!targetCommit) throw new Error("No compatible Club-3090 commit is recorded in this script.");
-  await startUpdateFlow("club3090-compatible", targetCommit);
 }
 function updateLogVisualMode() {
   const box = $("log");

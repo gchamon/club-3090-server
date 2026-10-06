@@ -20,7 +20,9 @@ Use systemd's journal to inspect service output, for example `journalctl -u club
 
 ## Updating
 
-The updater reports the checked-out server revision and does not perform self-updates. For a reviewed update, run `git pull` in the server repository, then `sudo ./install.sh` from that checkout to refresh service registration. Update the separate upstream `club-3090` checkout deliberately when needed; the installer never fetches or updates either repository.
+Use **System Update** in the admin panel to fast-forward both the Club-3090 Server checkout and the configured upstream `club-3090` checkout. The updater requires both worktrees to be clean and on branches with configured upstreams; it stops before fetching or merging if either checkout has local changes or is not tracking a branch. It never resets or stashes user changes. Resolve local changes or configure the missing Git upstream, then retry.
+
+The updater fetches both origins, merges only with `--ff-only`, rebuilds the Model DB from the updated server and upstream sources, then runs `install.sh` to refresh service registration and restart services. System Update is not an automatic background update. Monitor its output in Update Logs; completion requires the control service and admin HTTP endpoint to become ready.
 
 ## Troubleshooting
 

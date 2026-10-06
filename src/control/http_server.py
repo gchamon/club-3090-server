@@ -1243,16 +1243,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
         if path == "/admin/update":
             try:
                 data = self.read_json_body()
-                scope_name = _selector_token(data.get("scope"))
-                benchmark_active = benchmark_job_active()
-                if scope_name == "club3090" and benchmark_active:
-                    message = "Stop Model Scores benchmarking before migrating Club-3090."
-                    append_audit_text_line(f"Rejected Club-3090 migration while Model Scores benchmarking is active.")
-                    self.send_json({"ok": False, "error": message}, 409)
-                    return
-                if benchmark_active:
-                    append_audit_text_line("Self-update requested while Model Scores benchmarking is active; leaving benchmark queue and runtimes untouched.")
-                result = start_self_update_job(data.get("operation"), scope_name or data.get("scope"), data.get("target_commit"), data.get("version_kind"), data.get("version_name"))
+                result = start_self_update_job(data.get("operation"), data.get("scope"))
                 self.send_json(result)
             except Exception as e:
                 self.send_json({"ok": False, "error": str(e)}, 500)

@@ -1037,6 +1037,63 @@ def _apply_cpu_profile_globals(profile_name):
     return name
 
 
+def _load_repo_env_map():
+    env_path = os.path.join(CLUB3090_DIR, ".env")
+    result = {}
+    try:
+        with open(env_path, "r", encoding="utf-8", errors="replace") as f:
+            for raw_line in f:
+                line = str(raw_line or "").strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = str(key or "").strip()
+                if not key:
+                    continue
+                value = str(value or "").strip().strip("'").strip('"')
+                result[key] = value
+    except Exception:
+        result = {}
+    if not any(str(result.get(key) or "").strip() for key in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN")):
+        token_candidates = []
+        hf_home = str(os.environ.get("HF_HOME") or "").strip()
+        home = str(os.environ.get("HOME") or "").strip()
+        if hf_home:
+            token_candidates.append(os.path.join(hf_home, "token"))
+        if home:
+            token_candidates.extend([
+                os.path.join(home, ".cache", "huggingface", "token"),
+                os.path.join(home, ".huggingface", "token"),
+            ])
+        token_candidates.extend([
+            "/root/.cache/huggingface/token",
+            "/root/.huggingface/token",
+            *glob.glob("/home/*/.cache/huggingface/token"),
+            *glob.glob("/home/*/.huggingface/token"),
+        ])
+        for token_path in token_candidates:
+            try:
+                with open(token_path, "r", encoding="utf-8", errors="replace") as token_file:
+                    token = token_file.read(4096).strip()
+            except Exception:
+                continue
+            if token.startswith("hf_"):
+                result["HF_TOKEN"] = token
+                break
+    return result
+
+
+def _repo_subprocess_env():
+    env = os.environ.copy()
+    for key, value in _load_repo_env_map().items():
+        if key:
+            env[str(key)] = str(value)
+    if str(os.environ.get("CLUB3090_RESTART") or "").strip():
+        env["CLUB3090_RESTART"] = str(os.environ.get("CLUB3090_RESTART") or "").strip()
+    env["PYTHONUNBUFFERED"] = "1"
+    return env
+
+
 def ensure_upstream_repo_on_sys_path():
     repo_root = os.path.abspath(str(CLUB3090_DIR or "").strip() or ".")
     if repo_root and os.path.isdir(repo_root) and repo_root not in sys.path:
@@ -6823,44 +6880,28 @@ def self_update_source_snapshot():
     return source
 
 
-def start_self_update_job(operation, scope="controller", target_commit="", version_kind="", version_name=""):
+def start_self_update_job(operation, scope="controller"):
     if read_self_update_state().get("active"):
-        raise RuntimeError("A self-update job is already running")
-    operation = str(operation or "").strip().lower()
-    if operation not in {"update", "change_version", "upgrade"}:
-        raise ValueError("Invalid update operation")
+        raise RuntimeError("A System Update job is already running")
+    if model_install_jobs_active():
+        raise RuntimeError("Wait for the current model install job to finish before starting System Update")
+    if str(operation or "").strip().lower() != "update":
+        raise ValueError("Only the System Update operation is supported")
     scope_name = _selector_token(scope)
-    if operation != "upgrade":
-        scope_name = "controller"
-        target_commit = ""
-    elif scope_name not in {"controller", "club3090"}:
-        raise ValueError("Invalid update scope")
-    if operation == "change_version":
-        version_kind, version_name = normalize_self_update_version(version_kind, version_name)
-        source = read_self_update_source()
-        source.update(version_kind=version_kind, version_name=version_name)
-        write_json_file(SELF_UPDATE_SOURCE_FILE, source)
-        log_audit("self_update_version_changed", version_kind=version_kind, version_name=version_name)
-        return {"ok": True, "operation": operation, "self_update_source": self_update_source_snapshot()}
-    if operation == "upgrade":
-        if model_install_jobs_active():
-            raise RuntimeError("Wait for the current model install job to finish before starting an update")
-        if scope_name == "club3090":
-            active_fn = globals().get("benchmark_job_active")
-            if callable(active_fn) and active_fn():
-                raise RuntimeError("Stop Model Scores benchmarking before migrating Club-3090.")
+    if scope_name != "club3090":
+        raise ValueError("System Update requires the Club-3090 scope")
+    active_fn = globals().get("benchmark_job_active")
+    if callable(active_fn) and active_fn():
+        raise RuntimeError("Stop Model Scores benchmarking before starting System Update.")
     subprocess.run(["systemctl", "start", "club3090-updater.service"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
-    payload = {"operation": operation, "scope": scope_name, "target_commit": target_commit}
-    if operation == "change_version":
-        payload.update(version_kind=version_kind, version_name=version_name)
+    payload = {"operation": "update", "scope": "club3090"}
     result = request_self_update_service("/start", payload, timeout=20)
     if not result or result.get("ok") is False:
-        raise RuntimeError(str((result or {}).get("error") or "Self-update service rejected the request"))
-    log_audit("self_update_job_started", operation=operation, scope=scope_name, target_commit=target_commit, via="club3090-updater.service")
+        raise RuntimeError(str((result or {}).get("error") or "System Update service rejected the request"))
+    log_audit("system_update_job_started", scope="club3090", via="club3090-updater.service")
     return {
-        "ok": True, "operation": operation, "scope": scope_name,
-        "label": result.get("label") or operation, "command": result.get("command") or "",
-        "target_commit": target_commit,
+        "ok": True, "operation": "update", "scope": "club3090",
+        "label": result.get("label") or "System Update", "command": result.get("command") or "",
         "stream_url": result.get("stream_url") or "", "status_url": result.get("status_url") or "",
         "update_token": str(result.get("token") or ""),
         "focus_log_source": "update",

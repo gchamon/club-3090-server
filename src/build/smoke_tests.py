@@ -140,7 +140,7 @@ def run_repository_install_smoke_test(root: Path) -> tuple[bool, str]:
             "[install] Running upstream model setup for qwen3.6-27b",
             "[install] Upstream model setup completed",
             "[install] Rendering systemd service units",
-            "[install] Starting control, updater, and inference services",
+            "[install] Starting services; systemd may wait for startup",
             "[install] Installation complete",
             "[install] Checking service health with systemd (up to 60s)",
             "[install] Healthy: all managed services report active",
@@ -235,6 +235,24 @@ def run_repository_install_smoke_test(root: Path) -> tuple[bool, str]:
             health_check = f"is-active --quiet {service}"
             if health_check not in systemctl_calls or systemctl_calls.index(health_check) < systemctl_calls.index(expected_start):
                 return False, f"installer did not check health for {service} after starting services"
+        prior_systemctl_calls = systemctl_log.read_text(encoding="utf-8")
+        updater_env = dict(env)
+        updater_env["CLUB3090_RUNNING_FROM_UPDATER"] = "1"
+        updater_run = subprocess.run(
+            [str(root / "install.sh")], cwd=str(root), env=updater_env,
+            capture_output=True, text=True, check=False, timeout=60,
+        )
+        if updater_run.returncode:
+            return False, updater_run.stderr.strip() or "updater-owned installer run failed"
+        updater_calls = systemctl_log.read_text(encoding="utf-8")[len(prior_systemctl_calls):]
+        if "stop club3090-control.service club3090-vllm.service" not in updater_calls:
+            return False, "updater-owned install did not restart control and vLLM services"
+        if "stop club3090-control.service club3090-updater.service club3090-vllm.service" in updater_calls:
+            return False, "updater-owned install stopped its own updater service"
+        if "start club3090-control.service club3090-vllm.service" not in updater_calls:
+            return False, "updater-owned install did not restart control and vLLM services"
+        if "is-active --quiet club3090-updater.service" not in updater_calls:
+            return False, "updater-owned install did not health-check the still-running updater service"
         return True, "installer registered source-tree services without package-manager or git mutation"
 
 
@@ -427,6 +445,23 @@ result = sorted(failures)
 print(json.dumps(result))
 raise SystemExit(bool(result))
 """
+        check_env = dict(env)
+        check_env["CLUB3090_CONTROL_DIR"] = str(temp / "model-update-state")
+        check = subprocess.run(
+            [
+                sys.executable, "-c",
+                "import control.shared as shared; events=[]; shared.append_audit_text_line=events.append; "
+                "shared.refresh_status_snapshot=lambda: None; "
+                "summary=shared.run_model_update_check('smoke', {'variants': []}); "
+                "assert isinstance(summary, dict); "
+                "assert not any('_repo_subprocess_env' in str(event) or 'NameError' in str(event) for event in events); "
+                "print('model update checker passed')",
+            ],
+            cwd=str(root / "src"), env=check_env, capture_output=True,
+            text=True, check=False, timeout=30,
+        )
+        if check.returncode:
+            return False, check.stderr.strip() or "scheduled model-update check failed"
         result = subprocess.run(
             [sys.executable, "-c", audit],
             cwd=str(root / "src"), env=env, capture_output=True,
@@ -442,7 +477,7 @@ raise SystemExit(bool(result))
         if result.returncode or failures:
             details = "\n".join(failures) or result.stderr.strip() or result.stdout.strip()
             return False, f"unresolved control globals:\n{details}"
-        return True, "assembled control callable globals resolve"
+        return True, "assembled control globals resolve and the scheduled model-update check completes"
 
 
 def run_control_module_smoke_test(root: Path) -> tuple[bool, str]:
@@ -460,6 +495,33 @@ def run_control_module_smoke_test(root: Path) -> tuple[bool, str]:
             PYTHONDONTWRITEBYTECODE="1",
             PYTHONPATH=str(root / "src"),
         )
+        compose_rel = "models/qwen3.8-27b/llama-cpp/compose/single/iq4xs/base.yml"
+        compose_path = upstream / compose_rel
+        compose_path.parent.mkdir(parents=True)
+        compose_path.write_text(
+            "# Profile (at-a-glance):\n"
+            "#   Model: Qwen 3.8 27B\n"
+            "#   Topology: Single GPU\n"
+            "#   Status: 🧪 Experimental\n"
+            "services:\n"
+            "  qwen38-upstream:\n"
+            "    image: llama.cpp\n"
+            "    ports:\n"
+            "      - \"8020:8080\"\n"
+            "    command: -m /models/qwen38.gguf\n",
+            encoding="utf-8",
+        )
+        registry_path = upstream / "scripts/lib/profiles/compose_registry.py"
+        registry_path.parent.mkdir(parents=True)
+        registry_path.write_text(
+            "COMPOSE_REGISTRY = {\n"
+            "    'llamacpp/qwen38-upstream-single': {\n"
+            "        'model': 'qwen3.8-27b', 'engine': 'llama-cpp-local',\n"
+            f"        'compose_path': {compose_rel!r}, 'tp': 1, 'default_port': 8020,\n"
+            "    },\n"
+            "}\n",
+            encoding="utf-8",
+        )
         inventory = subprocess.run(
             [sys.executable, "-m", "control.http_server", "--rebuild-inventory"],
             cwd=str(root / "src"), env=env, capture_output=True,
@@ -473,6 +535,18 @@ def run_control_module_smoke_test(root: Path) -> tuple[bool, str]:
             return False, f"control inventory output was not JSON: {exc}"
         if payload.get("ok") is not True or not (state_dir / "runtime_inventory.json").is_file():
             return False, "control module did not rebuild inventory under CLUB3090_CONTROL_DIR"
+        rebuilt_inventory = json.loads((state_dir / "runtime_inventory.json").read_text(encoding="utf-8"))
+        qwen_models = [row for row in rebuilt_inventory.get("models", []) if row.get("model_id") == "qwen3.8-27b"]
+        qwen_rows = [row for row in rebuilt_inventory.get("variants", []) if row.get("model_id") == "qwen3.8-27b"]
+        selectors = {row.get("selector") or row.get("upstream_tag") for row in qwen_rows}
+        origins = {row.get("inventory_origin") for row in qwen_rows}
+        required_qwen_selectors = {
+            "llamacpp/qwen38-upstream-single",
+            "llamacpp/qwen38-27b-orcarouter-uncensored-single-iq4xs",
+            "llamacpp/qwen38-27b-hauhaucs-aggressive-single-iq4xs",
+        }
+        if len(qwen_models) != 1 or not required_qwen_selectors.issubset(selectors) or "control_catalog" not in origins:
+            return False, f"upstream and control Qwen 3.8 catalog rows did not merge: models={len(qwen_models)} selectors={sorted(selectors)} origins={sorted(origins)}"
         worker = subprocess.run(
             [sys.executable, "-m", "control.http_server", "--benchmark-worker"],
             cwd=str(root / "src"), env=env, capture_output=True,
@@ -534,7 +608,8 @@ def run_control_module_smoke_test(root: Path) -> tuple[bool, str]:
 def run_updater_status_smoke_test(root: Path) -> tuple[bool, str]:
     root = Path(root).resolve()
     with tempfile.TemporaryDirectory(prefix="club3090-updater-status-") as temp_raw:
-        state_dir = Path(temp_raw) / "state"
+        temp = Path(temp_raw)
+        state_dir = temp / "state"
         env = dict(os.environ)
         env.update(
             CLUB3090_CONTROL_DIR=str(state_dir),
@@ -559,8 +634,93 @@ def run_updater_status_smoke_test(root: Path) -> tuple[bool, str]:
         revision = expected.stdout.strip() if expected.returncode == 0 else ""
         if not revision or status.get("repository_revision") != revision:
             return False, "updater did not report the checked-out Git revision"
-        if "git pull" not in status.get("update_instructions", "") or "sudo ./install.sh" not in status.get("update_instructions", ""):
-            return False, "updater did not direct operators to update the checkout and reinstall services"
+        instructions = str(status.get("update_instructions") or "")
+        if "System Update" not in instructions or "tracking branches" not in instructions or "git pull" in instructions:
+            return False, "updater status did not describe the clean-tracking System Update"
         if status.get("automatic_updates") is not False or state_dir.exists():
             return False, "updater status enabled automatic updates or wrote mutable state"
-        return True, "updater module reports checkout revision and manual update instructions"
+        server_dir = temp / "server"
+        upstream_dir = temp / "upstream"
+        bin_dir = temp / "bin"
+        for directory in (server_dir, upstream_dir, bin_dir):
+            directory.mkdir()
+        (server_dir / "src").mkdir()
+        trace = temp / "system-update.trace"
+        git_wrapper = bin_dir / "git"
+        git_wrapper.write_text(
+            "#!/bin/sh\n"
+            "printf 'git %s\\n' \"$*\" >> \"$CLUB3090_TEST_TRACE\"\n"
+            "repo=$2; shift 2\n"
+            "case \"$1\" in\n"
+            "  rev-parse) if [ \"$2\" = \"--show-toplevel\" ]; then printf '%s\\n' \"$repo\"; "
+            "elif [ \"$CLUB3090_TEST_DIRTY\" = \"$repo\" ] && [ \"$2\" = \"--abbrev-ref\" ]; then exit 1; "
+            "else printf 'origin/main\\n'; fi ;;\n"
+            "  status) if [ \"$CLUB3090_TEST_DIRTY\" = \"$repo\" ]; then printf ' M file\\n'; fi ;;\n"
+            "  fetch|merge) : ;;\n"
+            "esac\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        git_wrapper.chmod(0o755)
+        python_wrapper = bin_dir / "python3"
+        python_wrapper.write_text(
+            "#!/bin/sh\nprintf 'python %s\\n' \"$*\" >> \"$CLUB3090_TEST_TRACE\"\nexit 0\n",
+            encoding="utf-8",
+        )
+        python_wrapper.chmod(0o755)
+        bash_wrapper = bin_dir / "bash"
+        bash_wrapper.write_text(
+            "#!/bin/sh\nprintf 'install %s\\n' \"$*\" >> \"$CLUB3090_TEST_TRACE\"\nexit 0\n",
+            encoding="utf-8",
+        )
+        bash_wrapper.chmod(0o755)
+        command_env = dict(env)
+        command_env.update(
+            CLUB3090_SERVER_DIR=str(server_dir),
+            CLUB3090_DIR=str(upstream_dir),
+            CLUB3090_CONTROL_DIR=str(temp / "update-state"),
+            CLUB3090_TEST_TRACE=str(trace),
+            PATH=f"{bin_dir}:{os.environ.get('PATH', '')}",
+            PYTHONPATH=str(root / "src"),
+        )
+        build = subprocess.run(
+            [
+                sys.executable, "-c",
+                "import json; from build.updater import build_update_command; "
+                "print(json.dumps(build_update_command('update', 'club3090')))",
+            ],
+            cwd=str(root / "src"), env=command_env, capture_output=True,
+            text=True, check=False, timeout=15,
+        )
+        if build.returncode:
+            return False, build.stderr.strip() or "System Update command construction failed"
+        _scope, _label, command, _source = json.loads(build.stdout)
+        clean = subprocess.run(
+            ["/bin/bash", "-c", command], cwd=str(root), env=command_env,
+            capture_output=True, text=True, check=False, timeout=15,
+        )
+        if clean.returncode:
+            return False, clean.stderr.strip() or "clean tracking-checkout System Update command failed"
+        trace_lines = trace.read_text(encoding="utf-8").splitlines()
+        milestones = [
+            f"git -C {server_dir} fetch --prune origin",
+            f"git -C {server_dir} merge --ff-only @{{u}}",
+            f"git -C {upstream_dir} fetch --prune origin",
+            f"git -C {upstream_dir} merge --ff-only @{{u}}",
+            "python -m control.http_server --rebuild-inventory",
+            f"install {server_dir}/install.sh",
+        ]
+        positions = [next((index for index, line in enumerate(trace_lines) if milestone in line), -1) for milestone in milestones]
+        if any(position < 0 for position in positions) or positions != sorted(positions):
+            return False, f"System Update stages did not run in order: {trace_lines!r}"
+        trace.write_text("", encoding="utf-8")
+        dirty_env = dict(command_env)
+        dirty_env["CLUB3090_TEST_DIRTY"] = str(upstream_dir)
+        dirty = subprocess.run(
+            ["/bin/bash", "-c", command], cwd=str(root), env=dirty_env,
+            capture_output=True, text=True, check=False, timeout=15,
+        )
+        dirty_lines = trace.read_text(encoding="utf-8").splitlines()
+        if dirty.returncode == 0 or "local changes" not in dirty.stderr or any(" fetch " in line or " merge " in line for line in dirty_lines):
+            return False, f"System Update did not stop before mutating a dirty checkout: rc={dirty.returncode} stderr={dirty.stderr!r} trace={dirty_lines!r}"
+        return True, "updater reports System Update and clean/dirty checkout behavior is guarded"

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import secrets
 import shlex
 import subprocess
@@ -42,16 +41,6 @@ UPDATE_LOG_FILE = os.path.join(CONTROL_DIR, "self-update.log")
 UPDATE_STATE_FILE = os.path.join(CONTROL_DIR, "self-update-state.json")
 UPDATE_SECRET_FILE = os.path.join(CONTROL_DIR, "self-update-secret")
 UPDATE_RELOAD_FLAG_FILE = os.path.join(CONTROL_DIR, "self-update-reload-updater")
-REMOTE_UPDATE_REPO_URL = os.environ.get(
-    "CLUB3090_SELF_UPDATE_REPO_URL",
-    "__CLUB3090_SELF_UPDATE_REPO_URL__",
-)
-REMOTE_UPDATE_REF = os.environ.get("CLUB3090_SELF_UPDATE_REF", "__CLUB3090_SELF_UPDATE_REF__")
-REMOTE_UPDATE_BRANCH = os.environ.get("CLUB3090_SELF_UPDATE_BRANCH", "__CLUB3090_SELF_UPDATE_BRANCH__")
-REMOTE_UPDATE_RAW_URL_TEMPLATE = os.environ.get(
-    "CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE",
-    "__CLUB3090_SELF_UPDATE_RAW_URL_TEMPLATE__",
-)
 UPDATER_BIND_HOST = os.environ.get("CLUB3090_UPDATER_BIND_HOST", "127.0.0.1")
 UPDATER_BIND_PORT = int(os.environ.get("CLUB3090_UPDATER_BIND_PORT", "18010") or "18010")
 CONTROL_ADMIN_BIND_PORT = int(os.environ.get("CLUB3090_ADMIN_BIND_PORT", "8008") or "8008")
@@ -124,7 +113,7 @@ def snapshot_state():
     with state_lock:
         snapshot = redact_state(dict(state))
     snapshot["repository_revision"] = repository_revision()
-    snapshot["update_instructions"] = f"cd {shlex.quote(str(SERVER_DIR))} && git pull && sudo ./install.sh"
+    snapshot["update_instructions"] = "System Update fast-forwards clean tracking branches in both Club-3090 checkouts, rebuilds the Model DB, and restarts managed services."
     return snapshot
 
 
@@ -262,60 +251,52 @@ def valid_request_secret(handler):
     return bool(supplied) and bool(expected) and secrets.compare_digest(supplied, expected)
 
 
-def shell_single_quote(value):
-    return "'" + str(value or "").replace("'", "'\"'\"'") + "'"
 
-
-def update_source_file():
-    return os.path.join(CONTROL_DIR, "self-update-source.json")
-
-
-def load_update_source():
-    payload = read_json_file(update_source_file(), {})
-    try:
-        if not isinstance(payload, dict):
-            raise ValueError("invalid source record")
-        kind, name = normalized_version(payload.get("version_kind", "branch"), payload.get("version_name", REMOTE_UPDATE_BRANCH))
-        cached_sha = str(payload.get("cached_sha") or "").lower()
-        applied_sha = str(payload.get("applied_sha") or "").lower()
-        if cached_sha and not re.fullmatch(r"[0-9a-f]{40}", cached_sha):
-            raise ValueError("invalid cached SHA")
-        if applied_sha and not re.fullmatch(r"[0-9a-f]{40}", applied_sha):
-            raise ValueError("invalid applied SHA")
-        cached_at = int(payload.get("cached_at") or 0)
-        return {
-            "version_kind": kind, "version_name": name,
-            "cached_sha": cached_sha,
-            "cached_script_version": str(payload.get("cached_script_version") or ""),
-            "cached_at": cached_at, "applied_sha": applied_sha,
-        }
-    except (TypeError, ValueError, subprocess.TimeoutExpired):
-        return {
-            "version_kind": "branch", "version_name": REMOTE_UPDATE_BRANCH,
-            "cached_sha": "", "cached_script_version": "", "cached_at": 0,
-            "applied_sha": "",
-        }
-
-
-def write_update_source(payload):
-    write_json_atomic(update_source_file(), payload)
-
-
-def normalized_version(kind, name):
-    kind = str(kind or "").strip().lower()
-    name = str(name or "").strip()
-    if kind not in {"branch", "tag"} or not name or any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
-        raise ValueError("Invalid branch or tag")
-    ref = f"refs/heads/{name}" if kind == "branch" else f"refs/tags/{name}"
-    result = subprocess.run(["git", "check-ref-format", ref], capture_output=True, text=True, check=False, timeout=10)
-    if result.returncode != 0:
-        raise ValueError("Invalid branch or tag name")
-    return kind, name
-
-
-def build_update_command(operation, scope_name="controller", target_commit="", version_kind="", version_name=""):
-    raise ValueError(f"Automatic updates are disabled. Update the checkout manually: cd {shlex.quote(str(SERVER_DIR))} && git pull && sudo ./install.sh")
-
+def build_update_command(operation, scope_name="controller"):
+    operation = str(operation or "").strip().lower()
+    scope = str(scope_name or "").strip().lower()
+    if operation != "update":
+        raise ValueError("Only the System Update operation is supported")
+    if scope != "club3090":
+        raise ValueError("System Update requires the Club-3090 scope")
+    upstream_dir = str(os.environ.get("CLUB3090_DIR") or "").strip()
+    if not upstream_dir:
+        raise ValueError("CLUB3090_DIR is required for System Update")
+    server_dir = str(SERVER_DIR)
+    control_dir = CONTROL_DIR
+    quoted_server = shlex.quote(server_dir)
+    quoted_upstream = shlex.quote(upstream_dir)
+    quoted_control = shlex.quote(control_dir)
+    command = f"""set -euo pipefail
+SERVER_DIR={quoted_server}
+UPSTREAM_DIR={quoted_upstream}
+CONTROL_DIR={quoted_control}
+for repo in "$SERVER_DIR" "$UPSTREAM_DIR"; do
+  git -C "$repo" rev-parse --show-toplevel >/dev/null 2>&1 || {{ echo "Not a Git worktree: $repo" >&2; exit 1; }}
+done
+for repo in "$SERVER_DIR" "$UPSTREAM_DIR"; do
+  if [[ -n "$(git -C "$repo" status --porcelain)" ]]; then
+    echo "Refusing System Update: checkout has local changes: $repo" >&2
+    exit 1
+  fi
+  git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name '@{{u}}' >/dev/null 2>&1 || {{
+    echo "Refusing System Update: checkout has no upstream tracking branch: $repo" >&2
+    exit 1
+  }}
+done
+echo "[system-update] Fast-forwarding Club-3090 Server checkout"
+git -C "$SERVER_DIR" fetch --prune origin
+git -C "$SERVER_DIR" merge --ff-only '@{{u}}'
+echo "[system-update] Fast-forwarding upstream Club-3090 checkout"
+git -C "$UPSTREAM_DIR" fetch --prune origin
+git -C "$UPSTREAM_DIR" merge --ff-only '@{{u}}'
+echo "[system-update] Rebuilding Model DB"
+cd "$SERVER_DIR/src"
+CLUB3090_CONTROL_DIR="$CONTROL_DIR" CLUB3090_DIR="$UPSTREAM_DIR" PYTHONPATH="$SERVER_DIR/src" python3 -m control.http_server --rebuild-inventory
+echo "[system-update] Reinstalling and restarting services"
+CLUB3090_RUNNING_FROM_UPDATER=1 CLUB3090_CONTROL_DIR="$CONTROL_DIR" CLUB3090_DIR="$UPSTREAM_DIR" bash "$SERVER_DIR/install.sh"
+"""
+    return "club3090", "System Update", command, "local Git checkouts"
 
 
 def wait_for_systemd_unit(unit_name, timeout=120):
@@ -371,29 +352,28 @@ def maybe_reload_updater():
 
 
 def finalize_job(return_code, operation):
-    if int(return_code or 0) == 0 and operation == "upgrade":
+    restart_updater = False
+    if int(return_code or 0) == 0 and operation == "update":
         control_ready = wait_for_systemd_unit("club3090-control.service", timeout=180)
         http_ready = wait_for_admin_http(timeout=120)
-        summary = "upgrade finished successfully" if control_ready and http_ready else "upgrade finished but readiness checks timed out"
-        status = "completed" if control_ready else "degraded"
-    elif int(return_code or 0) == 0:
-        summary, status = "update staged in local cache", "completed"
+        ready = control_ready and http_ready
+        summary = "System Update completed successfully" if ready else "System Update command finished but service readiness checks timed out"
+        status = "completed" if ready else "degraded"
+        if ready:
+            ensure_dir()
+            Path(UPDATE_RELOAD_FLAG_FILE).touch()
+            restart_updater = True
     else:
-        summary, status = f"update failed with return code {return_code}", "failed"
-    source_state = load_update_source()
+        summary = f"System Update failed with return code {return_code}"
+        status = "failed"
     set_state(
         active=False, status=status, finished_at=int(time.time()),
         return_code=int(return_code or 0), summary=summary,
         script_version=SCRIPT_VERSION,
-        version_kind=source_state["version_kind"],
-        version_name=source_state["version_name"],
-        cached_sha=source_state["cached_sha"],
-        pending_upgrade=bool(source_state["cached_sha"] and source_state["cached_sha"] != source_state["applied_sha"]),
     )
     append_update_log(f"[self-update service] {summary}")
-    if operation == "upgrade":
+    if restart_updater:
         maybe_reload_updater()
-
 
 def run_update_job(scope_name, label, command, source, operation):
     append_update_log(f"[self-update service] starting {label} via {source}")
@@ -413,42 +393,28 @@ def run_update_job(scope_name, label, command, source, operation):
     except Exception as exc:
         append_update_log(f"[self-update service] launcher error: {exc}")
         rc = 1
-    if rc == 0 and operation == "upgrade":
-        source_state = load_update_source()
-        source_state["applied_sha"] = source_state["cached_sha"]
-        write_update_source(source_state)
     finalize_job(rc, operation)
 
-def start_update(operation, scope_name="controller", target_commit="", version_kind="", version_name=""):
-    operation = str(operation or "").strip().lower()
+def start_update(operation, scope_name="controller"):
     with state_lock:
         if state.get("active"):
-            raise RuntimeError("A self-update job is already running")
-    normalized, label, command, source, target_commit = build_update_command(
-        operation, scope_name=scope_name, target_commit=target_commit,
-        version_kind=version_kind, version_name=version_name,
-    )
-    source_state = load_update_source()
-    if operation == "change_version":
-        return {"ok": True, "operation": operation, "self_update_source": source_state}
+            raise RuntimeError("A System Update job is already running")
+    normalized, label, command, source = build_update_command(operation, scope_name=scope_name)
     token = secrets.token_urlsafe(24)
     reset_update_log()
     now = int(time.time())
     snapshot = set_state(
-        active=True, status="running", operation=operation, scope=normalized,
+        active=True, status="running", operation="update", scope=normalized,
         label=label, command=command, started_at=now, finished_at=0,
         return_code=None, summary=f"{label} queued", token=token,
         log_file=UPDATE_LOG_FILE, script_version=SCRIPT_VERSION,
-        target_commit=target_commit, version_kind=source_state["version_kind"],
-        version_name=source_state["version_name"], cached_sha=source_state["cached_sha"],
-        pending_upgrade=bool(source_state["cached_sha"] and source_state["cached_sha"] != source_state["applied_sha"]),
         ui_ack_token="", ui_ack_at=0,
     )
-    append_update_log(f"[self-update service] queued {label} operation={operation} version={source_state['version_kind']}:{source_state['version_name']}")
+    append_update_log(f"[self-update service] queued {label}")
     worker = threading.Thread(
         target=run_update_job,
-        args=(normalized, label, command, source, operation),
-        name=f"club3090-self-update-{operation}",
+        args=(normalized, label, command, source, "update"),
+        name="club3090-system-update",
         daemon=True,
     )
     worker.start()
@@ -584,7 +550,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             payload = self.read_json()
-            result = start_update(payload.get("operation"), payload.get("scope"), payload.get("target_commit"), payload.get("version_kind"), payload.get("version_name"))
+            result = start_update(payload.get("operation"), payload.get("scope"))
             self.send_json(result)
         except Exception as exc:
             self.send_json({"ok": False, "error": str(exc)}, 500)
@@ -594,7 +560,7 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--status":
         print(json.dumps({
             "repository_revision": repository_revision(),
-            "update_instructions": f"cd {shlex.quote(str(SERVER_DIR))} && git pull && sudo ./install.sh",
+            "update_instructions": "System Update fast-forwards clean tracking branches in both Club-3090 checkouts, rebuilds the Model DB, and restarts managed services.",
             "automatic_updates": False,
         }, ensure_ascii=False))
         return

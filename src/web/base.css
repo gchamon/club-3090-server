@@ -4271,6 +4271,7 @@ details[open] > summary .score-collapse-cue::before {
 }
 .selected-model-card {
   background: #101823;
+  grid-column: 1 / -1;
 }
 .model-card-active-family {
   border-color: #5ff5e8;

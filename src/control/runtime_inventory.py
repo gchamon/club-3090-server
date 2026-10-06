@@ -2486,61 +2486,6 @@ def migrate_missing_custom_presets_from_backup(backup_dir):
     }
 
 
-def _load_repo_env_map():
-    env_path = os.path.join(CLUB3090_DIR, ".env")
-    result = {}
-    try:
-        with open(env_path, "r", encoding="utf-8", errors="replace") as f:
-            for raw_line in f:
-                line = str(raw_line or "").strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, value = line.split("=", 1)
-                key = str(key or "").strip()
-                if not key:
-                    continue
-                value = str(value or "").strip().strip("'").strip('"')
-                result[key] = value
-    except Exception:
-        result = {}
-    if not any(str(result.get(key) or "").strip() for key in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN")):
-        token_candidates = []
-        hf_home = str(os.environ.get("HF_HOME") or "").strip()
-        home = str(os.environ.get("HOME") or "").strip()
-        if hf_home:
-            token_candidates.append(os.path.join(hf_home, "token"))
-        if home:
-            token_candidates.extend([
-                os.path.join(home, ".cache", "huggingface", "token"),
-                os.path.join(home, ".huggingface", "token"),
-            ])
-        token_candidates.extend([
-            "/root/.cache/huggingface/token",
-            "/root/.huggingface/token",
-            *glob.glob("/home/*/.cache/huggingface/token"),
-            *glob.glob("/home/*/.huggingface/token"),
-        ])
-        for token_path in token_candidates:
-            try:
-                with open(token_path, "r", encoding="utf-8", errors="replace") as token_file:
-                    token = token_file.read(4096).strip()
-            except Exception:
-                continue
-            if token.startswith("hf_"):
-                result["HF_TOKEN"] = token
-                break
-    return result
-
-
-def _repo_subprocess_env():
-    env = os.environ.copy()
-    for key, value in _load_repo_env_map().items():
-        if key:
-            env[str(key)] = str(value)
-    if str(os.environ.get("CLUB3090_RESTART") or "").strip():
-        env["CLUB3090_RESTART"] = str(os.environ.get("CLUB3090_RESTART") or "").strip()
-    env["PYTHONUNBUFFERED"] = "1"
-    return env
 
 
 def _resolve_variant_model_dir_root(variant=None):

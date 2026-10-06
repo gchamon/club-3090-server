@@ -7316,7 +7316,7 @@ function ensurePresetActionModal() {
   const modal = doc.createElement("div");
   modal.id = "presetActionModal";
   modal.className = "club-modal hidden";
-  modal.innerHTML = `<div class="club-modal-card" role="dialog" aria-modal="true" aria-labelledby="presetActionModalTitle"><div class="panel-head"><h2 id="presetActionModalTitle">Confirm Action</h2><button class="plain-close-btn" title="Close" aria-label="Close" onclick="closePresetActionModal()">✕</button></div><div class="preset-help" id="presetActionModalBody">-</div><textarea id="presetActionModalDetail" class="modal-keybox hidden" readonly wrap="soft" spellcheck="false"></textarea><div class="preset-form-actions"><button class="btn blue" onclick="closePresetActionModal()">Cancel</button><button class="btn green" id="presetActionModalConfirm">Continue</button></div><div class="msg" id="presetActionModalMsg"></div></div>`;
+  modal.innerHTML = `<div class="club-modal-card" role="dialog" aria-modal="true" aria-labelledby="presetActionModalTitle"><div class="panel-head"><h2 id="presetActionModalTitle">Confirm Action</h2><button class="plain-close-btn" title="Close" aria-label="Close" onclick="closePresetActionModal()">✕</button></div><div class="preset-help" id="presetActionModalBody">-</div><textarea id="presetActionModalDetail" class="modal-keybox hidden" readonly wrap="soft" spellcheck="false"></textarea><div class="preset-form-actions"><button class="btn blue" id="presetActionModalCancel" onclick="closePresetActionModal()">Cancel</button><button class="btn green" id="presetActionModalConfirm">Continue</button></div><div class="msg" id="presetActionModalMsg"></div></div>`;
   doc.body.appendChild(modal);
 }
 function openPresetActionModal(opts = {}) {
@@ -7335,6 +7335,7 @@ function openPresetActionModal(opts = {}) {
     detail.classList.add("hidden");
   }
   const confirmBtn = $("presetActionModalConfirm");
+  $("presetActionModalCancel").textContent = opts.cancelLabel || "Cancel";
   confirmBtn.textContent = opts.confirmLabel || "Continue";
   confirmBtn.className = `btn ${opts.confirmClass || "green"}`;
   confirmBtn.onclick = async () => {
@@ -7804,62 +7805,35 @@ function requireSelectedAdminTaskTarget(actionLabel = "This task") {
   alert(message);
   return null;
 }
-async function startUpdateFlow(scope, targetCommit = "", options = {}) {
-  const operation = options.operation || "upgrade";
-  const normalized = scope === "club3090" ? "club3090" : "controller";
-  if (operation === "change_version") {
-    const source = lastStatus?.self_update_source || {};
-    const kind = window.prompt("Version kind: branch or tag", source.version_kind || "branch");
-    if (kind === null) return;
-    const name = window.prompt(`Enter ${kind} name`, source.version_name || "");
-    if (name === null || !name.trim()) return;
-    await post("/admin/update", { operation, version_kind: kind, version_name: name.trim() }, "/admin/update change_version");
-    await refreshStatus({ force: true });
-    setAuditMsg(`Selected ${kind} ${name.trim()}. No files downloaded or services restarted.`);
+async function startUpdateFlow() {
+  if (benchmarkJobActive()) {
+    alert("Stop Model Scores benchmarking before starting System Update.");
     return;
   }
-  if (operation === "upgrade" && normalized === "club3090") {
-    if (benchmarkJobActive()) {
-      alert("Stop Model Scores benchmarking before migrating Club-3090.");
-      return;
-    }
-    const confirmed = await openClubConfirmModal({
-      title: "Confirm Club-3090 Migration",
-      bodyHtml: "Run the full <code>--migrate</code> pass using the cached installer? This restarts services.",
-      confirmLabel: "Run Upgrade",
-      confirmClass: "red",
-      dangerBody: true,
-    });
-    if (!confirmed) return;
-  }
-  const payload = { operation, scope: normalized };
-  if (normalized === "club3090" && targetCommit) payload.target_commit = targetCommit;
-  beginPendingUpdateUi(normalized);
+  beginPendingUpdateUi("club3090");
   try {
-    await post("/admin/update", payload, `/admin/update ${operation} ${normalized}`, { silentFailure: true });
-    setAuditMsg(operation === "update" ? "Installer staged in local cache. Running services were not restarted." : "Upgrade launched from local cache. Output is streaming to Audit Logs.");
+    await post(
+      "/admin/update",
+      { operation: "update", scope: "club3090" },
+      "/admin/update update club3090",
+      { silentFailure: true },
+    );
+    setAuditMsg("System Update started. Output is streaming to Update Logs.");
   } catch (error) {
-    abandonPendingUpdateUi("Update launch failed before the updater handoff. Restored normal logs.");
+    abandonPendingUpdateUi("System Update failed before the updater handoff. Restored normal logs.");
     throw error;
   }
 }
-function promptUpdateRun() {
-  const source = lastStatus?.self_update_source || {};
-  const selected = `${source.version_kind || "branch"}:${source.version_name || "master"}`;
-  const pending = !!source.pending_upgrade;
-  const cached = source.cached_script_version || "unknown";
-  const sha = String(source.cached_sha || "").slice(0, 12);
-  openActionChoiceModal({
-    title: "Installer updates",
-    body: `Selected ${escapeHtml(selected)}. Update downloads to the local cache only; Upgrade applies the cached installer.`,
-    cardClass: "update-choice-card",
-    choices: [
-      { label: "Update", className: "blue", onClick: async () => startUpdateFlow("controller", "", { operation: "update" }) },
-      { label: "Change version", className: "gray", onClick: async () => startUpdateFlow("controller", "", { operation: "change_version" }) },
-      { label: pending ? `Upgrade · ${cached} · ${sha}` : "No pending local update", className: pending ? "orange" : "gray", disabled: !pending, onClick: async () => startUpdateFlow("controller", "", { operation: "upgrade" }) },
-      ...(pending ? [{ label: "Upgrade + Club-3090 migration", className: "red", onClick: async () => startUpdateFlow("club3090", "", { operation: "upgrade" }) }] : []),
-    ],
+async function promptUpdateRun() {
+  const confirmed = await openClubConfirmModal({
+    title: "Confirm System Update",
+    bodyHtml: "Fast-forward the Club-3090 Server checkout and its configured upstream Club-3090 checkout, rebuild the Model DB, then restart services? Both checkouts must be clean Git worktrees on tracking branches. Local changes are never reset or stashed.",
+    confirmLabel: "Run System Update",
+    confirmClass: "red",
+    dangerBody: true,
   });
+  if (!confirmed) return;
+  await startUpdateFlow();
 }
 function variantStatusBadgeSummary(rows) {
   const counts = new Map();
@@ -7879,17 +7853,23 @@ function variantStatusBadgeSummary(rows) {
 function experimentalVariantRows(rows) {
   return sortInventoryVariants(rows);
 }
-function promptModelInstall(variant) {
+function isRequiredModelAssetsError(error) {
+  const message = messageText(error);
+  return message.includes("Required model assets") && message.includes("are not ready under");
+}
+
+function promptModelInstall(variant, options = {}) {
   openPresetActionModal({
-    title: `Download ${escapeHtml(variant?.model_id || "model")} assets`,
-    body: `${escapeHtml(variantDisplayLabel(variant))} is not ready on disk yet. Download the required assets now?<br><br>${escapeHtml(variant?.install_reason || "This preset needs additional model files before it can run.")}`,
-    detail: variant?.install_command || "",
+    title: options.title || `Download ${escapeHtml(variant?.model_id || "model")} assets`,
+    body: options.body || `${escapeHtml(variantDisplayLabel(variant))} is not ready on disk yet. Download the required assets now?<br><br>${escapeHtml(variant?.install_reason || "This preset needs additional model files before it can run.")}`,
+    detail: options.detail ?? variant?.install_command ?? "",
+    cancelLabel: options.cancelLabel || "Cancel",
     confirmLabel: "Download",
     confirmClass: "green",
     onConfirm: async () => {
       closePresetActionModal();
       if (typeof focusAuditLogs === "function") focusAuditLogs();
-      const payload = await post(
+      await post(
         "/admin/model-install",
         {
           model_id: variant.model_id,
@@ -10633,7 +10613,18 @@ async function switchInventoryVariant(selector) {
     return;
   }
   openRuntimeLogsAtPoint(chooseVariantLogInstanceId(target, selector), "");
-  await post("/admin/switch", { instance_id: target.id, mode: selector }, `/admin/switch ${target.id} ${label}`);
+  try {
+    await post("/admin/switch", { instance_id: target.id, mode: selector }, `/admin/switch ${target.id} ${label}`);
+  } catch (error) {
+    if (!isRequiredModelAssetsError(error)) throw error;
+    promptModelInstall(variant, {
+      title: "Model assets required",
+      body: `${escapeHtml(label)} could not be deployed because required model assets are missing. Download them now, or cancel this deployment.`,
+      detail: messageText(error),
+      cancelLabel: "Cancel deployment",
+    });
+    return;
+  }
   await refreshStatus({ force: true });
 }
 switchMode = function (mode) {

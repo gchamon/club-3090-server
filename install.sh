@@ -210,12 +210,17 @@ progress "Reloading systemd unit definitions"
 "${SUDO[@]}" systemctl daemon-reload
 progress "Enabling control, benchmark, updater, and inference services"
 "${SUDO[@]}" systemctl enable club3090-control.service club3090-benchmarks.service club3090-updater.service club3090-vllm.service
-progress "Stopping control, updater, and inference services before applying the installed configuration"
-"${SUDO[@]}" systemctl stop club3090-control.service club3090-updater.service club3090-vllm.service
-progress "Starting control, updater, and inference services; systemd may wait for startup"
+service_restart_targets=(club3090-control.service club3090-vllm.service)
+if [[ "${CLUB3090_RUNNING_FROM_UPDATER:-0}" != "1" ]]; then
+  service_restart_targets=(club3090-control.service club3090-updater.service club3090-vllm.service)
+fi
+progress "Stopping services before applying the installed configuration"
+"${SUDO[@]}" systemctl stop "${service_restart_targets[@]}"
+progress "Starting services; systemd may wait for startup"
+service_health_targets=(club3090-control.service club3090-updater.service club3090-vllm.service)
 wait_for_services_healthy() {
   local timeout_seconds=60 deadline service
-  local -a services=(club3090-control.service club3090-updater.service club3090-vllm.service)
+  local -a services=("${service_health_targets[@]}")
   local -a inactive=()
   deadline=$((SECONDS + timeout_seconds))
   progress "Checking service health with systemd (up to ${timeout_seconds}s)"
@@ -233,7 +238,7 @@ wait_for_services_healthy() {
   done
   fail "service health check timed out after ${timeout_seconds}s; inactive: ${inactive[*]}. Inspect with journalctl -u <service>"
 }
-if ! "${SUDO[@]}" systemctl start club3090-control.service club3090-updater.service club3090-vllm.service; then
+if ! "${SUDO[@]}" systemctl start "${service_restart_targets[@]}"; then
   progress "systemd start returned a failure; checking final service states"
 fi
 progress "Installation complete"

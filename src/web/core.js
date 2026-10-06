@@ -259,25 +259,6 @@ function setHtmlIfChanged(node, html) {
 function setMsg(t) {
   $("msg").textContent = t || "";
 }
-function updateBannerDismissKey(startedAt, remoteKey = "") {
-  return `club3090-update-banner-dismissed:${String(startedAt || "0")}:${String(remoteKey || "")}`;
-}
-function currentUpdateBannerRemoteKey(status = lastStatus || {}) {
-  const remote = status?.remote_update || {};
-  return String(remote.commit_sha || remote.script_version || "none").trim() || "none";
-}
-function readUpdateBannerDismissed(startedAt, remoteKey = "") {
-  try {
-    return localStorage.getItem(updateBannerDismissKey(startedAt, remoteKey)) === "1";
-  } catch (e) {
-    return false;
-  }
-}
-function writeUpdateBannerDismissed(startedAt, remoteKey = "") {
-  try {
-    localStorage.setItem(updateBannerDismissKey(startedAt, remoteKey), "1");
-  } catch (e) {}
-}
 function currentSelfUpdateState(status = lastStatus || {}) {
   const update = status?.self_update;
   return update && typeof update === "object" ? update : {};
