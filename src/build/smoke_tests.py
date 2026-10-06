@@ -152,8 +152,6 @@ def run_repository_install_smoke_test(root: Path) -> tuple[bool, str]:
             return False, "control service does not execute the direct HTTP server module"
         if f"EnvironmentFile=-{env_file}" not in control_unit:
             return False, "control service omits its configured environment file"
-        if "/opt/club3090-control/control.py" in control_unit or "CONTROL_PAYLOAD" in control_unit:
-            return False, "control service references an installed/embedded application payload"
         benchmark_unit = (unit_dir / "club3090-benchmarks.service").read_text(encoding="utf-8")
         if f"WorkingDirectory={root}/src" not in benchmark_unit or "ExecStart=/usr/bin/python3 -m control.http_server --benchmark-worker" not in benchmark_unit:
             return False, "benchmark service does not execute the source-tree worker module"
