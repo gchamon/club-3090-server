@@ -1059,18 +1059,18 @@ function logStreamConfig() {
   if (currentLogSource === "debug")
     return { signature: "debug", url: "/admin/debug-stream?tail=4000" };
   if (currentLogSource === "benchmarks")
-    return { signature: "benchmarks", url: "/admin/logs?source=benchmarks&tail=4000" };
+    return { signature: "benchmarks", url: "/admin/log-stream?source=benchmarks&tail=4000" };
   if (currentLogSource === "script") {
     const selectedId = String(selectedScriptLogJobId || "");
     const streamId = selectedId || lastStatus?.script_job?.job_id || "latest";
-    const url = `/admin/logs?source=script&tail=4000${selectedId ? `&job_id=${encodeURIComponent(selectedId)}` : ""}`;
+    const url = `/admin/log-stream?source=script&tail=4000${selectedId ? `&job_id=${encodeURIComponent(selectedId)}` : ""}`;
     return { signature: `script:${streamId}`, url };
   }
   if (String(currentLogSource || "").startsWith("service:")) {
     const serviceId = String(currentLogSource).split(":", 2)[1] || "";
     return {
       signature: `service:${serviceId}`,
-      url: `/admin/logs?source=service&service=${encodeURIComponent(serviceId)}`,
+      url: `/admin/log-stream?source=service&service=${encodeURIComponent(serviceId)}`,
     };
   }
   if (String(currentLogSource || "").startsWith("model:")) {
@@ -1078,7 +1078,7 @@ function logStreamConfig() {
     const instanceId = modelSource?.instanceId || "";
     return {
       signature: `model:${instanceId || "primary"}`,
-      url: `/admin/logs${instanceId ? `?instance=${encodeURIComponent(instanceId)}` : ""}`,
+      url: `/admin/log-stream${instanceId ? `?instance=${encodeURIComponent(instanceId)}` : ""}`,
     };
   }
   const explicit = selectedDockerLogInstanceId();
@@ -1095,7 +1095,7 @@ function logStreamConfig() {
       : target && target.id;
   return {
     signature: `docker:${instanceId || "primary"}`,
-    url: `/admin/logs${instanceId ? `?instance=${encodeURIComponent(instanceId)}` : ""}`,
+    url: `/admin/log-stream${instanceId ? `?instance=${encodeURIComponent(instanceId)}` : ""}`,
   };
 }
 function noteKnownLogSource(source) {
@@ -1787,7 +1787,7 @@ setCurrentLogSource = function (source, options = {}) {
   currentLogSource = nextSource;
   noteKnownLogSource(currentLogSource);
   applyLogVisibility();
-  if (typeof writeUiStateToLocationHash === "function") writeUiStateToLocationHash({ active_tab: activeTabName, current_log_source: currentLogSource });
+  if (typeof writeUiStateToLocation === "function") writeUiStateToLocation({ active_tab: activeTabName, current_log_source: currentLogSource });
   connectLogs(true);
   scheduleLogCacheRefresh(LOG_CACHE_REFRESH_MS);
   updateLogVisualMode();

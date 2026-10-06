@@ -628,6 +628,115 @@ def run_control_module_smoke_test(root: Path) -> tuple[bool, str]:
         if (root / "runtime_inventory.json").exists():
             return False, "control module wrote runtime inventory outside the selected state directory"
         return True, "control, benchmark-worker, and web assets execute from source modules with isolated state"
+
+def run_admin_path_routing_smoke_test(root: Path) -> tuple[bool, str]:
+    root = Path(root).resolve()
+    with tempfile.TemporaryDirectory(prefix="club3090-admin-path-routing-") as temp_raw:
+        temp = Path(temp_raw)
+        control_dir = temp / "control"
+        upstream_dir = temp / "upstream"
+        control_dir.mkdir()
+        upstream_dir.mkdir()
+        env = dict(os.environ)
+        env.update(
+            CLUB3090_CONTROL_DIR=str(control_dir),
+            CLUB3090_DIR=str(upstream_dir),
+            PYTHONDONTWRITEBYTECODE="1",
+            PYTHONPATH=str(root / "src"),
+        )
+        code = r'''
+import email.message
+import io
+import json
+import threading
+import control.http_server as server
+
+def invoke(path):
+    handler = object.__new__(server.AdminHandler)
+    handler.path = path
+    handler.command = "GET"
+    handler.requestline = f"GET {path} HTTP/1.1"
+    handler.request_version = "HTTP/1.1"
+    handler.close_connection = False
+    handler.wfile = io.BytesIO()
+    handler.rfile = io.BytesIO()
+    handler.headers = email.message.Message()
+    handler.client_address = ("127.0.0.1", 12345)
+    handler._headers_buffer = []
+    handler.require_auth = lambda: True
+    server.AdminHandler.do_GET(handler)
+    response = handler.wfile.getvalue()
+    head, separator, body = response.partition(b"\r\n\r\n")
+    assert separator, f"response headers missing for {path}"
+    lines = head.decode("latin1").split("\r\n")
+    headers = {
+        name.lower(): value
+        for name, value in (line.split(": ", 1) for line in lines[1:] if ": " in line)
+    }
+    return lines[0], headers, body
+
+shell_paths = (
+    "/admin",
+    "/admin/system",
+    "/admin/ai-studio",
+    "/admin/benchmarks",
+    "/admin/metrics",
+    "/admin/users",
+    "/admin/scripts",
+    "/admin/logs",
+    "/admin/chat",
+)
+for path in shell_paths:
+    status, headers, body = invoke(path)
+    assert status == "HTTP/1.1 200 OK", (path, status)
+    assert headers.get("content-type", "").startswith("text/html"), (path, headers)
+    assert headers.get("cache-control") == "no-store, no-cache, must-revalidate", (path, headers)
+    assert b'<section id="overview"' in body, f"{path} did not serve the admin shell"
+
+status, _, _ = invoke("/admin/not-a-tab")
+assert status.startswith("HTTP/1.1 404"), status
+status, headers, body = invoke("/admin/benchmarks/status?live=1")
+benchmark_payload = json.loads(body)
+assert status == "HTTP/1.1 200 OK" and headers.get("content-type", "").startswith("application/json"), (status, headers)
+assert benchmark_payload.get("ok") is True and isinstance(benchmark_payload.get("benchmarks"), dict), benchmark_payload
+
+status, _, body = invoke("/admin/scripts/list?include_internal=1")
+scripts_payload = json.loads(body)
+assert status == "HTTP/1.1 200 OK" and scripts_payload.get("ok") is True, (status, scripts_payload)
+assert isinstance(scripts_payload.get("scripts"), list) and isinstance(scripts_payload.get("job"), dict), scripts_payload
+
+status, _, body = invoke("/admin/users/list")
+users_payload = json.loads(body)
+assert status == "HTTP/1.1 200 OK" and users_payload.get("ok") is True, (status, users_payload)
+assert isinstance(users_payload.get("users"), list) and isinstance(users_payload.get("groups"), list), users_payload
+
+real_begin_stream = server.AdminHandler.begin_admin_stream
+def begin_stopped_stream(handler, label):
+    key, stop_event = real_begin_stream(handler, label)
+    stop_event.set()
+    return key, stop_event
+server.AdminHandler.begin_admin_stream = begin_stopped_stream
+status, headers, _ = invoke("/admin/log-stream?source=benchmarks&tail=17")
+assert status == "HTTP/1.1 200 OK" and headers.get("content-type") == "text/event-stream", (status, headers)
+status, headers, body = invoke("/admin/logs?source=benchmarks")
+assert status == "HTTP/1.1 200 OK" and headers.get("content-type", "").startswith("text/html"), (status, headers)
+assert b'<section id="overview"' in body
+print("canonical admin paths and relocated GET APIs passed")
+'''
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=str(root / "src"),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=45,
+        )
+        if result.returncode:
+            return False, result.stderr.strip() or result.stdout.strip() or "admin path routing smoke failed"
+        return True, result.stdout.strip() or "admin path routing smoke passed"
+
+
 def run_updater_status_smoke_test(root: Path) -> tuple[bool, str]:
     root = Path(root).resolve()
     with tempfile.TemporaryDirectory(prefix="club3090-updater-status-") as temp_raw:

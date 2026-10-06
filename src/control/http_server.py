@@ -247,7 +247,7 @@ self.addEventListener("fetch", (event) => {{
   const request = event.request;
   if (!request || request.method !== "GET" || request.mode !== "navigate") return;
   const url = new URL(request.url);
-  if (!url.pathname.startsWith("/admin") || url.pathname === "/admin/sw.js") return;
+  if (!(url.pathname === "/admin" || url.pathname.startsWith("/admin/")) || url.pathname === "/admin/sw.js") return;
   event.respondWith(networkFirstAdminNavigation(request));
 }});
 """.strip() + "\n"
@@ -414,7 +414,17 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
         if path == "/":
             self.redirect("/admin")
             return
-        if path == "/admin":
+        if path in {
+            "/admin",
+            "/admin/system",
+            "/admin/ai-studio",
+            "/admin/benchmarks",
+            "/admin/metrics",
+            "/admin/users",
+            "/admin/scripts",
+            "/admin/logs",
+            "/admin/chat",
+        }:
             html = get_admin_html_template().replace("__SCRIPT_VERSION__", SCRIPT_VERSION).replace(":8008/admin", f":{ADMIN_PORT}/admin").replace(":8009", f":{PROXY_PORT}")
             self.queue_header("Cache-Control", "no-store, no-cache, must-revalidate")
             self.queue_header("Pragma", "no-cache")
@@ -438,7 +448,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             params = parse_admin_query_params(parsed)
             self.send_json(metrics_series_chunk(params.get("start"), params.get("end"), params.get("after"), params.get("limit", 240)))
             return
-        if path == "/admin/benchmarks":
+        if path == "/admin/benchmarks/status":
             params = parse_admin_query_params(parsed)
             live_only = str(params.get("live") or "").strip().lower() in {"1", "true", "yes", "on"}
             inventory_flags = [params.get("full"), params.get("inventory"), params.get("include_inventory")]
@@ -453,7 +463,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             else:
                 self.send_json({"ok": True, "benchmarks": benchmarks_snapshot(include_logs=include_logs, include_scores=include_scores)})
             return
-        if path == "/admin/scripts":
+        if path == "/admin/scripts/list":
             params = parse_admin_query_params(parsed)
             include_internal = str(params.get("include_internal") or "").strip().lower() in {"1", "true", "yes", "on"}
             self.send_json({"ok": True, "scripts": discover_upstream_scripts(include_internal=include_internal, include_validation=True), "include_internal": include_internal, "job": script_job_snapshot()})
@@ -543,7 +553,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
                 cleanup_path=archive_path,
             )
             return
-        if path == "/admin/logs":
+        if path == "/admin/log-stream":
             params = parse_admin_query_params(parsed)
             if str(params.get("source") or "").strip().lower() == "benchmarks":
                 stream_key, stop_event = self.begin_admin_stream("logs:benchmarks")
@@ -641,7 +651,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
         if path == "/admin/instances":
             self.send_json({"ok": True, "instances": instances_snapshot(), "single_gpu_modes": list(SINGLE_GPU_MODES), "dual_gpu_modes": list(DUAL_GPU_MODES), "running_dual_instances": running_dual_instance_snapshots()})
             return
-        if path == "/admin/users":
+        if path == "/admin/users/list":
             self.send_json({"ok": True, "users": list_users_public(), "groups": list_groups_public(), "server_config": read_server_config()})
             return
         if path == "/admin/groups":

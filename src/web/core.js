@@ -395,6 +395,9 @@ function abandonPendingUpdateUi(message = "") {
     currentLogSource = updateFallbackLogSource(updateMonitor.returnLogSource);
     if (typeof noteKnownLogSource === "function") noteKnownLogSource(currentLogSource);
     if (typeof applyLogVisibility === "function") applyLogVisibility();
+    if (typeof writeUiStateToLocation === "function") {
+      writeUiStateToLocation({ active_tab: activeTabName, current_log_source: currentLogSource });
+    }
     if (typeof queueUiStateSave === "function") {
       queueUiStateSave({ current_log_source: currentLogSource });
     }

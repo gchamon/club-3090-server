@@ -1386,20 +1386,22 @@ function triggerAdminPanelReload(message = "Reloading the admin panel...", delay
   setAuditMsg(message);
   const startedAt = Date.now();
   const navigate = () => {
-    const query = new URLSearchParams({ _: String(Date.now()) });
     const savedReturn = readPendingUpdateReturn();
     const restoreTab = normalizeTabName(updateMonitor.returnTab || savedReturn?.tab || activeTabName || "overview");
     const restoreScroll = Math.max(0, Number(updateMonitor.returnScrollTop || savedReturn?.scrollTop || 0));
-    if (restoreTab) query.set("restore_tab", restoreTab);
-    if (restoreScroll > 0) query.set("restore_scroll", String(restoreScroll));
-    if (restoreTab === "logs" && currentLogSource === "audit") {
-      try {
-        window.sessionStorage.setItem("club3090_system_update_audit_reload", "1");
-      } catch (e) {}
-      window.location.reload();
-      return;
-    }
-    window.location.href = `/admin?${query.toString()}`;
+    const target = new URL(
+      buildUiStateUrl(
+        {
+          active_tab: restoreTab,
+          current_log_source: currentLogSource,
+          tab_scroll_positions: { [restoreTab]: restoreScroll },
+        },
+        window.location.href,
+      ),
+      window.location.href,
+    );
+    target.searchParams.set("_", String(Date.now()));
+    window.location.href = `${target.pathname}${target.search}`;
   };
   const tryReload = async () => {
     if (Date.now() - startedAt > 30000) {

@@ -224,7 +224,7 @@ async function refreshBenchmarkSnapshot(options = {}) {
     query.set("include_scores", options.includeScores ? "1" : "0");
   }
   if (liveOnly && benchmarkSurfaceOpen() && benchmarkJobActive()) query.set("logs", "1");
-  const response = await fetchJsonWithTimeout(`/admin/benchmarks?${query.toString()}`, { cache: "no-store" }, liveOnly ? 4000 : 60000);
+  const response = await fetchJsonWithTimeout(`/admin/benchmarks/status?${query.toString()}`, { cache: "no-store" }, liveOnly ? 4000 : 60000);
   if (!response.ok) throw new Error(`benchmarks fetch failed (${response.status})`);
   const payload = mergeStatusPayloadBenchmarkSnapshot(lastStatus, await response.json());
   const benchmarks = payload?.benchmarks;
@@ -4710,7 +4710,7 @@ async function loadRunScripts() {
   renderRunScriptModal();
   try {
     const internalParam = scriptModalState.showInternal ? "&include_internal=1" : "";
-    const response = await fetchJsonWithTimeout(`/admin/scripts?_=${Date.now()}${internalParam}`, { cache: "no-store" }, 12000);
+    const response = await fetchJsonWithTimeout(`/admin/scripts/list?_=${Date.now()}${internalParam}`, { cache: "no-store" }, 12000);
     const payload = await response.json();
     if (!response.ok || payload?.ok === false) throw new Error(payload?.error || "Script discovery failed.");
     scriptModalState.scripts = Array.isArray(payload.scripts) ? payload.scripts : [];
@@ -5168,8 +5168,7 @@ function rememberTabScrollPosition(name = activeTabName) {
 function persistCurrentTabPosition() {
   rememberTabScrollPosition(activeTabName);
   const state = currentUiState();
-  writeUiStateToLocationHash(state);
-  writeUiStateToLocationSearch(state);
+  writeUiStateToLocation(state);
   lastQueuedUiStateJson = JSON.stringify(state);
   writeCachedUiState(state);
   queueUiStateSave();
@@ -5210,8 +5209,7 @@ function activateTab(name, firstRender = false) {
   } else if (previousTab === "benchmarks" && (benchmarkJobActive() || benchmarkJobFinishedReviewable())) {
     benchmarkMiniVisible = true;
   }
-  writeUiStateToLocationHash(currentUiState());
-  writeUiStateToLocationSearch(currentUiState());
+  writeUiStateToLocation(currentUiState());
   writeCachedUiState(currentUiState());
   logDebugEvent("tab_activate", { name: activeTabName, firstRender: !!firstRender });
   syncActiveTabDisplay();
@@ -7818,7 +7816,6 @@ async function startUpdateFlow() {
       "/admin/update update club3090",
       { silentFailure: true },
     );
-    window.history.replaceState(window.history.state, "", "/admin#tab=logs&log_source=audit");
     setAuditMsg("System Update started. Output is streaming to Audit Logs.");
   } catch (error) {
     abandonPendingUpdateUi("System Update failed before the updater handoff. Restored normal logs.");
@@ -9757,12 +9754,13 @@ function aiStudioCategoryPermalink(type) {
   if (!category) return "";
   const location = window.location;
   const target = location && location.href ? new URL(location.href) : new URL("/", "http://localhost");
-  ["ui_tab", "ui_scroll", "_", "restore_tab", "restore_scroll"].forEach((key) => {
+  ["tab", "log_source", "scroll", "ui_tab", "ui_scroll", "_", "restore_tab", "restore_scroll"].forEach((key) => {
     target.searchParams.delete(key);
   });
   target.searchParams.set("ui_ai_studio_category", category);
-  target.hash = "tab=ai-studio";
-  return `${target.pathname}${target.search}${target.hash}`;
+  target.pathname = "/admin/ai-studio";
+  target.hash = "";
+  return `${target.pathname}${target.search}`;
 }
 function renderOverviewAIStudioCategories() {
   const host = $("overviewAiStudioCategories");

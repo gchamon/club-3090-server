@@ -24,22 +24,14 @@ function normalizeUiLogSource(source) {
     ? value
     : "docker";
 }
-function readUiStateFromLocationHash() {
+function readUiStateFromLocationPath(pathname) {
   try {
-    const raw = String(window.location.hash || "").replace(/^#/, "");
-    if (!raw) return {};
-    const params = new URLSearchParams(raw);
-    const tab = params.has("tab") ? normalizeTabName(params.get("tab") || "") : "";
-    const scroll = Number(params.get("scroll") || "");
-    const state = {};
-    if (tab) state.active_tab = tab;
-    if (tab === "logs" && params.has("log_source")) {
-      state.current_log_source = normalizeUiLogSource(params.get("log_source"));
-    }
-    if (tab && Number.isFinite(scroll) && scroll > 0) {
-      state.tab_scroll_positions = { [tab]: Math.max(0, scroll) };
-    }
-    return state;
+    const path = String(pathname || window.location.pathname || "/admin");
+    if (path === "/admin") return { active_tab: "overview" };
+    if (!path.startsWith("/admin/")) return {};
+    const tab = path.slice("/admin/".length);
+    if (!["system", "ai-studio", "benchmarks", "metrics", "users", "scripts", "logs", "chat"].includes(tab)) return {};
+    return { active_tab: normalizeTabName(tab) };
   } catch (e) {
     return {};
   }
@@ -48,19 +40,21 @@ function normalizeAIStudioModelType(type) {
   const value = String(type || "").trim().toLowerCase();
   return ["text", "image", "audio", "speech", "video"].includes(value) ? value : "";
 }
-function readUiStateFromLocationSearch(search) {
+function readUiStateFromLocationSearch(search, activeTab = "") {
   try {
     const locationLike =
       (typeof window !== "undefined" && window.location) ||
       (typeof location !== "undefined" ? location : null) ||
       {};
     const params = new URLSearchParams(search === undefined ? locationLike.search || "" : search);
-    const tab = params.has("ui_tab") ? normalizeTabName(params.get("ui_tab") || "") : "";
-    const scroll = Number(params.get("ui_scroll") || "");
+    const tab = normalizeTabName(activeTab || readUiStateFromLocationPath(locationLike.pathname).active_tab || "overview");
+    const scroll = Number(params.get("scroll") || "");
     const modelType = normalizeAIStudioModelType(params.get("ui_ai_studio_category"));
     const state = {};
-    if (tab) state.active_tab = tab;
-    if (modelType) state.ai_studio_model_type = modelType;
+    if (tab === "logs" && params.has("log_source")) {
+      state.current_log_source = normalizeUiLogSource(params.get("log_source"));
+    }
+    if (tab === "ai-studio" && modelType) state.ai_studio_model_type = modelType;
     if (tab && Number.isFinite(scroll) && scroll > 0) {
       state.tab_scroll_positions = { [tab]: Math.max(0, scroll) };
     }
@@ -74,25 +68,9 @@ function readUiStateFromLocationNow() {
     (typeof window !== "undefined" && window.location) ||
     (typeof location !== "undefined" ? location : null) ||
     {};
-  const restoreParams = new URLSearchParams(locationLike.search || "");
-  const rawRestoreTab = String(restoreParams.get("restore_tab") || "").trim();
-  const restoreTab = rawRestoreTab ? normalizeTabName(rawRestoreTab) : "";
-  const restoreScroll = Number(
-    restoreParams.get("restore_scroll") || "",
-  );
-  const hashState = readUiStateFromLocationHash();
-  const searchState = readUiStateFromLocationSearch();
-  const state = { ...searchState, ...hashState };
-  if (restoreTab) {
-    state.active_tab = restoreTab;
-    if (Number.isFinite(restoreScroll) && restoreScroll > 0) {
-      state.tab_scroll_positions = {
-        ...(state.tab_scroll_positions || {}),
-        [restoreTab]: Math.max(0, restoreScroll),
-      };
-    }
-  }
-  return state;
+  const pathState = readUiStateFromLocationPath(locationLike.pathname);
+  const searchState = readUiStateFromLocationSearch(locationLike.search || "", pathState.active_tab);
+  return { ...pathState, ...searchState };
 }
 function applyLocationUiStateOverride() {
   const state = readUiStateFromLocationNow();
@@ -109,37 +87,29 @@ function applyLocationUiStateOverride() {
     });
   }
 }
-function writeUiStateToLocationHash(data = {}) {
-  try {
-    const tab = normalizeTabName(data.active_tab || activeTabName || "overview");
-    const scroll = Math.max(0, Number((data.tab_scroll_positions || {})[tab] || 0));
-    const params = new URLSearchParams();
-    params.set("tab", tab);
-    if (tab === "logs") params.set("log_source", normalizeUiLogSource(data.current_log_source || currentLogSource));
-    if (scroll > 0) params.set("scroll", String(Math.round(scroll)));
-    const nextHash = `#${params.toString()}`;
-    const nextUrl = `${window.location.pathname || ""}${window.location.search || ""}${nextHash}`;
-    if (window.location.hash !== nextHash) window.history.replaceState(null, "", nextUrl);
-  } catch (e) {}
+function buildUiStateUrl(data = {}, baseUrl = "") {
+  const tab = normalizeTabName(data.active_tab || activeTabName || "overview");
+  const nextUrl = new URL(baseUrl || window.location.href);
+  ["tab", "log_source", "scroll", "ui_tab", "ui_scroll", "ui_ai_studio_category", "restore_tab", "restore_scroll", "_"].forEach((key) => {
+    nextUrl.searchParams.delete(key);
+  });
+  if (tab === "logs") {
+    nextUrl.searchParams.set("log_source", normalizeUiLogSource(data.current_log_source || currentLogSource));
+  } else if (tab === "ai-studio") {
+    const modelType = normalizeAIStudioModelType(data.ai_studio_model_type || aiStudioModelType);
+    if (modelType) nextUrl.searchParams.set("ui_ai_studio_category", modelType);
+  }
+  const scroll = Math.max(0, Number((data.tab_scroll_positions || {})[tab] || 0));
+  if (scroll > 0) nextUrl.searchParams.set("scroll", String(Math.round(scroll)));
+  nextUrl.pathname = tab === "overview" ? "/admin" : `/admin/${tab}`;
+  nextUrl.hash = "";
+  return `${nextUrl.pathname}${nextUrl.search}`;
 }
-function writeUiStateToLocationSearch(data = {}) {
+function writeUiStateToLocation(data = {}) {
   try {
-    const nextUrl = new URL(window.location.href);
-    const modelType = normalizeAIStudioModelType(data.ai_studio_model_type);
-    const completingAuditUpdate =
-      window.sessionStorage.getItem("club3090_system_update_audit_reload") === "1" &&
-      normalizeTabName(data.active_tab) === "logs" &&
-      normalizeUiLogSource(data.current_log_source) === "audit";
-    if (completingAuditUpdate) {
-      window.sessionStorage.removeItem("club3090_system_update_audit_reload");
-    }
-    nextUrl.searchParams.delete("ui_tab");
-    nextUrl.searchParams.delete("ui_scroll");
-    if (modelType && !completingAuditUpdate) nextUrl.searchParams.set("ui_ai_studio_category", modelType);
-    else nextUrl.searchParams.delete("ui_ai_studio_category");
-    const nextPath = `${nextUrl.pathname}${nextUrl.search}${nextUrl.hash}`;
+    const nextPath = buildUiStateUrl(data);
     const currentPath = `${window.location.pathname || ""}${window.location.search || ""}${window.location.hash || ""}`;
-    if (nextPath !== currentPath) window.history.replaceState(null, "", nextPath);
+    if (nextPath !== currentPath) window.history.replaceState(window.history.state, "", nextPath);
   } catch (e) {}
 }
 function readJsonCache(key, fallback) {
@@ -661,11 +631,9 @@ function syncHeaderChatButtonAlignment() {
 function hydrateUiState(cfg) {
   if (uiStateHydrated) return;
   const cached = readCachedUiState(),
-    hashState = readUiStateFromLocationHash(),
-    searchState = readUiStateFromLocationSearch(),
-    restoreTab = normalizeTabName(urlParams.get("restore_tab") || ""),
-    restoreScroll = Number(urlParams.get("restore_scroll") || ""),
-    state = { ...(cfg || {}), ...searchState, ...cached, ...hashState };
+    pathState = readUiStateFromLocationPath(),
+    searchState = readUiStateFromLocationSearch(undefined, pathState.active_tab),
+    state = { ...(cfg || {}), ...cached, ...pathState, ...searchState };
   const locationModelType = normalizeAIStudioModelType(searchState.ai_studio_model_type);
   if (locationModelType) state.ai_studio_model_type = locationModelType;
   if (state.tab_scroll_positions && typeof state.tab_scroll_positions === "object") {
@@ -679,12 +647,6 @@ function hydrateUiState(cfg) {
   }
   if (typeof setMetricIntervalState === "function") {
     setMetricIntervalState(state.metric_time_value, state.metric_time_unit, { persist: false, refresh: false });
-  }
-  if (restoreTab) {
-    activeTabName = restoreTab;
-    if (Number.isFinite(restoreScroll) && restoreScroll > 0) {
-      tabScrollPositions[restoreTab] = Math.max(0, restoreScroll);
-    }
   }
   aiStudioModelType = normalizeAIStudioModelType(state.ai_studio_model_type) || aiStudioModelType;
   currentLogSource = normalizeUiLogSource(state.current_log_source);
@@ -717,6 +679,7 @@ function hydrateUiState(cfg) {
       nextUrl.searchParams.delete("ui_tab");
       nextUrl.searchParams.delete("ui_scroll");
       nextUrl.searchParams.delete("_");
+      nextUrl.hash = "";
       history.replaceState({}, document.title, `${nextUrl.pathname}${nextUrl.search}${nextUrl.hash}`);
     } catch (e) {}
   }
