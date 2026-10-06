@@ -6454,7 +6454,7 @@ function smToRank(value) {
     .toLowerCase()
     .replace(/^sm_/, "")
     .replace(/\+$/, "");
-  if (!raw) return 0;
+  if (/^\d{2}$/.test(raw)) return Number(raw[0]) * 100 + Number(raw[1]) * 10;
   const parts = raw.split(".", 2);
   const major = String(parts[0] || "").replace(/[^0-9]/g, "");
   let minor = String(parts[1] || "0").replace(/[^0-9]/g, "");
@@ -6710,7 +6710,11 @@ function variantHardwareSummary(variant) {
   } else if (minGpuCount > 1) {
     parts.push(`${minGpuCount} GPU minimum`);
   }
-  if (requiresSm) parts.push(`sm_${requiresSm.replace(/\+$/, "")}+`);
+  if (requiresSm) {
+    parts.push(variant?.engine === "strata"
+      ? "GPU compute capability: 7.5, 8.0, 8.6, 8.9, or 12.0"
+      : `sm_${requiresSm.replace(/\+$/, "")}+`);
+  }
   if (engineProfile) parts.push(engineProfile);
   if (nvlinkMode === "required") parts.push("NVLink required");
   return parts.join(" | ");
@@ -10143,7 +10147,13 @@ function variantRigBlockReason(variant) {
   }
   if (requiredSmRank > 0) {
     const eligibleBySm = rows.filter((row) => smToRank(row?.compute_cap) >= requiredSmRank);
-    if (eligibleBySm.length < Math.max(minGpuCount || 1, 1)) return `Requires sm_${requiredSm}+ hardware.`;
+    if (eligibleBySm.length < Math.max(minGpuCount || 1, 1)) {
+      if (variant?.engine === "strata") {
+        return "Strata requires a GPU with compute capability 7.5 or newer; detected " +
+          `${rows.map((row) => String(row?.compute_cap || "unknown")).join(", ")}.`;
+      }
+      return `Requires sm_${requiredSm}+ hardware.`;
+    }
   }
   return "";
 }
