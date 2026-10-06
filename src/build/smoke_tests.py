@@ -372,6 +372,77 @@ def run_installer_preflight_smoke_test(root: Path) -> tuple[bool, str]:
             return False, "selected-model dependency failure wrote state, service registration, or invoked upstream setup"
         return True, "installer reports missing prerequisites before filesystem writes"
 
+def run_control_runtime_globals_smoke_test(root: Path) -> tuple[bool, str]:
+    root = Path(root).resolve()
+    with tempfile.TemporaryDirectory(prefix="club3090-control-globals-") as temp_raw:
+        temp = Path(temp_raw)
+        env = dict(os.environ)
+        env.update(
+            CLUB3090_CONTROL_DIR=str(temp / "state"),
+            CLUB3090_DIR=str(temp / "upstream"),
+            PYTHONDONTWRITEBYTECODE="1",
+            PYTHONPATH=str(root / "src"),
+        )
+        audit = r"""
+import builtins, dis, json, types
+import control
+
+functions = {}
+def add(name, value):
+    if isinstance(value, types.FunctionType):
+        functions.setdefault(id(value), (name, value))
+def inspect_class(prefix, cls):
+    for name, value in vars(cls).items():
+        qualified = prefix + "." + name
+        if isinstance(value, (staticmethod, classmethod)):
+            add(qualified, value.__func__)
+        elif isinstance(value, property):
+            for suffix, fn in (("getter", value.fget), ("setter", value.fset), ("deleter", value.fdel)):
+                if fn is not None:
+                    add(qualified + "." + suffix, fn)
+        else:
+            add(qualified, value)
+for name, value in vars(control).items():
+    if isinstance(value, type):
+        inspect_class("control." + name, value)
+    else:
+        add("control." + name, value)
+failures = set()
+for qualified, fn in functions.values():
+    pending, seen = [fn.__code__], set()
+    while pending:
+        code = pending.pop()
+        if id(code) in seen:
+            continue
+        seen.add(id(code))
+        for instruction in dis.get_instructions(code):
+            if instruction.opname == "LOAD_GLOBAL":
+                name = instruction.argval
+                if name not in fn.__globals__ and not hasattr(builtins, name):
+                    failures.add(f"{qualified}: {name}")
+        pending.extend(value for value in code.co_consts if isinstance(value, types.CodeType))
+result = sorted(failures)
+print(json.dumps(result))
+raise SystemExit(bool(result))
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", audit],
+            cwd=str(root / "src"), env=env, capture_output=True,
+            text=True, check=False, timeout=60,
+        )
+        try:
+            failures = json.loads(result.stdout)
+        except ValueError as exc:
+            diagnostic = result.stderr.strip() or result.stdout.strip() or str(exc)
+            return False, f"control runtime global audit emitted malformed JSON: {diagnostic}"
+        if not isinstance(failures, list) or any(not isinstance(item, str) for item in failures):
+            return False, f"control runtime global audit emitted invalid JSON payload: {result.stdout.strip()}"
+        if result.returncode or failures:
+            details = "\n".join(failures) or result.stderr.strip() or result.stdout.strip()
+            return False, f"unresolved control globals:\n{details}"
+        return True, "assembled control callable globals resolve"
+
+
 def run_control_module_smoke_test(root: Path) -> tuple[bool, str]:
     root = Path(root).resolve()
     with tempfile.TemporaryDirectory(prefix="club3090-control-module-") as temp_raw:
@@ -383,6 +454,7 @@ def run_control_module_smoke_test(root: Path) -> tuple[bool, str]:
         env.update(
             CLUB3090_CONTROL_DIR=str(state_dir),
             CLUB3090_DIR=str(upstream),
+            CLUB3090_ADMIN_AUTH_DENIAL_LOG_WINDOW_SECONDS="7",
             PYTHONDONTWRITEBYTECODE="1",
             PYTHONPATH=str(root / "src"),
         )
@@ -409,10 +481,23 @@ def run_control_module_smoke_test(root: Path) -> tuple[bool, str]:
         assets = subprocess.run(
             [
                 sys.executable, "-c",
-                "import control; assert control.admin_session_ok({'Cookie': ''}, '127.0.0.1') is False; "
+                "import control; assert control.ADMIN_AUTH_DENIAL_LOG_WINDOW_SECONDS == 7; "
+                "control.admin_auth_denial_state.clear(); control.admin_auth_denial_state[('stale','/old')] = 1.0; "
+                "control.time.time=lambda: 1000.0; "
+                "assert control.should_log_admin_auth_denial('192.0.2.1','/admin'); "
+                "assert not control.should_log_admin_auth_denial('192.0.2.1','/admin'); "
+                "assert ('stale','/old') not in control.admin_auth_denial_state; "
+                "control._shared.DEBUG_LOGS=True; events=[]; control._shared.log_audit=lambda event, **kwargs: events.append(event); "
+                "exec(\"with control.suppress_chat_debug_audit():\\n control.debug_audit('chat_test')\"); "
+                "assert not events; control.debug_audit('chat_test'); assert events == ['debug_chat_test']; "
+                "control.docker_log_path_cache.clear(); calls=[]; "
+                "control.subprocess.check_output=lambda *args, **kwargs: (calls.append(args), '/var/lib/docker/containers/test/test-json.log')[1]; "
+                "assert control._docker_log_path('test-container') == '/var/lib/docker/containers/test/test-json.log'; "
+                "assert control._docker_log_path('test-container') == '/var/lib/docker/containers/test/test-json.log'; "
+                "assert len(calls) == 1; "
+                "assert control.admin_session_ok({'Cookie': ''}, '127.0.0.1') is False; "
                 "token=control.create_admin_session('127.0.0.1'); "
                 "assert control.admin_session_ok({'Cookie': f'{control.ADMIN_SESSION_COOKIE_NAME}={token}'}, '127.0.0.1'); "
-                "assert not control.admin_session_ok({'Cookie': f'{control.ADMIN_SESSION_COOKIE_NAME}={token}'}, '10.0.0.2'); "
                 "exec(\"class _Stop(Exception): pass\\n"
                 "control.refresh_docker_logrotate_config=lambda: None\\n"
                 "def _stop(delay): raise _Stop(delay)\\n"

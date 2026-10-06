@@ -94,6 +94,7 @@ AUTH_FAILURE_CACHE_SECONDS = _env_int("CLUB3090_ADMIN_AUTH_FAILURE_CACHE_SECONDS
 AUTH_CACHE_MAX_ENTRIES = _env_int("CLUB3090_ADMIN_AUTH_CACHE_MAX_ENTRIES", 256)
 ADMIN_SESSION_COOKIE_NAME = "club3090_admin_session"
 ADMIN_SESSION_TTL_SECONDS = _env_int("CLUB3090_ADMIN_SESSION_TTL_SECONDS", 86400)
+ADMIN_AUTH_DENIAL_LOG_WINDOW_SECONDS = _env_int("CLUB3090_ADMIN_AUTH_DENIAL_LOG_WINDOW_SECONDS", 30)
 ADMIN_SESSIONS_FILE = os.path.join(CONTROL_DIR, "admin_sessions.json")
 DOCKER_LOGROTATE_REFRESH_SECONDS = _env_int("CLUB3090_DOCKER_LOGROTATE_REFRESH_SECONDS", 21600)
 DOCKER_LOG_RETENTION_DAYS = _env_int("CLUB3090_DOCKER_LOG_RETENTION_DAYS", 7)
@@ -594,6 +595,7 @@ docker_names_cache = {
     "running": {"value": [], "time": 0.0},
     "all": {"value": [], "time": 0.0},
 }
+docker_log_path_cache = {}
 service_status_cache = {}
 gpu_count_cache = {"value": 0, "time": 0.0}
 compose_metadata_cache = {}
@@ -625,6 +627,7 @@ admin_session_lock = threading.Lock()
 admin_sessions = {}
 admin_sessions_loaded = False
 admin_auth_denial_lock = threading.Lock()
+chat_audit_context = threading.local()
 admin_auth_denial_state = {}
 audit_rate_limit_lock = threading.Lock()
 audit_rate_limit_state = {}
