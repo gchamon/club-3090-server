@@ -186,7 +186,6 @@ PY
 install_unit() {
   local source="$1" target="$2" line
   local rendered="$(mktemp)"
-  progress "Rendering and installing ${target}"
   while IFS= read -r line || [[ -n "${line}" ]]; do
     line="${line//@SOURCE_ROOT@/${ROOT}}"
     line="${line//@ENV_FILE@/${ENV_FILE}}"

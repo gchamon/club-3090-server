@@ -277,6 +277,16 @@ def run_repository_uninstall_smoke_test(root: Path) -> tuple[bool, str]:
             return False, "uninstaller left registered services or configuration behind"
         if not sentinel.is_file():
             return False, "uninstaller removed mutable runtime data"
+        uninstaller_output = result.stdout + result.stderr
+        for message in (
+            "[uninstall] Checking systemctl and privilege requirements",
+            "[uninstall] Stopping and disabling Club-3090 Server services",
+            f"[uninstall] Removing service configuration {env_file}",
+            "[uninstall] Reloading systemd unit definitions",
+            "[uninstall] Uninstallation complete",
+        ):
+            if message not in uninstaller_output:
+                return False, f"uninstaller omitted progress message {message!r}"
         systemctl_calls = calls.read_text(encoding="utf-8")
         for unit in units:
             if f"disable --now {unit}" not in systemctl_calls:
