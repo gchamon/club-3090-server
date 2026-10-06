@@ -89,6 +89,13 @@ def _env_float(name, default):
 
 def _env_str(name, default):
     return str(os.environ.get(name, str(default)))
+AUTH_CACHE_SECONDS = 120
+AUTH_FAILURE_CACHE_SECONDS = _env_int("CLUB3090_ADMIN_AUTH_FAILURE_CACHE_SECONDS", 30)
+AUTH_CACHE_MAX_ENTRIES = _env_int("CLUB3090_ADMIN_AUTH_CACHE_MAX_ENTRIES", 256)
+ADMIN_SESSION_COOKIE_NAME = "club3090_admin_session"
+ADMIN_SESSION_TTL_SECONDS = _env_int("CLUB3090_ADMIN_SESSION_TTL_SECONDS", 86400)
+ADMIN_SESSIONS_FILE = os.path.join(CONTROL_DIR, "admin_sessions.json")
+
 
 
 DEFAULT_RUNTIME_CONFIG = {
@@ -608,6 +615,10 @@ STORAGE_BROWSER_CHUNK_BYTES = 1024 * 1024
 STORAGE_BROWSER_MAX_FILE_BYTES = 1024 * 1024 * 1024
 runtime_inventory_built_at = 0.0
 model_install_job_lock = threading.RLock()
+auth_cache = {}
+auth_failure_cache = {}
+auth_inflight_locks = {}
+auth_lock = threading.Lock()
 admin_session_lock = threading.Lock()
 admin_sessions = {}
 admin_sessions_loaded = False

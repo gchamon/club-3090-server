@@ -393,7 +393,11 @@ def run_control_module_smoke_test(root: Path) -> tuple[bool, str]:
         assets = subprocess.run(
             [
                 sys.executable, "-c",
-                "import control; html=control.get_admin_html_template(); "
+                "import control; assert control.admin_session_ok({'Cookie': ''}, '127.0.0.1') is False; "
+                "token=control.create_admin_session('127.0.0.1'); "
+                "assert control.admin_session_ok({'Cookie': f'{control.ADMIN_SESSION_COOKIE_NAME}={token}'}, '127.0.0.1'); "
+                "assert not control.admin_session_ok({'Cookie': f'{control.ADMIN_SESSION_COOKIE_NAME}={token}'}, '10.0.0.2'); "
+                "html=control.get_admin_html_template(); "
                 "assert 'renderAIStudioLaneActions' in html; "
                 "assert 'Start this inference runtime automatically at boot' in html; "
                 "assert 'toggle_enabled' in html; print(len(html))",
