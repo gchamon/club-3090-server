@@ -55,7 +55,16 @@ SOURCE_ROOT = str(Path(__file__).resolve().parents[2])
 CLUB3090_DIR = os.path.abspath(os.environ.get("CLUB3090_DIR", os.path.join(SOURCE_ROOT, "club-3090")))
 CONTROL_DIR = os.path.abspath(os.environ.get("CLUB3090_CONTROL_DIR", "/var/lib/club3090-control"))
 MCP_PROTOCOL_VERSION = "2025-03-26"
-SCRIPT_VERSION = os.environ.get("CLUB3090_SCRIPT_VERSION", "unknown")
+_configured_script_version = str(os.environ.get("CLUB3090_SCRIPT_VERSION") or "").strip()
+if re.search(r"v\d+\.\d+\.\d+[a-z]*$", _configured_script_version):
+    SCRIPT_VERSION = _configured_script_version
+else:
+    try:
+        with open(os.path.join(SOURCE_ROOT, "metadata.json"), "r", encoding="utf-8") as _metadata_file:
+            _metadata_version = str(json.load(_metadata_file).get("version") or "").strip()
+        SCRIPT_VERSION = f"v{_metadata_version}" if re.fullmatch(r"\d+\.\d+\.\d+[a-z]*", _metadata_version) else "unknown"
+    except Exception:
+        SCRIPT_VERSION = "unknown"
 SCRIPT_CLUB3090_COMPAT = {}
 _SCRIPT_VERSION_MATCH = re.search(r"v(\d+)\.(\d+)\.(\d+)([a-z]*)\s*$", str(SCRIPT_VERSION or ""))
 DEBUG_LOGS = not (_SCRIPT_VERSION_MATCH and int(_SCRIPT_VERSION_MATCH.group(3)) == 0)

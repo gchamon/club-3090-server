@@ -1,6 +1,6 @@
 {
-  "version": "0.11.16",
-  "release_date": "2026-09-29",
+  "version": "0.12.0",
+  "release_date": "2026-10-07",
   "change_log_icons": {
     "new_feature": "🟢",
     "fix": "🐞",

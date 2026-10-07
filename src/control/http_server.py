@@ -2,6 +2,33 @@ import control as _control
 globals().update({name: value for name, value in vars(_control).items() if not name.startswith("__")})
 del _control
 
+def _current_source_commit():
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=SOURCE_ROOT,
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        ).strip().lower()
+    except Exception:
+        return ""
+    return commit if re.fullmatch(r"[0-9a-f]{40}", commit) else ""
+
+
+SCRIPT_COMMIT = _current_source_commit()
+
+
+def _admin_version_commit_link():
+    short_commit = SCRIPT_COMMIT[:7] if SCRIPT_COMMIT else "unknown"
+    label = xml_escape(f"{SCRIPT_VERSION} - {short_commit}")
+    if not SCRIPT_COMMIT:
+        return label
+    url = f"https://github.com/gchamon/club-3090-server/tree/{SCRIPT_COMMIT}"
+    return f'<a class="brand-version-link" href="{url}">{label}</a>'
+
+
+
 class CommonMixin:
     def log_message(self, fmt, *args):
         return
@@ -425,7 +452,13 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             "/admin/logs",
             "/admin/chat",
         }:
-            html = get_admin_html_template().replace("__SCRIPT_VERSION__", SCRIPT_VERSION).replace(":8008/admin", f":{ADMIN_PORT}/admin").replace(":8009", f":{PROXY_PORT}")
+            html = (
+                get_admin_html_template()
+                .replace("__SCRIPT_VERSION__", SCRIPT_VERSION)
+                .replace("__VERSION_COMMIT_LINK__", _admin_version_commit_link())
+                .replace(":8008/admin", f":{ADMIN_PORT}/admin")
+                .replace(":8009", f":{PROXY_PORT}")
+            )
             self.queue_header("Cache-Control", "no-store, no-cache, must-revalidate")
             self.queue_header("Pragma", "no-cache")
             self.send_bytes(html.encode("utf-8"), "text/html; charset=utf-8")

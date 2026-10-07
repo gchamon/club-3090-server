@@ -641,6 +641,7 @@ def run_admin_path_routing_smoke_test(root: Path) -> tuple[bool, str]:
         env.update(
             CLUB3090_CONTROL_DIR=str(control_dir),
             CLUB3090_DIR=str(upstream_dir),
+            CLUB3090_SCRIPT_VERSION="unknown",
             PYTHONDONTWRITEBYTECODE="1",
             PYTHONPATH=str(root / "src"),
         )
@@ -650,6 +651,10 @@ import io
 import json
 import threading
 import control.http_server as server
+
+assert server.SCRIPT_VERSION == "v0.12.0", server.SCRIPT_VERSION
+server.SCRIPT_COMMIT = "0123456789abcdef0123456789abcdef01234567"
+EXPECTED_VERSION_LINK = b'<a class="brand-version-link" href="https://github.com/gchamon/club-3090-server/tree/0123456789abcdef0123456789abcdef01234567">v0.12.0 - 0123456</a>'
 
 def invoke(path):
     handler = object.__new__(server.AdminHandler)
@@ -692,6 +697,7 @@ for path in shell_paths:
     assert headers.get("content-type", "").startswith("text/html"), (path, headers)
     assert headers.get("cache-control") == "no-store, no-cache, must-revalidate", (path, headers)
     assert b'<section id="overview"' in body, f"{path} did not serve the admin shell"
+    assert EXPECTED_VERSION_LINK in body, f"{path} did not render the version and commit tree link"
 
 status, _, _ = invoke("/admin/not-a-tab")
 assert status.startswith("HTTP/1.1 404"), status

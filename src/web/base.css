@@ -134,6 +134,19 @@ header {
   font-size: 18px;
   font-weight: 800;
 }
+.brand-version-link {
+  color: inherit;
+  text-decoration-color: var(--muted);
+  text-underline-offset: 2px;
+}
+.brand-version-link:hover {
+  color: var(--blue);
+}
+.brand-version-link:focus-visible {
+  border-radius: 2px;
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
 .pill {
   flex: 0 1 min(352px, calc(100vw - 120px));
   width: min(352px, calc(100vw - 120px));
