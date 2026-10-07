@@ -9,7 +9,14 @@ function clearLog() {
 function appendLogToSignature(signature, t) {
   const targetSignature = String(signature || currentLogSignature || logStreamConfig().signature || "").trim();
   if (!targetSignature) return;
-  appendLogChunk(targetSignature, `${t}\n`);
+  const now = new Date();
+  const stamp = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")} ${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}:${String(now.getSeconds()).padStart(2, "0")}`;
+  const text = String(t ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const stamped = text.split("\n").map((line) => {
+    if (!line || /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\s|$)/.test(line)) return line;
+    return `${stamp} ${line}`;
+  }).join("\n");
+  appendLogChunk(targetSignature, `${stamped}\n`);
 }
 function appendLog(t) {
   const signature = currentLogSignature || logStreamConfig().signature;

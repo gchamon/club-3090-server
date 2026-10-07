@@ -636,6 +636,22 @@ def write_instance_artifacts(instance):
         f"{device_id_lines}"
         "              capabilities: [gpu]\n"
     )
+    if is_strata and str(spec.get("strata_install_mode") or "") == "orca":
+        override += (
+            "    entrypoint: !override\n"
+            "      - /opt/strata/.venv/bin/python\n"
+            "      - -m\n"
+            "      - serve.server\n"
+            "    command: !override\n"
+            "      - --engine\n"
+            "      - strata\n"
+            "      - --config\n"
+            "      - /data/config/strata-orca-iq3_xxs.json\n"
+            "      - --host\n"
+            "      - 0.0.0.0\n"
+            "      - --port\n"
+            "      - \"8080\"\n"
+        )
     if not is_strata:
         override += "    volumes:\n"
         override += f"      - {cache_root}:{GLOBAL_VLLM_CACHE_CONTAINER_ROOT}\n"

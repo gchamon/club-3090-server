@@ -54,6 +54,7 @@ except Exception:
 SOURCE_ROOT = str(Path(__file__).resolve().parents[2])
 CLUB3090_DIR = os.path.abspath(os.environ.get("CLUB3090_DIR", os.path.join(SOURCE_ROOT, "club-3090")))
 CONTROL_DIR = os.path.abspath(os.environ.get("CLUB3090_CONTROL_DIR", "/var/lib/club3090-control"))
+MCP_PROTOCOL_VERSION = "2025-03-26"
 SCRIPT_VERSION = os.environ.get("CLUB3090_SCRIPT_VERSION", "unknown")
 SCRIPT_CLUB3090_COMPAT = {}
 _SCRIPT_VERSION_MATCH = re.search(r"v(\d+)\.(\d+)\.(\d+)([a-z]*)\s*$", str(SCRIPT_VERSION or ""))
@@ -1395,9 +1396,26 @@ def maybe_warmup_variant_runtime(spec, ready_url, *, timeout=240):
             time.sleep(1)
     return {"ok": False, "skipped": False, "reason": last_error or "warmup request failed"}
 
+def _local_log_timestamp():
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _timestamp_human_log_line(text):
+    line = str(text or "").rstrip("\r\n")
+    if not line:
+        return ""
+    if re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\s|$)", line):
+        return line
+    return f"{_local_log_timestamp()} {line}"
+
+
+def _timestamp_human_log_lines(text):
+    return [_timestamp_human_log_line(line) for line in str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n") if line]
+
+
 def log_control(message):
     os.makedirs(CONTROL_DIR, exist_ok=True)
-    line = time.strftime("%Y-%m-%d %H:%M:%S") + " " + str(message).rstrip() + "\n"
+    line = _timestamp_human_log_line(message) + "\n"
     try:
         with open(CONTROL_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(line)
@@ -1516,34 +1534,53 @@ def script_user_agent():
 
 def append_audit_text_line(text):
     os.makedirs(CONTROL_DIR, exist_ok=True)
-    line = str(text or "").rstrip("\n") + "\n"
+    lines = _timestamp_human_log_lines(text)
+    if not lines:
+        return
     try:
         with open(AUDIT_LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(line)
+            f.write("\n".join(lines) + "\n")
     except Exception:
         pass
 
 
 def append_debug_text_line(text):
+    global DEBUG_TEXT_CHUNK_PENDING
     os.makedirs(CONTROL_DIR, exist_ok=True)
-    line = str(text or "").rstrip("\n") + "\n"
-    try:
-        with open(DEBUG_LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(line)
-    except Exception:
-        pass
+    with DEBUG_TEXT_CHUNK_LOCK:
+        pending = DEBUG_TEXT_CHUNK_PENDING
+        DEBUG_TEXT_CHUNK_PENDING = ""
+        lines = _timestamp_human_log_lines(pending) + _timestamp_human_log_lines(text)
+        if not lines:
+            return
+        try:
+            with open(DEBUG_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write("".join(f"{line}\n" for line in lines))
+        except Exception:
+            pass
+
+
+DEBUG_TEXT_CHUNK_LOCK = threading.Lock()
+DEBUG_TEXT_CHUNK_PENDING = ""
 
 
 def append_debug_text_chunk(text):
-    os.makedirs(CONTROL_DIR, exist_ok=True)
-    chunk = str(text or "")
+    global DEBUG_TEXT_CHUNK_PENDING
+    chunk = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
     if not chunk:
         return
-    try:
-        with open(DEBUG_LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(chunk)
-    except Exception:
-        pass
+    with DEBUG_TEXT_CHUNK_LOCK:
+        pending = DEBUG_TEXT_CHUNK_PENDING + chunk
+        lines = pending.split("\n")
+        DEBUG_TEXT_CHUNK_PENDING = lines.pop()
+        if not lines:
+            return
+        os.makedirs(CONTROL_DIR, exist_ok=True)
+        try:
+            with open(DEBUG_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write("".join(f"{_timestamp_human_log_line(line)}\n" for line in lines if line))
+        except Exception:
+            pass
 
 
 def _clear_debug_shell_session_locked():
@@ -4771,6 +4808,9 @@ def _preset_resource_path_allowed(path, row):
             continue
     return False
 
+def _model_resource_path_allowed_generic(path):
+    return _preset_resource_path_allowed(path, {})
+
 
 def variant_resource_plan_from_row(row, include_missing=False):
     variant = row if isinstance(row, dict) else {}
@@ -6200,6 +6240,86 @@ def _wait_for_model_update_targets(job_id, prefix, affected_variants):
             time.sleep(10)
 
 
+def _prepare_strata_orca(job_id, prefix, variant, env_map):
+    token = str((env_map or {}).get("HF_TOKEN") or "").strip()
+    if not token:
+        raise RuntimeError("OrcaRouter requires HF_TOKEN already authorized for gated repository orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF.")
+    data_root = os.path.abspath(str((variant or {}).get("strata_data_path") or ""))
+    if not data_root or not _path_is_within(os.path.join(CONTROL_DIR, "builtin-models"), data_root):
+        raise RuntimeError("Orca data path is outside the controller-owned builtin-models directory.")
+    os.makedirs(data_root, exist_ok=True)
+    filenames = [
+        "Qwen3.8-Flash-Next-Uncensored-IQ3_XXS-00001-of-00002.gguf",
+        "Qwen3.8-Flash-Next-Uncensored-IQ3_XXS-00002-of-00002.gguf",
+    ]
+    step = {
+        "repo_ids": ["orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF"],
+        "filenames": filenames,
+        "local_dir": data_root,
+    }
+    try:
+        _run_hf_download_step(job_id, prefix, step, env_map)
+    except Exception as exc:
+        raise RuntimeError(
+            "OrcaRouter download failed; verify HF_TOKEN is authorized for gated repository "
+            "orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF. "
+            f"Downloader: {str(exc)[:500]}"
+        ) from exc
+    shard1, shard2 = (os.path.join(data_root, name) for name in filenames)
+    if not all(os.path.isfile(path) for path in (shard1, shard2)):
+        raise RuntimeError("OrcaRouter gated download did not produce both IQ3_XXS shards; authorize the token and retry.")
+    source = os.path.abspath(str((variant or {}).get("strata_source_path") or ""))
+    image = str((variant or {}).get("strata_image") or "")
+    config = {
+        "exe": "build/strata",
+        "args": ["--pack", "/data/packs/orca-iq3_xxs", "--native", f"/data/{filenames[0]}", "--ple-gguf", f"/data/{filenames[0]}", "--expert-profile", "/opt/strata/data/expert-profile.bin", "--expert-cache", "auto", "--prefill", "512", "--spec", "4", "--spec-min-p", "0.5", "--mtp", "/data/mtp/rt", "--max-context", "32768", "--kv", "int8"],
+        "cwd": "/opt/strata", "tokenizer": "/data/packs/orca-iq3_xxs/tokenizer",
+        "model_name": "orcarouter-qwen3.8-flash-next-uncensored-iq3_xxs",
+        "log": "/data/strata-orca-iq3_xxs.log", "host": "0.0.0.0", "port": 8080,
+    }
+    config_dir = os.path.join(data_root, "config")
+    os.makedirs(config_dir, exist_ok=True)
+    config_path = os.path.join(config_dir, "strata-orca-iq3_xxs.json")
+    with open(config_path, "w", encoding="utf-8") as handle:
+        json.dump(config, handle, indent=2)
+        handle.write("\n")
+    os.chmod(config_path, 0o600)
+    docker_command = [
+        "docker", "run", "--rm", "-v", f"{data_root}:/data",
+        "-e", "STRATA_GGUF_PY=/opt/strata/third_party/llama.cpp/gguf-py",
+        "--entrypoint", "/bin/bash", image, "-lc",
+        "set -e; cd /opt/strata; "
+        f".venv/bin/python tools/iq_pack.py --gguf /data/{shlex.quote(filenames[0])} --out /data/packs/orca-iq3_xxs --compat-bf16; "
+        ".venv/bin/python tools/mtp_fetch.py fetch --out /data/mtp; "
+        ".venv/bin/python tools/mtp_pack.py --src /data/mtp --experts q2_0 --out /data/mtp/mtp-q2_0.gguf; "
+        ".venv/bin/python tools/mtp_rt.py --gguf /data/mtp/mtp-q2_0.gguf --out /data/mtp/rt; "
+        "cp /opt/strata/data/draft_vocab.bin /data/mtp/rt/draft_vocab.bin",
+    ]
+    process = subprocess.Popen(docker_command, cwd=CLUB3090_DIR, env=env_map, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=False, bufsize=0)
+    _register_model_install_process(job_id, process)
+    try:
+        _stream_process_output_to_audit(process, prefix)
+        if int(process.wait()) != 0:
+            raise RuntimeError("OrcaRouter compatibility packing/MTP preparation failed.")
+    finally:
+        _clear_model_install_process(job_id, process)
+    expected = (
+        shard1, shard2,
+        os.path.join(data_root, "packs", "orca-iq3_xxs", "tokenizer"),
+        os.path.join(data_root, "packs", "orca-iq3_xxs", "index.txt"),
+        os.path.join(data_root, "packs", "orca-iq3_xxs", "dense.bin"),
+        os.path.join(data_root, "packs", "orca-iq3_xxs", "native_experts.txt"),
+        os.path.join(data_root, "mtp", "mtp-q2_0.gguf"),
+        os.path.join(data_root, "mtp", "rt"),
+        os.path.join(data_root, "mtp", "rt", "draft_vocab.bin"),
+        config_path,
+    )
+    if not all(os.path.exists(path) for path in expected):
+        raise RuntimeError("OrcaRouter preparation completed without all required shards, tokenizer, MTP vocabulary, and config artifacts.")
+    if not any(name.endswith(".gguf") or name.endswith(".bin") for name in os.listdir(os.path.join(data_root, "packs", "orca-iq3_xxs"))):
+        raise RuntimeError("OrcaRouter compatibility pack is missing its packed model artifacts.")
+
+
 def _run_model_install_job(job_id, model_id, variant_id, install_command, update_mode=False):
     prefix = f"[model-update {model_id}]" if update_mode else f"[model-install {model_id}]"
     append_audit_text_line(f"{prefix} starting {install_command}")
@@ -6248,6 +6368,13 @@ def _run_model_install_job(job_id, model_id, variant_id, install_command, update
             append_audit_text_line(f"{prefix} {message}")
             raise RuntimeError(message)
         setup_install = _parse_setup_install_command(install_command)
+        used_builtin_downloads = False
+        orca_install = str(variant.get("strata_install_mode") or "") == "orca"
+        if str(variant.get("engine") or "").strip().lower() == "strata":
+            if update_mode:
+                raise RuntimeError("Strata presets do not support model update actions")
+            if orca_install and not str(env_map.get("HF_TOKEN") or "").strip():
+                raise RuntimeError("OrcaRouter requires HF_TOKEN already authorized for gated repository orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF.")
         if str(variant.get("engine") or "").strip().lower() == "strata":
             if update_mode:
                 raise RuntimeError("Strata presets do not support model update actions")
@@ -6320,6 +6447,8 @@ def _run_model_install_job(job_id, model_id, variant_id, install_command, update
                     monitor.join(timeout=5)
         else:
             rc = 0
+        if rc == 0 and orca_install:
+            _prepare_strata_orca(job_id, prefix, variant, env_map)
     except Exception as e:
         append_audit_text_line(f"{prefix} launcher error: {e}")
         rc = 999

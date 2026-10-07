@@ -69,7 +69,15 @@ Use the pinned upstream Strata `v0.1.40.1` source at commit `82f46a8c8f475f001ad
 
 ## Feasibility status and assumptions
 
-- **Technical conclusion:** the existing runtime inventory, per-instance Compose manager, and OpenAI-compatible proxy provide integration points for a Strata preset, but the Strata engine family, image/data installation, runtime readiness, GPU mapping, and proxy selection require explicit controller support. Feasibility is pending implementation and runtime integration verification.
-- Pin Strata `v0.1.40.1` / commit `82f46a8c8f475f001ad76d92f58f4a4f8ffb0253` until a later deliberate version update. If the pinned upstream Dockerfile or API contract changes, update the catalog/install contract and rerun integration verification rather than silently following `main`.
-- Initial catalog scope is one NVIDIA Docker-backed IQ2_XS Qwen3.8-Flash-Next variant. Other model families/quantizations, AMD/HIP, multi-GPU, vision input, Anthropic/Responses proxy APIs, benchmarking, global-mode switching, and model resource update/delete are not included in this implementation.
-- Keep model bytes and user configuration persistent outside the image. Image rebuild/update must not clear `/data`; stopping or deleting an instance must not delete model data.
+- **Implementation status:** the initial four original-Qwen presets and the special Coder, Swift 1.5, Unsloth, and OrcaRouter presets are implemented in the controller and covered by `strata_preset_smoke`; live hardware startup and authorized Orca downloads remain host-level integration checks.
+- Pin Strata `v0.1.40.1` / commit `82f46a8c8f475f001ad76d92f58f4a4f8ffb0253`. If the pinned upstream Dockerfile or API contract changes, update the catalog/install contract and rerun integration verification rather than silently following `main`.
+- Catalog scope includes the four original Qwen quantizations, Coder `IQ1_M`, Swift 1.5 `IQ2_XS` and `IQ3_XXS`, Unsloth `UD-IQ4_XS` and experimental `UD-Q4_K_XL`, and the distinct experimental OrcaRouter uncensored `IQ3_XXS` conversion preset. Other model families, AMD/HIP, multi-GPU, vision input, Anthropic/Responses proxy APIs, benchmarking, global-mode switching, and generic model resource update/delete remain excluded.
+- Keep model bytes and user configuration persistent outside the image; image rebuild/update and stopping/deleting instances must not clear each variant's `/data`.
+
+## Expanded special presets and timestamped logs
+
+The four original Qwen entries remain unchanged. The added entries use the pinned Strata family/model tokens, distinct persistent data roots, and advisory fit metadata. Swift exposes only the two sizes supported by the pin; the experimental Unsloth and OrcaRouter rows remain installable. OrcaRouter is a separate gated download and compatibility-pack/MTP preparation path with a non-secret direct-server configuration; installation requires an HF token already authorized for its repository.
+
+Human-readable control, audit, debug, streamed install/build, Docker runtime, and browser-generated log entries show their production time. Structured audit JSON retains its integer `ts`; historic log files are not rewritten.
+
+The isolated `python3 src/build/build.py --smoke-tests strata_preset_smoke` test covers catalog metadata, Orca preparation contracts, and timestamped log behavior. It does not replace the pinned-host checks above, particularly real gated HF authorization, GPU startup, or live OpenAI-proxy traffic.

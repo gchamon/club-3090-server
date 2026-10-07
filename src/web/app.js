@@ -6703,6 +6703,13 @@ function variantHardwareSummary(variant) {
   if (recommendedCombinedMemory > 0) {
     parts.push(`${recommendedCombinedMemory} GB combined RAM+VRAM fit guidance (advisory)`);
   }
+  const download = Number(variant?.download_size_gb || 0);
+  const systemRam = Number(variant?.recommended_system_memory_gb || 0);
+  const residentRam = Number(variant?.recommended_resident_memory_gb || 0);
+  if (download > 0) parts.push(`${download.toFixed(download % 1 ? 1 : 0)} GB download (advisory)`);
+  if (systemRam > 0) parts.push(`${systemRam} GB system RAM guidance (advisory)`);
+  if (residentRam > 0) parts.push(`${residentRam} GB resident memory guidance (advisory)`);
+  if (variant?.requires_nvme) parts.push("NVMe recommended/required for expert storage (advisory fit guidance)");
   if (minVram > 0) {
     parts.push(
       minGpuCount > 1 ? `${minGpuCount}x ${minVram} GB minimum` : `${minVram} GB minimum`,

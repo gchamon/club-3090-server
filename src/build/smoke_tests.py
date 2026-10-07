@@ -926,10 +926,16 @@ def run_strata_preset_smoke_test(root: Path) -> tuple[bool, str]:
         except (OSError, ValueError) as exc:
             return False, f"Strata inventory was not valid JSON: {exc}"
         expected = {
-            "strata/qwen3.8-flash-next-q2-0": ("Q2_0", 37.6),
-            "strata/qwen3.8-flash-next-iq2-xs": ("IQ2_XS", 39.2),
-            "strata/qwen3.8-flash-next-iq3-xxs": ("IQ3_XXS", 47.0),
-            "strata/qwen3.8-flash-next-iq3-s": ("IQ3_S", 54.8),
+            "strata/qwen3.8-flash-next-q2-0": ("Q2_0", 37.6, "qwen"),
+            "strata/qwen3.8-flash-next-iq2-xs": ("IQ2_XS", 39.2, "qwen"),
+            "strata/qwen3.8-flash-next-iq3-xxs": ("IQ3_XXS", 47.0, "qwen"),
+            "strata/qwen3.8-flash-next-iq3-s": ("IQ3_S", 54.8, "qwen"),
+            "strata/qwen3.8-flash-next-coder-iq1-m": ("IQ1_M", None, "coder"),
+            "strata/swift-1-5-iq2-xs": ("IQ2_XS", None, "swift"),
+            "strata/swift-1-5-iq3-xxs": ("IQ3_XXS", None, "swift"),
+            "strata/unsloth-ud-iq4-xs": ("UD-IQ4_XS", None, "unsloth"),
+            "strata/unsloth-ud-q4-k-xl": ("UD-Q4_K_XL", None, "unsloth"),
+            "strata/orcarouter-qwen3.8-flash-next-uncensored-iq3-xxs": ("IQ3_XXS", None, "orca"),
         }
         rows = {
             row.get("selector") or row.get("upstream_tag"): row
@@ -939,7 +945,7 @@ def run_strata_preset_smoke_test(root: Path) -> tuple[bool, str]:
         if set(rows) != set(expected):
             return False, f"Strata inventory selectors differ: {sorted(rows)}"
         compose_paths, data_paths = set(), set()
-        for selector, (model_token, guidance) in expected.items():
+        for selector, (model_token, guidance, family) in expected.items():
             row = rows[selector]
             compose = Path(row.get("compose_abs_path") or row.get("compose_path") or "")
             data = Path(row.get("strata_data_path") or row.get("data_path") or "")
@@ -947,25 +953,41 @@ def run_strata_preset_smoke_test(root: Path) -> tuple[bool, str]:
             data_paths.add(str(data))
             if row.get("strata_model_token") != model_token:
                 return False, f"{selector} has wrong Strata MODEL token"
+            expected_model_id = "qwen3.8-flash-next" if family != "orca" else "orcarouter-qwen3.8-flash-next-uncensored-iq3_xxs"
             if (
-                row.get("model_id") != "qwen3.8-flash-next"
+                row.get("model_id") != expected_model_id
                 or row.get("engine") != "strata"
                 or row.get("engine_display") != "Strata"
                 or row.get("profile_engine_id") != "strata"
+                or row.get("strata_family") != family
                 or row.get("topology") != "single"
                 or row.get("requires_min_gpu_count") != 1
                 or row.get("requires_sm") != "75+"
             ):
-                return False, f"{selector} lost its Strata model, engine, topology, or hardware identity"
-            if float(row.get("recommended_combined_memory_gb") or 0) != guidance:
+                return False, f"{selector} lost its Strata model, family, engine, topology, or hardware identity"
+            if guidance is not None and float(row.get("recommended_combined_memory_gb") or 0) != guidance:
                 return False, f"{selector} lost advisory combined-memory guidance"
+            if model_token in {"UD-Q4_K_XL", "IQ3_XXS"} and (family == "orca" or family == "unsloth"):
+                if row.get("status_kind") != "experimental" or row.get("install_state") not in {"requires_download", "ready"}:
+                    return False, f"{selector} must remain installable with its experimental state"
+            if family == "coder" and (row.get("download_size_gb") != 58.4 or row.get("recommended_system_memory_gb") != 32):
+                return False, f"{selector} lost its Coder advisory sizing"
+            if family == "unsloth" and model_token == "UD-IQ4_XS":
+                if row.get("download_size_gb") != 93.7 or row.get("recommended_system_memory_gb") != 48 or row.get("recommended_resident_memory_gb") != 59.5 or not row.get("requires_nvme"):
+                    return False, f"{selector} lost its UD-IQ4_XS advisory sizing"
+            if family == "unsloth" and model_token == "UD-Q4_K_XL":
+                if row.get("download_size_gb") != 111.3 or row.get("recommended_system_memory_gb") != 48 or row.get("recommended_resident_memory_gb") != 77 or not row.get("requires_nvme"):
+                    return False, f"{selector} lost its UD-Q4_K_XL advisory sizing"
+            if family == "orca" and (row.get("strata_install_mode") != "orca" or row.get("download_size_gb") != 85.2):
+                return False, f"{selector} lost its distinct Orca install contract"
             if row.get("hardware_blocked") not in (False, None):
                 return False, f"{selector} was unexpectedly hardware-blocked in the inventory fixture"
             if not compose.is_file() or not data.is_dir():
                 return False, f"{selector} does not have its isolated Compose/data paths"
             compose_text = compose.read_text(encoding="utf-8")
             if (
-                f"MODEL: {model_token}" not in compose_text
+                f"FAMILY: {family}" not in compose_text
+                or f"MODEL: {model_token}" not in compose_text
                 or "${PORT}:8080" not in compose_text
                 or 'PORT: "8080"' not in compose_text
                 or "/data" not in compose_text
@@ -975,7 +997,7 @@ def run_strata_preset_smoke_test(root: Path) -> tuple[bool, str]:
                 or "start_period: 600s" not in compose_text
             ):
                 return False, f"{selector} Compose contract is incomplete"
-        if len(compose_paths) != 4 or len(data_paths) != 4:
+        if len(compose_paths) != len(expected) or len(data_paths) != len(expected):
             return False, "Strata selectors do not have distinct Compose and data directories"
         source_paths = {row.get("strata_source_path") for row in rows.values()}
         images = {row.get("strata_image") for row in rows.values()}
@@ -1045,7 +1067,7 @@ for index, row in enumerate(rows.values()):
 with patch.object(system, "evaluate_strata_hardware",
                   return_value={"hardware_blocked": True, "hardware_block_reason": "fixture blocked"}):
     enriched = system.enrich_strata_hardware_rows(source_rows)
-assert len(enriched) == 4, len(enriched)
+assert len(enriched) == len(expected), len(enriched)
 assert {row.get("selector") or row.get("upstream_tag") for row in enriched} == set(expected)
 for index, (original, result) in enumerate(zip(source_rows, enriched)):
     assert result is not original
@@ -1094,6 +1116,15 @@ assert all(name not in env_text + override_text for name in
            ("VLLM_CACHE_ROOT", "TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR"))
 assert os.stat(artifact_paths["env"]).st_mode & 0o777 == 0o600
 assert os.stat(artifact_paths["override"]).st_mode & 0o777 == 0o600
+orca_row = next(row for row in rows.values() if row.get("strata_install_mode") == "orca")
+orca_instance = {"id": "ORCA0", "kind": "single", "gpu_index": 0, "gpu_indices": [0],
+                 "mode": orca_row["selector"], "port": 19451}
+with patch.object(control, "instance_variant_spec", return_value=orca_row), \
+     patch.object(control, "resolve_variant_launch_env", return_value={}):
+    orca_paths = control.write_instance_artifacts(orca_instance)
+orca_override = open(orca_paths["override"], encoding="utf-8").read()
+assert "serve.server" in orca_override and "/data/config/strata-orca-iq3_xxs.json" in orca_override
+assert "entrypoint: !override" in orca_override and "VLLM_CACHE_ROOT" not in orca_override
 selector = blocked_row["selector"]
 proxy_instance = {"id": "GPU0", "mode": selector, "gpu_index": 0,
                   "gpu_indices": [0], "port": 19450}
@@ -1117,6 +1148,82 @@ with patch.object(control, "resolve_variant_spec", return_value=blocked_row), \
      patch.object(control, "strata_runtime_ready", return_value=False):
     target, _target_spec = control.proxy_running_target_for_selector(selector)
     assert target is None, target
+import tempfile
+import control.shared as shared
+orca_data = os.path.join(control.CONTROL_DIR, "builtin-models", "orca-smoke")
+orca_variant = {"strata_data_path": orca_data, "strata_source_path": os.path.join(control.CONTROL_DIR, "builtin-models", "strata", "source"), "strata_image": "club3090-strata:v0.1.40.1"}
+with patch.object(shared, "_run_hf_download_step", side_effect=AssertionError("download ran without token")):
+    try:
+        control._prepare_strata_orca("job", "[model-install orca]", orca_variant, {})
+    except RuntimeError as exc:
+        assert "authorized" in str(exc) and "gated repository" in str(exc), exc
+    else:
+        raise AssertionError("Orca install accepted missing HF token")
+assert not os.path.exists(orca_data)
+def fake_orca_download(_job, _prefix, step, _env):
+    assert step["repo_ids"] == ["orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF"]
+    for name in step["filenames"]:
+        with open(os.path.join(step["local_dir"], name), "wb") as handle:
+            handle.write(b"fixture shard")
+class FakeProcess:
+    def wait(self):
+        return 0
+def fake_orca_docker(argv, **_kwargs):
+    command = argv[-1]
+    assert "tools/iq_pack.py" in command and "--compat-bf16" in command
+    assert "tools/mtp_fetch.py fetch --out /data/mtp" in command
+    assert "tools/mtp_pack.py --src /data/mtp --experts q2_0 --out /data/mtp/mtp-q2_0.gguf" in command
+    assert "tools/mtp_rt.py --gguf /data/mtp/mtp-q2_0.gguf --out /data/mtp/rt" in command
+    assert "cp /opt/strata/data/draft_vocab.bin /data/mtp/rt/draft_vocab.bin" in command
+    for relative in ("packs/orca-iq3_xxs/tokenizer", "packs/orca-iq3_xxs/index.txt",
+                     "packs/orca-iq3_xxs/dense.bin", "packs/orca-iq3_xxs/native_experts.txt",
+                     "mtp/mtp-q2_0.gguf", "mtp/rt/draft_vocab.bin"):
+        target = os.path.join(orca_data, relative)
+        if relative.endswith("/tokenizer"):
+            os.makedirs(target, exist_ok=True)
+        else:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "wb") as handle:
+                handle.write(b"prepared")
+    return FakeProcess()
+with patch.object(shared, "_run_hf_download_step", side_effect=fake_orca_download), \
+     patch.object(shared.subprocess, "Popen", side_effect=fake_orca_docker), \
+     patch.object(shared, "_stream_process_output_to_audit"):
+    control._prepare_strata_orca("job", "[model-install orca]", orca_variant, {"HF_TOKEN": "fixture-secret"})
+orca_config = open(os.path.join(orca_data, "config", "strata-orca-iq3_xxs.json"), encoding="utf-8").read()
+assert "orcarouter-qwen3.8-flash-next-uncensored-iq3_xxs" in orca_config
+assert "fixture-secret" not in orca_config and "api_key" not in orca_config.lower()
+import io
+import threading
+log_dir = tempfile.mkdtemp(prefix="strata-log-fixture-")
+shared.CONTROL_DIR = log_dir
+shared.AUDIT_LOG_FILE = os.path.join(log_dir, "audit.log")
+shared.DEBUG_LOG_FILE = os.path.join(log_dir, "debug.log")
+shared.append_audit_text_line("audit one\naudit two")
+shared.append_debug_text_chunk("chunk one\nchunk two\n")
+shared.append_debug_text_line("debug complete")
+shared._stream_process_output_to_audit(type("Output", (), {"stdout": io.BytesIO(b"compiler warning one\ncompiler warning two\n")})(), "[model-install fixture]")
+audit_entries = open(shared.AUDIT_LOG_FILE, encoding="utf-8").read().splitlines()
+debug_entries = open(shared.DEBUG_LOG_FILE, encoding="utf-8").read().splitlines()
+stamp_pattern = __import__("re").compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d ")
+assert all(stamp_pattern.match(line) and not stamp_pattern.match(line[20:]) for line in audit_entries + debug_entries)
+assert any("[model-install fixture] compiler warning one" in line for line in audit_entries)
+import control.logs as runtime_logs
+runtime_logs.LOG_BOOTSTRAP_MARKER = "fixture-bootstrap-marker"
+watcher = object.__new__(runtime_logs.RuntimeLogWatcher)
+watcher.container_name = "fixture"
+watcher.cond = threading.Condition()
+watcher.bootstrap_lines = []
+watcher.bootstrap_done = False
+watcher.tail_lines = __import__("collections").deque()
+watcher.tail_bytes = 0
+watcher.events = __import__("collections").deque(maxlen=10)
+watcher.last_timestamp = ""
+watcher.last_line = ""
+watcher.seq = 0
+watcher.status_message = ""
+watcher._append_line("compiler warning", timestamp="2026-10-06T10:11:12.000000000Z")
+assert watcher.bootstrap_lines == ["2026-10-06T10:11:12.000000000Z compiler warning"]
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
 api_key = control.ensure_strata_api_key()
@@ -1149,4 +1256,4 @@ finally:
         )
         if evaluator_run.returncode:
             return False, f"Strata hardware evaluator smoke failed: {evaluator_run.stderr.strip() or evaluator_run.stdout.strip()}"
-        return True, "four Strata variants preserve exact tokens, isolated data/Compose paths, shared pinned install metadata, and hardware evaluator semantics"
+        return True, "ten Strata variants preserve selector/token/family metadata, advisory fit details, Orca preparation, timestamped logs, and hardware evaluator behavior"

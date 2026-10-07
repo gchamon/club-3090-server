@@ -264,6 +264,10 @@ def _load_upstream_weights_reader():
     return _store_upstream_cache(_load_upstream_weights_reader, root, value)
 
 
+def _load_weight_reader():
+    return _load_upstream_weights_reader()
+
+
 def _load_upstream_weight_models():
     root = _upstream_repo_cache_root()
     cached = getattr(_load_upstream_weight_models, "_cache", None)
@@ -3561,6 +3565,12 @@ def _launch_setting_ignored(name):
         "VLLM_IMAGE",
         "HF_HOME",
         "MODEL",
+        "FAMILY",
+        "API_KEY",
+        "STRATA_API_KEY",
+        "GPU",
+        "GPUS",
+        "LAYER_SPLIT",
     }
 
 
@@ -4310,7 +4320,21 @@ def _detect_variant_install_state(variant, model_dir_root):
         except Exception:
             image_exists = False
         ready = commit == STRATA_COMMIT and image_exists
-        return {"install_state": "ready" if ready else "requires_download", "install_command": "strata-image-build", "install_reason": "" if ready else "Pinned Strata source and runtime image are not installed."}
+        if str((variant or {}).get("strata_install_mode") or "") == "orca":
+            data = str((variant or {}).get("strata_data_path") or "")
+            artifacts = [
+                os.path.join(data, "Qwen3.8-Flash-Next-Uncensored-IQ3_XXS-00001-of-00002.gguf"),
+                os.path.join(data, "Qwen3.8-Flash-Next-Uncensored-IQ3_XXS-00002-of-00002.gguf"),
+                os.path.join(data, "packs", "orca-iq3_xxs", "tokenizer"),
+                os.path.join(data, "packs", "orca-iq3_xxs", "index.txt"),
+                os.path.join(data, "packs", "orca-iq3_xxs", "dense.bin"),
+                os.path.join(data, "packs", "orca-iq3_xxs", "native_experts.txt"),
+                os.path.join(data, "mtp", "mtp-q2_0.gguf"),
+                os.path.join(data, "mtp", "rt", "draft_vocab.bin"),
+                os.path.join(data, "config", "strata-orca-iq3_xxs.json"),
+            ]
+            ready = ready and all(os.path.exists(path) for path in artifacts)
+        return {"install_state": "ready" if ready else "requires_download", "install_command": "strata-image-build", "install_reason": "" if ready else "Pinned Strata source, runtime image, or required model preparation artifacts are not installed."}
     model_id = str((variant or {}).get("model_id") or "").strip()
     if str((variant or {}).get("source_kind") or "").strip().lower() == "custom":
         host_model_dir = str((variant or {}).get("host_model_dir") or "").strip()
@@ -4712,6 +4736,12 @@ def _rebuild_runtime_mode_tables(inventory):
             "strata_image": str(entry.get("strata_image") or ""),
             "strata_commit": str(entry.get("strata_commit") or ""),
             "recommended_combined_memory_gb": entry.get("recommended_combined_memory_gb"),
+            "strata_family": str(entry.get("strata_family") or ""),
+            "strata_install_mode": str(entry.get("strata_install_mode") or "standard"),
+            "download_size_gb": entry.get("download_size_gb"),
+            "recommended_system_memory_gb": entry.get("recommended_system_memory_gb"),
+            "recommended_resident_memory_gb": entry.get("recommended_resident_memory_gb"),
+            "requires_nvme": bool(entry.get("requires_nvme")),
             "speculative_method": entry.get("speculative_method"),
             "drafted_tokens": entry.get("drafted_tokens"),
             "requires_min_vram_gb": int(entry.get("requires_min_vram_gb") or 0),
@@ -5303,6 +5333,12 @@ def rebuild_runtime_inventory():
             "strata_data_path": str(row.get("strata_data_path") or ""),
             "strata_image": str(row.get("strata_image") or ""),
             "strata_commit": str(row.get("strata_commit") or ""),
+            "strata_family": str(row.get("strata_family") or ""),
+            "strata_install_mode": str(row.get("strata_install_mode") or "standard"),
+            "download_size_gb": row.get("download_size_gb"),
+            "recommended_system_memory_gb": row.get("recommended_system_memory_gb"),
+            "recommended_resident_memory_gb": row.get("recommended_resident_memory_gb"),
+            "requires_nvme": bool(row.get("requires_nvme")),
             "recommended_combined_memory_gb": row.get("recommended_combined_memory_gb"),
             "compose_environment": runtime_meta.get("compose_environment") or [],
             "compose_volumes": runtime_meta.get("compose_volumes") or [],

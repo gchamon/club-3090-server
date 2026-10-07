@@ -192,25 +192,26 @@ class RuntimeLogWatcher:
         clean = str(line or "").rstrip("\n")
         if not clean or "GET /health HTTP/1.1" in clean:
             return
-        encoded_len = len((clean + "\n").encode("utf-8", errors="replace"))
+        displayed = f"{timestamp} {clean}" if timestamp else clean
+        encoded_len = len((displayed + "\n").encode("utf-8", errors="replace"))
         with self.cond:
             if timestamp and timestamp == self.last_timestamp and clean == self.last_line:
                 return
             self.last_timestamp = timestamp or self.last_timestamp
             self.last_line = clean
             if not self.bootstrap_done:
-                self.bootstrap_lines.append(clean)
+                self.bootstrap_lines.append(displayed)
                 if LOG_BOOTSTRAP_MARKER in clean:
                     self.bootstrap_done = True
             else:
-                self.tail_lines.append(clean)
+                self.tail_lines.append(displayed)
                 self.tail_bytes += encoded_len
                 while self.tail_lines and self.tail_bytes > LOG_TAIL_MAX_BYTES:
                     dropped = self.tail_lines.popleft()
                     self.tail_bytes -= len((dropped + "\n").encode("utf-8", errors="replace"))
             self.status_message = f"following {self.container_name}"
             self.seq += 1
-            self.events.append((self.seq, clean + "\n"))
+            self.events.append((self.seq, displayed + "\n"))
             self.cond.notify_all()
 
     def _load_initial_snapshot(self):
