@@ -792,6 +792,7 @@ def run_updater_status_smoke_test(root: Path) -> tuple[bool, str]:
             "case \"$1\" in\n"
             "  rev-parse) if [ \"$2\" = \"--show-toplevel\" ]; then "
             "if [ \"$CLUB3090_TEST_DUBIOUS\" = \"$repo\" ]; then printf 'fatal: detected dubious ownership\\n' >&2; exit 1; fi; "
+            "if [ \"$CLUB3090_TEST_NESTED\" = \"$repo\" ]; then printf '%s/nested\\n' \"$repo\"; exit 0; fi; "
             "printf '%s\\n' \"$repo\"; "
             "elif [ \"$CLUB3090_TEST_DIRTY\" = \"$repo\" ] && [ \"$2\" = \"--abbrev-ref\" ]; then exit 1; "
             "else printf 'origin/main\\n'; fi ;;\n"
@@ -854,17 +855,23 @@ def run_updater_status_smoke_test(root: Path) -> tuple[bool, str]:
         if clean.returncode:
             return False, clean.stderr.strip() or "clean tracking-checkout System Update command failed"
         trace_lines = trace.read_text(encoding="utf-8").splitlines()
-        milestones = [
-            f"git -C {server_dir} fetch --prune origin",
-            f"git -C {server_dir} merge --ff-only @{{u}}",
-            f"git -C {upstream_dir} fetch --prune origin",
-            f"git -C {upstream_dir} merge --ff-only @{{u}}",
-            "python -m control.http_server --rebuild-inventory",
-            f"install {server_dir}/install.sh",
-        ]
-        positions = [next((index for index, line in enumerate(trace_lines) if milestone in line), -1) for milestone in milestones]
-        if any(position < 0 for position in positions) or positions != sorted(positions):
-            return False, f"System Update stages did not run in order: {trace_lines!r}"
+        server_uid = os.stat(server_dir).st_uid
+        server_passwd = subprocess.run(
+            ["getent", "passwd", str(server_uid)],
+            capture_output=True, text=True, check=False, timeout=5,
+        )
+        if server_passwd.returncode or not server_passwd.stdout.strip():
+            return False, f"no passwd entry for server fixture owner uid {server_uid}"
+        server_account = server_passwd.stdout.strip().split(":")
+        server_user, server_home = server_account[0], server_account[5]
+        installer_trace = next((line for line in trace_lines if "bash " + str(server_dir / "install.sh") in line), "")
+        if (
+            not installer_trace.startswith(f"runuser --user {server_user} -- env HOME={server_home} ")
+            or "CLUB3090_RUNNING_FROM_UPDATER=1" not in installer_trace
+            or f"CLUB3090_CONTROL_DIR={command_env['CLUB3090_CONTROL_DIR']}" not in installer_trace
+            or f"CLUB3090_DIR={upstream_dir}" not in installer_trace
+        ):
+            return False, f"System Update did not invoke installer as server checkout owner with updater environment: {trace_lines!r}"
         for repo in (server_dir, upstream_dir):
             repo_uid = os.stat(repo).st_uid
             passwd = subprocess.run(
@@ -900,6 +907,16 @@ def run_updater_status_smoke_test(root: Path) -> tuple[bool, str]:
         dubious_lines = trace.read_text(encoding="utf-8").splitlines()
         if dubious.returncode == 0 or "detected dubious ownership" not in dubious.stderr or any(" fetch " in line or " merge " in line for line in dubious_lines):
             return False, f"System Update hid a Git ownership failure or mutated before preflight: rc={dubious.returncode} stderr={dubious.stderr!r} trace={dubious_lines!r}"
+        trace.write_text("", encoding="utf-8")
+        nested_env = dict(command_env)
+        nested_env["CLUB3090_TEST_NESTED"] = str(upstream_dir)
+        nested = subprocess.run(
+            ["/bin/bash", "-c", command], cwd=str(root), env=nested_env,
+            capture_output=True, text=True, check=False, timeout=15,
+        )
+        nested_lines = trace.read_text(encoding="utf-8").splitlines()
+        if nested.returncode == 0 or "not the worktree root" not in nested.stderr or any(" fetch " in line or " merge " in line for line in nested_lines):
+            return False, f"System Update did not reject a nested checkout path before mutation: rc={nested.returncode} stderr={nested.stderr!r} trace={nested_lines!r}"
         return True, "updater runs Git as checkout owner and guards clean, dirty, and ownership failures"
 
 def run_strata_preset_smoke_test(root: Path) -> tuple[bool, str]:

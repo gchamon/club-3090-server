@@ -5152,6 +5152,36 @@ function handleBenchmarkJobTransition(previousStatus = {}, nextStatus = {}) {
     summary || `${mode.charAt(0).toUpperCase()}${mode.slice(1)} benchmark queue completed.`,
   ).catch(() => {});
 }
+const refreshedModelInstallInventoryJobIds = new Set();
+function handleModelInstallInventoryRefresh(previousStatus = {}, nextStatus = {}) {
+  const previousJobs = Array.isArray(previousStatus?.model_install_jobs)
+    ? previousStatus.model_install_jobs
+    : [previousStatus?.model_install_job].filter(Boolean);
+  const nextJobs = Array.isArray(nextStatus?.model_install_jobs)
+    ? nextStatus.model_install_jobs
+    : [nextStatus?.model_install_job].filter(Boolean);
+  const nextIds = new Set(nextJobs.map((job) => String(job?.job_id || "")).filter(Boolean));
+  for (const jobId of refreshedModelInstallInventoryJobIds) {
+    if (!nextIds.has(jobId)) refreshedModelInstallInventoryJobIds.delete(jobId);
+  }
+  const previousById = new Map(
+    previousJobs.map((job) => [String(job?.job_id || ""), job]).filter(([jobId]) => jobId),
+  );
+  for (const job of nextJobs) {
+    const jobId = String(job?.job_id || "");
+    const previous = previousById.get(jobId);
+    if (
+      !jobId ||
+      !previous?.active ||
+      job?.active ||
+      String(job?.status || "") !== "success" ||
+      job?.inventory_rebuild_ok !== true ||
+      refreshedModelInstallInventoryJobIds.has(jobId)
+    ) continue;
+    refreshedModelInstallInventoryJobIds.add(jobId);
+    refreshStatus({ force: true, includeInventory: true, inventoryDetail: "full" }).catch(() => {});
+  }
+}
 const tabScrollPositions = window.club3090TabScrollPositions || (window.club3090TabScrollPositions = Object.create(null));
 function currentPageScrollTop() {
   return Math.max(
@@ -5536,7 +5566,10 @@ function renderStatusSurface(label, projection, render, errors) {
   }, errors);
 }
 function renderStatusUi(j, previousStatus = null, options = {}) {
-  if (j && typeof j === "object") lastStatus = j;
+  if (j && typeof j === "object") {
+    handleModelInstallInventoryRefresh(previousStatus || {}, j);
+    lastStatus = j;
+  }
   const metrics = j?.metrics || {};
   const power = j?.power || {};
   const renderErrors = [];

@@ -4309,17 +4309,19 @@ def _container_model_subpath(model_path):
 
 def _detect_variant_install_state(variant, model_dir_root):
     if str((variant or {}).get("engine") or "").strip().lower() == "strata":
-        image = str((variant or {}).get("strata_image") or STRATA_IMAGE)
         source = str((variant or {}).get("strata_source_path") or os.path.join(CONTROL_DIR, "builtin-models", "strata", "source"))
+        image = str((variant or {}).get("strata_image") or STRATA_IMAGE)
         try:
             commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True, stderr=subprocess.DEVNULL, timeout=5).strip()
         except Exception:
             commit = ""
+        source_ready = commit == STRATA_COMMIT
         try:
             image_exists = subprocess.run(["docker", "image", "inspect", image], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8).returncode == 0
         except Exception:
             image_exists = False
-        ready = commit == STRATA_COMMIT and image_exists
+        image_ready = image_exists
+        ready = source_ready and image_ready
         if str((variant or {}).get("strata_install_mode") or "") == "orca":
             data = str((variant or {}).get("strata_data_path") or "")
             artifacts = [
@@ -4333,8 +4335,18 @@ def _detect_variant_install_state(variant, model_dir_root):
                 os.path.join(data, "mtp", "rt", "draft_vocab.bin"),
                 os.path.join(data, "config", "strata-orca-iq3_xxs.json"),
             ]
-            ready = ready and all(os.path.exists(path) for path in artifacts)
-        return {"install_state": "ready" if ready else "requires_download", "install_command": "strata-image-build", "install_reason": "" if ready else "Pinned Strata source, runtime image, or required model preparation artifacts are not installed."}
+            artifacts_ready = all(os.path.exists(path) for path in artifacts)
+            ready = ready and artifacts_ready
+        else:
+            artifacts_ready = True
+        reasons = []
+        if not source_ready:
+            reasons.append(f"Pinned Strata source at {source} is not at commit {STRATA_COMMIT}.")
+        if not image_ready:
+            reasons.append(f"Strata runtime image {image} is unavailable.")
+        if not artifacts_ready:
+            reasons.append("Required Orca model preparation artifacts are not installed.")
+        return {"install_state": "ready" if ready else "requires_download", "install_command": "strata-image-build", "install_reason": "" if ready else " ".join(reasons)}
     model_id = str((variant or {}).get("model_id") or "").strip()
     if str((variant or {}).get("source_kind") or "").strip().lower() == "custom":
         host_model_dir = str((variant or {}).get("host_model_dir") or "").strip()

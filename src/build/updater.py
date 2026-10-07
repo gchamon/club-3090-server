@@ -272,22 +272,40 @@ SERVER_DIR={quoted_server}
 UPSTREAM_DIR={quoted_upstream}
 CONTROL_DIR={quoted_control}
 command -v runuser >/dev/null 2>&1 || {{ echo "System Update requires runuser to access Git worktrees as their owners" >&2; exit 1; }}
-git_as_repo_owner() {{
+git_repo_owner() {{
   local repo="$1" repo_uid passwd_entry repo_user repo_home
-  shift
   repo_uid="$(stat -c '%u' -- "$repo")" || {{ echo "Unable to determine Git worktree owner: $repo" >&2; return 1; }}
   passwd_entry="$(getent passwd "$repo_uid")" || {{ echo "No account found for Git worktree owner uid $repo_uid ($repo)" >&2; return 1; }}
   repo_user="${{passwd_entry%%:*}}"
-  repo_home="$(printf '%s\\n' "$passwd_entry" | cut -d: -f6)"
+  repo_home="$(printf '%s\n' "$passwd_entry" | cut -d: -f6)"
   [[ -n "$repo_user" && -n "$repo_home" ]] || {{ echo "Incomplete account entry for Git worktree owner uid $repo_uid ($repo)" >&2; return 1; }}
+  printf '%s\n%s\n' "$repo_user" "$repo_home"
+}}
+git_as_repo_owner() {{
+  local repo="$1" owner_info repo_user repo_home
+  shift
+  owner_info="$(git_repo_owner "$repo")" || return 1
+  repo_user="${{owner_info%%$'\n'*}}"
+  repo_home="${{owner_info#*$'\n'}}"
   runuser --user "$repo_user" -- env HOME="$repo_home" git -C "$repo" "$@"
 }}
 for repo in "$SERVER_DIR" "$UPSTREAM_DIR"; do
-  git_as_repo_owner "$repo" rev-parse --show-toplevel >/dev/null || {{
+  if ! git_top="$(git_as_repo_owner "$repo" rev-parse --show-toplevel)"; then
     echo "Not a Git worktree or inaccessible as its owner: $repo" >&2
     exit 1
-  }}
+  fi
+  if [[ "$git_top" != "$repo" ]]; then
+    echo "Configured Git path is not the worktree root: $repo (actual root: $git_top)" >&2
+    exit 1
+  fi
 done
+server_owner_info="$(git_repo_owner "$SERVER_DIR")"
+server_user="${{server_owner_info%%$'\n'*}}"
+server_home="${{server_owner_info#*$'\n'}}"
+if [[ -z "$server_user" || -z "$server_home" ]]; then
+  echo "Unable to resolve server checkout owner: $SERVER_DIR" >&2
+  exit 1
+fi
 for repo in "$SERVER_DIR" "$UPSTREAM_DIR"; do
   if ! worktree_status="$(git_as_repo_owner "$repo" status --porcelain)"; then
     echo "Unable to inspect Git worktree status: $repo" >&2
@@ -312,7 +330,7 @@ echo "[system-update] Rebuilding Model DB"
 cd "$SERVER_DIR/src"
 CLUB3090_CONTROL_DIR="$CONTROL_DIR" CLUB3090_DIR="$UPSTREAM_DIR" PYTHONPATH="$SERVER_DIR/src" python3 -m control.http_server --rebuild-inventory
 echo "[system-update] Reinstalling and restarting services"
-CLUB3090_RUNNING_FROM_UPDATER=1 CLUB3090_CONTROL_DIR="$CONTROL_DIR" CLUB3090_DIR="$UPSTREAM_DIR" bash "$SERVER_DIR/install.sh"
+runuser --user "$server_user" -- env HOME="$server_home" CLUB3090_RUNNING_FROM_UPDATER=1 CLUB3090_CONTROL_DIR="$CONTROL_DIR" CLUB3090_DIR="$UPSTREAM_DIR" bash "$SERVER_DIR/install.sh"
 """
     return "club3090", "System Update", command, "local Git checkouts"
 
