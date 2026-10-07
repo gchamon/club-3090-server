@@ -3,16 +3,10 @@ globals().update({name: value for name, value in vars(_control).items() if not n
 del _control
 
 def _current_source_commit():
-    try:
-        commit = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            cwd=SOURCE_ROOT,
-            text=True,
-            stderr=subprocess.DEVNULL,
-            timeout=3,
-        ).strip().lower()
-    except Exception:
-        return ""
+    configured_root = str(os.environ.get("CLUB3090_SERVER_DIR") or "").strip()
+    repo_root = configured_root if configured_root and os.path.isabs(configured_root) else SOURCE_ROOT
+    commit = run_git_as_repository_owner(repo_root, ["rev-parse", "HEAD"])
+    commit = str(commit or "").strip().lower()
     return commit if re.fullmatch(r"[0-9a-f]{40}", commit) else ""
 
 

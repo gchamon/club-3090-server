@@ -52,6 +52,37 @@ except Exception:
     tomllib = None
 
 SOURCE_ROOT = str(Path(__file__).resolve().parents[2])
+
+def run_git_as_repository_owner(repo_path, args, timeout=3):
+    """Run a bounded, read-only Git command as the repository directory owner."""
+    try:
+        repo = os.path.abspath(str(repo_path or "").strip())
+        owner_uid = os.stat(repo).st_uid
+        if pwd is None:
+            return ""
+        owner = pwd.getpwuid(owner_uid)
+        preexec_fn = None
+        if os.geteuid() != owner_uid:
+            if os.geteuid() != 0:
+                return ""
+            def drop_privileges():
+                os.setgroups(os.getgrouplist(owner.pw_name, owner.pw_gid))
+                os.setgid(owner.pw_gid)
+                os.setuid(owner_uid)
+            preexec_fn = drop_privileges
+        result = subprocess.run(
+            ["git", "-C", repo, *[str(arg) for arg in args]],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+            preexec_fn=preexec_fn,
+            env={**os.environ, "HOME": owner.pw_dir},
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except Exception:
+        return ""
+
 CLUB3090_DIR = os.path.abspath(os.environ.get("CLUB3090_DIR", os.path.join(SOURCE_ROOT, "club-3090")))
 CONTROL_DIR = os.path.abspath(os.environ.get("CLUB3090_CONTROL_DIR", "/var/lib/club3090-control"))
 MCP_PROTOCOL_VERSION = "2025-03-26"
