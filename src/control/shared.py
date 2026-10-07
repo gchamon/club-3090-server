@@ -6462,7 +6462,23 @@ def _run_model_install_job(job_id, model_id, variant_id, install_command, update
             normalized_files.extend(_normalize_duplicate_model_file_hardlinks())
             for line in normalized_files:
                 append_audit_text_line(f"{prefix} {line}")
-            rebuild_runtime_inventory()
+            if str(variant.get("engine") or "").strip().lower() == "strata":
+                rebuilt_inventory = rebuild_runtime_inventory()
+                rebuilt_variant = next(
+                    (
+                        row for row in (rebuilt_inventory.get("variants") or [])
+                        if str(row.get("variant_id") or "") == str(variant_id or "")
+                    ),
+                    None,
+                )
+                if rebuilt_variant is None:
+                    rc = 999
+                    raise RuntimeError(f"Strata variant {variant_id} is missing from rebuilt runtime inventory")
+                try:
+                    ensure_variant_install_ready(rebuilt_variant)
+                except Exception:
+                    rc = 999
+                    raise
             if update_mode:
                 state = read_model_update_state()
                 for resource in _model_update_plan_resources(variant, install_command):

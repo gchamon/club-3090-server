@@ -944,6 +944,95 @@ def run_strata_preset_smoke_test(root: Path) -> tuple[bool, str]:
         }
         if set(rows) != set(expected):
             return False, f"Strata inventory selectors differ: {sorted(rows)}"
+        readiness = subprocess.run(
+            [
+                sys.executable, "-c",
+                "import json, subprocess, types; import control; "
+                f"row=json.loads({json.dumps(json.dumps(rows['strata/qwen3.8-flash-next-iq2-xs']))}); "
+                "original_check_output=subprocess.check_output; original_run=subprocess.run; "
+                "subprocess.check_output=lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError()); "
+                "subprocess.run=lambda *a, **k: types.SimpleNamespace(returncode=1); "
+                "state=control._detect_variant_install_state(row, ''); "
+                "assert state['install_state']=='requires_download' and 'Pinned Strata source' in state['install_reason'] and 'runtime image' in state['install_reason']; "
+                f"subprocess.check_output=lambda *a, **k: {json.dumps(control_commit := '82f46a8c8f475f001ad76d92f58f4a4f8ffb0253')}; "
+                "subprocess.run=lambda *a, **k: types.SimpleNamespace(returncode=0); "
+                "assert control._detect_variant_install_state(row, '')['install_state']=='ready'; "
+                "subprocess.run=lambda *a, **k: types.SimpleNamespace(returncode=1); "
+                "state=control._detect_variant_install_state(row, ''); "
+                "assert state['install_state']=='requires_download' and 'runtime image' in state['install_reason']; "
+                "subprocess.check_output=lambda *a, **k: 'wrong-commit'; "
+                "subprocess.run=lambda *a, **k: types.SimpleNamespace(returncode=0); "
+                "state=control._detect_variant_install_state(row, ''); "
+                "assert state['install_state']=='requires_download' and 'Pinned Strata source' in state['install_reason']; "
+                "subprocess.check_output=original_check_output; subprocess.run=original_run",
+            ],
+            cwd=str(root / "src"), env=env, capture_output=True,
+            text=True, check=False, timeout=15,
+        )
+        if readiness.returncode:
+            return False, readiness.stderr.strip() or "Strata source/image readiness transition failed"
+        install_job = subprocess.run(
+            [
+                sys.executable, "-c",
+                "import json, os, types; import control as c; s=c._shared; "
+                f"variant=json.loads({json.dumps(json.dumps(rows['strata/qwen3.8-flash-next-iq2-xs']))}); "
+                "s.load_runtime_inventory=lambda *a, **k: {'variants':[variant]}; "
+                "s._monitor_plan_from_variant_install=lambda *a, **k: None; "
+                "s._model_install_affected_variants=lambda *a, **k: []; "
+                "s._acquire_model_install_download_locks=lambda *a, **k: []; "
+                "s._snapshot_model_install_cleanup_targets=lambda *a, **k: []; "
+                "s._register_model_install_process=lambda *a, **k: None; s._clear_model_install_process=lambda *a, **k: None; "
+                "s._stream_process_output_to_audit=lambda *a, **k: None; "
+                "s._normalize_shared_mmproj_hardlinks=lambda: []; s._normalize_duplicate_model_file_hardlinks=lambda: []; "
+                "s.rebuild_runtime_inventory=lambda: {'variants':[variant]}; s.refresh_status_snapshot=lambda: None; "
+                "s.append_audit_text_line=lambda *a, **k: None; s.log_audit=lambda *a, **k: None; "
+                "s._repo_subprocess_env=lambda: dict(os.environ); "
+                "s._release_model_install_download_locks=lambda *a, **k: None; "
+                "s.ensure_variant_install_ready=lambda row: (_ for _ in ()).throw(RuntimeError('image unavailable')); "
+                "class_source='class Proc:\\n returncode=0\\n stdout=None\\n def wait(self): return 0\\n'; "
+                "exec(class_source); s.subprocess.Popen=lambda *a, **k: Proc(); "
+                "s._run_model_install_job('job-strata','qwen3.8-flash-next',variant['variant_id'],'strata-image-build'); "
+                "job=s.model_install_jobs['job-strata']; "
+                "assert job['status']=='failed' and job['return_code']==999 and job['inventory_rebuild_ok'] is False",
+            ],
+            cwd=str(root / "src"), env=env, capture_output=True,
+            text=True, check=False, timeout=15,
+        )
+        if install_job.returncode:
+            return False, install_job.stderr.strip() or "Strata install job did not fail when post-rebuild readiness failed"
+        successful_install_job = subprocess.run(
+            [
+                sys.executable, "-c",
+                "import json, os; import control as c; s=c._shared; "
+                f"variant=json.loads({json.dumps(json.dumps(rows['strata/qwen3.8-flash-next-iq2-xs']))}); "
+                "variant['install_state']='requires_download'; "
+                "rebuilt_variant=dict(variant, install_state='ready', install_reason=''); "
+                "s.load_runtime_inventory=lambda *a, **k: {'variants':[variant]}; "
+                "s._monitor_plan_from_variant_install=lambda *a, **k: None; "
+                "s._model_install_affected_variants=lambda *a, **k: []; "
+                "s._acquire_model_install_download_locks=lambda *a, **k: []; "
+                "s._snapshot_model_install_cleanup_targets=lambda *a, **k: []; "
+                "s._register_model_install_process=lambda *a, **k: None; s._clear_model_install_process=lambda *a, **k: None; "
+                "s._stream_process_output_to_audit=lambda *a, **k: None; "
+                "s._normalize_shared_mmproj_hardlinks=lambda: []; s._normalize_duplicate_model_file_hardlinks=lambda: []; "
+                "rebuild_calls=[]; "
+                "s.rebuild_runtime_inventory=lambda: (rebuild_calls.append(True) or {'variants':[rebuilt_variant]}); "
+                "logs=[]; s.refresh_status_snapshot=lambda: None; s.append_audit_text_line=lambda *a, **k: logs.append(a); s.log_audit=lambda *a, **k: None; "
+                "s._repo_subprocess_env=lambda: dict(os.environ); "
+                "s._release_model_install_download_locks=lambda *a, **k: None; "
+                "s.ensure_variant_install_ready=lambda row: (_ for _ in ()).throw(AssertionError('install readiness must receive rebuilt row')) if row is not rebuilt_variant or row['install_state']!='ready' else None; "
+                "class_source='class Proc:\\n returncode=0\\n stdout=None\\n def wait(self): return 0\\n'; "
+                "exec(class_source); s.subprocess.Popen=lambda *a, **k: Proc(); "
+                "s._run_model_install_job('job-strata-ready','qwen3.8-flash-next',variant['variant_id'],'strata-image-build'); "
+                "job=s.model_install_jobs['job-strata-ready']; "
+                "assert job['status']=='success' and job['return_code']==0 and job['inventory_rebuild_ok'] is True, (job, rebuild_calls, logs); "
+                "assert len(rebuild_calls)==1, (job, rebuild_calls, logs)",
+            ],
+            cwd=str(root / "src"), env=env, capture_output=True,
+            text=True, check=False, timeout=15,
+        )
+        if successful_install_job.returncode:
+            return False, successful_install_job.stderr.strip() or "Strata successful install did not publish rebuilt ready inventory"
         compose_paths, data_paths = set(), set()
         for selector, (model_token, guidance, family) in expected.items():
             row = rows[selector]
