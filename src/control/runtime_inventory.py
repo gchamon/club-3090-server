@@ -2606,10 +2606,14 @@ def _probe_host_gpus(timeout=8):
 
 def _compute_capability_rank(value):
     text = str(value or "").strip().lower().replace("sm_", "")
+    if text.endswith("+"):
+        text = text[:-1]
     if not text:
         return 0
     if "." in text:
         major, minor = text.split(".", 1)
+    elif re.fullmatch(r"\d{2}", text):
+        major, minor = text[0], text[1]
     else:
         major, minor = text, "0"
     major = re.sub(r"[^0-9]", "", major)
@@ -2787,8 +2791,9 @@ def _apply_variant_hardware_guard(spec, env_map):
         )
     if wrong_sm:
         row = wrong_sm[0]
+        required_sm_display = required_sm if required_sm.endswith("+") else f"{required_sm}+"
         raise RuntimeError(
-            f"{spec_map.get('selector') or spec_map.get('variant_id') or 'Selected preset'} requires sm_{required_sm}+,"
+            f"{spec_map.get('selector') or spec_map.get('variant_id') or 'Selected preset'} requires sm_{required_sm_display},"
             f" but GPU {row['index']} reports sm_{row.get('compute_cap') or 'unknown'}."
         )
     if low_free:

@@ -1143,6 +1143,30 @@ rows = {
     for row in json.loads(os.environ["STRATA_SMOKE_ROWS"])
 }
 
+iq2_xs = rows["strata/qwen3.8-flash-next-iq2-xs"]
+assert system._compute_capability_rank("75+") == 750
+assert system._compute_capability_rank("8.6") == 860
+gpu_row = {
+    "index": 0, "name": "GPU", "memory_total_mib": 24576,
+    "memory_free_mib": 24000, "compute_cap": "8.6",
+}
+with patch.object(system, "_probe_host_gpus", return_value=[gpu_row]):
+    guarded_env = system._apply_variant_hardware_guard(
+        iq2_xs, {"CLUB3090_GPU": "0"}
+    )
+assert guarded_env["CLUB3090_GPU"] == "0", guarded_env
+gpu_row["compute_cap"] = "7.0"
+with patch.object(system, "_probe_host_gpus", return_value=[gpu_row]):
+    try:
+        system._apply_variant_hardware_guard(
+            iq2_xs, {"CLUB3090_GPU": "0"}
+        )
+    except RuntimeError as exc:
+        assert "requires sm_75+," in str(exc), exc
+        assert "reports sm_7.0." in str(exc), exc
+    else:
+        raise AssertionError("Strata launch guard accepted SM 7.0")
+
 def evaluate(*, host="Linux", docker="/usr/bin/docker", nvidia="/usr/bin/nvidia-smi",
              runtime=True, cdi=False, gpu_output="0, 8.6, 580.1", gpu_rc=0, assigned=None):
     def run_cmd(command, timeout=None):
