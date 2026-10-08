@@ -108,12 +108,45 @@ def run_repository_install_smoke_test(root: Path) -> tuple[bool, str]:
         )
         for key in ("CLUB3090_ADMIN_PORT", "CLUB3090_PROXY_PORT", "CLUB3090_ADMIN_BIND_HOST", "CLUB3090_PROXY_BIND_HOST", "DEFAULT_MODE", "CLUB3090_ENABLE_EXTRA_TEMPS"):
             env.pop(key, None)
+        state_dir.mkdir()
+        update_state_path = state_dir / "self-update-state.json"
+        update_state_path.write_text(json.dumps({
+            "active": True,
+            "status": "running",
+            "token": "stale-install-token",
+            "stale_field": "discard",
+        }), encoding="utf-8")
         result = subprocess.run(
             [str(root / "install.sh")], cwd=str(root), env=env,
             capture_output=True, text=True, check=False, timeout=60,
         )
         if result.returncode:
             return False, result.stderr.strip() or result.stdout.strip() or "install.sh failed"
+        installer_output = result.stdout + result.stderr
+        if "[install] Refreshing updater state" not in installer_output:
+            return False, "normal installation did not announce updater-state refresh"
+        try:
+            installed_update_state = json.loads(update_state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            return False, f"normal installation did not write valid updater state: {exc}"
+        expected_update_state = {
+            "active": False,
+            "status": "idle",
+            "scope": "",
+            "label": "",
+            "command": "",
+            "started_at": 0,
+            "finished_at": 0,
+            "return_code": None,
+            "summary": "idle",
+            "token": "",
+            "log_file": str(state_dir / "self-update.log"),
+            "script_version": env.get("CLUB3090_SCRIPT_VERSION", "unknown"),
+            "ui_ack_token": "",
+            "ui_ack_at": 0,
+        }
+        if installed_update_state != expected_update_state:
+            return False, f"normal installation did not reset stale updater state: {installed_update_state!r}"
         if (temp / "upstream-setup.log").exists():
             return False, "installer unexpectedly invoked upstream model setup without a selector"
         for name in ("nvidia-smi", "sha256sum", "hf"):
@@ -260,12 +293,27 @@ def run_repository_install_smoke_test(root: Path) -> tuple[bool, str]:
         prior_systemctl_calls = systemctl_log.read_text(encoding="utf-8")
         updater_env = dict(env)
         updater_env["CLUB3090_RUNNING_FROM_UPDATER"] = "1"
+        active_update_state = {
+            "active": True,
+            "status": "running",
+            "scope": "club3090",
+            "token": "update-owned-install-token",
+            "started_at": 123,
+            "custom_field": "must survive",
+        }
+        update_state_path.write_text(json.dumps(active_update_state), encoding="utf-8")
+        active_update_state_bytes = update_state_path.read_bytes()
         updater_run = subprocess.run(
             [str(root / "install.sh")], cwd=str(root), env=updater_env,
             capture_output=True, text=True, check=False, timeout=60,
         )
         if updater_run.returncode:
             return False, updater_run.stderr.strip() or "updater-owned installer run failed"
+        updater_output = updater_run.stdout + updater_run.stderr
+        if "[install] Refreshing updater state" in updater_output:
+            return False, "updater-owned installation attempted to refresh live updater state"
+        if update_state_path.read_bytes() != active_update_state_bytes:
+            return False, "updater-owned installation modified the in-flight update state"
         updater_calls = systemctl_log.read_text(encoding="utf-8")[len(prior_systemctl_calls):]
         if "stop club3090-control.service club3090-vllm.service" not in updater_calls:
             return False, "updater-owned install did not restart control and vLLM services"
@@ -826,6 +874,44 @@ def run_updater_status_smoke_test(root: Path) -> tuple[bool, str]:
             return False, "updater status did not describe the clean-tracking System Update"
         if status.get("automatic_updates") is not False or state_dir.exists():
             return False, "updater status enabled automatic updates or wrote mutable state"
+        state_dir.mkdir()
+        state_path = state_dir / "self-update-state.json"
+        state_path.write_text(json.dumps({
+            "active": True,
+            "status": "running",
+            "token": "stale-token",
+            "finished_at": 1,
+            "internal_error": "stale",
+        }), encoding="utf-8")
+        reset = subprocess.run(
+            [sys.executable, "-m", "build.updater", "--reset-state"],
+            cwd=str(root / "src"), env=env, capture_output=True,
+            text=True, check=False, timeout=15,
+        )
+        if reset.returncode:
+            return False, reset.stderr.strip() or "updater state reset command failed"
+        try:
+            reset_state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            return False, f"updater reset state was unavailable or invalid: {exc}"
+        expected_state = {
+            "active": False,
+            "status": "idle",
+            "scope": "",
+            "label": "",
+            "command": "",
+            "started_at": 0,
+            "finished_at": 0,
+            "return_code": None,
+            "summary": "idle",
+            "token": "",
+            "log_file": str(state_dir / "self-update.log"),
+            "script_version": "unknown",
+            "ui_ack_token": "",
+            "ui_ack_at": 0,
+        }
+        if reset_state != expected_state:
+            return False, f"updater reset state did not match the initial controlled payload: {reset_state!r}"
         server_dir = temp / "server"
         upstream_dir = temp / "upstream"
         bin_dir = temp / "bin"

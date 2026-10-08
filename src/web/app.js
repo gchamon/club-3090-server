@@ -5749,7 +5749,7 @@ refreshStatus = async function (opts = {}) {
       if (renderErrors.length) statusWarnings.push(`Partial UI render: ${renderErrors.join(" | ")}`);
       setMsg(joinMessageParts(statusWarnings));
     } catch (e) {
-      if (recoverPendingUpdateMonitor()) {
+      if (await recoverPendingUpdateMonitor()) {
         setMsg("");
         return;
       }
@@ -5795,7 +5795,7 @@ async function bootAdminUi() {
   loadCodeSyntaxConfig().catch(() => {});
   if (!uiStateHydrated) hydrateUiState({});
   syncActiveTabDisplay();
-  recoverPendingUpdateMonitor();
+  recoverPendingUpdateMonitor().catch(() => {});
   startExternalUpdateSignalStream();
   hydratePresetSummaryCache();
   const chatCacheApplied = hydrateChatStateFromLocalCache();

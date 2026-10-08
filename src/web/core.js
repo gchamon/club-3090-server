@@ -46,6 +46,7 @@ const UPDATE_PENDING_TOKEN_KEY = "club3090-update-pending-token";
 const UPDATE_COMPLETED_TOKEN_KEY = "club3090-update-completed-token";
 const UPDATE_PENDING_RETURN_KEY = "club3090-update-pending-return";
 let updateUiLocked = false;
+let pendingUpdateRecoveryPromise = null;
 let updateSignalEventSource = null;
 let updateSignalReconnectTimer = null;
 let updateSignalConnectionToken = 0;
@@ -546,19 +547,56 @@ function startExternalUpdateSignalStream() {
     }, UPDATE_SIGNAL_RECONNECT_MS);
   };
 }
-function recoverPendingUpdateMonitor(scope = "controller") {
+async function recoverPendingUpdateMonitor(scope = "controller") {
   if (updateMonitor.active || updateMonitor.completed) return false;
   const token = storedUpdateToken(UPDATE_PENDING_TOKEN_KEY);
   if (!token || storedUpdateToken(UPDATE_COMPLETED_TOKEN_KEY) === token) return false;
-  beginUpdateMonitor(
-    {
-      token,
-      stream_url: `/admin/update-stream?token=${encodeURIComponent(token)}&tail=4000`,
-      status_url: `/admin/update-status?token=${encodeURIComponent(token)}`,
-    },
-    scope,
-  );
-  return true;
+  if (pendingUpdateRecoveryPromise) return pendingUpdateRecoveryPromise;
+  pendingUpdateRecoveryPromise = (async () => {
+    try {
+      const response = await fetch(`/admin/update-status?token=${encodeURIComponent(token)}`, { cache: "no-store" });
+      if (response.status === 403) {
+        markUpdateTokenCompleted(token);
+        return false;
+      }
+      if (!response.ok) return false;
+      let payload;
+      try {
+        payload = await response.json();
+      } catch (error) {
+        markUpdateTokenCompleted(token);
+        return false;
+      }
+      const update = payload?.self_update;
+      if (
+        payload?.ok !== true ||
+        update?.active !== true ||
+        String(update?.token || "").trim() !== token
+      ) {
+        markUpdateTokenCompleted(token);
+        return false;
+      }
+      if (storedUpdateToken(UPDATE_COMPLETED_TOKEN_KEY) === token) return false;
+      if (updateMonitor.active) return updateMonitor.token === token;
+      beginUpdateMonitor(
+        {
+          ...update,
+          token,
+          stream_url: update.stream_url || `/admin/update-stream?token=${encodeURIComponent(token)}&tail=4000`,
+          status_url: update.status_url || `/admin/update-status?token=${encodeURIComponent(token)}`,
+        },
+        update.scope || scope,
+      );
+      return true;
+    } catch (error) {
+      return false;
+    }
+  })();
+  try {
+    return await pendingUpdateRecoveryPromise;
+  } finally {
+    pendingUpdateRecoveryPromise = null;
+  }
 }
 function minimizeSurfacesForUpdateMode() {
   try {

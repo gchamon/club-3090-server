@@ -183,6 +183,15 @@ with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, prefix=
 os.chmod(temporary, 0o600)
 os.replace(temporary, path)
 PY
+if [[ "${CLUB3090_RUNNING_FROM_UPDATER:-0}" != "1" ]]; then
+  progress "Refreshing updater state"
+  "${SUDO[@]}" env \
+    PYTHONPATH="${ROOT}/src" \
+    CLUB3090_CONTROL_DIR="${STATE}" \
+    CLUB3090_SERVER_DIR="${ROOT}" \
+    python3 -m build.updater --reset-state
+fi
+
 
 install_unit() {
   local source="$1" target="$2" line

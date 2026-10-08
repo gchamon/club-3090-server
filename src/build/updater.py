@@ -48,35 +48,33 @@ HTTPS_ENABLED = str(os.environ.get("CLUB3090_HTTPS_ENABLED", "")).strip().lower(
 SERVER_CONFIG_FILE = os.path.join(CONTROL_DIR, "server_config.json")
 SERVER_DIR = Path(os.environ.get("CLUB3090_SERVER_DIR") or Path(__file__).resolve().parents[2]).resolve()
 
+def initial_state():
+    return {
+        "active": False,
+        "status": "idle",
+        "scope": "",
+        "label": "",
+        "command": "",
+        "started_at": 0,
+        "finished_at": 0,
+        "return_code": None,
+        "summary": "idle",
+        "token": "",
+        "log_file": UPDATE_LOG_FILE,
+        "script_version": SCRIPT_VERSION,
+        "ui_ack_token": "",
+        "ui_ack_at": 0,
+    }
+
+
 state_lock = threading.Lock()
-state = {
-    "active": False,
-    "status": "idle",
-    "scope": "",
-    "label": "",
-    "command": "",
-    "started_at": 0,
-    "finished_at": 0,
-    "return_code": None,
-    "summary": "idle",
-    "token": "",
-    "log_file": UPDATE_LOG_FILE,
-    "script_version": SCRIPT_VERSION,
-    "ui_ack_token": "",
-    "ui_ack_at": 0,
-}
+state = initial_state()
 
 
 def ensure_dir():
     os.makedirs(CONTROL_DIR, exist_ok=True)
 
 
-def write_json_atomic(path, payload):
-    ensure_dir()
-    tmp = f"{path}.tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True, ensure_ascii=False)
-    os.replace(tmp, path)
 
 
 def load_state():
@@ -599,6 +597,9 @@ def main():
             "update_instructions": "System Update fast-forwards clean tracking branches in both Club-3090 checkouts, rebuilds the Model DB, and restarts managed services.",
             "automatic_updates": False,
         }, ensure_ascii=False))
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "--reset-state":
+        write_json_atomic(UPDATE_STATE_FILE, initial_state())
         return
     ensure_dir()
     ensure_secret()
