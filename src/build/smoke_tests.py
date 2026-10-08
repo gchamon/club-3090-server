@@ -179,6 +179,33 @@ def run_repository_install_smoke_test(root: Path) -> tuple[bool, str]:
             if f"EnvironmentFile=-{env_file}" not in unit_text:
                 return False, f"{unit_name} omits its configured environment file"
         vllm_unit = (unit_dir / "club3090-vllm.service").read_text(encoding="utf-8")
+        if f"ExecStop={root}/scripts/club3090-server/stop-vllm-last-mode.sh" not in vllm_unit:
+            return False, "vLLM unit does not stop managed inference instances"
+        systemctl_log.write_text("", encoding="utf-8")
+        script_runs = (
+            ("start.sh", (), "start club3090-control.service club3090-updater.service club3090-benchmarks.service club3090-vllm.service"),
+            ("stop.sh", (), "stop club3090-vllm.service club3090-benchmarks.service club3090-updater.service club3090-control.service"),
+            ("stop.sh", ("--gpu",), "stop club3090-vllm.service"),
+        )
+        expected_calls = []
+        for script_name, script_args, expected_call in script_runs:
+            script_result = subprocess.run(
+                [str(root / "scripts" / "club3090-server" / script_name), *script_args],
+                cwd=str(root), env=env, capture_output=True, text=True,
+                check=False, timeout=10,
+            )
+            expected_calls.append(expected_call)
+            calls = systemctl_log.read_text(encoding="utf-8").splitlines()
+            if script_result.returncode or calls != expected_calls:
+                return False, f"{script_name} {script_args} invoked unexpected systemctl commands: rc={script_result.returncode} calls={calls!r} stderr={script_result.stderr!r}"
+        systemctl_log.write_text("", encoding="utf-8")
+        invalid_stop = subprocess.run(
+            [str(root / "scripts" / "club3090-server" / "stop.sh"), "--invalid"],
+            cwd=str(root), env=env, capture_output=True, text=True,
+            check=False, timeout=10,
+        )
+        if invalid_stop.returncode == 0 or systemctl_log.read_text(encoding="utf-8"):
+            return False, "stop.sh accepted an unknown option or invoked systemctl before rejecting it"
         if "ConditionKernelCommandLine=" in vllm_unit:
             return False, "vLLM unit retains a boot-mode condition"
         if "Wants=network-online.target club3090-control.service" not in vllm_unit or "After=docker.service network-online.target club3090-control.service" not in vllm_unit:
@@ -957,6 +984,13 @@ def run_strata_preset_smoke_test(root: Path) -> tuple[bool, str]:
         inventory_path = state_dir / "runtime_inventory.json"
         if not inventory_path.is_file():
             return False, "Strata inventory rebuild did not write isolated inventory"
+        stop_dispatch = subprocess.run(
+            [sys.executable, "-m", "control.http_server", "--stop-managed-instances"],
+            cwd=str(root / "src"), env=env, capture_output=True,
+            text=True, check=False, timeout=30,
+        )
+        if stop_dispatch.returncode:
+            return False, stop_dispatch.stderr.strip() or "managed-instance stop CLI did not exit successfully with no configured instances"
         try:
             inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
@@ -1243,6 +1277,53 @@ for selector, row in rows.items():
 blocked_row = next(iter(rows.values()))
 instance = {"id": "GPU0", "kind": "single", "gpu_index": 0, "gpu_indices": [0],
             "mode": blocked_row["selector"], "port": 19450}
+iq2_instance = dict(instance, mode=iq2_xs["selector"])
+ready_calls = []
+def stratum_timeout(*args, **kwargs):
+    ready_calls.append(kwargs.get("timeout"))
+    raise RuntimeError("Timed out waiting for runtime readiness at http://127.0.0.1:19450/v1/models.\nStrata fixture logs")
+with patch.object(control, "instance_variant_spec", return_value=iq2_xs), \
+     patch.object(control, "_instance_launch",
+                  side_effect=lambda target: {"instance": target, "output": "started"}), \
+     patch.object(control, "instance_ready_url",
+                  return_value="http://127.0.0.1:19450/v1/models"), \
+     patch.object(control, "instance_container_name", return_value="strata-gpu0"), \
+     patch.object(control, "wait_for_runtime_ready", side_effect=stratum_timeout), \
+     patch.object(control, "stop_instance", return_value=(0, "compose down")) as stop_timed_out, \
+     patch.object(control, "clear_switch_failure"):
+    boot_result = control.start_instances_parallel([iq2_instance])
+assert ready_calls == [300], ready_calls
+stop_timed_out.assert_called_once_with("GPU0", timeout=60)
+assert len(boot_result["failed"]) == 1
+assert "Strata fixture logs" in boot_result["failed"][0]["error"]
+assert os.path.isdir(iq2_xs["strata_data_path"]), iq2_xs["strata_data_path"]
+non_strata_timeouts = []
+with patch.object(control, "instance_variant_spec", return_value={"engine": "vllm"}), \
+     patch.object(control, "is_strata_variant", return_value=False), \
+     patch.object(control, "instance_ready_url",
+                  return_value="http://127.0.0.1:19450/v1/models"), \
+     patch.object(control, "instance_container_name", return_value="vllm-gpu0"), \
+     patch.object(control, "variant_engine_family", return_value="vllm"), \
+     patch.object(control, "wait_for_runtime_ready",
+                  side_effect=lambda *args, **kwargs: non_strata_timeouts.append(kwargs.get("timeout"))), \
+     patch.object(control, "maybe_warmup_variant_runtime",
+                  return_value={"skipped": True, "reason": "fixture"}), \
+     patch.object(control, "clear_switch_failure"):
+    control._instance_wait_until_ready(instance)
+assert non_strata_timeouts == [900], non_strata_timeouts
+managed_config = [
+    {"id": "GPU0", "mode": iq2_xs["selector"], "enabled": False},
+    {"id": "GPU1", "mode": "vllm/default", "enabled": True},
+    {"id": "GPU2", "mode": "", "enabled": False},
+]
+with patch.object(control, "read_instances_config", return_value=managed_config), \
+     patch.object(control, "stop_instance", side_effect=[(0, "compose down"), (1, "stop failed")]) as managed_stop:
+    managed_results = control.stop_managed_instances()
+assert [row["id"] for row in managed_results] == ["GPU0", "GPU1"]
+assert [row["rc"] for row in managed_results] == [0, 1], managed_results
+assert managed_results[1]["output"] == "stop failed"
+assert managed_stop.call_args_list[0].args == ("GPU0",)
+assert managed_stop.call_args_list[1].args == ("GPU1",)
 with patch.object(control, "instance_variant_spec", return_value=blocked_row), \
      patch.object(control, "evaluate_strata_hardware",
                   return_value={"hardware_blocked": True, "hardware_block_reason": "fixture incompatible"}), \

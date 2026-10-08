@@ -2970,6 +2970,15 @@ def main():
         rebuilt = rebuild_runtime_inventory()
         print(json.dumps({"ok": True, "models": len(rebuilt.get("models") or []), "variants": len(rebuilt.get("variants") or [])}))
         return
+    if len(sys.argv) > 1 and sys.argv[1] == "--stop-managed-instances":
+        load_runtime_inventory(force=not os.path.exists(RUNTIME_INVENTORY_FILE), rebuild_if_missing=True)
+        results = stop_managed_instances()
+        for row in results:
+            state = "stopped" if int(row.get("rc") or 0) == 0 else "failed"
+            print(f"{row.get('id') or 'instance'} {state}: {row.get('output') or ''}")
+        if any(int(row.get("rc") or 0) != 0 for row in results):
+            raise SystemExit(1)
+        return
     if len(sys.argv) > 1 and sys.argv[1] == "--boot-enabled-instances":
         load_runtime_inventory(force=not os.path.exists(RUNTIME_INVENTORY_FILE), rebuild_if_missing=True)
         boot_enabled_instances()

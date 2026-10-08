@@ -812,12 +812,23 @@ def _instance_launch(instance):
 def _instance_wait_until_ready(instance):
     spec = instance_variant_spec(instance)
     ready_url = instance_ready_url(instance)
-    wait_for_runtime_ready(
-        instance_container_name(instance),
-        ready_url,
-        timeout=900,
-        engine_family=variant_engine_family(spec),
-    )
+    strata = is_strata_variant(spec)
+    try:
+        wait_for_runtime_ready(
+            instance_container_name(instance),
+            ready_url,
+            timeout=300 if strata else 900,
+            engine_family=variant_engine_family(spec),
+        )
+    except RuntimeError as exc:
+        if not strata or not str(exc).startswith("Timed out waiting for runtime readiness at "):
+            raise
+        stop_rc, stop_output = stop_instance(instance["id"], timeout=60)
+        if stop_rc != 0:
+            raise RuntimeError(
+                f"{exc}\nTimed-out Strata instance stop failed (rc={stop_rc}): {stop_output}"
+            ) from exc
+        raise
     warmup = {"skipped": True, "reason": "strata-does-not-use-vllm-warmup"} if is_strata_variant(spec) else maybe_warmup_variant_runtime(spec, ready_url)
     if warmup.get("skipped"):
         log_control(f"INSTANCE warmup skipped {instance['id']} mode={instance['mode']}: {warmup.get('reason')}")
@@ -925,19 +936,32 @@ def start_instance(instance_id, track_switch_job=True):
         raise
 
 
-def stop_instance(instance_id):
+def stop_instance(instance_id, timeout=600):
     instance = get_instance(instance_id)
     if not instance:
         raise ValueError(f"Unknown instance: {instance_id}")
     if not instance.get("mode"):
         return 0, "No preset selected."
     cmd = instance_compose_args(instance) + ["down"]
-    rc, out = run_cmd(cmd, timeout=600, cwd=instance_compose_project_dir(instance), env=instance_stop_subprocess_env())
+    rc, out = run_cmd(cmd, timeout=max(1, int(timeout)), cwd=instance_compose_project_dir(instance), env=instance_stop_subprocess_env())
     if rc != 0:
         rc2, out2 = run_cmd(["docker", "rm", "-f", instance_container_name(instance)], timeout=120)
         out = (out or "") + f"\nmanual rm rc={rc2} {out2}"
     log_control(f"INSTANCE stop {instance['id']} rc={rc}: {out[-4000:]}")
     return rc, out[-4000:]
+
+def stop_managed_instances():
+    results = []
+    for instance in read_instances_config():
+        if not instance.get("mode"):
+            continue
+        instance_id = str(instance.get("id") or "")
+        try:
+            rc, output = stop_instance(instance_id)
+        except Exception as exc:
+            rc, output = 1, str(exc)
+        results.append({"id": instance_id, "rc": int(rc or 0), "output": str(output or "")[-4000:]})
+    return results
 
 def _configured_scope_targets_for_mode(instance_id="", mode=""):
     selector = canonical_mode_selector(mode) if mode else ""

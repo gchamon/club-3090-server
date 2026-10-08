@@ -11,6 +11,7 @@ RemainAfterExit=yes
 EnvironmentFile=-@ENV_FILE@
 WorkingDirectory=@SOURCE_ROOT@/src
 ExecStart=@SOURCE_ROOT@/scripts/club3090-server/start-vllm-last-mode.sh
+ExecStop=@SOURCE_ROOT@/scripts/club3090-server/stop-vllm-last-mode.sh
 TimeoutStartSec=1800
 StandardOutput=journal
 StandardError=journal
