@@ -594,7 +594,11 @@ function setUpdateUiLocked(locked) {
     .querySelectorAll("button, input, select, textarea")
     .forEach((node) => {
       if (!node || node.id === "log") return;
-      if (updateUiLocked) node.setAttribute("disabled", "disabled");
+      const logControl =
+        node.closest("#logSourcePanel") ||
+        node.id === "copyCurrentLogBtn" ||
+        node.id === "downloadAllLogsBtn";
+      if (updateUiLocked && !logControl) node.setAttribute("disabled", "disabled");
       else if (!node.dataset.scopeDisabled) node.removeAttribute("disabled");
     });
   if ($("log")) $("log").removeAttribute("disabled");

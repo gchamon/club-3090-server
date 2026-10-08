@@ -4040,27 +4040,14 @@ details[open] > summary .score-collapse-cue::before {
   box-shadow: 0 0 0 1px #5ff5e84a !important;
 }
 .update-lock-active .tab,
-.update-lock-active .logtools button,
+.update-lock-active .logtools button:not(#copyCurrentLogBtn):not(#downloadAllLogsBtn),
 .update-lock-active .logtools input,
-.update-lock-active .logtools select,
-.update-lock-active .logs .logheadchecks,
-.update-lock-active .logs .logheadchecks input,
-.update-lock-active .logs .logheadchecks select {
+.update-lock-active .logtools select {
   pointer-events: none;
   opacity: 0.45;
 }
-.update-lock-active .logtools input#searchQuery {
-  pointer-events: none;
-}
 .update-lock-active .logs textarea#log {
   opacity: 1;
-}
-.log-source-panel-disabled {
-  opacity: 0.74;
-}
-.log-source-panel-disabled .subtabs,
-.log-source-panel-disabled .preset-actions {
-  pointer-events: none;
 }
 .assistant-modal-card {
   width: min(1120px, calc(100vw - 32px));

@@ -6,10 +6,8 @@ function renderLogSourcePanel() {
       ? lastStatus.upstream_services.filter((row) => row && row.running)
       : [];
     const modelSources = modelLogSourceEntries();
-    const scriptActive = !!lastStatus?.script_job?.active || currentLogSource === "script";
-    panel.className = `panel log-source-panel${updateActive ? " log-source-panel-disabled" : ""}`;
-    const disabledAttr = updateActive ? ' disabled aria-disabled="true"' : "";
-    panel.innerHTML = `<div class="panel-head"><h2>Log Sources</h2><div class="preset-actions">${renderIconButton({ title: "Export", action: "exportCurrentLog()", icon: "upload", disabled: updateActive })}</div></div><div class="subtabs">${[
+    panel.className = "panel log-source-panel";
+    panel.innerHTML = `<div class="panel-head"><h2>Log Sources</h2><div class="preset-actions">${renderIconButton({ title: "Export", action: "exportCurrentLog()", icon: "upload" })}</div></div><div class="subtabs">${[
       { id: "control", label: "Web UI Server" },
       { id: "audit", label: "Audit" },
       { id: "debug", label: "Debug" },
@@ -27,7 +25,7 @@ function renderLogSourcePanel() {
     ]
       .map(
         (row) =>
-          `<button class="subtab${currentLogSource === row.id ? " active" : ""}"${disabledAttr} onclick="setCurrentLogSource('${escapeJs(row.id)}')">${escapeHtml(row.label)}</button>`,
+          `<button class="subtab${currentLogSource === row.id ? " active" : ""}" onclick="setCurrentLogSource('${escapeJs(row.id)}')">${escapeHtml(row.label)}</button>`,
       )
       .join("")}</div><div class="value smallgap" id="logsSourceSummary">-</div>`;
   }
@@ -1783,7 +1781,6 @@ setCurrentLogSource = function (source, options = {}) {
       : "docker";
   if (nextSource === "script") selectedScriptLogJobId = String(options.scriptJobId || "");
   else selectedScriptLogJobId = "";
-  if (selfUpdateActive(lastStatus) && nextSource !== "update") return;
   currentLogSource = nextSource;
   noteKnownLogSource(currentLogSource);
   applyLogVisibility();
