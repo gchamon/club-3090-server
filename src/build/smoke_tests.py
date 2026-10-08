@@ -1112,7 +1112,7 @@ def run_strata_preset_smoke_test(root: Path) -> tuple[bool, str]:
         readiness = subprocess.run(
             [
                 sys.executable, "-c",
-                "import json, subprocess, types; import control; "
+                "import json, os, subprocess, types; import control; "
                 f"row=json.loads({json.dumps(json.dumps(rows['strata/qwen3.8-flash-next-iq2-xs']))}); "
                 "original_check_output=subprocess.check_output; original_run=subprocess.run; "
                 "subprocess.check_output=lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError()); "
@@ -1121,6 +1121,11 @@ def run_strata_preset_smoke_test(root: Path) -> tuple[bool, str]:
                 "assert state['install_state']=='requires_download' and 'Pinned Strata source' in state['install_reason'] and 'runtime image' in state['install_reason']; "
                 f"subprocess.check_output=lambda *a, **k: {json.dumps(control_commit := '82f46a8c8f475f001ad76d92f58f4a4f8ffb0253')}; "
                 "subprocess.run=lambda *a, **k: types.SimpleNamespace(returncode=0); "
+                "state=control._detect_variant_install_state(row, ''); "
+                "assert state['install_state']=='requires_download' and 'prepared config' in state['install_reason']; "
+                "blocked_source='try:\\n control.ensure_variant_install_ready(row)\\nexcept RuntimeError as exc:\\n assert \\'prepared config\\' in str(exc)\\nelse:\\n raise AssertionError(\\'launch guard accepted an unprepared Strata model\\')'; exec(blocked_source); "
+                "os.makedirs(os.path.dirname(row['strata_config_path']), exist_ok=True); "
+                "open(row['strata_config_path'], 'w').write('{}'); "
                 "assert control._detect_variant_install_state(row, '')['install_state']=='ready'; "
                 "row['install_state']='requires_download'; row['install_reason']='Install the pinned Strata runtime image and source checkout.'; "
                 "control.write_json_file(control.RUNTIME_INVENTORY_FILE, {'variants':[row]}); "
@@ -1154,6 +1159,7 @@ def run_strata_preset_smoke_test(root: Path) -> tuple[bool, str]:
                 "s._register_model_install_process=lambda *a, **k: None; s._clear_model_install_process=lambda *a, **k: None; "
                 "s._stream_process_output_to_audit=lambda *a, **k: None; "
                 "s._normalize_shared_mmproj_hardlinks=lambda: []; s._normalize_duplicate_model_file_hardlinks=lambda: []; "
+                "s._prepare_strata_model=lambda *a, **k: None; "
                 "s.rebuild_runtime_inventory=lambda: {'variants':[variant]}; s.refresh_status_snapshot=lambda: None; "
                 "s.append_audit_text_line=lambda *a, **k: None; s.log_audit=lambda *a, **k: None; "
                 "s._repo_subprocess_env=lambda: dict(os.environ); "
@@ -1185,6 +1191,7 @@ def run_strata_preset_smoke_test(root: Path) -> tuple[bool, str]:
                 "s._register_model_install_process=lambda *a, **k: None; s._clear_model_install_process=lambda *a, **k: None; "
                 "s._stream_process_output_to_audit=lambda *a, **k: None; "
                 "s._normalize_shared_mmproj_hardlinks=lambda: []; s._normalize_duplicate_model_file_hardlinks=lambda: []; "
+                "s._prepare_strata_model=lambda *a, **k: None; "
                 "rebuild_calls=[]; "
                 "s.rebuild_runtime_inventory=lambda: (rebuild_calls.append(True) or {'variants':[rebuilt_variant]}); "
                 "s.read_json_file=lambda *a, **k: {'variants':[rebuilt_variant]}; "
@@ -1204,6 +1211,37 @@ def run_strata_preset_smoke_test(root: Path) -> tuple[bool, str]:
         )
         if successful_install_job.returncode:
             return False, successful_install_job.stderr.strip() or "Strata successful install did not publish rebuilt ready inventory"
+        prefetch = subprocess.run(
+            [
+                sys.executable, "-c",
+                "import json, os; import control as c; s=c._shared; "
+                f"variant=json.loads({json.dumps(json.dumps(rows['strata/qwen3.8-flash-next-iq2-xs']))}); "
+                "config=variant['strata_config_path']; data=variant['strata_data_path']; "
+                "os.makedirs(data, exist_ok=True); "
+                "part=os.path.join(data,'Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf.part'); "
+                "open(part,'w').write('partial'); "
+                "os.path.exists(config) and os.unlink(config); assert not os.path.exists(config); "
+                "variant['service_name']='strata'; s.ensure_strata_api_key=lambda: 'test-key'; "
+                "s._register_model_install_process=lambda *a, **k: None; s._clear_model_install_process=lambda *a, **k: None; "
+                "s._stream_process_output_to_audit=lambda *a, **k: None; s.append_audit_text_line=lambda *a, **k: None; "
+                "calls=[]; class_source='class Proc:\\n def __init__(self, code): self.code=code; self.returncode=code; self.stdout=None\\n def wait(self):\\n  if self.code==0: os.makedirs(os.path.dirname(config), exist_ok=True); open(config,chr(119)).write(chr(123)+chr(125))\\n  return self.code'; exec(class_source); "
+                "popen_source='def popen(args, **kwargs):\\n calls.append((args,kwargs)); return Proc(1 if len(calls)==1 else 0)'; exec(popen_source); "
+                "s.subprocess.Popen=popen; failure_source='try:\\n s._prepare_strata_model(\"job\",\"[model-install test]\",variant,dict(os.environ))\\nexcept RuntimeError as exc:\\n assert \"download and setup failed\" in str(exc)\\nelse:\\n raise AssertionError(\"failed Strata prefetch was accepted\")'; exec(failure_source); "
+                "assert os.path.isfile(part) and not os.path.exists(config); "
+                "s._prepare_strata_model('job','[model-install test]',variant,dict(os.environ)); "
+                "assert os.path.isfile(config) and os.path.isfile(part); "
+                "args,kwargs=calls[1]; joined=' '.join(args); setup=args[-1]; "
+                "assert args[:2]==['docker','compose'] and ' run --rm --no-deps ' in f' {joined} '; "
+                "assert '--setup --yes' in setup and '--model IQ2_XS' in setup and '--family qwen' in setup and '--no-start' in setup; "
+                "assert '/data/config/strata-iq2_xs.json' in setup and 'API_KEY' in setup; "
+                "assert kwargs['env']['STRATA_API_KEY']=='test-key' and kwargs['env']['PORT']=='0'; "
+                "s._prepare_strata_model('job','[model-install test]',variant,dict(os.environ)); assert len(calls)==2",
+            ],
+            cwd=str(root / "src"), env=env, capture_output=True,
+            text=True, check=False, timeout=15,
+        )
+        if prefetch.returncode:
+            return False, prefetch.stderr.strip() or "Strata setup prefetch did not preserve retryable downloads and publish readiness config"
         compose_paths, data_paths = set(), set()
         for selector, (model_token, guidance, family) in expected.items():
             row = rows[selector]

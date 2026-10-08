@@ -4326,9 +4326,14 @@ def _detect_variant_install_state(variant, model_dir_root):
         except Exception:
             image_exists = False
         image_ready = image_exists
-        ready = source_ready and image_ready
-        if str((variant or {}).get("strata_install_mode") or "") == "orca":
-            data = str((variant or {}).get("strata_data_path") or "")
+        data = str((variant or {}).get("strata_data_path") or "")
+        model_token = str((variant or {}).get("strata_model_token") or "")
+        family = str((variant or {}).get("strata_family") or "")
+        install_mode = str((variant or {}).get("strata_install_mode") or "standard")
+        config_path = str((variant or {}).get("strata_config_path") or strata_setup_config_path(data, family, model_token, install_mode))
+        config_ready = os.path.isfile(config_path)
+        ready = source_ready and image_ready and config_ready
+        if install_mode == "orca":
             artifacts = [
                 os.path.join(data, "Qwen3.8-Flash-Next-Uncensored-IQ3_XXS-00001-of-00002.gguf"),
                 os.path.join(data, "Qwen3.8-Flash-Next-Uncensored-IQ3_XXS-00002-of-00002.gguf"),
@@ -4338,18 +4343,19 @@ def _detect_variant_install_state(variant, model_dir_root):
                 os.path.join(data, "packs", "orca-iq3_xxs", "native_experts.txt"),
                 os.path.join(data, "mtp", "mtp-q2_0.gguf"),
                 os.path.join(data, "mtp", "rt", "draft_vocab.bin"),
-                os.path.join(data, "config", "strata-orca-iq3_xxs.json"),
             ]
             artifacts_ready = all(os.path.exists(path) for path in artifacts)
             ready = ready and artifacts_ready
         else:
-            artifacts_ready = True
+            artifacts_ready = config_ready
         reasons = []
         if not source_ready:
             reasons.append(f"Pinned Strata source at {source} is not at commit {STRATA_COMMIT}.")
         if not image_ready:
             reasons.append(f"Strata runtime image {image} is unavailable.")
-        if not artifacts_ready:
+        if not config_ready:
+            reasons.append(f"Strata model setup is incomplete: expected prepared config {config_path}.")
+        if install_mode == "orca" and not artifacts_ready:
             reasons.append("Required Orca model preparation artifacts are not installed.")
         return {"install_state": "ready" if ready else "requires_download", "install_command": "strata-image-build", "install_reason": "" if ready else " ".join(reasons)}
     model_id = str((variant or {}).get("model_id") or "").strip()
@@ -5365,6 +5371,7 @@ def rebuild_runtime_inventory():
             "strata_model_token": str(row.get("strata_model_token") or ""),
             "strata_source_path": str(row.get("strata_source_path") or ""),
             "strata_data_path": str(row.get("strata_data_path") or ""),
+            "strata_config_path": str(row.get("strata_config_path") or ""),
             "strata_image": str(row.get("strata_image") or ""),
             "strata_commit": str(row.get("strata_commit") or ""),
             "strata_family": str(row.get("strata_family") or ""),

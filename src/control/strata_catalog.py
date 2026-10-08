@@ -58,6 +58,16 @@ def _strata_base_compose(model_token, family, service, data_root):
 '''
 
 
+
+def strata_setup_config_path(data_root, family, model_token, install_mode="standard"):
+    if str(install_mode or "").strip().lower() == "orca":
+        filename = "strata-orca-iq3_xxs.json"
+    else:
+        family_prefix = "" if str(family or "").strip().lower() == "qwen" else f"{str(family or '').strip().lower()}-"
+        filename = f"strata-{family_prefix}{str(model_token or '').strip().lower()}.json"
+    return os.path.join(str(data_root or ""), "config", filename)
+
+
 def strata_builtin_custom_model_rows():
     root = os.path.abspath(os.path.join(CONTROL_DIR, "builtin-models"))
     source = os.path.join(root, "strata", "source")
@@ -83,6 +93,7 @@ def strata_builtin_custom_model_rows():
                 handle.write(text)
         os.makedirs(data, exist_ok=True)
         model_id = variant.get("model_id", "qwen3.8-flash-next")
+        config_path = strata_setup_config_path(data, variant["family"], model_token, variant.get("install_mode", "standard"))
         row = {
             "id": f"builtin-strata-{slug}", "slug": selector, "selector": selector,
             "display_name": variant["display"], "model_id": model_id,
@@ -92,10 +103,11 @@ def strata_builtin_custom_model_rows():
             "compose_rel_path": os.path.relpath(compose, root).replace(os.sep, "/"),
             "compose_meta": {"service_name": "strata", "port": 8080, "served_model_name": variant.get("served", "qwen3.8-flash-next")},
             "inventory_origin": "control_catalog", "source_kind": "curated", "custom_preset": True,
-            "install_command": "strata-image-build", "install_reason": "Install the pinned Strata runtime image and source checkout.",
+            "install_command": "strata-image-build", "install_reason": "Install the pinned Strata runtime and prepare its model data.",
             "strata_model_token": model_token, "strata_family": variant["family"],
             "strata_install_mode": variant.get("install_mode", "standard"),
             "strata_source_path": source, "strata_data_path": data,
+            "strata_config_path": config_path,
             "strata_image": STRATA_IMAGE, "strata_commit": STRATA_COMMIT,
             "status_kind": variant.get("status", "production"),
             "download_size_gb": variant.get("download"),
