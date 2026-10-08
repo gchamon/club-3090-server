@@ -90,7 +90,7 @@ CLUB3090_DIR=/absolute/path/to/club-3090 ./install.sh
 
 Run the installer as the checkout owner; it uses `sudo` for system changes. The checkout must remain at the installed path: systemd services execute the Python modules, scripts, and web assets directly from it. The installer registers systemd units and stores the service environment in `/etc/club3090-server.env`; mutable runtime data defaults to `/var/lib/club3090-control` and can be redirected with `CLUB3090_CONTROL_DIR`.
 
-Successful installation starts the control, updater, and vLLM services, then waits up to 60 seconds for all three to report `active` through systemd; a timeout reports inactive units. In AI Studio, each inference runtime row's **Start this inference runtime automatically at boot** checkbox controls whether that runtime starts on subsequent boots. Verify with `systemctl is-active club3090-control.service`, `systemctl is-active club3090-updater.service`, and `systemctl is-active club3090-vllm.service`; inspect the installed unit with `systemctl cat club3090-control.service`. For service operations see [Operations](OPERATIONS.md).
+Successful installation submits service-start jobs without waiting for services to become active. During System Update, the admin UI monitors the inference service for up to one minute and then returns control to the operator even if inference is still starting. Verify service state with `systemctl is-active club3090-control.service`, `systemctl is-active club3090-updater.service`, and `systemctl is-active club3090-vllm.service`; inspect the installed unit with `systemctl cat club3090-control.service`. For service operations see [Operations](OPERATIONS.md).
 
 ## Uninstall
 

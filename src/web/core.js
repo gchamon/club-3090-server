@@ -39,6 +39,8 @@ let updateMonitor = {
   returnTab: "",
   returnScrollTop: 0,
   returnLogSource: "docker",
+  scope: "",
+  waitingForInference: false,
 };
 const UPDATE_PENDING_TOKEN_KEY = "club3090-update-pending-token";
 const UPDATE_COMPLETED_TOKEN_KEY = "club3090-update-completed-token";
@@ -385,6 +387,7 @@ function abandonPendingUpdateUi(message = "") {
     updateMonitor.statusTimer = null;
   }
   updateMonitor.active = false;
+  updateMonitor.waitingForInference = false;
   updateMonitor.completed = true;
   updateMonitor.streamUrl = "";
   updateMonitor.statusUrl = "";

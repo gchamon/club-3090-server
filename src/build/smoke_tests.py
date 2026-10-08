@@ -76,7 +76,7 @@ def run_repository_install_smoke_test(root: Path) -> tuple[bool, str]:
         mutation_wrapper = '#!/bin/sh\nif [ "$1" = "-C" ] && [ "$3" = "rev-parse" ]; then if [ -n "${CLUB3090_TEST_SERVER_DIR:-}" ] && [ "$2" = "$CLUB3090_TEST_SERVER_DIR" ]; then printf "%s\\n" "$2"; exit 0; fi; exec "$CLUB3090_TEST_REAL_GIT" "$@"; fi\nprintf "%s\\n" "$*" >> "$CLUB3090_TEST_MUTATION_LOG"\nexit 99\n'
         wrappers = {
             "sudo": '#!/bin/sh\nexec "$@"\n',
-            "systemctl": '#!/bin/sh\nprintf "%s\\n" "$*" >> "$CLUB3090_TEST_SYSTEMCTL_LOG"\nif [ "$1" = "is-active" ] && [ "${CLUB3090_TEST_HEALTH_DELAY:-}" = "1" ]; then marker="${CLUB3090_TEST_SYSTEMCTL_LOG}.$3"; if [ ! -e "$marker" ]; then : > "$marker"; exit 1; fi; fi\nexit 0\n',
+            "systemctl": '#!/bin/sh\nprintf "%s\\n" "$*" >> "$CLUB3090_TEST_SYSTEMCTL_LOG"\nif [ "$1" = "start" ] && [ "$2" != "--no-block" ] && [ "${CLUB3090_TEST_BLOCK_START:-}" = "1" ]; then sleep 10; fi\nif [ "$1" = "is-active" ] && [ "${CLUB3090_TEST_HEALTH_DELAY:-}" = "1" ]; then marker="${CLUB3090_TEST_SYSTEMCTL_LOG}.$3"; if [ ! -e "$marker" ]; then : > "$marker"; exit 1; fi; fi\nexit 0\n',
             "docker": '#!/bin/sh\nif [ "$1 $2 $3" = "compose version" ]; then exit 0; fi\nexit 0\n',
             "git": mutation_wrapper,
             "apt": mutation_wrapper,
@@ -140,11 +140,8 @@ def run_repository_install_smoke_test(root: Path) -> tuple[bool, str]:
             "[install] Running upstream model setup for qwen3.6-27b",
             "[install] Upstream model setup completed",
             "[install] Rendering systemd service units",
-            "[install] Starting services; systemd may wait for startup",
+            "[install] Submitting service start jobs without waiting for startup",
             "[install] Installation complete",
-            "[install] Checking service health with systemd (up to 60s)",
-            "[install] Healthy: all managed services report active",
-            "[install] Waiting for active services:",
         ):
             if message not in installer_output:
                 return False, f"installer omitted progress message {message!r}"
@@ -174,12 +171,12 @@ def run_repository_install_smoke_test(root: Path) -> tuple[bool, str]:
             ("club3090-cert-refresh.service", "refresh-ip-certificate.sh"),
         ):
             unit_text = (unit_dir / unit_name).read_text(encoding="utf-8")
-            if f"ExecStart={root}/scripts/club3090-server/{helper_name}" not in unit_text:
+            if f"ExecStart={root}/scripts/{helper_name}" not in unit_text:
                 return False, f"{unit_name} does not execute its checkout-owned helper"
             if f"EnvironmentFile=-{env_file}" not in unit_text:
                 return False, f"{unit_name} omits its configured environment file"
         vllm_unit = (unit_dir / "club3090-vllm.service").read_text(encoding="utf-8")
-        if f"ExecStop={root}/scripts/club3090-server/stop-vllm-last-mode.sh" not in vllm_unit:
+        if f"ExecStop={root}/scripts/stop-vllm-last-mode.sh" not in vllm_unit:
             return False, "vLLM unit does not stop managed inference instances"
         systemctl_log.write_text("", encoding="utf-8")
         script_runs = (
@@ -190,7 +187,7 @@ def run_repository_install_smoke_test(root: Path) -> tuple[bool, str]:
         expected_calls = []
         for script_name, script_args, expected_call in script_runs:
             script_result = subprocess.run(
-                [str(root / "scripts" / "club3090-server" / script_name), *script_args],
+                [str(root / "scripts" / script_name), *script_args],
                 cwd=str(root), env=env, capture_output=True, text=True,
                 check=False, timeout=10,
             )
@@ -200,7 +197,7 @@ def run_repository_install_smoke_test(root: Path) -> tuple[bool, str]:
                 return False, f"{script_name} {script_args} invoked unexpected systemctl commands: rc={script_result.returncode} calls={calls!r} stderr={script_result.stderr!r}"
         systemctl_log.write_text("", encoding="utf-8")
         invalid_stop = subprocess.run(
-            [str(root / "scripts" / "club3090-server" / "stop.sh"), "--invalid"],
+            [str(root / "scripts" / "stop.sh"), "--invalid"],
             cwd=str(root), env=env, capture_output=True, text=True,
             check=False, timeout=10,
         )
@@ -253,15 +250,13 @@ def run_repository_install_smoke_test(root: Path) -> tuple[bool, str]:
         if expected_enable not in systemctl_calls:
             return False, "installer did not enable the expected repository-native services"
         expected_stop = "stop club3090-control.service club3090-updater.service club3090-vllm.service"
-        expected_start = "start club3090-control.service club3090-updater.service club3090-vllm.service"
+        expected_start = "--no-block start club3090-control.service club3090-updater.service club3090-vllm.service"
         if expected_stop not in systemctl_calls or expected_start not in systemctl_calls:
-            return False, "installer did not stop and start the deployment services"
+            return False, "installer did not stop and submit service starts non-blockingly"
         if not systemctl_calls.index(expected_enable) < systemctl_calls.index(expected_stop) < systemctl_calls.index(expected_start):
-            return False, "installer did not stop and restart deployment services after enabling units"
-        for service in ("club3090-control.service", "club3090-updater.service", "club3090-vllm.service"):
-            health_check = f"is-active --quiet {service}"
-            if health_check not in systemctl_calls or systemctl_calls.index(health_check) < systemctl_calls.index(expected_start):
-                return False, f"installer did not check health for {service} after starting services"
+            return False, "installer did not stop and submit service starts after enabling units"
+        if "is-active" in systemctl_calls:
+            return False, "installer waited for systemd service health instead of returning after start submission"
         prior_systemctl_calls = systemctl_log.read_text(encoding="utf-8")
         updater_env = dict(env)
         updater_env["CLUB3090_RUNNING_FROM_UPDATER"] = "1"
@@ -276,10 +271,24 @@ def run_repository_install_smoke_test(root: Path) -> tuple[bool, str]:
             return False, "updater-owned install did not restart control and vLLM services"
         if "stop club3090-control.service club3090-updater.service club3090-vllm.service" in updater_calls:
             return False, "updater-owned install stopped its own updater service"
-        if "start club3090-control.service club3090-vllm.service" not in updater_calls:
-            return False, "updater-owned install did not restart control and vLLM services"
-        if "is-active --quiet club3090-updater.service" not in updater_calls:
-            return False, "updater-owned install did not health-check the still-running updater service"
+        updater_start = "--no-block start club3090-control.service club3090-vllm.service"
+        if updater_start not in updater_calls:
+            return False, "updater-owned install did not submit control and vLLM starts non-blockingly"
+        prior_systemctl_calls = systemctl_log.read_text(encoding="utf-8")
+        blocked_start_env = dict(updater_env)
+        blocked_start_env["CLUB3090_TEST_BLOCK_START"] = "1"
+        try:
+            blocked_start_run = subprocess.run(
+                [str(root / "install.sh")], cwd=str(root), env=blocked_start_env,
+                capture_output=True, text=True, check=False, timeout=5,
+            )
+        except subprocess.TimeoutExpired:
+            return False, "installer blocked on systemd start despite --no-block"
+        if blocked_start_run.returncode:
+            return False, blocked_start_run.stderr.strip() or "non-blocking installer run failed"
+        blocked_start_calls = systemctl_log.read_text(encoding="utf-8")[len(prior_systemctl_calls):]
+        if updater_start not in blocked_start_calls:
+            return False, "installer did not submit updater-owned service starts with --no-block"
         dotenv_root = temp / "dotenv-server"
         dotenv_root.mkdir()
         shutil.copy2(root / "install.sh", dotenv_root / "install.sh")

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SERVER_DIR="${CLUB3090_SERVER_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)}"
+SERVER_DIR="${CLUB3090_SERVER_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)}"
 CONTROL_DIR="${CLUB3090_CONTROL_DIR:-/var/lib/club3090-control}"
 
 printf '[club3090-vllm] applying active power profile before model startup\n'

@@ -6,5 +6,5 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 EnvironmentFile=-@ENV_FILE@
-ExecStart=@SOURCE_ROOT@/scripts/club3090-server/refresh-ip-certificate.sh
+ExecStart=@SOURCE_ROOT@/scripts/refresh-ip-certificate.sh
 TimeoutStartSec=240
