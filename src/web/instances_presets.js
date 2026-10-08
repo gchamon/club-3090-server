@@ -312,8 +312,7 @@ powerAction = async function (a) {
     alert("Select a GPU or Pair scope first.");
     return;
   }
-  if (a === "stop_container" && !(await openClubConfirmModal(`Stop ${scopeLabel(cur)} now?`)))
-    return;
+  if (!(await confirmRuntimePowerAction(a, scopeLabel(cur)))) return;
   try {
     await post("/admin/power", {
       action: a,

@@ -728,6 +728,18 @@ function openClubConfirmModal(message = "", title = "") {
     clubDecisionResolver = ({ action }) => resolve(action === "ok");
   });
 }
+
+async function confirmRuntimePowerAction(action, runtimeName) {
+  const labels = {
+    start_instance: "Start",
+    restart_instance: "Restart",
+    stop_container: "Stop",
+    unload_instance: "Unload",
+  };
+  const label = labels[String(action || "").trim()];
+  if (!label) return true;
+  return openClubConfirmModal(`${label} ${String(runtimeName || "selected runtime")}?`);
+}
 function openClubTextInputModal(config = {}) {
   ensureClubDecisionModal();
   const options =

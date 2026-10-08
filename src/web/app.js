@@ -9873,8 +9873,7 @@ async function aiStudioRuntimeAction(instanceId, action) {
   if (typeof benchmarkJobActive === "function" && benchmarkJobActive()) return;
   const item = (lastStatus?.instances || []).find((row) => String(row.id).toUpperCase() === String(instanceId).toUpperCase());
   if (!item || !item.mode) return;
-  if (action === "stop_container" && !(await openClubConfirmModal(`Stop ${item.display_name || item.id}?`))) return;
-  if (action === "unload_instance" && !(await openClubConfirmModal(`Stop the selected runtime, clear ${item.display_name || item.id}'s preset slug, disable autoboot, and release its model/VRAM?`))) return;
+  if (!(await confirmRuntimePowerAction(action, item.display_name || item.id))) return;
   try {
     await post("/admin/power", { action, instance_id: instanceId });
     await refreshStatus({ force: true });
@@ -10763,6 +10762,11 @@ async function restartAllSummaryPresets() {
     ? presetSummaryCache.restartTargets
     : [];
   if (!targets.length) return;
+  const runtimeNames = targets.map((target) => {
+    const variant = findVariantBySelector(target.mode);
+    return `${target.instance_id}: ${variantDisplayLabel(variant || { upstream_tag: target.mode })}`;
+  });
+  if (!(await confirmRuntimePowerAction("restart_instance", runtimeNames.join(", ")))) return;
   for (const target of targets) {
     await post(
       "/admin/switch",
