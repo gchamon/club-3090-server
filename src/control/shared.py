@@ -6516,6 +6516,17 @@ def _run_model_install_job(job_id, model_id, variant_id, install_command, update
                     raise RuntimeError(f"Strata variant {variant_id} is missing from rebuilt runtime inventory")
                 try:
                     ensure_variant_install_ready(rebuilt_variant)
+                    persisted_inventory = read_json_file(RUNTIME_INVENTORY_FILE, {})
+                    persisted_variant = next(
+                        (
+                            row for row in (persisted_inventory.get("variants") or [])
+                            if str(row.get("variant_id") or "") == str(variant_id or "")
+                        ),
+                        None,
+                    )
+                    if not persisted_variant or str(persisted_variant.get("install_state") or "").strip().lower() != "ready":
+                        reason = str((persisted_variant or {}).get("install_reason") or "persisted inventory does not report ready")
+                        raise RuntimeError(f"Strata variant {variant_id} readiness was not persisted: {reason}")
                 except Exception:
                     rc = 999
                     raise

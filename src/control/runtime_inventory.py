@@ -4861,6 +4861,23 @@ def default_dual_mode_selector():
     return DUAL_GPU_MODES[0] if DUAL_GPU_MODES else canonical_mode_selector(DEFAULT_MODE or "vllm/dual")
 
 
+
+def _refresh_strata_install_states(inventory):
+    if not isinstance(inventory, dict):
+        return False
+    changed = False
+    for variant in inventory.get("variants") or []:
+        if not isinstance(variant, dict) or str(variant.get("engine") or "").strip().lower() != "strata":
+            continue
+        state = _detect_variant_install_state(variant, _resolve_variant_model_dir_root(variant))
+        for key in ("install_state", "install_command", "install_reason"):
+            value = state.get(key, "")
+            if variant.get(key) != value:
+                variant[key] = value
+                changed = True
+    return changed
+
+
 def rebuild_runtime_inventory():
     global runtime_inventory_cache, runtime_inventory_built_at
     repo_root = os.path.abspath(CLUB3090_DIR)
@@ -5523,6 +5540,9 @@ def load_runtime_inventory(force=False, rebuild_if_missing=True):
     if not force:
         data = read_json_file(RUNTIME_INVENTORY_FILE, {})
         if isinstance(data, dict) and data.get("variants"):
+            changed = _refresh_strata_install_states(data)
+            if changed:
+                write_json_file(RUNTIME_INVENTORY_FILE, data)
             _rebuild_runtime_mode_tables(data)
             with runtime_inventory_lock:
                 runtime_inventory_cache = dict(data)
