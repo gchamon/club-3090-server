@@ -5620,6 +5620,28 @@ details[open] > summary .score-collapse-cue::before {
   gap: 4px;
   overflow-wrap: anywhere;
 }
+.ai-studio-runtime-title-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.ai-studio-runtime-autostart {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin: 0;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.ai-studio-runtime-title {
+  color: var(--text);
+  font: inherit;
+  font-weight: 700;
+}
 .ai-studio-runtime-actions {
   display: flex;
   flex-wrap: wrap;
