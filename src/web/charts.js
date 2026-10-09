@@ -103,13 +103,13 @@ function normalizeMetricTimeValue(value) {
   return Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, 1800) : 5;
 }
 function normalizeMetricTimeUnit(value) {
-  return ["s", "m"].includes(String(value || "")) ? String(value) : "m";
+  return ["m", "h", "d"].includes(String(value || "")) ? String(value) : "m";
 }
 function currentMetricIntervalState() {
   return { value: metricTimeValue, unit: metricTimeUnit };
 }
 function metricIntervalSeconds(value = metricTimeValue, unit = metricTimeUnit) {
-  return Math.min(1800, normalizeMetricTimeValue(value) * ({ s: 1, m: 60 }[normalizeMetricTimeUnit(unit)] || 60));
+  return Math.min(1800, normalizeMetricTimeValue(value) * ({ m: 60, h: 3600, d: 86400 }[normalizeMetricTimeUnit(unit)] || 60));
 }
 
 async function loadMetricsSeriesRange(startT, endT, { continuation = false } = {}) {
@@ -1956,7 +1956,7 @@ function metricsPopupPanelHtml() {
   return `<div class="metrics-controls" id="metricsControls">
             <label class="metrics-control"><span>Time interval:</span><input id="metricsTimeValue" type="text" inputmode="numeric" value="5" aria-label="Metrics time interval"></label>
             <select id="metricsTimeUnit" aria-label="Metrics time unit">
-              <option value="s">Seconds</option><option value="m" selected>Minutes</option>
+              <option value="m" selected>Minutes</option><option value="h">Hours</option><option value="d">Days</option>
             </select>
           </div>
           <div id="mMain" class="metricpane active">
