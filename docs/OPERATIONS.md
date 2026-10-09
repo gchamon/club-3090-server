@@ -84,6 +84,8 @@ See [Removed Model Manager](removed-model-manager.md) for remaining model-resour
 
 Default chat presets enable thinking and preserve reasoning in the response when the selected model/runtime supports it. The Chat interface displays returned reasoning in an expandable **Thinking** card.
 
+The llama.cpp Qwen 3.8 27B presets start with thinking enabled at low effort to avoid spending tokens on unnecessarily long reasoning. This is an engine launch default, independent of the request-level `chat_template_kwargs` below. Per-preset launch environment overrides can set `REASONING`, `LLAMA_ARG_REASONING`, and `LLAMA_ARG_REASONING_EFFORT`; explicit values override the controller defaults.
+
 To disable thinking for a custom preset, open **Presets** in the admin interface and set both fields under `chat_template_kwargs` to `false`:
 
 ```json

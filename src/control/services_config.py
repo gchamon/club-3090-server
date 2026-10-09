@@ -408,6 +408,15 @@ def preset_builtin_launch_env_overrides(spec, selector=""):
         }
     if selector == "vllm/gemma-int8-mtp":
         return {"MAX_MODEL_LEN": "131072"}
+    if (
+        str(row.get("model_id") or "").strip() == "qwen3.8-27b"
+        and str(row.get("engine") or "").strip().lower() == "llamacpp"
+    ):
+        return {
+            "REASONING": "on",
+            "LLAMA_ARG_REASONING": "on",
+            "LLAMA_ARG_REASONING_EFFORT": "low",
+        }
     preserved_nightly_selectors = {
         "vllm/dual-dflash",
         "vllm/dual-dflash-noviz",

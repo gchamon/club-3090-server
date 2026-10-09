@@ -656,6 +656,27 @@ def run_control_module_smoke_test(root: Path) -> tuple[bool, str]:
         }
         if len(qwen_models) != 1 or not required_qwen_selectors.issubset(selectors) or "control_catalog" not in origins:
             return False, f"upstream and control Qwen 3.8 catalog rows did not merge: models={len(qwen_models)} selectors={sorted(selectors)} origins={sorted(origins)}"
+        reasoning_defaults = subprocess.run(
+            [
+                sys.executable, "-c",
+                "import json; import control; "
+                f"inventory=json.loads({json.dumps(json.dumps(rebuilt_inventory))}); "
+                "rows={row.get('selector'): row for row in inventory.get('variants', [])}; "
+                "expected={'REASONING':'on','LLAMA_ARG_REASONING':'on','LLAMA_ARG_REASONING_EFFORT':'low'}; "
+                "for_selector=('llamacpp/qwen38-upstream-single','llamacpp/qwen38-27b-orcarouter-uncensored-single-iq4xs','llamacpp/qwen38-27b-hauhaucs-aggressive-single-iq4xs'); "
+                "assert all(control.resolve_variant_launch_env(rows[selector]) == expected for selector in for_selector), {selector: control.resolve_variant_launch_env(rows[selector]) for selector in for_selector}; "
+                "assert control.preset_builtin_launch_env_overrides({'model_id':'other','engine':'llamacpp'}) == {}; "
+                "assert control.preset_builtin_launch_env_overrides({'model_id':'qwen3.8-27b','engine':'strata'}) == {}; "
+                "control.write_server_config({'preset_launch_overrides':{'llamacpp/qwen38-upstream-single':{'env':{'REASONING':'off','LLAMA_ARG_REASONING_EFFORT':'high'}}}}); "
+                "overridden=control.resolve_variant_launch_env(rows['llamacpp/qwen38-upstream-single']); "
+                "assert overridden['REASONING']=='off' and overridden['LLAMA_ARG_REASONING_EFFORT']=='high' and overridden['LLAMA_ARG_REASONING']=='on', overridden; "
+                "print('Qwen 3.8 27B low-effort defaults and per-preset overrides passed')",
+            ],
+            cwd=str(root / "src"), env=env, capture_output=True,
+            text=True, check=False, timeout=30,
+        )
+        if reasoning_defaults.returncode:
+            return False, reasoning_defaults.stderr.strip() or "Qwen 3.8 reasoning defaults/overrides failed"
         worker = subprocess.run(
             [sys.executable, "-m", "control.http_server", "--benchmark-worker"],
             cwd=str(root / "src"), env=env, capture_output=True,
