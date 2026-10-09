@@ -5394,6 +5394,7 @@ def rebuild_runtime_inventory():
             "strata_commit": str(row.get("strata_commit") or ""),
             "strata_family": str(row.get("strata_family") or ""),
             "strata_install_mode": str(row.get("strata_install_mode") or "standard"),
+            "required_chat_template_kwargs": dict(row.get("required_chat_template_kwargs") or {}) if isinstance(row.get("required_chat_template_kwargs"), dict) else {},
             "download_size_gb": row.get("download_size_gb"),
             "recommended_system_memory_gb": row.get("recommended_system_memory_gb"),
             "recommended_resident_memory_gb": row.get("recommended_resident_memory_gb"),

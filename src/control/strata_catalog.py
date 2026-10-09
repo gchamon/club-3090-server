@@ -110,6 +110,7 @@ def strata_builtin_custom_model_rows():
             "install_command": "strata-image-build", "install_reason": "Install the pinned Strata runtime and prepare its model data.",
             "strata_model_token": model_token, "strata_family": variant["family"],
             "strata_install_mode": variant.get("install_mode", "standard"),
+            **({"required_chat_template_kwargs": {"enable_thinking": True}} if variant["family"] == "qwen" else {}),
             "strata_source_path": source, "strata_data_path": data,
             "strata_config_path": config_path,
             "strata_image": STRATA_IMAGE, "strata_commit": STRATA_COMMIT,

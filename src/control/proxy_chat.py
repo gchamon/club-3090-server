@@ -226,6 +226,12 @@ def ensure_runtime_thinking_defaults(payload, spec=None, preset_name=""):
         return payload
     current = payload.get("chat_template_kwargs")
     current_map = dict(current) if isinstance(current, dict) else {}
+    row = spec if isinstance(spec, dict) else {}
+    required = row.get("required_chat_template_kwargs")
+    if isinstance(required, dict) and required:
+        updated = dict(payload)
+        updated["chat_template_kwargs"] = {**current_map, **required}
+        return updated
     if "enable_thinking" in current_map:
         return payload
     if preset_requests_enable_thinking(preset_name):

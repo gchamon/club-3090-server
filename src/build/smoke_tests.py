@@ -1113,11 +1113,25 @@ def run_strata_preset_smoke_test(root: Path) -> tuple[bool, str]:
         }
         if set(rows) != set(expected):
             return False, f"Strata inventory selectors differ: {sorted(rows)}"
+        if any(
+            bool(row.get("required_chat_template_kwargs", {}).get("enable_thinking"))
+            != (expected[selector][2] == "qwen")
+            for selector, row in rows.items()
+        ):
+            return False, "Strata Qwen thinking defaults are missing or applied to a non-Qwen variant"
         readiness = subprocess.run(
             [
                 sys.executable, "-c",
                 "import json, os, subprocess, types; import control; "
                 f"row=json.loads({json.dumps(json.dumps(rows['strata/qwen3.8-flash-next-iq2-xs']))}); "
+                "assert row['required_chat_template_kwargs']=={'enable_thinking': True}; "
+                "admin_payload=control.build_admin_chat_payload({'messages':[{'role':'user','content':'probe'}],'params':{'enable_thinking':False}}, row); "
+                "assert admin_payload['chat_template_kwargs']['enable_thinking'] is True, admin_payload; "
+                "proxy_payload=json.loads(control.apply_preset(json.dumps({'messages':[{'role':'user','content':'probe'}],'chat_template_kwargs':{'enable_thinking':False}}).encode(), '', None, row)); "
+                "assert proxy_payload['chat_template_kwargs']['enable_thinking'] is True, proxy_payload; "
+                f"coder_row=json.loads({json.dumps(json.dumps(rows['strata/qwen3.8-flash-next-coder-iq1-m']))}); "
+                "coder_payload=control.build_admin_chat_payload({'messages':[{'role':'user','content':'probe'}],'params':{'enable_thinking':False}}, coder_row); "
+                "assert coder_payload['chat_template_kwargs']['enable_thinking'] is False, coder_payload; "
                 "original_check_output=subprocess.check_output; original_run=subprocess.run; "
                 "subprocess.check_output=lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError()); "
                 "subprocess.run=lambda *a, **k: types.SimpleNamespace(returncode=1, stdout=''); "
