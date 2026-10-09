@@ -17,9 +17,6 @@ const DETACHED_METRICS_MODE = urlParams.get("detached") === "metrics";
 const DETACHED_METRICS_INITIAL_PANE = String(urlParams.get("pane") || "").trim();
 let lastStatus = null;
 let activeTabName = "overview";
-let showGlobalLogs = true;
-let showGlobalLogSources =
-  window.showGlobalLogSources || (window.showGlobalLogSources = Object.create(null));
 let currentLogSource = "docker";
 let selectedScriptLogJobId = "";
 const knownLogSources = new Set(["docker", "audit", "debug", "benchmarks", "script"]);
@@ -39,11 +36,14 @@ let updateMonitor = {
   returnTab: "",
   returnScrollTop: 0,
   returnLogSource: "docker",
+  scope: "",
+  waitingForInference: false,
 };
 const UPDATE_PENDING_TOKEN_KEY = "club3090-update-pending-token";
 const UPDATE_COMPLETED_TOKEN_KEY = "club3090-update-completed-token";
 const UPDATE_PENDING_RETURN_KEY = "club3090-update-pending-return";
 let updateUiLocked = false;
+let pendingUpdateRecoveryPromise = null;
 let updateSignalEventSource = null;
 let updateSignalReconnectTimer = null;
 let updateSignalConnectionToken = 0;
@@ -118,9 +118,6 @@ function popupLogWindowActive(signature = "") {
     } catch (e) {}
     return Date.now() - Number(state?.lastActiveAt || 0) < 2000;
   });
-}
-function effectiveShowGlobalLogs() {
-  return currentLogGlobalEnabled() && !currentLogSourceDetached();
 }
 function escapeHtml(value) {
   return String(value || "")
@@ -385,6 +382,7 @@ function abandonPendingUpdateUi(message = "") {
     updateMonitor.statusTimer = null;
   }
   updateMonitor.active = false;
+  updateMonitor.waitingForInference = false;
   updateMonitor.completed = true;
   updateMonitor.streamUrl = "";
   updateMonitor.statusUrl = "";
@@ -543,19 +541,56 @@ function startExternalUpdateSignalStream() {
     }, UPDATE_SIGNAL_RECONNECT_MS);
   };
 }
-function recoverPendingUpdateMonitor(scope = "controller") {
+async function recoverPendingUpdateMonitor(scope = "controller") {
   if (updateMonitor.active || updateMonitor.completed) return false;
   const token = storedUpdateToken(UPDATE_PENDING_TOKEN_KEY);
   if (!token || storedUpdateToken(UPDATE_COMPLETED_TOKEN_KEY) === token) return false;
-  beginUpdateMonitor(
-    {
-      token,
-      stream_url: `/admin/update-stream?token=${encodeURIComponent(token)}&tail=4000`,
-      status_url: `/admin/update-status?token=${encodeURIComponent(token)}`,
-    },
-    scope,
-  );
-  return true;
+  if (pendingUpdateRecoveryPromise) return pendingUpdateRecoveryPromise;
+  pendingUpdateRecoveryPromise = (async () => {
+    try {
+      const response = await fetch(`/admin/update-status?token=${encodeURIComponent(token)}`, { cache: "no-store" });
+      if (response.status === 403) {
+        markUpdateTokenCompleted(token);
+        return false;
+      }
+      if (!response.ok) return false;
+      let payload;
+      try {
+        payload = await response.json();
+      } catch (error) {
+        markUpdateTokenCompleted(token);
+        return false;
+      }
+      const update = payload?.self_update;
+      if (
+        payload?.ok !== true ||
+        update?.active !== true ||
+        String(update?.token || "").trim() !== token
+      ) {
+        markUpdateTokenCompleted(token);
+        return false;
+      }
+      if (storedUpdateToken(UPDATE_COMPLETED_TOKEN_KEY) === token) return false;
+      if (updateMonitor.active) return updateMonitor.token === token;
+      beginUpdateMonitor(
+        {
+          ...update,
+          token,
+          stream_url: update.stream_url || `/admin/update-stream?token=${encodeURIComponent(token)}&tail=4000`,
+          status_url: update.status_url || `/admin/update-status?token=${encodeURIComponent(token)}`,
+        },
+        update.scope || scope,
+      );
+      return true;
+    } catch (error) {
+      return false;
+    }
+  })();
+  try {
+    return await pendingUpdateRecoveryPromise;
+  } finally {
+    pendingUpdateRecoveryPromise = null;
+  }
 }
 function minimizeSurfacesForUpdateMode() {
   try {
@@ -594,7 +629,11 @@ function setUpdateUiLocked(locked) {
     .querySelectorAll("button, input, select, textarea")
     .forEach((node) => {
       if (!node || node.id === "log") return;
-      if (updateUiLocked) node.setAttribute("disabled", "disabled");
+      const logControl =
+        node.closest("#logSourcePanel") ||
+        node.id === "copyCurrentLogBtn" ||
+        node.id === "downloadAllLogsBtn";
+      if (updateUiLocked && !logControl) node.setAttribute("disabled", "disabled");
       else if (!node.dataset.scopeDisabled) node.removeAttribute("disabled");
     });
   if ($("log")) $("log").removeAttribute("disabled");
@@ -682,6 +721,18 @@ function openClubConfirmModal(message = "", title = "") {
   return new Promise((resolve) => {
     clubDecisionResolver = ({ action }) => resolve(action === "ok");
   });
+}
+
+async function confirmRuntimePowerAction(action, runtimeName) {
+  const labels = {
+    start_instance: "Start",
+    restart_instance: "Restart",
+    stop_container: "Stop",
+    unload_instance: "Unload",
+  };
+  const label = labels[String(action || "").trim()];
+  if (!label) return true;
+  return openClubConfirmModal(`${label} ${String(runtimeName || "selected runtime")}?`);
 }
 function openClubTextInputModal(config = {}) {
   ensureClubDecisionModal();

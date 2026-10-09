@@ -1,3 +1,152 @@
+const LOG_THEME_STORAGE_KEY = "club3090.log-theme.v1";
+const LOG_THEMES = {
+  original: { label: "Original" },
+  "warm-paper": {
+    label: "Warm Paper",
+    background: "#f1e9d6",
+    foreground: "#302d27",
+    border: "#aa9f88",
+    updateForeground: "#765000",
+    updateBorder: "#9a7000",
+    colorScheme: "light",
+    ansiForegrounds: {
+      black: "#51483d", red: "#a12e28", green: "#286238", yellow: "#755000",
+      blue: "#225d8f", magenta: "#7b3d77", cyan: "#00686f", white: "#434039",
+      "bright-black": "#625a50", "bright-red": "#96251f", "bright-green": "#205d32",
+      "bright-yellow": "#6e4a00", "bright-blue": "#194f80", "bright-magenta": "#71346c",
+      "bright-cyan": "#005c62", "bright-white": "#33302b",
+    },
+    ansiBackgrounds: {
+      black: "#ebe6dd", red: "#f4e3de", green: "#e5efdf", yellow: "#f5edce",
+      blue: "#e2edf5", magenta: "#f1e4ef", cyan: "#dff0ed", white: "#f8f2e4",
+      "bright-black": "#e4dfd4", "bright-red": "#f6e0db", "bright-green": "#deebde",
+      "bright-yellow": "#f4e9ca", "bright-blue": "#dce9f3", "bright-magenta": "#eedfec",
+      "bright-cyan": "#d9ebe8", "bright-white": "#fbf6eb",
+    },
+  },
+  "cool-mist": {
+    label: "Cool Mist",
+    background: "#e8f0f3",
+    foreground: "#22323a",
+    border: "#9eafb8",
+    updateForeground: "#764b00",
+    updateBorder: "#8e6500",
+    colorScheme: "light",
+    ansiForegrounds: {
+      black: "#43515a", red: "#a12c38", green: "#23603d", yellow: "#765600",
+      blue: "#205b92", magenta: "#783b83", cyan: "#006a73", white: "#3d4a52",
+      "bright-black": "#525d64", "bright-red": "#962431", "bright-green": "#1e5937",
+      "bright-yellow": "#6d4e00", "bright-blue": "#194f83", "bright-magenta": "#703476",
+      "bright-cyan": "#005e67", "bright-white": "#2c3b43",
+    },
+    ansiBackgrounds: {
+      black: "#e1e7e8", red: "#f2dfdf", green: "#dceade", yellow: "#f2ebcf",
+      blue: "#dce9f3", magenta: "#ece1ef", cyan: "#d9eeed", white: "#f3f5f0",
+      "bright-black": "#d8e0e1", "bright-red": "#f3dadb", "bright-green": "#d5e8da",
+      "bright-yellow": "#efe7c2", "bright-blue": "#d5e4f0", "bright-magenta": "#e7d9eb",
+      "bright-cyan": "#d0e9e8", "bright-white": "#f8f8f2",
+    },
+  },
+  "high-contrast-light": {
+    label: "High-Contrast Light",
+    background: "#f2f0e8",
+    foreground: "#171914",
+    border: "#56584f",
+    updateForeground: "#633d00",
+    updateBorder: "#654500",
+    colorScheme: "light",
+    ansiForegrounds: {
+      black: "#30312d", red: "#8c1d12", green: "#17552a", yellow: "#624300",
+      blue: "#174b80", magenta: "#6b2b73", cyan: "#00575f", white: "#252722",
+      "bright-black": "#4d4f48", "bright-red": "#7f160d", "bright-green": "#104923",
+      "bright-yellow": "#573b00", "bright-blue": "#124170", "bright-magenta": "#5e2267",
+      "bright-cyan": "#004c54", "bright-white": "#1c1e19",
+    },
+    ansiBackgrounds: {
+      black: "#e0ded6", red: "#f0d8d3", green: "#dce9dd", yellow: "#efe5bf",
+      blue: "#d7e4f0", magenta: "#e9d9e8", cyan: "#d4e8e4", white: "#f4f1e6",
+      "bright-black": "#d4d2c9", "bright-red": "#eccfc9", "bright-green": "#d0e1d2",
+      "bright-yellow": "#e7d9ab", "bright-blue": "#cddded", "bright-magenta": "#dfcce0",
+      "bright-cyan": "#c8e0dc", "bright-white": "#ece9dd",
+    },
+  },
+};
+let currentLogTheme = "original";
+function logThemeOptionsHtml(selected = "") {
+  return Object.entries(LOG_THEMES)
+    .map(([value, theme]) => `<option value="${value}"${value === selected ? " selected" : ""}>${escapeHtml(theme.label)}</option>`)
+    .join("");
+}
+function logThemeStyleRules() {
+  return Object.entries(LOG_THEMES)
+    .filter(([name]) => name !== "original")
+    .map(([name, theme]) => {
+      const surface = `.log[data-log-theme="${name}"],.popup-log[data-log-theme="${name}"]`;
+      const outputRules = Object.entries(theme.ansiForegrounds)
+        .map(([color, value]) => `.log-render[data-log-theme="${name}"] .ansi-${color}{color:${value};}`)
+        .concat(Object.entries(theme.ansiBackgrounds)
+          .map(([color, value]) => `.log-render[data-log-theme="${name}"] .ansi-bg-${color}{background-color:${value};}`))
+        .join("");
+      return `${surface}{color-scheme:${theme.colorScheme};background-color:${theme.background};color:${theme.foreground};border-color:${theme.border};}${surface}.log-update{color:${theme.updateForeground};border-color:${theme.updateBorder};box-shadow:none;}${outputRules}`;
+    })
+    .join("\n");
+}
+function ensureLogThemeStyles(doc = document) {
+  if (!doc?.head || !doc.createElement) return;
+  let style = doc.getElementById("logThemeStyles");
+  if (!style) {
+    style = doc.createElement("style");
+    style.id = "logThemeStyles";
+    doc.head.appendChild(style);
+  }
+  const rules = logThemeStyleRules();
+  if (style.textContent !== rules) style.textContent = rules;
+}
+function normalizeLogTheme(name) {
+  const value = String(name || "").trim();
+  return Object.prototype.hasOwnProperty.call(LOG_THEMES, value) ? value : "original";
+}
+function syncLogThemeToViewers() {
+  ["logRender", "log"].forEach((id) => {
+    const box = $(id);
+    if (box && box.dataset.logTheme !== currentLogTheme) box.dataset.logTheme = currentLogTheme;
+  });
+  const selector = $("logThemeSelect");
+  if (selector && selector.value !== currentLogTheme) selector.value = currentLogTheme;
+  Object.values(window.logPopupStates || {}).forEach((state) => {
+    const doc = popupLogDocument(state);
+    const box = doc?.getElementById("popupLogText");
+    const popupSelector = doc?.getElementById("popupLogThemeSelect");
+    if (box && box.dataset.logTheme !== currentLogTheme) box.dataset.logTheme = currentLogTheme;
+    if (popupSelector && popupSelector.value !== currentLogTheme) popupSelector.value = currentLogTheme;
+  });
+}
+function setLogTheme(name) {
+  currentLogTheme = normalizeLogTheme(name);
+  ensureLogThemeStyles();
+  try {
+    localStorage.setItem(LOG_THEME_STORAGE_KEY, currentLogTheme);
+  } catch (e) {}
+  syncLogThemeToViewers();
+  return currentLogTheme;
+}
+function initializeLogTheme() {
+  ensureLogThemeStyles();
+  const selector = $("logThemeSelect");
+  if (selector) {
+    const options = logThemeOptionsHtml();
+    if (selector.dataset.optionsReady !== "true") {
+      selector.innerHTML = options;
+      selector.dataset.optionsReady = "true";
+    }
+  }
+  let stored = "original";
+  try {
+    stored = localStorage.getItem(LOG_THEME_STORAGE_KEY) || "original";
+  } catch (e) {}
+  currentLogTheme = normalizeLogTheme(stored);
+  syncLogThemeToViewers();
+}
 function renderLogSourcePanel() {
   const panel = $("logSourcePanel");
   const updateActive = selfUpdateActive(lastStatus);
@@ -6,10 +155,8 @@ function renderLogSourcePanel() {
       ? lastStatus.upstream_services.filter((row) => row && row.running)
       : [];
     const modelSources = modelLogSourceEntries();
-    const scriptActive = !!lastStatus?.script_job?.active || currentLogSource === "script";
-    panel.className = `panel log-source-panel${updateActive ? " log-source-panel-disabled" : ""}`;
-    const disabledAttr = updateActive ? ' disabled aria-disabled="true"' : "";
-    panel.innerHTML = `<div class="panel-head"><h2>Log Sources</h2><div class="preset-actions">${renderIconButton({ title: "Export", action: "exportCurrentLog()", icon: "upload", disabled: updateActive })}</div></div><div class="subtabs">${[
+    panel.className = "panel log-source-panel";
+    panel.innerHTML = `<div class="panel-head"><h2>Log Sources</h2><div class="preset-actions">${renderIconButton({ title: "Export", action: "exportCurrentLog()", icon: "upload" })}</div></div><div class="subtabs">${[
       { id: "control", label: "Web UI Server" },
       { id: "audit", label: "Audit" },
       { id: "debug", label: "Debug" },
@@ -27,7 +174,7 @@ function renderLogSourcePanel() {
     ]
       .map(
         (row) =>
-          `<button class="subtab${currentLogSource === row.id ? " active" : ""}"${disabledAttr} onclick="setCurrentLogSource('${escapeJs(row.id)}')">${escapeHtml(row.label)}</button>`,
+          `<button class="subtab${currentLogSource === row.id ? " active" : ""}" onclick="setCurrentLogSource('${escapeJs(row.id)}')">${escapeHtml(row.label)}</button>`,
       )
       .join("")}</div><div class="value smallgap" id="logsSourceSummary">-</div>`;
   }
@@ -884,21 +1031,11 @@ function logPopoutButtonSvg(detached = false) {
     ? '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 19H5v-5m0 5 7-7" fill="none" /><path d="M14 17h3a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2H9a2 2 0 0 0-2 2v3" fill="none" /></svg>'
     : '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 5h5v5m0-5-7 7" fill="none" /><path d="M10 7H7a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-3" fill="none" /></svg>';
 }
-function currentLogSettingsKey() {
-  return currentLogPopupTarget().signature || String(currentLogSource || "docker");
-}
-function currentLogGlobalEnabled() {
-  const key = currentLogSettingsKey();
-  if (Object.prototype.hasOwnProperty.call(showGlobalLogSources, key)) {
-    return !!showGlobalLogSources[key];
-  }
-  return !!showGlobalLogs;
-}
 function currentLogSourceDetached() {
   return popupLogWindowOpen(currentLogPopupTarget().signature);
 }
 function logViewerVisible() {
-  return !currentLogSourceDetached() && (activeTabName === "logs" || effectiveShowGlobalLogs());
+  return !currentLogSourceDetached() && activeTabName === "logs";
 }
 function logIsNearBottom(box = $("logRender") || $("log")) {
   if (!box) return true;
@@ -1002,20 +1139,12 @@ applyLogVisibility = function () {
   document.body.classList.toggle("logs-tab", isLogs);
   document.body.classList.toggle("log-popup-open", popupLogWindowOpen());
   document.body.classList.remove("audit-tab");
-  const card = document.querySelector(".logs.panel");
+  const card = $("logCard");
   const currentPopup = currentLogPopupTarget();
   const detached = popupLogWindowOpen(currentPopup.signature);
-  if (card)
-    card.classList.toggle(
-      "log-card-hidden",
-      detached || (!isLogs && !effectiveShowGlobalLogs()),
-    );
+  if (card) card.classList.toggle("log-card-hidden", detached || !isLogs);
   if (card) card.classList.toggle("log-card-update-mode", currentLogSource === "update");
   if ($("logTitle")) $("logTitle").textContent = currentLogHeading();
-  if ($("showGlobalLogs")) {
-    $("showGlobalLogs").checked = effectiveShowGlobalLogs();
-    $("showGlobalLogs").disabled = currentLogSourceDetached();
-  }
   if ($("logPopoutBtn")) {
     const updatePopoutBlocked = updateMonitor.active && currentLogSource === "update";
     $("logPopoutBtn").title = detached ? "Reattach logs" : "Pop out logs";
@@ -1223,10 +1352,9 @@ async function downloadAllLogs() {
   }
 }
 async function refreshBackgroundLogCaches() {
+  if (!logViewerVisible()) return;
   const currentSource = String(currentLogSource || "docker");
-  const ordered = logViewerVisible()
-    ? Array.from(knownLogSources).filter((source) => source !== currentSource)
-    : [currentSource, ...Array.from(knownLogSources).filter((source) => source !== currentSource)];
+  const ordered = Array.from(knownLogSources).filter((source) => source !== currentSource);
   for (const source of ordered) {
     if (source === "update") continue;
     try {
@@ -1235,13 +1363,13 @@ async function refreshBackgroundLogCaches() {
   }
 }
 function scheduleLogCacheRefresh(delayMs = LOG_CACHE_REFRESH_MS) {
-  logCacheRefreshNonce += 1;
-  if (logCacheRefreshTimer) clearInterval(logCacheRefreshTimer);
-  const delay = Math.max(LOG_CACHE_REFRESH_MS, Number(delayMs || LOG_CACHE_REFRESH_MS));
+  clearInterval(logCacheRefreshTimer);
+  logCacheRefreshTimer = null;
+  const delay = Number(delayMs);
+  if (!(delay > 0) || !logViewerVisible()) return;
   logCacheRefreshTimer = setInterval(() => {
     refreshBackgroundLogCaches().catch(() => {});
-  }, delay);
-  if (delayMs === 0) refreshBackgroundLogCaches().catch(() => {});
+  }, Math.max(LOG_CACHE_REFRESH_MS, delay));
 }
 function scheduleLogStreamReconnect(delayMs = 5000) {
   if (logReconnectTimer) clearTimeout(logReconnectTimer);
@@ -1333,8 +1461,10 @@ function detachedLogPopupHtml(state) {
       .popup-title-row { display:flex; align-items:center; gap:8px; }
       .popup-title { font-size:20px; font-weight:800; margin:0; }
       .popup-meta { color:var(--muted); font-size:12px; line-height:1.35; }
-      .popup-actions { display:flex; align-items:center; gap:8px; }
+      .popup-actions { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
       .popup-select { min-width:180px; max-width:320px; background:rgba(6,10,16,.98); color:var(--text); border:1px solid var(--line); border-radius:10px; padding:6px 10px; font:600 12px/1.2 system-ui,-apple-system,Segoe UI,Arial,sans-serif; }
+      .popup-theme-select { min-width:150px; max-width:180px; }
+      @media (max-width: 600px) { .popup-head { flex-direction:column; } .popup-actions { width:100%; justify-content:flex-start; } .popup-theme-select { flex:1 1 145px; min-width:0; } }
       .popup-select.hidden { display:none; }
       .popup-btn { display:inline-flex; align-items:center; justify-content:center; width:20px; height:20px; padding:0; border:0; background:transparent; color:var(--muted); cursor:pointer; }
       .popup-btn:hover, .popup-btn:focus-visible { color:#eef4ff; outline:none; }
@@ -1343,6 +1473,7 @@ function detachedLogPopupHtml(state) {
       .popup-check input { margin:0; }
       .popup-log { flex:1 1 auto; width:100%; min-height:180px; resize:none; white-space:pre-wrap; overflow-wrap:anywhere; background:var(--field); color:#a5ffa5; border:1px solid #26313f; border-radius:12px; padding:12px; font:12px/1.35 Consolas,monospace; }
       .popup-log.log-update { color:#ffb347; border-color:#8a652b; box-shadow:inset 0 0 0 1px rgba(255,179,71,.14); }
+      ${logThemeStyleRules()}
     </style>
   </head>
   <body>
@@ -1362,10 +1493,11 @@ function detachedLogPopupHtml(state) {
         </div>
         <div class="popup-actions">
           <select id="popupInstanceSelect" class="popup-select hidden" aria-label="Detached Docker log target"></select>
+          <select id="popupLogThemeSelect" class="popup-select popup-theme-select" aria-label="Log output theme">${logThemeOptionsHtml(currentLogTheme)}</select>
           <label class="popup-check"><input type="checkbox" id="popupAutoscroll" checked />auto-scroll</label>
         </div>
       </div>
-      <textarea class="popup-log" id="popupLogText" readonly wrap="soft">Connecting...</textarea>
+      <textarea class="popup-log" id="popupLogText" data-log-theme="${currentLogTheme}" readonly wrap="soft">Connecting...</textarea>
     </div>
     <script>
       (() => {
@@ -1410,6 +1542,22 @@ function detachedLogPopupHtml(state) {
               }
             }
           } catch (e) {}
+          notify();
+        });
+        document.getElementById("popupLogThemeSelect")?.addEventListener("change", (event) => {
+          const theme = String(event.target?.value || "original");
+          try {
+            if (window.opener && !window.opener.closed && typeof window.opener.setLogTheme === "function") {
+              window.opener.setLogTheme(theme);
+              notify();
+              return;
+            }
+          } catch (e) {}
+          try {
+            localStorage.setItem("club3090.log-theme.v1", theme);
+          } catch (e) {}
+          const box = document.getElementById("popupLogText");
+          if (box) box.dataset.logTheme = theme;
           notify();
         });
         window.addEventListener("beforeunload", () => {
@@ -1466,6 +1614,8 @@ function renderDetachedLogPopup(state) {
   const box = doc.getElementById("popupLogText");
   const autoscroll = doc.getElementById("popupAutoscroll");
   const selector = doc.getElementById("popupInstanceSelect");
+  const themeSelector = doc.getElementById("popupLogThemeSelect");
+  if (themeSelector && themeSelector.value !== currentLogTheme) themeSelector.value = currentLogTheme;
   if (doc.title !== String(state.title || "Logs")) doc.title = String(state.title || "Logs");
   if (title && title.textContent !== String(state.title || "Logs")) title.textContent = String(state.title || "Logs");
   if (label && label.textContent !== String(state.label || "")) label.textContent = String(state.label || "");
@@ -1484,6 +1634,7 @@ function renderDetachedLogPopup(state) {
     selector.classList.toggle("hidden", !(String(state.source || "") === "docker" && options.length > 1));
   }
   if (!box) return;
+  box.dataset.logTheme = currentLogTheme;
   const entry = logCacheEntry(state.signature);
   const nextValue = entry.loaded ? collapseRepeatedLogText(entry.text) : "Connecting...\n";
   const changed = box.value !== nextValue;
@@ -1783,26 +1934,13 @@ setCurrentLogSource = function (source, options = {}) {
       : "docker";
   if (nextSource === "script") selectedScriptLogJobId = String(options.scriptJobId || "");
   else selectedScriptLogJobId = "";
-  if (selfUpdateActive(lastStatus) && nextSource !== "update") return;
   currentLogSource = nextSource;
   noteKnownLogSource(currentLogSource);
   applyLogVisibility();
   if (typeof writeUiStateToLocation === "function") writeUiStateToLocation({ active_tab: activeTabName, current_log_source: currentLogSource });
-  connectLogs(true);
-  scheduleLogCacheRefresh(LOG_CACHE_REFRESH_MS);
-  updateLogVisualMode();
-};
-setShowGlobalLogs = function (v) {
-  showGlobalLogs = !!v;
-  showGlobalLogSources[currentLogSettingsKey()] = !!v;
-  window.showGlobalLogSources = showGlobalLogSources;
-  applyLogVisibility();
-  queueUiStateSave({
-    show_global_logs: showGlobalLogs,
-    show_global_logs_by_source: { ...showGlobalLogSources },
-  });
-  connectLogs(false);
+  if (logViewerVisible()) connectLogs(true);
   scheduleLogCacheRefresh(logViewerVisible() ? LOG_CACHE_REFRESH_MS : 0);
+  updateLogVisualMode();
 };
 setScope = function (scope, reconnect = true) {
   const ids = new Set(scopeItems().map((x) => x.id));
@@ -1819,7 +1957,7 @@ setScope = function (scope, reconnect = true) {
   updateScopedCards();
   applyLogVisibility();
   queueUiStateSave();
-  if (reconnect) connectLogs(true);
+  if (reconnect && logViewerVisible()) connectLogs(true);
 };
 function focusAuditLogs() {
   if (currentLogSource !== "audit") setCurrentLogSource("audit");
@@ -1965,9 +2103,6 @@ post = async function (path, obj, label = "", options = {}) {
     refreshStatus().catch(() => {});
     throw e;
   }
-};
-metricTab = function (e, n) {
-  metricSourceChanged(n);
 };
 togglePowerOptimizations = async function () {
   const enable =
@@ -2129,3 +2264,4 @@ function syncActiveTabDisplay() {
   applyLogVisibility();
   applyMetricsVisibility();
 }
+initializeLogTheme();

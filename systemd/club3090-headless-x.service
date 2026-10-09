@@ -5,7 +5,7 @@ After=multi-user.target
 [Service]
 Type=simple
 EnvironmentFile=-@ENV_FILE@
-ExecStart=@SOURCE_ROOT@/scripts/club3090-server/prepare-headless-x.sh
+ExecStart=@SOURCE_ROOT@/scripts/prepare-headless-x.sh
 Restart=always
 RestartSec=5
 StandardOutput=journal

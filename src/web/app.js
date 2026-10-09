@@ -5152,6 +5152,36 @@ function handleBenchmarkJobTransition(previousStatus = {}, nextStatus = {}) {
     summary || `${mode.charAt(0).toUpperCase()}${mode.slice(1)} benchmark queue completed.`,
   ).catch(() => {});
 }
+const refreshedModelInstallInventoryJobIds = new Set();
+function handleModelInstallInventoryRefresh(previousStatus = {}, nextStatus = {}) {
+  const previousJobs = Array.isArray(previousStatus?.model_install_jobs)
+    ? previousStatus.model_install_jobs
+    : [previousStatus?.model_install_job].filter(Boolean);
+  const nextJobs = Array.isArray(nextStatus?.model_install_jobs)
+    ? nextStatus.model_install_jobs
+    : [nextStatus?.model_install_job].filter(Boolean);
+  const nextIds = new Set(nextJobs.map((job) => String(job?.job_id || "")).filter(Boolean));
+  for (const jobId of refreshedModelInstallInventoryJobIds) {
+    if (!nextIds.has(jobId)) refreshedModelInstallInventoryJobIds.delete(jobId);
+  }
+  const previousById = new Map(
+    previousJobs.map((job) => [String(job?.job_id || ""), job]).filter(([jobId]) => jobId),
+  );
+  for (const job of nextJobs) {
+    const jobId = String(job?.job_id || "");
+    const previous = previousById.get(jobId);
+    if (
+      !jobId ||
+      !previous?.active ||
+      job?.active ||
+      String(job?.status || "") !== "success" ||
+      job?.inventory_rebuild_ok !== true ||
+      refreshedModelInstallInventoryJobIds.has(jobId)
+    ) continue;
+    refreshedModelInstallInventoryJobIds.add(jobId);
+    refreshStatus({ force: true, includeInventory: true, inventoryDetail: "full" }).catch(() => {});
+  }
+}
 const tabScrollPositions = window.club3090TabScrollPositions || (window.club3090TabScrollPositions = Object.create(null));
 function currentPageScrollTop() {
   return Math.max(
@@ -5536,15 +5566,14 @@ function renderStatusSurface(label, projection, render, errors) {
   }, errors);
 }
 function renderStatusUi(j, previousStatus = null, options = {}) {
-  if (j && typeof j === "object") lastStatus = j;
+  if (j && typeof j === "object") {
+    handleModelInstallInventoryRefresh(previousStatus || {}, j);
+    lastStatus = j;
+  }
   const metrics = j?.metrics || {};
   const power = j?.power || {};
   const renderErrors = [];
   if (j?.benchmarks?.job) syncBenchmarkModalControlLock(j.benchmarks.job, j.benchmarks);
-  if ($("showGlobalLogs")) {
-    $("showGlobalLogs").checked = effectiveShowGlobalLogs();
-    $("showGlobalLogs").disabled = currentLogSourceDetached();
-  }
   renderStatusSurface("connection", j.__status_cache, () => renderStatusConnectionBanner(j), renderErrors);
   renderStatusSurface("overview", [
     j.metrics, j.power, j.system, j.system_metric_peaks, j.uptime_seconds,
@@ -5602,7 +5631,7 @@ function renderStatusUi(j, previousStatus = null, options = {}) {
   }
   safeRenderStep("tab sync", () => syncActiveTabDisplay(), renderErrors);
   reconcileUpdateUiFromStatus(j);
-  if (activeTabName === "logs" || effectiveShowGlobalLogs()) connectLogs(false);
+  if (activeTabName === "logs") connectLogs(false);
   if (!options.cached) {
     handleSwitchJobTransition(previousStatus, j);
     handleBenchmarkJobTransition(previousStatus, j);
@@ -5716,7 +5745,7 @@ refreshStatus = async function (opts = {}) {
       if (renderErrors.length) statusWarnings.push(`Partial UI render: ${renderErrors.join(" | ")}`);
       setMsg(joinMessageParts(statusWarnings));
     } catch (e) {
-      if (recoverPendingUpdateMonitor()) {
+      if (await recoverPendingUpdateMonitor()) {
         setMsg("");
         return;
       }
@@ -5762,7 +5791,7 @@ async function bootAdminUi() {
   loadCodeSyntaxConfig().catch(() => {});
   if (!uiStateHydrated) hydrateUiState({});
   syncActiveTabDisplay();
-  recoverPendingUpdateMonitor();
+  recoverPendingUpdateMonitor().catch(() => {});
   startExternalUpdateSignalStream();
   hydratePresetSummaryCache();
   const chatCacheApplied = hydrateChatStateFromLocalCache();
@@ -6454,7 +6483,7 @@ function smToRank(value) {
     .toLowerCase()
     .replace(/^sm_/, "")
     .replace(/\+$/, "");
-  if (!raw) return 0;
+  if (/^\d{2}$/.test(raw)) return Number(raw[0]) * 100 + Number(raw[1]) * 10;
   const parts = raw.split(".", 2);
   const major = String(parts[0] || "").replace(/[^0-9]/g, "");
   let minor = String(parts[1] || "0").replace(/[^0-9]/g, "");
@@ -6699,6 +6728,17 @@ function variantHardwareSummary(variant) {
   const engineProfile = String(variant?.engine_profile || "").trim();
   const nvlinkMode = variantNvlinkMode(variant);
   const parts = [];
+  const recommendedCombinedMemory = Number(variant?.recommended_combined_memory_gb || 0);
+  if (recommendedCombinedMemory > 0) {
+    parts.push(`${recommendedCombinedMemory} GB combined RAM+VRAM fit guidance (advisory)`);
+  }
+  const download = Number(variant?.download_size_gb || 0);
+  const systemRam = Number(variant?.recommended_system_memory_gb || 0);
+  const residentRam = Number(variant?.recommended_resident_memory_gb || 0);
+  if (download > 0) parts.push(`${download.toFixed(download % 1 ? 1 : 0)} GB download (advisory)`);
+  if (systemRam > 0) parts.push(`${systemRam} GB system RAM guidance (advisory)`);
+  if (residentRam > 0) parts.push(`${residentRam} GB resident memory guidance (advisory)`);
+  if (variant?.requires_nvme) parts.push("NVMe recommended/required for expert storage (advisory fit guidance)");
   if (minVram > 0) {
     parts.push(
       minGpuCount > 1 ? `${minGpuCount}x ${minVram} GB minimum` : `${minVram} GB minimum`,
@@ -6706,7 +6746,11 @@ function variantHardwareSummary(variant) {
   } else if (minGpuCount > 1) {
     parts.push(`${minGpuCount} GPU minimum`);
   }
-  if (requiresSm) parts.push(`sm_${requiresSm.replace(/\+$/, "")}+`);
+  if (requiresSm) {
+    parts.push(variant?.engine === "strata"
+      ? "GPU compute capability: 7.5, 8.0, 8.6, 8.9, or 12.0"
+      : `sm_${requiresSm.replace(/\+$/, "")}+`);
+  }
   if (engineProfile) parts.push(engineProfile);
   if (nvlinkMode === "required") parts.push("NVLink required");
   return parts.join(" | ");
@@ -7282,7 +7326,7 @@ function sortInventoryVariants(rows) {
   });
 }
 function ensureDynamicPresetLayout() {
-  const presets = $("aiStudioTextModels");
+  const presets = $("aiStudioContent");
   if (!presets) return;
   const firstPanel = presets.querySelector(".panel");
   if (!firstPanel) return;
@@ -9801,11 +9845,12 @@ function renderAIStudioRuntimePanel(status = lastStatus) {
   const instances = Array.isArray(status?.instances) ? status.instances : [];
   const runtimes = Array.isArray(status?.running_runtimes) ? status.running_runtimes : [];
   const rows = instances.filter((item) => String(item?.mode || "").trim());
+  const header = `<div class="ai-studio-runtime-head"><strong>Inference runtimes</strong><a class="btn" href="/admin/logs?log_source=docker">Logs</a></div>`;
   if (!rows.length) {
-    setHtmlIfChanged(host, `<div class="ai-studio-runtime-empty">No inference engine is selected or running.</div>`);
+    setHtmlIfChanged(host, `${header}<div class="ai-studio-runtime-empty">No inference engine is selected or running.</div>`);
     return;
   }
-  setHtmlIfChanged(host, `<div class="ai-studio-runtime-head"><strong>Inference runtimes</strong></div><div class="ai-studio-runtime-rows">${rows.map((item) => {
+  setHtmlIfChanged(host, `${header}<div class="ai-studio-runtime-rows">${rows.map((item) => {
     const runtime = runtimes.find((row) => String(row?.id || "").toUpperCase() === String(item.id || "").toUpperCase()) || {};
     const variant = findVariantBySelector(item.mode);
     const active = !!(runtime.running ?? item.running);
@@ -9816,17 +9861,19 @@ function renderAIStudioRuntimePanel(status = lastStatus) {
     const displayName = String(item.display_name || item.id);
     const namedGpuIndices = (displayName.match(/\d+/g) || []).join(", ");
     const gpuLabel = gpu && namedGpuIndices !== gpu ? ` · GPU ${gpu}` : "";
-    const disabledStart = active || starting;
-    const disabledStop = !active && !starting;
-    return `<article class="ai-studio-runtime-row"><div class="ai-studio-runtime-meta"><strong>${escapeHtml(displayName)}${escapeHtml(gpuLabel)}</strong><span>${escapeHtml(label)}</span><label><input type="checkbox" ${item.enabled ? "checked" : ""} ${typeof benchmarkJobActive === "function" && benchmarkJobActive() ? "disabled" : ""} onchange="aiStudioRuntimeAutostart('${escapeJs(item.id)}', this.checked)"> Start this inference runtime automatically at boot</label></div><span class="status-badge ${active ? "status-success" : starting ? "status-warning" : "status-info"}">${state}</span><div class="ai-studio-runtime-actions"><button class="btn green" ${disabledStart ? "disabled" : ""} onclick="aiStudioRuntimeAction('${escapeJs(item.id)}','start_instance')">Start</button><button class="btn blue" ${disabledStop ? "disabled" : ""} onclick="aiStudioRuntimeAction('${escapeJs(item.id)}','restart_instance')">Restart</button><button class="btn rose" ${!active && !starting ? "disabled" : ""} onclick="aiStudioRuntimeAction('${escapeJs(item.id)}','unload_instance')">Unload</button><button class="btn rose" ${!active ? "disabled" : ""} onclick="aiStudioRuntimeAction('${escapeJs(item.id)}','stop_container')">Stop</button></div></article>`;
+    const action = active ? "restart_instance" : "start_instance";
+    const actionLabel = active ? "Restart" : starting ? "Starting…" : "Start";
+    const actionClass = active ? "blue" : starting ? "amber" : "green";
+    const actionDisabled = starting;
+    const autostartDisabled = typeof benchmarkJobActive === "function" && benchmarkJobActive();
+    return `<article class="ai-studio-runtime-row"><div class="ai-studio-runtime-meta"><div class="ai-studio-runtime-title-row"><strong class="ai-studio-runtime-title">${escapeHtml(displayName)}${escapeHtml(gpuLabel)}</strong><label class="ai-studio-runtime-autostart" title="Start at boot"><input type="checkbox" aria-label="Start at boot" ${item.enabled ? "checked" : ""} ${autostartDisabled ? "disabled" : ""} onchange="aiStudioRuntimeAutostart('${escapeJs(item.id)}', this.checked)">Start at boot</label></div><span>${escapeHtml(label)}</span></div><span class="status-badge ${active ? "status-success" : starting ? "status-warning" : "status-info"}">${state}</span><div class="ai-studio-runtime-actions"><button class="btn ${actionClass}" ${actionDisabled ? "disabled" : ""} onclick="aiStudioRuntimeAction('${escapeJs(item.id)}','${action}')">${actionLabel}</button><button class="btn rose" ${!active && !starting ? "disabled" : ""} onclick="aiStudioRuntimeAction('${escapeJs(item.id)}','unload_instance')">Unload</button><button class="btn rose" ${!active ? "disabled" : ""} onclick="aiStudioRuntimeAction('${escapeJs(item.id)}','stop_container')">Stop</button></div></article>`;
   }).join("")}</div>`);
 }
 async function aiStudioRuntimeAction(instanceId, action) {
   if (typeof benchmarkJobActive === "function" && benchmarkJobActive()) return;
   const item = (lastStatus?.instances || []).find((row) => String(row.id).toUpperCase() === String(instanceId).toUpperCase());
   if (!item || !item.mode) return;
-  if (action === "stop_container" && !(await openClubConfirmModal(`Stop ${item.display_name || item.id}?`))) return;
-  if (action === "unload_instance" && !(await openClubConfirmModal(`Stop the selected runtime, clear ${item.display_name || item.id}'s preset slug, disable autoboot, and release its model/VRAM?`))) return;
+  if (!(await confirmRuntimePowerAction(action, item.display_name || item.id))) return;
   try {
     await post("/admin/power", { action, instance_id: instanceId });
     await refreshStatus({ force: true });
@@ -9850,8 +9897,7 @@ function renderAIStudioTab() {
   const typeHost = $("aiStudioModelTypes");
   const contentHost = $("aiStudioContent");
   const resourceView = $("aiStudioResourceView");
-  const textModels = $("aiStudioTextModels");
-  if (!typeHost || !contentHost || !resourceView || !textModels) return;
+  if (!typeHost || !contentHost || !resourceView) return;
   const counts = [
     ["text", "Text Models"],
     ["image", "Image Models"],
@@ -9862,7 +9908,7 @@ function renderAIStudioTab() {
   setHtmlIfChanged(typeHost, `<div class="ai-studio-summary-row">${counts.map(([key, label]) => `<button type="button" class="resource-manager-total-card ai-studio-model-type${aiStudioModelType === key ? " active" : ""}" aria-pressed="${aiStudioModelType === key ? "true" : "false"}" onclick="selectAIStudioModelType('${key}')"><span class="resource-manager-total-label">${label}</span><span class="resource-manager-total-value">${key === "text" ? aiStudioTextModelCount() : aiStudioModelTypeCount(key)}</span></button>`).join("")}</div>`);
   const textMode = aiStudioModelType === "text";
   resourceView.classList.toggle("hidden", textMode);
-  textModels.classList.toggle("hidden", !textMode);
+  contentHost.classList.toggle("hidden", !textMode);
   if (!textMode) setHtmlIfChanged(resourceView, renderAIStudioView());
 }
 function renderAIStudioView() {
@@ -10096,6 +10142,7 @@ function rigSummaryText() {
   return `${base} | ${nvlink.present ? "NVLink active" : "NVLink inactive"}`;
 }
 function variantFitsCurrentRig(variant) {
+  if (variant?.hardware_blocked) return false;
   const rows = Array.isArray(lastStatus?.gpus) ? lastStatus.gpus.filter((row) => row && !row.error) : [];
   if (!rows.length) return true;
   const minGpuCount = Number(variant?.requires_min_gpu_count || 0);
@@ -10117,6 +10164,8 @@ function variantFitsCurrentRig(variant) {
   return true;
 }
 function variantRigBlockReason(variant) {
+  const serverReason = String(variant?.hardware_block_reason || "").trim();
+  if (variant?.hardware_blocked) return serverReason || "Hardware prerequisites are not satisfied on this host.";
   const rows = Array.isArray(lastStatus?.gpus) ? lastStatus.gpus.filter((row) => row && !row.error) : [];
   const minGpuCount = Number(variant?.requires_min_gpu_count || 0);
   const minVramGb = Number(variant?.requires_min_vram_gb || 0);
@@ -10136,7 +10185,13 @@ function variantRigBlockReason(variant) {
   }
   if (requiredSmRank > 0) {
     const eligibleBySm = rows.filter((row) => smToRank(row?.compute_cap) >= requiredSmRank);
-    if (eligibleBySm.length < Math.max(minGpuCount || 1, 1)) return `Requires sm_${requiredSm}+ hardware.`;
+    if (eligibleBySm.length < Math.max(minGpuCount || 1, 1)) {
+      if (variant?.engine === "strata") {
+        return "Strata requires a GPU with compute capability 7.5 or newer; detected " +
+          `${rows.map((row) => String(row?.compute_cap || "unknown")).join(", ")}.`;
+      }
+      return `Requires sm_${requiredSm}+ hardware.`;
+    }
   }
   return "";
 }
@@ -10155,7 +10210,9 @@ function variantEffectiveStatusKind(variant) {
   return rawKind || "unknown";
 }
 function variantEffectiveInstallState(variant) {
-  return variantRigBlockReason(variant) ? "hardware_blocked" : String(variant?.install_state || "unknown");
+  return variant?.hardware_blocked || variantRigBlockReason(variant)
+    ? "hardware_blocked"
+    : String(variant?.install_state || "unknown");
 }
 function variantDisplayGroupKey(variant) {
   if (variantNvlinkMode(variant) === "required") return "nvlink";
@@ -10704,6 +10761,11 @@ async function restartAllSummaryPresets() {
     ? presetSummaryCache.restartTargets
     : [];
   if (!targets.length) return;
+  const runtimeNames = targets.map((target) => {
+    const variant = findVariantBySelector(target.mode);
+    return `${target.instance_id}: ${variantDisplayLabel(variant || { upstream_tag: target.mode })}`;
+  });
+  if (!(await confirmRuntimePowerAction("restart_instance", runtimeNames.join(", ")))) return;
   for (const target of targets) {
     await post(
       "/admin/switch",
@@ -11087,6 +11149,8 @@ function dynamicPresetModelsRenderSignature() {
   const variantState = inventoryVariants().map((variant) => [
     variantSelector(variant),
     variant?.install_state,
+    variant?.hardware_blocked,
+    variant?.hardware_block_reason,
     variant?.status,
     variant?.status_kind,
     variant?.resource_size_bytes,

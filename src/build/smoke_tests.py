@@ -76,7 +76,7 @@ def run_repository_install_smoke_test(root: Path) -> tuple[bool, str]:
         mutation_wrapper = '#!/bin/sh\nif [ "$1" = "-C" ] && [ "$3" = "rev-parse" ]; then if [ -n "${CLUB3090_TEST_SERVER_DIR:-}" ] && [ "$2" = "$CLUB3090_TEST_SERVER_DIR" ]; then printf "%s\\n" "$2"; exit 0; fi; exec "$CLUB3090_TEST_REAL_GIT" "$@"; fi\nprintf "%s\\n" "$*" >> "$CLUB3090_TEST_MUTATION_LOG"\nexit 99\n'
         wrappers = {
             "sudo": '#!/bin/sh\nexec "$@"\n',
-            "systemctl": '#!/bin/sh\nprintf "%s\\n" "$*" >> "$CLUB3090_TEST_SYSTEMCTL_LOG"\nif [ "$1" = "is-active" ] && [ "${CLUB3090_TEST_HEALTH_DELAY:-}" = "1" ]; then marker="${CLUB3090_TEST_SYSTEMCTL_LOG}.$3"; if [ ! -e "$marker" ]; then : > "$marker"; exit 1; fi; fi\nexit 0\n',
+            "systemctl": '#!/bin/sh\nprintf "%s\\n" "$*" >> "$CLUB3090_TEST_SYSTEMCTL_LOG"\nif [ "$1" = "start" ] && [ "$2" != "--no-block" ] && [ "${CLUB3090_TEST_BLOCK_START:-}" = "1" ]; then sleep 10; fi\nif [ "$1" = "is-active" ] && [ "${CLUB3090_TEST_HEALTH_DELAY:-}" = "1" ]; then marker="${CLUB3090_TEST_SYSTEMCTL_LOG}.$3"; if [ ! -e "$marker" ]; then : > "$marker"; exit 1; fi; fi\nexit 0\n',
             "docker": '#!/bin/sh\nif [ "$1 $2 $3" = "compose version" ]; then exit 0; fi\nexit 0\n',
             "git": mutation_wrapper,
             "apt": mutation_wrapper,
@@ -108,12 +108,45 @@ def run_repository_install_smoke_test(root: Path) -> tuple[bool, str]:
         )
         for key in ("CLUB3090_ADMIN_PORT", "CLUB3090_PROXY_PORT", "CLUB3090_ADMIN_BIND_HOST", "CLUB3090_PROXY_BIND_HOST", "DEFAULT_MODE", "CLUB3090_ENABLE_EXTRA_TEMPS"):
             env.pop(key, None)
+        state_dir.mkdir()
+        update_state_path = state_dir / "self-update-state.json"
+        update_state_path.write_text(json.dumps({
+            "active": True,
+            "status": "running",
+            "token": "stale-install-token",
+            "stale_field": "discard",
+        }), encoding="utf-8")
         result = subprocess.run(
             [str(root / "install.sh")], cwd=str(root), env=env,
             capture_output=True, text=True, check=False, timeout=60,
         )
         if result.returncode:
             return False, result.stderr.strip() or result.stdout.strip() or "install.sh failed"
+        installer_output = result.stdout + result.stderr
+        if "[install] Refreshing updater state" not in installer_output:
+            return False, "normal installation did not announce updater-state refresh"
+        try:
+            installed_update_state = json.loads(update_state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            return False, f"normal installation did not write valid updater state: {exc}"
+        expected_update_state = {
+            "active": False,
+            "status": "idle",
+            "scope": "",
+            "label": "",
+            "command": "",
+            "started_at": 0,
+            "finished_at": 0,
+            "return_code": None,
+            "summary": "idle",
+            "token": "",
+            "log_file": str(state_dir / "self-update.log"),
+            "script_version": env.get("CLUB3090_SCRIPT_VERSION", "unknown"),
+            "ui_ack_token": "",
+            "ui_ack_at": 0,
+        }
+        if installed_update_state != expected_update_state:
+            return False, f"normal installation did not reset stale updater state: {installed_update_state!r}"
         if (temp / "upstream-setup.log").exists():
             return False, "installer unexpectedly invoked upstream model setup without a selector"
         for name in ("nvidia-smi", "sha256sum", "hf"):
@@ -140,11 +173,8 @@ def run_repository_install_smoke_test(root: Path) -> tuple[bool, str]:
             "[install] Running upstream model setup for qwen3.6-27b",
             "[install] Upstream model setup completed",
             "[install] Rendering systemd service units",
-            "[install] Starting services; systemd may wait for startup",
+            "[install] Submitting service start jobs without waiting for startup",
             "[install] Installation complete",
-            "[install] Checking service health with systemd (up to 60s)",
-            "[install] Healthy: all managed services report active",
-            "[install] Waiting for active services:",
         ):
             if message not in installer_output:
                 return False, f"installer omitted progress message {message!r}"
@@ -174,11 +204,38 @@ def run_repository_install_smoke_test(root: Path) -> tuple[bool, str]:
             ("club3090-cert-refresh.service", "refresh-ip-certificate.sh"),
         ):
             unit_text = (unit_dir / unit_name).read_text(encoding="utf-8")
-            if f"ExecStart={root}/scripts/club3090-server/{helper_name}" not in unit_text:
+            if f"ExecStart={root}/scripts/{helper_name}" not in unit_text:
                 return False, f"{unit_name} does not execute its checkout-owned helper"
             if f"EnvironmentFile=-{env_file}" not in unit_text:
                 return False, f"{unit_name} omits its configured environment file"
         vllm_unit = (unit_dir / "club3090-vllm.service").read_text(encoding="utf-8")
+        if f"ExecStop={root}/scripts/stop-vllm-last-mode.sh" not in vllm_unit:
+            return False, "vLLM unit does not stop managed inference instances"
+        systemctl_log.write_text("", encoding="utf-8")
+        script_runs = (
+            ("start.sh", (), "start club3090-control.service club3090-updater.service club3090-benchmarks.service club3090-vllm.service"),
+            ("stop.sh", (), "stop club3090-vllm.service club3090-benchmarks.service club3090-updater.service club3090-control.service"),
+            ("stop.sh", ("--gpu",), "stop club3090-vllm.service"),
+        )
+        expected_calls = []
+        for script_name, script_args, expected_call in script_runs:
+            script_result = subprocess.run(
+                [str(root / "scripts" / script_name), *script_args],
+                cwd=str(root), env=env, capture_output=True, text=True,
+                check=False, timeout=10,
+            )
+            expected_calls.append(expected_call)
+            calls = systemctl_log.read_text(encoding="utf-8").splitlines()
+            if script_result.returncode or calls != expected_calls:
+                return False, f"{script_name} {script_args} invoked unexpected systemctl commands: rc={script_result.returncode} calls={calls!r} stderr={script_result.stderr!r}"
+        systemctl_log.write_text("", encoding="utf-8")
+        invalid_stop = subprocess.run(
+            [str(root / "scripts" / "stop.sh"), "--invalid"],
+            cwd=str(root), env=env, capture_output=True, text=True,
+            check=False, timeout=10,
+        )
+        if invalid_stop.returncode == 0 or systemctl_log.read_text(encoding="utf-8"):
+            return False, "stop.sh accepted an unknown option or invoked systemctl before rejecting it"
         if "ConditionKernelCommandLine=" in vllm_unit:
             return False, "vLLM unit retains a boot-mode condition"
         if "Wants=network-online.target club3090-control.service" not in vllm_unit or "After=docker.service network-online.target club3090-control.service" not in vllm_unit:
@@ -226,33 +283,60 @@ def run_repository_install_smoke_test(root: Path) -> tuple[bool, str]:
         if expected_enable not in systemctl_calls:
             return False, "installer did not enable the expected repository-native services"
         expected_stop = "stop club3090-control.service club3090-updater.service club3090-vllm.service"
-        expected_start = "start club3090-control.service club3090-updater.service club3090-vllm.service"
+        expected_start = "--no-block start club3090-control.service club3090-updater.service club3090-vllm.service"
         if expected_stop not in systemctl_calls or expected_start not in systemctl_calls:
-            return False, "installer did not stop and start the deployment services"
+            return False, "installer did not stop and submit service starts non-blockingly"
         if not systemctl_calls.index(expected_enable) < systemctl_calls.index(expected_stop) < systemctl_calls.index(expected_start):
-            return False, "installer did not stop and restart deployment services after enabling units"
-        for service in ("club3090-control.service", "club3090-updater.service", "club3090-vllm.service"):
-            health_check = f"is-active --quiet {service}"
-            if health_check not in systemctl_calls or systemctl_calls.index(health_check) < systemctl_calls.index(expected_start):
-                return False, f"installer did not check health for {service} after starting services"
+            return False, "installer did not stop and submit service starts after enabling units"
+        if "is-active" in systemctl_calls:
+            return False, "installer waited for systemd service health instead of returning after start submission"
         prior_systemctl_calls = systemctl_log.read_text(encoding="utf-8")
         updater_env = dict(env)
         updater_env["CLUB3090_RUNNING_FROM_UPDATER"] = "1"
+        active_update_state = {
+            "active": True,
+            "status": "running",
+            "scope": "club3090",
+            "token": "update-owned-install-token",
+            "started_at": 123,
+            "custom_field": "must survive",
+        }
+        update_state_path.write_text(json.dumps(active_update_state), encoding="utf-8")
+        active_update_state_bytes = update_state_path.read_bytes()
         updater_run = subprocess.run(
             [str(root / "install.sh")], cwd=str(root), env=updater_env,
             capture_output=True, text=True, check=False, timeout=60,
         )
         if updater_run.returncode:
             return False, updater_run.stderr.strip() or "updater-owned installer run failed"
+        updater_output = updater_run.stdout + updater_run.stderr
+        if "[install] Refreshing updater state" in updater_output:
+            return False, "updater-owned installation attempted to refresh live updater state"
+        if update_state_path.read_bytes() != active_update_state_bytes:
+            return False, "updater-owned installation modified the in-flight update state"
         updater_calls = systemctl_log.read_text(encoding="utf-8")[len(prior_systemctl_calls):]
         if "stop club3090-control.service club3090-vllm.service" not in updater_calls:
             return False, "updater-owned install did not restart control and vLLM services"
         if "stop club3090-control.service club3090-updater.service club3090-vllm.service" in updater_calls:
             return False, "updater-owned install stopped its own updater service"
-        if "start club3090-control.service club3090-vllm.service" not in updater_calls:
-            return False, "updater-owned install did not restart control and vLLM services"
-        if "is-active --quiet club3090-updater.service" not in updater_calls:
-            return False, "updater-owned install did not health-check the still-running updater service"
+        updater_start = "--no-block start club3090-control.service club3090-vllm.service"
+        if updater_start not in updater_calls:
+            return False, "updater-owned install did not submit control and vLLM starts non-blockingly"
+        prior_systemctl_calls = systemctl_log.read_text(encoding="utf-8")
+        blocked_start_env = dict(updater_env)
+        blocked_start_env["CLUB3090_TEST_BLOCK_START"] = "1"
+        try:
+            blocked_start_run = subprocess.run(
+                [str(root / "install.sh")], cwd=str(root), env=blocked_start_env,
+                capture_output=True, text=True, check=False, timeout=5,
+            )
+        except subprocess.TimeoutExpired:
+            return False, "installer blocked on systemd start despite --no-block"
+        if blocked_start_run.returncode:
+            return False, blocked_start_run.stderr.strip() or "non-blocking installer run failed"
+        blocked_start_calls = systemctl_log.read_text(encoding="utf-8")[len(prior_systemctl_calls):]
+        if updater_start not in blocked_start_calls:
+            return False, "installer did not submit updater-owned service starts with --no-block"
         dotenv_root = temp / "dotenv-server"
         dotenv_root.mkdir()
         shutil.copy2(root / "install.sh", dotenv_root / "install.sh")
@@ -475,8 +559,10 @@ raise SystemExit(bool(result))
                 sys.executable, "-c",
                 "import control.shared as shared; events=[]; shared.append_audit_text_line=events.append; "
                 "shared.refresh_status_snapshot=lambda: None; "
+                "summary=shared.run_model_update_check('scheduled', {'variants': []}); "
+                "assert isinstance(summary, dict) and not events, (summary, events); "
                 "summary=shared.run_model_update_check('smoke', {'variants': []}); "
-                "assert isinstance(summary, dict); "
+                "assert isinstance(summary, dict) and any('checked 0 resources' in event for event in events), (summary, events); "
                 "assert not any('_repo_subprocess_env' in str(event) or 'NameError' in str(event) for event in events); "
                 "print('model update checker passed')",
             ],
@@ -617,7 +703,6 @@ def run_control_module_smoke_test(root: Path) -> tuple[bool, str]:
                 "handler.end_admin_stream(key,second); assert key not in control.admin_stream_registry; control.admin_stream_registry.clear(); "
                 "html=control.get_admin_html_template(); "
                 "assert 'renderAIStudioLaneActions' in html; "
-                "assert 'Start this inference runtime automatically at boot' in html; "
                 "assert 'toggle_enabled' in html; print(len(html))",
             ],
             cwd=str(root / "src"), env=env, capture_output=True,
@@ -641,6 +726,8 @@ def run_admin_path_routing_smoke_test(root: Path) -> tuple[bool, str]:
         env.update(
             CLUB3090_CONTROL_DIR=str(control_dir),
             CLUB3090_DIR=str(upstream_dir),
+            CLUB3090_SERVER_DIR=str(root),
+            CLUB3090_SCRIPT_VERSION="unknown",
             PYTHONDONTWRITEBYTECODE="1",
             PYTHONPATH=str(root / "src"),
         )
@@ -649,7 +736,14 @@ import email.message
 import io
 import json
 import threading
+import control
+FIXED_COMMIT = "0123456789abcdef0123456789abcdef01234567"
+control.run_git_as_repository_owner = lambda repo, args: FIXED_COMMIT
 import control.http_server as server
+
+assert server.SCRIPT_VERSION == "v0.12.0", server.SCRIPT_VERSION
+assert server.SCRIPT_COMMIT == FIXED_COMMIT, server.SCRIPT_COMMIT
+EXPECTED_VERSION_LINK = b'<a class="brand-version-link" href="https://github.com/gchamon/club-3090-server/tree/0123456789abcdef0123456789abcdef01234567">v0.12.0 - 0123456</a>'
 
 def invoke(path):
     handler = object.__new__(server.AdminHandler)
@@ -692,6 +786,16 @@ for path in shell_paths:
     assert headers.get("content-type", "").startswith("text/html"), (path, headers)
     assert headers.get("cache-control") == "no-store, no-cache, must-revalidate", (path, headers)
     assert b'<section id="overview"' in body, f"{path} did not serve the admin shell"
+    assert EXPECTED_VERSION_LINK in body, f"{path} did not render the version and commit tree link"
+    assert body.count(b'class="brand-version-link"') == 1, f"{path} did not render exactly one version link"
+
+server.run_git_as_repository_owner = lambda repo, args: ""
+server.SCRIPT_COMMIT = server._current_source_commit()
+assert server.SCRIPT_COMMIT == ""
+status, _, body = invoke("/admin")
+assert status == "HTTP/1.1 200 OK"
+assert b"v0.12.0 - unknown" in body
+assert b'class="brand-version-link"' not in body
 
 status, _, _ = invoke("/admin/not-a-tab")
 assert status.startswith("HTTP/1.1 404"), status
@@ -771,6 +875,44 @@ def run_updater_status_smoke_test(root: Path) -> tuple[bool, str]:
             return False, "updater status did not describe the clean-tracking System Update"
         if status.get("automatic_updates") is not False or state_dir.exists():
             return False, "updater status enabled automatic updates or wrote mutable state"
+        state_dir.mkdir()
+        state_path = state_dir / "self-update-state.json"
+        state_path.write_text(json.dumps({
+            "active": True,
+            "status": "running",
+            "token": "stale-token",
+            "finished_at": 1,
+            "internal_error": "stale",
+        }), encoding="utf-8")
+        reset = subprocess.run(
+            [sys.executable, "-m", "build.updater", "--reset-state"],
+            cwd=str(root / "src"), env=env, capture_output=True,
+            text=True, check=False, timeout=15,
+        )
+        if reset.returncode:
+            return False, reset.stderr.strip() or "updater state reset command failed"
+        try:
+            reset_state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            return False, f"updater reset state was unavailable or invalid: {exc}"
+        expected_state = {
+            "active": False,
+            "status": "idle",
+            "scope": "",
+            "label": "",
+            "command": "",
+            "started_at": 0,
+            "finished_at": 0,
+            "return_code": None,
+            "summary": "idle",
+            "token": "",
+            "log_file": str(state_dir / "self-update.log"),
+            "script_version": "unknown",
+            "ui_ack_token": "",
+            "ui_ack_at": 0,
+        }
+        if reset_state != expected_state:
+            return False, f"updater reset state did not match the initial controlled payload: {reset_state!r}"
         server_dir = temp / "server"
         upstream_dir = temp / "upstream"
         bin_dir = temp / "bin"
@@ -786,6 +928,7 @@ def run_updater_status_smoke_test(root: Path) -> tuple[bool, str]:
             "case \"$1\" in\n"
             "  rev-parse) if [ \"$2\" = \"--show-toplevel\" ]; then "
             "if [ \"$CLUB3090_TEST_DUBIOUS\" = \"$repo\" ]; then printf 'fatal: detected dubious ownership\\n' >&2; exit 1; fi; "
+            "if [ \"$CLUB3090_TEST_NESTED\" = \"$repo\" ]; then printf '%s/nested\\n' \"$repo\"; exit 0; fi; "
             "printf '%s\\n' \"$repo\"; "
             "elif [ \"$CLUB3090_TEST_DIRTY\" = \"$repo\" ] && [ \"$2\" = \"--abbrev-ref\" ]; then exit 1; "
             "else printf 'origin/main\\n'; fi ;;\n"
@@ -848,17 +991,23 @@ def run_updater_status_smoke_test(root: Path) -> tuple[bool, str]:
         if clean.returncode:
             return False, clean.stderr.strip() or "clean tracking-checkout System Update command failed"
         trace_lines = trace.read_text(encoding="utf-8").splitlines()
-        milestones = [
-            f"git -C {server_dir} fetch --prune origin",
-            f"git -C {server_dir} merge --ff-only @{{u}}",
-            f"git -C {upstream_dir} fetch --prune origin",
-            f"git -C {upstream_dir} merge --ff-only @{{u}}",
-            "python -m control.http_server --rebuild-inventory",
-            f"install {server_dir}/install.sh",
-        ]
-        positions = [next((index for index, line in enumerate(trace_lines) if milestone in line), -1) for milestone in milestones]
-        if any(position < 0 for position in positions) or positions != sorted(positions):
-            return False, f"System Update stages did not run in order: {trace_lines!r}"
+        server_uid = os.stat(server_dir).st_uid
+        server_passwd = subprocess.run(
+            ["getent", "passwd", str(server_uid)],
+            capture_output=True, text=True, check=False, timeout=5,
+        )
+        if server_passwd.returncode or not server_passwd.stdout.strip():
+            return False, f"no passwd entry for server fixture owner uid {server_uid}"
+        server_account = server_passwd.stdout.strip().split(":")
+        server_user, server_home = server_account[0], server_account[5]
+        installer_trace = next((line for line in trace_lines if "bash " + str(server_dir / "install.sh") in line), "")
+        if (
+            not installer_trace.startswith(f"runuser --user {server_user} -- env HOME={server_home} ")
+            or "CLUB3090_RUNNING_FROM_UPDATER=1" not in installer_trace
+            or f"CLUB3090_CONTROL_DIR={command_env['CLUB3090_CONTROL_DIR']}" not in installer_trace
+            or f"CLUB3090_DIR={upstream_dir}" not in installer_trace
+        ):
+            return False, f"System Update did not invoke installer as server checkout owner with updater environment: {trace_lines!r}"
         for repo in (server_dir, upstream_dir):
             repo_uid = os.stat(repo).st_uid
             passwd = subprocess.run(
@@ -894,4 +1043,941 @@ def run_updater_status_smoke_test(root: Path) -> tuple[bool, str]:
         dubious_lines = trace.read_text(encoding="utf-8").splitlines()
         if dubious.returncode == 0 or "detected dubious ownership" not in dubious.stderr or any(" fetch " in line or " merge " in line for line in dubious_lines):
             return False, f"System Update hid a Git ownership failure or mutated before preflight: rc={dubious.returncode} stderr={dubious.stderr!r} trace={dubious_lines!r}"
+        trace.write_text("", encoding="utf-8")
+        nested_env = dict(command_env)
+        nested_env["CLUB3090_TEST_NESTED"] = str(upstream_dir)
+        nested = subprocess.run(
+            ["/bin/bash", "-c", command], cwd=str(root), env=nested_env,
+            capture_output=True, text=True, check=False, timeout=15,
+        )
+        nested_lines = trace.read_text(encoding="utf-8").splitlines()
+        if nested.returncode == 0 or "not the worktree root" not in nested.stderr or any(" fetch " in line or " merge " in line for line in nested_lines):
+            return False, f"System Update did not reject a nested checkout path before mutation: rc={nested.returncode} stderr={nested.stderr!r} trace={nested_lines!r}"
         return True, "updater runs Git as checkout owner and guards clean, dirty, and ownership failures"
+
+def run_strata_preset_smoke_test(root: Path) -> tuple[bool, str]:
+    root = Path(root).resolve()
+    with tempfile.TemporaryDirectory(prefix="club3090-strata-preset-") as temp_raw:
+        temp = Path(temp_raw)
+        state_dir = temp / "state"
+        model_dir = temp / "models"
+        upstream = temp / "upstream"
+        upstream.mkdir()
+        env = dict(os.environ)
+        env.update(
+            CLUB3090_CONTROL_DIR=str(state_dir),
+            CLUB3090_DIR=str(upstream),
+            MODEL_DIR=str(model_dir),
+            CLUB3090_SERVER_DIR=str(root),
+            PYTHONPATH=str(root / "src"),
+            PYTHONDONTWRITEBYTECODE="1",
+        )
+        rebuild = subprocess.run(
+            [sys.executable, "-m", "control.http_server", "--rebuild-inventory"],
+            cwd=str(root / "src"), env=env, capture_output=True,
+            text=True, check=False, timeout=30,
+        )
+        if rebuild.returncode:
+            return False, rebuild.stderr.strip() or "Strata inventory rebuild failed"
+        inventory_path = state_dir / "runtime_inventory.json"
+        if not inventory_path.is_file():
+            return False, "Strata inventory rebuild did not write isolated inventory"
+        stop_dispatch = subprocess.run(
+            [sys.executable, "-m", "control.http_server", "--stop-managed-instances"],
+            cwd=str(root / "src"), env=env, capture_output=True,
+            text=True, check=False, timeout=30,
+        )
+        if stop_dispatch.returncode:
+            return False, stop_dispatch.stderr.strip() or "managed-instance stop CLI did not exit successfully with no configured instances"
+        try:
+            inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            return False, f"Strata inventory was not valid JSON: {exc}"
+        expected = {
+            "strata/qwen3.8-flash-next-q2-0": ("Q2_0", 37.6, "qwen"),
+            "strata/qwen3.8-flash-next-iq2-xs": ("IQ2_XS", 39.2, "qwen"),
+            "strata/qwen3.8-flash-next-iq3-xxs": ("IQ3_XXS", 47.0, "qwen"),
+            "strata/qwen3.8-flash-next-iq3-s": ("IQ3_S", 54.8, "qwen"),
+            "strata/qwen3.8-flash-next-coder-iq1-m": ("IQ1_M", None, "coder"),
+            "strata/swift-1-5-iq2-xs": ("IQ2_XS", None, "swift"),
+            "strata/swift-1-5-iq3-xxs": ("IQ3_XXS", None, "swift"),
+            "strata/unsloth-ud-iq4-xs": ("UD-IQ4_XS", None, "unsloth"),
+            "strata/unsloth-ud-q4-k-xl": ("UD-Q4_K_XL", None, "unsloth"),
+            "strata/orcarouter-qwen3.8-flash-next-uncensored-iq3-xxs": ("IQ3_XXS", None, "orca"),
+        }
+        rows = {
+            row.get("selector") or row.get("upstream_tag"): row
+            for row in inventory.get("variants", [])
+            if (row.get("selector") or row.get("upstream_tag")) in expected
+        }
+        if set(rows) != set(expected):
+            return False, f"Strata inventory selectors differ: {sorted(rows)}"
+        if any(
+            bool(row.get("required_chat_template_kwargs", {}).get("enable_thinking"))
+            != (expected[selector][2] == "qwen")
+            for selector, row in rows.items()
+        ):
+            return False, "Strata Qwen thinking defaults are missing or applied to a non-Qwen variant"
+        readiness = subprocess.run(
+            [
+                sys.executable, "-c",
+                "import json, os, subprocess, types; import control; "
+                f"row=json.loads({json.dumps(json.dumps(rows['strata/qwen3.8-flash-next-iq2-xs']))}); "
+                "assert row['required_chat_template_kwargs']=={'enable_thinking': True}; "
+                "admin_payload=control.build_admin_chat_payload({'messages':[{'role':'user','content':'probe'}],'params':{'enable_thinking':False}}, row); "
+                "assert admin_payload['chat_template_kwargs']['enable_thinking'] is True, admin_payload; "
+                "proxy_payload=json.loads(control.apply_preset(json.dumps({'messages':[{'role':'user','content':'probe'}],'chat_template_kwargs':{'enable_thinking':False}}).encode(), '', None, row)); "
+                "assert proxy_payload['chat_template_kwargs']['enable_thinking'] is True, proxy_payload; "
+                f"coder_row=json.loads({json.dumps(json.dumps(rows['strata/qwen3.8-flash-next-coder-iq1-m']))}); "
+                "coder_payload=control.build_admin_chat_payload({'messages':[{'role':'user','content':'probe'}],'params':{'enable_thinking':False}}, coder_row); "
+                "assert coder_payload['chat_template_kwargs']['enable_thinking'] is False, coder_payload; "
+                "original_check_output=subprocess.check_output; original_run=subprocess.run; "
+                "subprocess.check_output=lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError()); "
+                "subprocess.run=lambda *a, **k: types.SimpleNamespace(returncode=1, stdout=''); "
+                "state=control._detect_variant_install_state(row, ''); "
+                "assert state['install_state']=='requires_download' and 'Pinned Strata source' in state['install_reason'] and 'runtime image' in state['install_reason'], state; "
+                f"control_commit={json.dumps('82f46a8c8f475f001ad76d92f58f4a4f8ffb0253')}; "
+                "subprocess.check_output=lambda *a, **k: control_commit; "
+                "subprocess.run=lambda *a, **k: types.SimpleNamespace(returncode=0, stdout=''); "
+                "state=control._detect_variant_install_state(row, ''); "
+                "assert state['install_state']=='requires_download' and 'prepared config' in state['install_reason'] and 'io.club3090.strata.commit=missing' in state['install_reason'], state; "
+                "inspect_calls=[]; "
+                "subprocess.run=lambda args, **kwargs: (inspect_calls.append((args,kwargs)) or types.SimpleNamespace(returncode=0, stdout=control_commit+'\\n')); "
+                "assert control.strata_image_commit(row['strata_image'])==control_commit; "
+                "assert inspect_calls[-1][0][:3]==['docker','image','inspect'] and 'io.club3090.strata.commit' in inspect_calls[-1][0][4], inspect_calls; "
+                "subprocess.run=lambda *a, **k: types.SimpleNamespace(returncode=0, stdout=control_commit); "
+                "blocked_source='try:\\n control.ensure_variant_install_ready(row)\\nexcept RuntimeError as exc:\\n assert \\'prepared config\\' in str(exc)\\nelse:\\n raise AssertionError(\\'launch guard accepted an unprepared Strata model\\')'; exec(blocked_source); "
+                "os.makedirs(os.path.dirname(row['strata_config_path']), exist_ok=True); "
+                "open(row['strata_config_path'], 'w').write('{}'); "
+                "assert control._detect_variant_install_state(row, '')['install_state']=='ready', control._detect_variant_install_state(row, ''); "
+                "row['install_state']='requires_download'; row['install_reason']='Install the pinned Strata runtime image and source checkout.'; "
+                "control.write_json_file(control.RUNTIME_INVENTORY_FILE, {'variants':[row]}); "
+                "control.runtime_inventory_cache={}; control.runtime_inventory_built_at=0; "
+                "assert control.load_runtime_inventory(force=False)['variants'][0]['install_state']=='ready'; "
+                "assert control.read_json_file(control.RUNTIME_INVENTORY_FILE, {})['variants'][0]['install_reason']==''; "
+                "subprocess.run=lambda *a, **k: types.SimpleNamespace(returncode=0, stdout='wrong-commit'); "
+                "state=control._detect_variant_install_state(row, ''); "
+                "assert state['install_state']=='requires_download' and 'image label' in state['install_reason'], state; "
+                "subprocess.run=lambda *a, **k: types.SimpleNamespace(returncode=1, stdout=''); "
+                "state=control._detect_variant_install_state(row, ''); "
+                "assert state['install_state']=='requires_download' and 'runtime image' in state['install_reason'], state; "
+                "subprocess.check_output=lambda *a, **k: 'wrong-commit'; "
+                "subprocess.run=lambda *a, **k: types.SimpleNamespace(returncode=0, stdout=control_commit); "
+                "state=control._detect_variant_install_state(row, ''); "
+                "assert state['install_state']=='requires_download' and 'Pinned Strata source' in state['install_reason']; "
+                "subprocess.check_output=original_check_output; subprocess.run=original_run",
+            ],
+            cwd=str(root / "src"), env=env, capture_output=True,
+            text=True, check=False, timeout=15,
+        )
+        if readiness.returncode:
+            return False, readiness.stderr.strip() or "Strata source/image readiness transition failed"
+        install_job = subprocess.run(
+            [
+                sys.executable, "-c",
+                "import json, os, types; import control as c; s=c._shared; "
+                f"variant=json.loads({json.dumps(json.dumps(rows['strata/qwen3.8-flash-next-iq2-xs']))}); "
+                "s.load_runtime_inventory=lambda *a, **k: {'variants':[variant]}; "
+                "s._monitor_plan_from_variant_install=lambda *a, **k: None; "
+                "s._model_install_affected_variants=lambda *a, **k: []; "
+                "s._acquire_model_install_download_locks=lambda *a, **k: []; "
+                "s._snapshot_model_install_cleanup_targets=lambda *a, **k: []; "
+                "s._register_model_install_process=lambda *a, **k: None; s._clear_model_install_process=lambda *a, **k: None; "
+                "s._stream_process_output_to_audit=lambda *a, **k: None; "
+                "s._normalize_shared_mmproj_hardlinks=lambda: []; s._normalize_duplicate_model_file_hardlinks=lambda: []; "
+                "s._prepare_strata_model=lambda *a, **k: None; "
+                "s.rebuild_runtime_inventory=lambda: {'variants':[variant]}; s.refresh_status_snapshot=lambda: None; "
+                "s.append_audit_text_line=lambda *a, **k: None; s.log_audit=lambda *a, **k: None; "
+                "s._repo_subprocess_env=lambda: dict(os.environ); "
+                "s._release_model_install_download_locks=lambda *a, **k: None; "
+                "s.ensure_variant_install_ready=lambda row: (_ for _ in ()).throw(RuntimeError('image unavailable')); "
+                "class_source='class Proc:\\n returncode=0\\n stdout=None\\n def wait(self): return 0\\n'; "
+                "exec(class_source); s.subprocess.Popen=lambda *a, **k: Proc(); "
+                "s._run_model_install_job('job-strata','qwen3.8-flash-next',variant['variant_id'],'strata-image-build'); "
+                "job=s.model_install_jobs['job-strata']; "
+                "assert job['status']=='failed' and job['return_code']==999 and job['inventory_rebuild_ok'] is False",
+            ],
+            cwd=str(root / "src"), env=env, capture_output=True,
+            text=True, check=False, timeout=15,
+        )
+        if install_job.returncode:
+            return False, install_job.stderr.strip() or "Strata install job did not fail when post-rebuild readiness failed"
+        successful_install_job = subprocess.run(
+            [
+                sys.executable, "-c",
+                "import json, os; import control as c; s=c._shared; "
+                f"variant=json.loads({json.dumps(json.dumps(rows['strata/qwen3.8-flash-next-iq2-xs']))}); "
+                "variant['install_state']='requires_download'; "
+                "rebuilt_variant=dict(variant, install_state='ready', install_reason=''); "
+                "s.load_runtime_inventory=lambda *a, **k: {'variants':[variant]}; "
+                "s._monitor_plan_from_variant_install=lambda *a, **k: None; "
+                "s._model_install_affected_variants=lambda *a, **k: []; "
+                "s._acquire_model_install_download_locks=lambda *a, **k: []; "
+                "s._snapshot_model_install_cleanup_targets=lambda *a, **k: []; "
+                "s._register_model_install_process=lambda *a, **k: None; s._clear_model_install_process=lambda *a, **k: None; "
+                "s._stream_process_output_to_audit=lambda *a, **k: None; "
+                "s._normalize_shared_mmproj_hardlinks=lambda: []; s._normalize_duplicate_model_file_hardlinks=lambda: []; "
+                "s._prepare_strata_model=lambda *a, **k: None; "
+                "rebuild_calls=[]; "
+                "s.rebuild_runtime_inventory=lambda: (rebuild_calls.append(True) or {'variants':[rebuilt_variant]}); "
+                "s.read_json_file=lambda *a, **k: {'variants':[rebuilt_variant]}; "
+                "logs=[]; s.refresh_status_snapshot=lambda: None; s.append_audit_text_line=lambda *a, **k: logs.append(a); s.log_audit=lambda *a, **k: None; "
+                "s._repo_subprocess_env=lambda: dict(os.environ); "
+                "s._release_model_install_download_locks=lambda *a, **k: None; "
+                "s.ensure_variant_install_ready=lambda row: (_ for _ in ()).throw(AssertionError('install readiness must receive rebuilt row')) if row is not rebuilt_variant or row['install_state']!='ready' else None; "
+                "class_source='class Proc:\\n returncode=0\\n stdout=None\\n def wait(self): return 0\\n'; exec(class_source); commands=[]; s.subprocess.Popen=lambda *a, **k: (commands.append(a[0]) or Proc()); "
+                "s._run_model_install_job('job-strata-ready','qwen3.8-flash-next',variant['variant_id'],'strata-image-build'); "
+                "job=s.model_install_jobs['job-strata-ready']; "
+                "assert job['status']=='success' and job['return_code']==0 and job['inventory_rebuild_ok'] is True, (job, rebuild_calls, logs); "
+                "assert len(rebuild_calls)==1, (job, rebuild_calls, logs); "
+                "assert '--label io.club3090.strata.commit=82f46a8c8f475f001ad76d92f58f4a4f8ffb0253' in commands[0][2], commands",
+            ],
+            cwd=str(root / "src"), env=env, capture_output=True,
+            text=True, check=False, timeout=15,
+        )
+        if successful_install_job.returncode:
+            return False, successful_install_job.stderr.strip() or "Strata successful install did not publish rebuilt ready inventory"
+        prefetch = subprocess.run(
+            [
+                sys.executable, "-c",
+                "import json, os; import control as c; s=c._shared; "
+                f"variant=json.loads({json.dumps(json.dumps(rows['strata/qwen3.8-flash-next-iq2-xs']))}); "
+                "config=variant['strata_config_path']; data=variant['strata_data_path']; "
+                "os.makedirs(data, exist_ok=True); "
+                "part=os.path.join(data,'Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf.part'); "
+                "open(part,'w').write('partial'); "
+                "os.makedirs(os.path.dirname(config), exist_ok=True); json.dump({'args':['--max-context','32768']}, open(config,'w')); "
+                "variant['service_name']='strata'; s.ensure_strata_api_key=lambda: 'test-key'; "
+                "s._register_model_install_process=lambda *a, **k: None; s._clear_model_install_process=lambda *a, **k: None; "
+                "s._stream_process_output_to_audit=lambda *a, **k: None; s.append_audit_text_line=lambda *a, **k: None; "
+                "calls=[]; class_source='class Proc:\\n def __init__(self, code): self.code=code; self.returncode=code; self.stdout=None\\n def wait(self):\\n  if self.code==0: os.makedirs(os.path.dirname(config), exist_ok=True); json.dump({\\'args\\':[\\'--max-context\\',\\'262144\\']}, open(config,\\'w\\'))\\n  return self.code'; exec(class_source); "
+                "popen_source='def popen(args, **kwargs):\\n calls.append((args,kwargs)); return Proc(1 if len(calls)==1 else 0)'; exec(popen_source); "
+                "s.subprocess.Popen=popen; failure_source='try:\\n s._prepare_strata_model(\"job\",\"[model-install test]\",variant,dict(os.environ))\\nexcept RuntimeError as exc:\\n assert \"download and setup failed\" in str(exc)\\nelse:\\n raise AssertionError(\"failed Strata prefetch was accepted\")'; exec(failure_source); "
+                "assert os.path.isfile(part) and json.load(open(config))['args'][1]=='32768'; "
+                "s._prepare_strata_model('job','[model-install test]',variant,dict(os.environ)); "
+                "assert os.path.isfile(config) and os.path.isfile(part); prepared=json.load(open(config)); assert prepared['args'][1]=='262144' and prepared['fit_max_tokens'] is True and os.stat(config).st_mode & 0o777==0o600; "
+                "args,kwargs=calls[1]; joined=' '.join(args); setup=args[-1]; "
+                "assert args[:2]==['docker','compose'] and ' run --rm --no-deps ' in f' {joined} '; "
+                "assert '--setup --yes' in setup and '--model IQ2_XS' in setup and '--family qwen' in setup and '--no-start' in setup; "
+                "assert '/data/config/strata-iq2_xs.json' in setup and 'API_KEY' in setup; "
+                "assert kwargs['env']['STRATA_API_KEY']=='test-key' and kwargs['env']['PORT']=='0'; "
+                "s._prepare_strata_model('job','[model-install test]',variant,dict(os.environ)); assert len(calls)==2; "
+                "json.dump({'args':['--max-context','262144']}, open(config,'w')); before=len(calls); "
+                "s._prepare_strata_model('job','[model-install test]',variant,dict(os.environ)); "
+                "assert len(calls)==before and json.load(open(config))['fit_max_tokens'] is True"
+            ],
+            cwd=str(root / "src"), env=env, capture_output=True,
+            text=True, check=False, timeout=15,
+        )
+        if prefetch.returncode:
+            return False, prefetch.stderr.strip() or "Strata setup prefetch did not preserve retryable downloads and publish readiness config"
+        compose_paths, data_paths = set(), set()
+        for selector, (model_token, guidance, family) in expected.items():
+            row = rows[selector]
+            compose = Path(row.get("compose_abs_path") or row.get("compose_path") or "")
+            data = Path(row.get("strata_data_path") or row.get("data_path") or "")
+            compose_paths.add(str(compose))
+            data_paths.add(str(data))
+            if data.parent != model_dir or not data.name.startswith("strata-"):
+                return False, f"{selector} data root is not an isolated MODEL_DIR/strata-<preset> path: {data}"
+            if compose.parent.parent != state_dir / "builtin-models":
+                return False, f"{selector} Compose path escaped controller-owned metadata: {compose}"
+            if Path(row.get("strata_config_path") or "").parent.parent != data:
+                return False, f"{selector} setup config is not inside its MODEL_DIR data root"
+            if row.get("strata_model_token") != model_token:
+                return False, f"{selector} has wrong Strata MODEL token"
+            expected_model_id = "qwen3.8-flash-next" if family != "orca" else "orcarouter-qwen3.8-flash-next-uncensored-iq3_xxs"
+            if (
+                row.get("model_id") != expected_model_id
+                or row.get("engine") != "strata"
+                or row.get("engine_display") != "Strata"
+                or row.get("profile_engine_id") != "strata"
+                or row.get("strata_family") != family
+                or row.get("topology") != "single"
+                or row.get("requires_min_gpu_count") != 1
+                or row.get("requires_sm") != "75+"
+            ):
+                return False, f"{selector} lost its Strata model, family, engine, topology, or hardware identity"
+            if guidance is not None and float(row.get("recommended_combined_memory_gb") or 0) != guidance:
+                return False, f"{selector} lost advisory combined-memory guidance"
+            if model_token in {"UD-Q4_K_XL", "IQ3_XXS"} and (family == "orca" or family == "unsloth"):
+                if row.get("status_kind") != "experimental" or row.get("install_state") not in {"requires_download", "ready"}:
+                    return False, f"{selector} must remain installable with its experimental state"
+            if family == "coder" and (row.get("download_size_gb") != 58.4 or row.get("recommended_system_memory_gb") != 32):
+                return False, f"{selector} lost its Coder advisory sizing"
+            if family == "unsloth" and model_token == "UD-IQ4_XS":
+                if row.get("download_size_gb") != 93.7 or row.get("recommended_system_memory_gb") != 48 or row.get("recommended_resident_memory_gb") != 59.5 or not row.get("requires_nvme"):
+                    return False, f"{selector} lost its UD-IQ4_XS advisory sizing"
+            if family == "unsloth" and model_token == "UD-Q4_K_XL":
+                if row.get("download_size_gb") != 111.3 or row.get("recommended_system_memory_gb") != 48 or row.get("recommended_resident_memory_gb") != 77 or not row.get("requires_nvme"):
+                    return False, f"{selector} lost its UD-Q4_K_XL advisory sizing"
+            if family == "orca" and (row.get("strata_install_mode") != "orca" or row.get("download_size_gb") != 85.2):
+                return False, f"{selector} lost its distinct Orca install contract"
+            if row.get("hardware_blocked") not in (False, None):
+                return False, f"{selector} was unexpectedly hardware-blocked in the inventory fixture"
+            if not compose.is_file() or not data.is_dir():
+                return False, f"{selector} does not have its isolated Compose/data paths"
+            compose_text = compose.read_text(encoding="utf-8")
+            if (
+                f"FAMILY: {family}" not in compose_text
+                or f"MODEL: {model_token}" not in compose_text
+                or f"{data}:/data" not in compose_text
+                or "${PORT}:8080" not in compose_text
+                or 'PORT: "8080"' not in compose_text
+                or "/data" not in compose_text
+                or "memlock:" not in compose_text
+                or "driver: nvidia" not in compose_text
+                or 'API_KEY: "${STRATA_API_KEY}"' not in compose_text
+                or "start_period: 600s" not in compose_text
+            ):
+                return False, f"{selector} Compose contract is incomplete"
+        if len(compose_paths) != len(expected) or len(data_paths) != len(expected):
+            return False, "Strata selectors do not have distinct Compose and data directories"
+        source_paths = {row.get("strata_source_path") for row in rows.values()}
+        images = {row.get("strata_image") for row in rows.values()}
+        commits = {row.get("strata_commit") for row in rows.values()}
+        expected_source = str(state_dir / "builtin-models" / "strata" / "source")
+        if source_paths != {expected_source} or images != {"club3090-strata:v0.1.40.1"}:
+            return False, "Strata variants do not share the pinned source and image contract"
+        evaluator = r'''
+import json
+import os
+from unittest.mock import patch
+import control
+system = control
+
+expected = set(json.loads(os.environ["STRATA_SMOKE_EXPECTED"]))
+rows = {
+    row.get("selector") or row.get("upstream_tag"): row
+    for row in json.loads(os.environ["STRATA_SMOKE_ROWS"])
+}
+
+iq2_xs = rows["strata/qwen3.8-flash-next-iq2-xs"]
+assert system._compute_capability_rank("75+") == 750
+assert system._compute_capability_rank("8.6") == 860
+gpu_row = {
+    "index": 0, "name": "GPU", "memory_total_mib": 24576,
+    "memory_free_mib": 24000, "compute_cap": "8.6",
+}
+with patch.object(system, "_probe_host_gpus", return_value=[gpu_row]):
+    guarded_env = system._apply_variant_hardware_guard(
+        iq2_xs, {"CLUB3090_GPU": "0"}
+    )
+assert guarded_env["CLUB3090_GPU"] == "0", guarded_env
+gpu_row["compute_cap"] = "7.0"
+with patch.object(system, "_probe_host_gpus", return_value=[gpu_row]):
+    try:
+        system._apply_variant_hardware_guard(
+            iq2_xs, {"CLUB3090_GPU": "0"}
+        )
+    except RuntimeError as exc:
+        assert "requires sm_75+," in str(exc), exc
+        assert "reports sm_7.0." in str(exc), exc
+    else:
+        raise AssertionError("Strata launch guard accepted SM 7.0")
+
+def evaluate(*, host="Linux", docker="/usr/bin/docker", nvidia="/usr/bin/nvidia-smi",
+             runtime=True, cdi=False, gpu_output="0, 8.6, 580.1", gpu_rc=0, assigned=None):
+    def run_cmd(command, timeout=None):
+        if any("DiscoveredDevices" in argument for argument in command):
+            devices = [{"Source": "cdi", "ID": "nvidia.com/gpu=0"}] if cdi else []
+            return (0, json.dumps(devices))
+        if "info" in command:
+            return (0, json.dumps({"nvidia": {}} if runtime else {"runc": {}}))
+        return (gpu_rc, gpu_output)
+    with patch.object(system.platform, "system", return_value=host), \
+         patch.object(system.shutil, "which",
+                      side_effect=lambda name: docker if name == "docker" else nvidia), \
+         patch.object(system, "run_cmd", side_effect=run_cmd):
+        return system.evaluate_strata_hardware(assigned)
+
+def blocked(result, phrase):
+    assert result["hardware_blocked"] is True, result
+    assert phrase.lower() in result["hardware_block_reason"].lower(), result
+
+blocked(evaluate(host="Darwin"), "Linux")
+blocked(evaluate(docker=None), "Docker")
+blocked(evaluate(runtime=False), "neither the NVIDIA runtime nor")
+assert evaluate(runtime=False, cdi=True)["hardware_blocked"] is False, evaluate(runtime=False, cdi=True)
+blocked(evaluate(nvidia=None), "nvidia-smi")
+blocked(evaluate(gpu_rc=1, gpu_output=""), "nvidia-smi")
+blocked(evaluate(gpu_output="0, 8.6, 579.99"), "580")
+blocked(evaluate(gpu_output="0, 9.9, 580.1"), "compute capability")
+
+# The table evaluates all visible GPUs; a selected instance evaluates only
+# its assigned GPU, even when another visible GPU is compatible.
+mixed = "0, 9.9, 580.1\n1, 8.9, 580.1"
+assert evaluate(gpu_output=mixed)["hardware_blocked"] is False
+blocked(evaluate(gpu_output=mixed, assigned=[0]), "compute capability")
+assert evaluate(gpu_output=mixed, assigned=[1])["hardware_blocked"] is False
+assert evaluate(gpu_output=mixed, assigned=[0, 1])["hardware_blocked"] is False
+
+# Every supported architecture is accepted, and enrichment returns independent
+# row copies while preserving the install projection and all four selectors.
+for capability in ("7.5", "8.0", "8.6", "8.9", "12.0"):
+    assert evaluate(gpu_output=f"0, {capability}, 580.1")["hardware_blocked"] is False
+source_rows = []
+for index, row in enumerate(rows.values()):
+    enriched_source = dict(row)
+    enriched_source["install_state"] = f"state-{index}"
+    enriched_source["install_reason"] = f"reason-{index}"
+    source_rows.append(enriched_source)
+with patch.object(system, "evaluate_strata_hardware",
+                  return_value={"hardware_blocked": True, "hardware_block_reason": "fixture blocked"}):
+    enriched = system.enrich_strata_hardware_rows(source_rows)
+assert len(enriched) == len(expected), len(enriched)
+assert {row.get("selector") or row.get("upstream_tag") for row in enriched} == set(expected)
+for index, (original, result) in enumerate(zip(source_rows, enriched)):
+    assert result is not original
+    assert original.get("hardware_blocked") is not True
+    assert result["hardware_blocked"] is True
+    assert result["hardware_block_reason"] == "fixture blocked"
+    assert result["install_state"] == original["install_state"] == f"state-{index}"
+    assert result["install_reason"] == original["install_reason"] == f"reason-{index}"
+control.load_runtime_inventory(force=True)
+for selector, row in rows.items():
+    for operation in (
+        lambda selector=selector: control.preset_resource_delete_plan(selector),
+        lambda selector=selector: control.preset_cache_delete_plan(selector),
+        lambda selector=selector: control.start_model_update_job(variant_id=selector),
+        lambda path=row["strata_data_path"]: control.delete_model_resource_paths([path]),
+    ):
+        try:
+            operation()
+        except ValueError as exc:
+            assert "Strata" in str(exc), exc
+        else:
+            raise AssertionError(f"generic resource action was allowed for {selector}")
+
+blocked_row = next(iter(rows.values()))
+instance = {"id": "GPU0", "kind": "single", "gpu_index": 0, "gpu_indices": [0],
+            "mode": blocked_row["selector"], "port": 19450}
+iq2_instance = dict(instance, mode=iq2_xs["selector"])
+ready_calls = []
+def stratum_timeout(*args, **kwargs):
+    ready_calls.append(kwargs.get("timeout"))
+    raise RuntimeError("Timed out waiting for runtime readiness at http://127.0.0.1:19450/v1/models.\nStrata fixture logs")
+with patch.object(control, "instance_variant_spec", return_value=iq2_xs), \
+     patch.object(control, "_instance_launch",
+                  side_effect=lambda target: {"instance": target, "output": "started"}), \
+     patch.object(control, "instance_ready_url",
+                  return_value="http://127.0.0.1:19450/v1/models"), \
+     patch.object(control, "instance_container_name", return_value="strata-gpu0"), \
+     patch.object(control, "wait_for_runtime_ready", side_effect=stratum_timeout), \
+     patch.object(control, "stop_instance", return_value=(0, "compose down")) as stop_timed_out, \
+     patch.object(control, "clear_switch_failure"):
+    boot_result = control.start_instances_parallel([iq2_instance])
+assert ready_calls == [300], ready_calls
+stop_timed_out.assert_called_once_with("GPU0", timeout=60)
+assert len(boot_result["failed"]) == 1
+assert "Strata fixture logs" in boot_result["failed"][0]["error"]
+assert os.path.isdir(iq2_xs["strata_data_path"]), iq2_xs["strata_data_path"]
+non_strata_timeouts = []
+with patch.object(control, "instance_variant_spec", return_value={"engine": "vllm"}), \
+     patch.object(control, "is_strata_variant", return_value=False), \
+     patch.object(control, "instance_ready_url",
+                  return_value="http://127.0.0.1:19450/v1/models"), \
+     patch.object(control, "instance_container_name", return_value="vllm-gpu0"), \
+     patch.object(control, "variant_engine_family", return_value="vllm"), \
+     patch.object(control, "wait_for_runtime_ready",
+                  side_effect=lambda *args, **kwargs: non_strata_timeouts.append(kwargs.get("timeout"))), \
+     patch.object(control, "maybe_warmup_variant_runtime",
+                  return_value={"skipped": True, "reason": "fixture"}), \
+     patch.object(control, "clear_switch_failure"):
+    control._instance_wait_until_ready(instance)
+assert non_strata_timeouts == [900], non_strata_timeouts
+managed_config = [
+    {"id": "GPU0", "mode": iq2_xs["selector"], "enabled": False},
+    {"id": "GPU1", "mode": "vllm/default", "enabled": True},
+    {"id": "GPU2", "mode": "", "enabled": False},
+]
+with patch.object(control, "read_instances_config", return_value=managed_config), \
+     patch.object(control, "stop_instance", side_effect=[(0, "compose down"), (1, "stop failed")]) as managed_stop:
+    managed_results = control.stop_managed_instances()
+assert [row["id"] for row in managed_results] == ["GPU0", "GPU1"]
+assert [row["rc"] for row in managed_results] == [0, 1], managed_results
+assert managed_results[1]["output"] == "stop failed"
+assert managed_stop.call_args_list[0].args == ("GPU0",)
+assert managed_stop.call_args_list[1].args == ("GPU1",)
+with patch.object(control, "instance_variant_spec", return_value=blocked_row), \
+     patch.object(control, "evaluate_strata_hardware",
+                  return_value={"hardware_blocked": True, "hardware_block_reason": "fixture incompatible"}), \
+     patch.object(control, "ensure_variant_install_ready", side_effect=AssertionError("install preflight ran")), \
+     patch.object(control, "preflight_instance_docker_images", side_effect=AssertionError("image preflight ran")):
+    try:
+        control._instance_launch(instance)
+    except RuntimeError as exc:
+        assert "fixture incompatible" in str(exc), exc
+    else:
+        raise AssertionError("hardware-blocked Strata assignment launched")
+
+with patch.object(control, "instance_variant_spec", return_value=blocked_row), \
+     patch.object(control, "resolve_variant_launch_env", return_value={}):
+    artifact_paths = control.write_instance_artifacts(instance)
+env_text = open(artifact_paths["env"], encoding="utf-8").read()
+override_text = open(artifact_paths["override"], encoding="utf-8").read()
+assert "GPU=0" in env_text and "STRATA_API_KEY=" in env_text
+assert all(name not in env_text + override_text for name in
+           ("VLLM_CACHE_ROOT", "TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR"))
+assert os.stat(artifact_paths["env"]).st_mode & 0o777 == 0o600
+assert os.stat(artifact_paths["override"]).st_mode & 0o777 == 0o600
+orca_row = next(row for row in rows.values() if row.get("strata_install_mode") == "orca")
+orca_instance = {"id": "ORCA0", "kind": "single", "gpu_index": 0, "gpu_indices": [0],
+                 "mode": orca_row["selector"], "port": 19451}
+with patch.object(control, "instance_variant_spec", return_value=orca_row), \
+     patch.object(control, "resolve_variant_launch_env", return_value={}):
+    orca_paths = control.write_instance_artifacts(orca_instance)
+orca_override = open(orca_paths["override"], encoding="utf-8").read()
+assert "serve.server" in orca_override and "/data/config/strata-orca-iq3_xxs.json" in orca_override
+assert "entrypoint: !override" in orca_override and "VLLM_CACHE_ROOT" not in orca_override
+selector = blocked_row["selector"]
+proxy_instance = {"id": "GPU0", "mode": selector, "gpu_index": 0,
+                  "gpu_indices": [0], "port": 19450}
+for path in (f"/v1/{selector}/models", f"/{selector}/models"):
+    upstream, parsed_selector, _cap = control.parse_preset_path(path)
+    assert parsed_selector == selector and upstream == "/v1/models", (path, upstream, parsed_selector)
+with patch.object(control, "resolve_variant_spec", return_value=blocked_row), \
+     patch.object(control, "visible_instances", return_value=[proxy_instance]), \
+     patch.object(control, "instance_running", return_value=True), \
+     patch.object(control, "instance_runtime_port", return_value=19450), \
+     patch.object(control, "instance_runtime_container_name", return_value="club3090-gpu0"), \
+     patch.object(control, "strata_runtime_ready", return_value=True), \
+     patch.object(control, "vllm_container_names", side_effect=AssertionError("global vLLM lookup ran")):
+    target, target_spec = control.proxy_running_target_for_selector(selector)
+    assert target and target["id"] == "GPU0" and target_spec["engine"] == "strata"
+with patch.object(control, "resolve_variant_spec", return_value=blocked_row), \
+     patch.object(control, "visible_instances", return_value=[proxy_instance]), \
+     patch.object(control, "instance_running", return_value=True), \
+     patch.object(control, "instance_runtime_port", return_value=19450), \
+     patch.object(control, "instance_runtime_container_name", return_value="club3090-gpu0"), \
+     patch.object(control, "strata_runtime_ready", return_value=False):
+    target, _target_spec = control.proxy_running_target_for_selector(selector)
+    assert target is None, target
+import tempfile
+import control.shared as shared
+orca_data = os.path.join(os.environ["MODEL_DIR"], "strata-orca-smoke")
+orca_variant = {"strata_data_path": orca_data, "strata_source_path": os.path.join(control.CONTROL_DIR, "builtin-models", "strata", "source"), "strata_image": "club3090-strata:v0.1.40.1"}
+with patch.object(shared, "_run_hf_download_step", side_effect=AssertionError("download ran without token")):
+    try:
+        control._prepare_strata_orca("job", "[model-install orca]", orca_variant, {})
+    except RuntimeError as exc:
+        assert "authorized" in str(exc) and "gated repository" in str(exc), exc
+    else:
+        raise AssertionError("Orca install accepted missing HF token")
+assert not os.path.exists(orca_data)
+def fake_orca_download(_job, _prefix, step, _env):
+    assert step["repo_ids"] == ["orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF"]
+    for name in step["filenames"]:
+        with open(os.path.join(step["local_dir"], name), "wb") as handle:
+            handle.write(b"fixture shard")
+class FakeProcess:
+    def wait(self):
+        return 0
+def fake_orca_docker(argv, **_kwargs):
+    command = argv[-1]
+    assert "tools/iq_pack.py" in command and "--compat-bf16" in command
+    assert "tools/mtp_fetch.py fetch --out /data/mtp" in command
+    assert "tools/mtp_pack.py --src /data/mtp --experts q2_0 --out /data/mtp/mtp-q2_0.gguf" in command
+    assert "tools/mtp_rt.py --gguf /data/mtp/mtp-q2_0.gguf --out /data/mtp/rt" in command
+    assert "cp /opt/strata/data/draft_vocab.bin /data/mtp/rt/draft_vocab.bin" in command
+    for relative in ("packs/orca-iq3_xxs/tokenizer", "packs/orca-iq3_xxs/index.txt",
+                     "packs/orca-iq3_xxs/dense.bin", "packs/orca-iq3_xxs/native_experts.txt",
+                     "mtp/mtp-q2_0.gguf", "mtp/rt/draft_vocab.bin"):
+        target = os.path.join(orca_data, relative)
+        if relative.endswith("/tokenizer"):
+            os.makedirs(target, exist_ok=True)
+        else:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "wb") as handle:
+                handle.write(b"prepared")
+    return FakeProcess()
+with patch.object(shared, "_run_hf_download_step", side_effect=fake_orca_download), \
+     patch.object(shared.subprocess, "Popen", side_effect=fake_orca_docker), \
+     patch.object(shared, "_stream_process_output_to_audit"):
+    control._prepare_strata_orca("job", "[model-install orca]", orca_variant, {"HF_TOKEN": "fixture-secret"})
+orca_config = open(os.path.join(orca_data, "config", "strata-orca-iq3_xxs.json"), encoding="utf-8").read()
+assert "orcarouter-qwen3.8-flash-next-uncensored-iq3_xxs" in orca_config
+assert "fixture-secret" not in orca_config and "api_key" not in orca_config.lower()
+assert json.loads(orca_config)["fit_max_tokens"] is True
+import io
+import threading
+log_dir = tempfile.mkdtemp(prefix="strata-log-fixture-")
+shared.CONTROL_DIR = log_dir
+shared.AUDIT_LOG_FILE = os.path.join(log_dir, "audit.log")
+shared.DEBUG_LOG_FILE = os.path.join(log_dir, "debug.log")
+shared.append_audit_text_line("audit one\naudit two")
+shared.append_debug_text_chunk("chunk one\nchunk two\n")
+shared.append_debug_text_line("debug complete")
+shared._stream_process_output_to_audit(type("Output", (), {"stdout": io.BytesIO(b"compiler warning one\ncompiler warning two\n")})(), "[model-install fixture]")
+audit_entries = open(shared.AUDIT_LOG_FILE, encoding="utf-8").read().splitlines()
+debug_entries = open(shared.DEBUG_LOG_FILE, encoding="utf-8").read().splitlines()
+stamp_pattern = __import__("re").compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d ")
+assert all(stamp_pattern.match(line) and not stamp_pattern.match(line[20:]) for line in audit_entries + debug_entries)
+assert any("[model-install fixture] compiler warning one" in line for line in audit_entries)
+import control.logs as runtime_logs
+runtime_logs.LOG_BOOTSTRAP_MARKER = "fixture-bootstrap-marker"
+watcher = object.__new__(runtime_logs.RuntimeLogWatcher)
+watcher.container_name = "fixture"
+watcher.cond = threading.Condition()
+watcher.bootstrap_lines = []
+watcher.bootstrap_done = False
+watcher.tail_lines = __import__("collections").deque()
+watcher.tail_bytes = 0
+watcher.events = __import__("collections").deque(maxlen=10)
+watcher.last_timestamp = ""
+watcher.last_line = ""
+watcher.seq = 0
+watcher.status_message = ""
+watcher._append_line("compiler warning", timestamp="2026-10-06T10:11:12.000000000Z")
+assert watcher.bootstrap_lines == ["2026-10-06T10:11:12.000000000Z compiler warning"]
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import threading
+api_key = control.ensure_strata_api_key()
+class ReadyHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        authorized = self.path == "/v1/models" and self.headers.get("Authorization") == f"Bearer {api_key}"
+        status = 200 if self.path == "/health" or authorized else 401
+        self.send_response(status)
+        self.end_headers()
+        self.wfile.write(b"{}")
+    def log_message(self, *args):
+        pass
+server = ThreadingHTTPServer(("127.0.0.1", 0), ReadyHandler)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+try:
+    root_url = f"http://127.0.0.1:{server.server_port}/"
+    assert system.strata_runtime_ready("fixture", root_url)
+    with patch.object(control, "ensure_strata_api_key", return_value="invalid"):
+        assert not system.strata_runtime_ready("fixture", root_url)
+finally:
+    server.shutdown()
+'''
+        evaluator_env = dict(env)
+        evaluator_env["STRATA_SMOKE_EXPECTED"] = json.dumps(sorted(expected))
+        evaluator_env["STRATA_SMOKE_ROWS"] = json.dumps(list(rows.values()))
+        evaluator_run = subprocess.run(
+            [sys.executable, "-c", evaluator],
+            cwd=str(root / "src"), env=evaluator_env, capture_output=True,
+            text=True, check=False, timeout=30,
+        )
+        if evaluator_run.returncode:
+            return False, f"Strata hardware evaluator smoke failed: {evaluator_run.stderr.strip() or evaluator_run.stdout.strip()}"
+        return True, "ten Strata variants use isolated MODEL_DIR data roots, pinned-image labels, selector/token/family metadata, Orca preparation, and hardware evaluator behavior"
+
+
+def run_power_runtime_smoke_test(root: Path) -> tuple[bool, str]:
+    root = Path(root).resolve()
+    script = r'''
+import datetime
+import os
+import subprocess
+import sys
+from types import SimpleNamespace
+
+import control
+import importlib.util
+http_server_spec = importlib.util.spec_from_file_location("power_smoke_http_server", os.path.join(control.SOURCE_ROOT, "src", "control", "http_server.py"))
+http_server = importlib.util.module_from_spec(http_server_spec)
+http_server_spec.loader.exec_module(http_server)
+
+commands = []
+control.shutil.which = lambda name: "/usr/bin/nvidia-smi" if name == "nvidia-smi" else None
+control.run_cmd = lambda command, timeout=20: (commands.append(list(command)) or (0, "All done."))
+control.apply_fan_curve_once = lambda: []
+control.set_cpu_governor = lambda governor: [governor]
+control.clear_gpu_session_peaks = lambda: None
+selected = control.apply_gpu_power_profile("eco")
+assert selected["gpu_profile"] == "eco" and control.GPU_ACTIVE_POWER_LIMIT_W == 240, selected
+assert ["nvidia-smi", "-pl", "240"] in commands, commands
+saved = control.read_server_config()
+assert saved["active_gpu_power_profile"] == "eco", saved
+restored = subprocess.run(
+    [sys.executable, "-c", RESTORE_SCRIPT],
+    check=False, capture_output=True, text=True, timeout=30,
+    env=os.environ.copy(),
+)
+if restored.returncode:
+    raise AssertionError(restored.stderr or restored.stdout)
+
+now = datetime.datetime.now(datetime.timezone.utc)
+log_text = ""
+control.metrics["active_requests"] = 0
+control.read_instances_config = lambda: []
+control.current_container = lambda: "strata"
+control.get_runtime_log_watcher = lambda name: SimpleNamespace(snapshot=lambda: {"text": log_text})
+control.benchmark_power_actions_owned = lambda: False
+control.script_power_actions_owned = lambda: False
+control.image_studio_activity_active = lambda: False
+control.switch_job_active = lambda: False
+control.POWER_IDLE_AFTER_SECONDS = 10
+control.runtime_activity_last_seen = now.timestamp() - 100
+control.runtime_active_observed = False
+control.runtime_idle_power_applied = False
+power_events = []
+control.ensure_default_runtime_power = lambda reason: power_events.append(("active", reason))
+control.apply_cpu_idle_power = lambda: power_events.append(("cpu_idle",))
+control.apply_gpu_idle_power = lambda: power_events.append(("gpu_idle",))
+stamp = now.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+log_text = f"{stamp} [strata] thinking: 4418 of max 16384 tokens"
+assert control.reconcile_runtime_power(now=now.timestamp())["active"]
+assert ("active", "runtime_activity_detected") in power_events, power_events
+tool_time = now + datetime.timedelta(seconds=1)
+log_text = f"{tool_time.strftime('%Y-%m-%dT%H:%M:%S.%fZ')} [strata] writing a tool call: get_weather"
+assert not control.reconcile_runtime_power(now=tool_time.timestamp())["active"]
+assert not any(event[0].endswith("_idle") for event in power_events), power_events
+done_time = tool_time + datetime.timedelta(seconds=1)
+log_text = f"{done_time.strftime('%Y-%m-%dT%H:%M:%S.%fZ')} [strata] done: 4418 tokens"
+assert not control.reconcile_runtime_power(now=done_time.timestamp())["idle_applied"]
+assert not any(event[0].endswith("_idle") for event in power_events), power_events
+idle_time = done_time.timestamp() + 11
+assert control.reconcile_runtime_power(now=idle_time)["idle_applied"]
+assert ("cpu_idle",) in power_events and ("gpu_idle",) in power_events, power_events
+
+control.metrics["active_requests"] = 0
+control.metrics["queued_requests"] = 0
+control.metrics["failed_requests"] = 0
+http_server.primary_instance = lambda: None
+http_server.active_mode = lambda: "test"
+http_server.active_port = lambda: 8000
+http_server.resolve_variant_spec = lambda mode: {}
+http_server.benchmark_job_active = lambda: False
+http_server.proxy_swap_feature_enabled = lambda: False
+http_server.proxy_requested_selector = lambda body, preset: ""
+http_server.authorize_proxy_request = lambda *args, **kwargs: (True, {"user_name": "", "count_request": False, "permissions": {}})
+http_server.ensure_vllm_running_for_request = lambda target: (_ for _ in ()).throw(RuntimeError("startup failed"))
+http_server.record_user_usage = lambda *args: None
+http_server.log_control = lambda *args: None
+response = []
+handler = object.__new__(http_server.ProxyHandler)
+handler.headers = {}
+handler.path = "/v1/models"
+handler.send_json = lambda payload, status: response.append((payload, status))
+http_server.last_request_finished_at = 0
+handler.forward(None, "/v1/models", "", None)
+assert http_server.metrics["active_requests"] == 0, http_server.metrics
+assert http_server.last_request_finished_at > 0, http_server.last_request_finished_at
+assert response and response[0][1] == 502, response
+startup_order = []
+http_server.ensure_runtime_config_file = lambda: None
+http_server.ensure_code_syntax_config_file = lambda: None
+http_server.restore_persisted_performance_profile = lambda apply_now=False: startup_order.append(("restore_profile", apply_now))
+http_server.restore_persisted_fan_state = lambda apply_now=False: None
+http_server.write_server_config = lambda config: config
+http_server.ensure_local_api_token = lambda: None
+http_server.recover_benchmark_state_on_startup = lambda: None
+http_server.port_open = lambda *args, **kwargs: True
+http_server.load_runtime_inventory = lambda **kwargs: startup_order.append(("load_inventory",))
+http_server.boot_enabled_instances = lambda: startup_order.append(("boot",))
+http_server.sys.argv = ["control", "--boot-enabled-instances"]
+http_server.main()
+assert startup_order.index(("restore_profile", True)) < startup_order.index(("boot",)), startup_order
+assert ("load_inventory",) in startup_order, startup_order
+print("profile persistence, boot restoration order, Strata wake/idle transitions, and proxy startup-error completion passed")
+'''
+    restore_script = r'''
+import control
+commands = []
+control.shutil.which = lambda name: "/usr/bin/nvidia-smi" if name == "nvidia-smi" else None
+control.run_cmd = lambda command, timeout=20: (commands.append(list(command)) or (0, "All done."))
+control.apply_fan_curve_once = lambda: []
+control.set_cpu_governor = lambda governor: [governor]
+control.clear_gpu_session_peaks = lambda: None
+restored = control.restore_persisted_performance_profile(apply_now=True)
+assert restored["gpu_profile"] == "eco", restored
+assert ["nvidia-smi", "-pl", "240"] in commands, commands
+'''
+    script = script.replace("RESTORE_SCRIPT", repr(restore_script))
+    with tempfile.TemporaryDirectory(prefix="club3090-power-runtime-") as temp_raw:
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(root / "src")
+        env["CLUB3090_CONTROL_DIR"] = temp_raw
+        for key in ("CLUB3090_ADMIN_PORT", "CLUB3090_PROXY_PORT", "CLUB3090_ADMIN_BIND_HOST", "CLUB3090_PROXY_BIND_HOST"):
+            env.pop(key, None)
+        result = subprocess.run(
+            [sys.executable, "-c", script], cwd=str(root), env=env,
+            capture_output=True, text=True, check=False, timeout=60,
+        )
+        if result.returncode:
+            return False, f"Power runtime smoke failed: {result.stderr.strip() or result.stdout.strip()}"
+        return True, result.stdout.strip()
+
+
+def run_metrics_dashboard_smoke_test(root: Path) -> tuple[bool, str]:
+    root = Path(root).resolve()
+    script = r'''
+const fs = require("fs");
+const vm = require("vm");
+const window = { metricsPopupStates: {}, addEventListener() {} };
+const context = {
+  window, document: {}, console, setTimeout, clearTimeout, URLSearchParams,
+  Date, Math, Number, String, Object, Array, Map, Set, Promise,
+};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync("src/web/charts.js", "utf8"), context);
+const html = context.metricsPopupPanelHtml();
+const sections = ["Inference", "CPU + RAM", "Network", "System"];
+for (const section of sections) {
+  if (!html.includes(`<h3 class="metric-section-title">${section}</h3>`)) {
+    throw new Error(`Missing Metrics section: ${section}`);
+  }
+}
+if ((html.match(/class="metricpane active"/g) || []).length !== sections.length) {
+  throw new Error("Metrics sections are not all simultaneously active");
+}
+const mainStart = html.indexOf('<div id="mMain"');
+const cpuStart = html.indexOf('<div id="mCpuRam"', mainStart);
+const inference = html.slice(mainStart, cpuStart);
+for (const id of ["cGpu", "cMem", "cLatency", "cTps", "gpuMetricCharts"]) {
+  if (!inference.includes(`id="${id}"`)) throw new Error(`Inference section is missing ${id}`);
+}
+if (html.includes('id="mGpu"')) throw new Error("Obsolete standalone GPU section remains");
+if (html.includes("metricsSourceSelect")) throw new Error("Obsolete Source selector remains");
+if (!html.includes('id="metricsTimeValue"') || !html.includes('id="metricsTimeUnit"')) {
+  throw new Error("Time interval controls are missing");
+}
+const holder = { innerHTML: "" };
+const aggregateDraws = [];
+const gpuDraws = [];
+context.metricsElement = (id) => id === "gpuMetricCharts" ? holder : null;
+context.currentStatusMetricPoint = () => ({});
+context.persistentMetricPeakValue = () => 0;
+context.seriesPeakValue = () => 0;
+context.persistentGpuMetricPeakValue = () => 0;
+context.draw = (id) => aggregateDraws.push(id);
+context.drawGpuSeries = (...args) => gpuDraws.push(args);
+context.holder = holder;
+context.aggregateDraws = aggregateDraws;
+context.gpuDraws = gpuDraws;
+vm.runInContext("metricsSeriesState.points = []", context);
+vm.runInContext('renderMetrics({gpus:[{index:0},{index:1}],system:{}},{skipPopups:true})', context);
+for (const id of ["cGpu", "cMem", "cLatency", "cTps"]) {
+  if (!aggregateDraws.includes(id)) throw new Error(`Aggregate inference chart ${id} was not drawn`);
+}
+if (!holder.innerHTML.includes('id="cGpu0Temp"') || !holder.innerHTML.includes('id="cGpu0Power"')) {
+  throw new Error("Per-GPU core-temperature and power charts were not generated");
+}
+if (holder.innerHTML.indexOf('id="cGpu0Temp"') > holder.innerHTML.indexOf('id="cGpu0Power"') ||
+    holder.innerHTML.indexOf('id="cGpu0Power"') > holder.innerHTML.indexOf('id="cGpu1Temp"')) {
+  throw new Error("Per-GPU temperature and power charts are not grouped by GPU");
+}
+if (gpuDraws.length !== 4 || gpuDraws.some((args) => !["temp", "power"].includes(args[3]))) {
+  throw new Error(`Unexpected per-GPU chart data: ${JSON.stringify(gpuDraws.map((args) => [args[0], args[3]]))}`);
+}
+console.log("four Metrics sections render together; aggregate inference and per-GPU temperature/power charts are generated");
+'''
+    node = shutil.which("node")
+    if not node:
+        return False, "node executable required for Metrics dashboard smoke"
+    result = subprocess.run(
+        [node, "-e", script], cwd=str(root), capture_output=True,
+        text=True, check=False, timeout=15,
+    )
+    if result.returncode:
+        return False, f"Metrics dashboard smoke failed: {result.stderr.strip() or result.stdout.strip()}"
+    return True, result.stdout.strip()
+
+
+def run_logs_theme_smoke_test(root: Path) -> tuple[bool, str]:
+    root = Path(root).resolve()
+    script = r'''
+const fs = require("fs");
+const vm = require("vm");
+const elements = {};
+function element(id) {
+  return elements[id] || (elements[id] = {
+    id, value: "original", innerHTML: "", textContent: "", dataset: {},
+    classList: { toggle() {} },
+  });
+}
+for (const id of ["logThemeSelect", "logRender", "log"]) element(id);
+const values = new Map([["club3090.log-theme.v1", "warm-paper"]]);
+const localStorage = {
+  getItem(key) { return values.get(key) ?? null; },
+  setItem(key, value) { values.set(key, String(value)); },
+};
+const document = {
+  head: { appendChild(style) { elements[style.id] = style; } },
+  getElementById: element,
+  createElement() { return { id: "", textContent: "", dataset: {} }; },
+};
+const window = { logPopupStates: {} };
+const context = {
+  window, document, localStorage, console, Object, String, Array, Set, Map,
+  escapeHtml: (text) => String(text).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;"),
+  $: (id) => document.getElementById(id),
+};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync("src/web/logs.js", "utf8"), context);
+const selector = element("logThemeSelect");
+if (selector.value !== "warm-paper" || !selector.innerHTML.includes("High-Contrast Light")) {
+  throw new Error("Saved theme was not restored into the selector");
+}
+if (element("logRender").dataset.logTheme !== "warm-paper" || element("log").dataset.logTheme !== "warm-paper") {
+  throw new Error("Saved theme was not applied to both main log surfaces");
+}
+if (!element("logThemeStyles").textContent.includes(".ansi-red{color:#a12e28;}")) {
+  throw new Error("Light theme does not retain a readable semantic ANSI palette");
+}
+const themes = vm.runInContext("LOG_THEMES", context);
+function luminance(hex) {
+  const [r, g, b] = hex.slice(1).match(/../g).map((component) => {
+    const channel = parseInt(component, 16) / 255;
+    return channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4;
+  });
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+function contrast(first, second) {
+  const values = [luminance(first), luminance(second)].sort((a, b) => b - a);
+  return (values[0] + 0.05) / (values[1] + 0.05);
+}
+for (const [name, theme] of Object.entries(themes)) {
+  if (name === "original") continue;
+  const pairs = [[theme.foreground, theme.background], [theme.updateForeground, theme.background]];
+  for (const foreground of Object.values(theme.ansiForegrounds)) {
+    for (const background of Object.values(theme.ansiBackgrounds)) pairs.push([foreground, background]);
+  }
+  const minimum = Math.min(...pairs.map(([foreground, background]) => contrast(foreground, background)));
+  if (minimum < 4.5) throw new Error(`${name} palette contrast falls below WCAG AA: ${minimum.toFixed(2)}`);
+}
+const popupElements = {
+  popupLogText: element("popupLogText"),
+  popupLogThemeSelect: element("popupLogThemeSelect"),
+};
+const popupDocument = { getElementById(id) { return popupElements[id] || null; } };
+window.logPopupStates.audit = { win: { closed: false, document: popupDocument } };
+context.setLogTheme("cool-mist");
+if (values.get("club3090.log-theme.v1") !== "cool-mist" ||
+    selector.value !== "cool-mist" ||
+    element("logRender").dataset.logTheme !== "cool-mist" ||
+    popupElements.popupLogText.dataset.logTheme !== "cool-mist" ||
+    popupElements.popupLogThemeSelect.value !== "cool-mist") {
+  throw new Error("Theme selection did not persist and synchronize main and detached viewers");
+}
+const popupHtml = context.detachedLogPopupHtml({ signature: "audit", title: "Audit Logs" });
+if (!popupHtml.includes('id="popupLogThemeSelect"') ||
+    !popupHtml.includes('data-log-theme="cool-mist"') ||
+    !popupHtml.includes('value="cool-mist" selected')) {
+  throw new Error("Detached popup did not render the active theme and selector");
+}
+if (context.setLogTheme("invalid") !== "original" ||
+    element("logRender").dataset.logTheme !== "original" ||
+    popupElements.popupLogThemeSelect.value !== "original") {
+  throw new Error("Invalid theme value did not fall back to Original");
+}
+context.localStorage.setItem = () => { throw new Error("storage unavailable"); };
+if (context.setLogTheme("high-contrast-light") !== "high-contrast-light" ||
+    element("logRender").dataset.logTheme !== "high-contrast-light") {
+  throw new Error("Theme selection failed when browser storage was unavailable");
+}
+console.log("Logs theme persistence, original fallback, ANSI contrast, and popup synchronization passed");
+'''
+    node = shutil.which("node")
+    if not node:
+        return False, "node executable required for Logs theme smoke"
+    result = subprocess.run(
+        [node, "-e", script], cwd=str(root), capture_output=True,
+        text=True, check=False, timeout=15,
+    )
+    if result.returncode:
+        return False, f"Logs theme smoke failed: {result.stderr.strip() or result.stdout.strip()}"
+    return True, result.stdout.strip()

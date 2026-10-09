@@ -264,6 +264,10 @@ def _load_upstream_weights_reader():
     return _store_upstream_cache(_load_upstream_weights_reader, root, value)
 
 
+def _load_weight_reader():
+    return _load_upstream_weights_reader()
+
+
 def _load_upstream_weight_models():
     root = _upstream_repo_cache_root()
     cached = getattr(_load_upstream_weight_models, "_cache", None)
@@ -2494,7 +2498,7 @@ def _resolve_variant_model_dir_root(variant=None):
     if host_model_dir:
         return os.path.normpath(host_model_dir)
     env_map = _load_repo_env_map()
-    raw = str(env_map.get("MODEL_DIR") or "").strip()
+    raw = str(os.environ.get("MODEL_DIR") or env_map.get("MODEL_DIR") or "").strip()
     if not raw:
         return os.path.join(CLUB3090_DIR, "models-cache")
     if os.path.isabs(raw):
@@ -2602,10 +2606,14 @@ def _probe_host_gpus(timeout=8):
 
 def _compute_capability_rank(value):
     text = str(value or "").strip().lower().replace("sm_", "")
+    if text.endswith("+"):
+        text = text[:-1]
     if not text:
         return 0
     if "." in text:
         major, minor = text.split(".", 1)
+    elif re.fullmatch(r"\d{2}", text):
+        major, minor = text[0], text[1]
     else:
         major, minor = text, "0"
     major = re.sub(r"[^0-9]", "", major)
@@ -2783,8 +2791,9 @@ def _apply_variant_hardware_guard(spec, env_map):
         )
     if wrong_sm:
         row = wrong_sm[0]
+        required_sm_display = required_sm if required_sm.endswith("+") else f"{required_sm}+"
         raise RuntimeError(
-            f"{spec_map.get('selector') or spec_map.get('variant_id') or 'Selected preset'} requires sm_{required_sm}+,"
+            f"{spec_map.get('selector') or spec_map.get('variant_id') or 'Selected preset'} requires sm_{required_sm_display},"
             f" but GPU {row['index']} reports sm_{row.get('compute_cap') or 'unknown'}."
         )
     if low_free:
@@ -3561,6 +3570,12 @@ def _launch_setting_ignored(name):
         "VLLM_IMAGE",
         "HF_HOME",
         "MODEL",
+        "FAMILY",
+        "API_KEY",
+        "STRATA_API_KEY",
+        "GPU",
+        "GPUS",
+        "LAYER_SPLIT",
     }
 
 
@@ -4297,7 +4312,70 @@ def _container_model_subpath(model_path):
     return path.strip("/")
 
 
+def strata_image_commit(image):
+    try:
+        result = subprocess.run(
+            [
+                "docker", "image", "inspect",
+                "--format", f'{{{{ index .Config.Labels "{STRATA_IMAGE_COMMIT_LABEL}" }}}}',
+                str(image or ""),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+    except Exception:
+        return ""
+    if result.returncode != 0:
+        return ""
+    return str(result.stdout or "").strip()
+
+
 def _detect_variant_install_state(variant, model_dir_root):
+    if str((variant or {}).get("engine") or "").strip().lower() == "strata":
+        source = str((variant or {}).get("strata_source_path") or os.path.join(CONTROL_DIR, "builtin-models", "strata", "source"))
+        image = str((variant or {}).get("strata_image") or STRATA_IMAGE)
+        try:
+            commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True, stderr=subprocess.DEVNULL, timeout=5).strip()
+        except Exception:
+            commit = ""
+        source_ready = commit == STRATA_COMMIT
+        image_commit = strata_image_commit(image)
+        image_ready = image_commit == STRATA_COMMIT
+        data = str((variant or {}).get("strata_data_path") or "")
+        model_token = str((variant or {}).get("strata_model_token") or "")
+        family = str((variant or {}).get("strata_family") or "")
+        install_mode = str((variant or {}).get("strata_install_mode") or "standard")
+        config_path = str((variant or {}).get("strata_config_path") or strata_setup_config_path(data, family, model_token, install_mode))
+        config_ready = os.path.isfile(config_path)
+        ready = source_ready and image_ready and config_ready
+        if install_mode == "orca":
+            artifacts = [
+                os.path.join(data, "Qwen3.8-Flash-Next-Uncensored-IQ3_XXS-00001-of-00002.gguf"),
+                os.path.join(data, "Qwen3.8-Flash-Next-Uncensored-IQ3_XXS-00002-of-00002.gguf"),
+                os.path.join(data, "packs", "orca-iq3_xxs", "tokenizer"),
+                os.path.join(data, "packs", "orca-iq3_xxs", "index.txt"),
+                os.path.join(data, "packs", "orca-iq3_xxs", "dense.bin"),
+                os.path.join(data, "packs", "orca-iq3_xxs", "native_experts.txt"),
+                os.path.join(data, "mtp", "mtp-q2_0.gguf"),
+                os.path.join(data, "mtp", "rt", "draft_vocab.bin"),
+            ]
+            artifacts_ready = all(os.path.exists(path) for path in artifacts)
+            ready = ready and artifacts_ready
+        else:
+            artifacts_ready = config_ready
+        reasons = []
+        if not source_ready:
+            reasons.append(f"Pinned Strata source at {source} is not at commit {STRATA_COMMIT}.")
+        if not image_ready:
+            reasons.append(f"Strata runtime image {image} is not built from pinned source commit {STRATA_COMMIT} (image label {STRATA_IMAGE_COMMIT_LABEL}={image_commit or 'missing'}).")
+        if not config_ready:
+            reasons.append(f"Strata model setup is incomplete: expected prepared config {config_path}.")
+        if install_mode == "orca" and not artifacts_ready:
+            reasons.append("Required Orca model preparation artifacts are not installed.")
+        return {"install_state": "ready" if ready else "requires_download", "install_command": "strata-image-build", "install_reason": "" if ready else " ".join(reasons)}
     model_id = str((variant or {}).get("model_id") or "").strip()
     if str((variant or {}).get("source_kind") or "").strip().lower() == "custom":
         host_model_dir = str((variant or {}).get("host_model_dir") or "").strip()
@@ -4691,6 +4769,20 @@ def _rebuild_runtime_mode_tables(inventory):
             "install_state": str(entry.get("install_state") or "").strip(),
             "install_command": str(entry.get("install_command") or "").strip(),
             "install_reason": str(entry.get("install_reason") or "").strip(),
+            "hardware_blocked": bool(entry.get("hardware_blocked")),
+            "hardware_block_reason": str(entry.get("hardware_block_reason") or "").strip(),
+            "strata_model_token": str(entry.get("strata_model_token") or ""),
+            "strata_source_path": str(entry.get("strata_source_path") or ""),
+            "strata_data_path": str(entry.get("strata_data_path") or ""),
+            "strata_image": str(entry.get("strata_image") or ""),
+            "strata_commit": str(entry.get("strata_commit") or ""),
+            "recommended_combined_memory_gb": entry.get("recommended_combined_memory_gb"),
+            "strata_family": str(entry.get("strata_family") or ""),
+            "strata_install_mode": str(entry.get("strata_install_mode") or "standard"),
+            "download_size_gb": entry.get("download_size_gb"),
+            "recommended_system_memory_gb": entry.get("recommended_system_memory_gb"),
+            "recommended_resident_memory_gb": entry.get("recommended_resident_memory_gb"),
+            "requires_nvme": bool(entry.get("requires_nvme")),
             "speculative_method": entry.get("speculative_method"),
             "drafted_tokens": entry.get("drafted_tokens"),
             "requires_min_vram_gb": int(entry.get("requires_min_vram_gb") or 0),
@@ -4793,6 +4885,23 @@ def default_dual_mode_selector():
     return DUAL_GPU_MODES[0] if DUAL_GPU_MODES else canonical_mode_selector(DEFAULT_MODE or "vllm/dual")
 
 
+
+def _refresh_strata_install_states(inventory):
+    if not isinstance(inventory, dict):
+        return False
+    changed = False
+    for variant in inventory.get("variants") or []:
+        if not isinstance(variant, dict) or str(variant.get("engine") or "").strip().lower() != "strata":
+            continue
+        state = _detect_variant_install_state(variant, _resolve_variant_model_dir_root(variant))
+        for key in ("install_state", "install_command", "install_reason"):
+            value = state.get(key, "")
+            if variant.get(key) != value:
+                variant[key] = value
+                changed = True
+    return changed
+
+
 def rebuild_runtime_inventory():
     global runtime_inventory_cache, runtime_inventory_built_at
     repo_root = os.path.abspath(CLUB3090_DIR)
@@ -4809,6 +4918,7 @@ def rebuild_runtime_inventory():
     compose_registry = _load_upstream_compose_registry()
     if _migration_normalize_migrated_public_name_collisions(compose_registry, tag_by_compose=tag_by_compose):
         custom_model_rows = read_custom_model_registry()
+    custom_model_rows.extend(strata_builtin_custom_model_rows())
     custom_model_rows.extend(qwen38_builtin_custom_model_rows())
     migrated_selector_by_source_compose = {}
     for row in custom_model_rows:
@@ -5150,7 +5260,7 @@ def rebuild_runtime_inventory():
         profile_like = str(row.get("profile_like") or "").strip()
         registry_entry = compose_registry.get(profile_like) or {}
         profile_engine = str(row.get("profile_engine_id") or registry_entry.get("engine") or "").strip()
-        engine_family = _normalize_engine("vllm")
+        engine_family = _normalize_engine(row.get("engine") or "vllm")
         profile_like_lower = profile_like.lower()
         compose_hint = str(registry_entry.get("compose_path") or compose_rel_path).replace("\\", "/").lower()
         if (
@@ -5160,7 +5270,7 @@ def rebuild_runtime_inventory():
             or "/ik-llama/" in compose_hint
         ):
             engine_family = "llamacpp"
-        engine_display = "llama.cpp" if profile_engine == "llama-cpp-local" else _selector_engine_display(profile_like or str(row.get("selector") or ""), compose_rel_path or compose_hint)
+        engine_display = str(row.get("engine_display") or ("Strata" if engine_family == "strata" else ("llama.cpp" if profile_engine == "llama-cpp-local" else _selector_engine_display(profile_like or str(row.get("selector") or ""), compose_rel_path or compose_hint))))
         runtime_tp = int((runtime_meta.get("tp") or runtime_meta.get("tensor_parallel") or registry_entry.get("tp") or 1) or 1)
         topology = _infer_topology_from_compose_path(
             str(registry_entry.get("compose_path") or compose_rel_path or row.get("selector") or row.get("slug") or ""),
@@ -5214,7 +5324,7 @@ def rebuild_runtime_inventory():
             "custom_preset": bool(custom_preset),
             "engine": engine_family,
             "engine_display": engine_display or engine_family,
-            "engine_profile": str(row.get("profile_engine_id") or registry_entry.get("engine") or "vllm-nightly-clean").strip(),
+            "engine_profile": str(row.get("engine_profile") or row.get("profile_engine_id") or registry_entry.get("engine") or "vllm-nightly-clean").strip(),
             "topology": topology,
             "compose_rel_path": compose_rel_path,
             "compose_abs_path": compose_abs_path,
@@ -5249,7 +5359,7 @@ def rebuild_runtime_inventory():
             "requires_min_vram_gb": int(row.get("requires_min_vram_gb") or 0),
             "requires_min_gpu_count": max(required_gpu_count, int(row.get("requires_min_gpu_count") or 0)),
             "tensor_parallel": runtime_tp,
-            "requires_sm": str(registry_entry.get("required_sm") or "").strip(),
+            "requires_sm": str(row.get("requires_sm") or registry_entry.get("required_sm") or "").strip(),
             "requires_nvlink": bool(custom_nvlink_mode == "required"),
             "nvlink_mode": custom_nvlink_mode,
             "source_kind": "custom",
@@ -5276,6 +5386,20 @@ def rebuild_runtime_inventory():
             "requires_hf_approval": bool(row.get("requires_hf_approval", False)),
             "install_command": str(row.get("install_command") or "").strip(),
             "install_reason": str(row.get("install_reason") or "").strip(),
+            "strata_model_token": str(row.get("strata_model_token") or ""),
+            "strata_source_path": str(row.get("strata_source_path") or ""),
+            "strata_data_path": str(row.get("strata_data_path") or ""),
+            "strata_config_path": str(row.get("strata_config_path") or ""),
+            "strata_image": str(row.get("strata_image") or ""),
+            "strata_commit": str(row.get("strata_commit") or ""),
+            "strata_family": str(row.get("strata_family") or ""),
+            "strata_install_mode": str(row.get("strata_install_mode") or "standard"),
+            "required_chat_template_kwargs": dict(row.get("required_chat_template_kwargs") or {}) if isinstance(row.get("required_chat_template_kwargs"), dict) else {},
+            "download_size_gb": row.get("download_size_gb"),
+            "recommended_system_memory_gb": row.get("recommended_system_memory_gb"),
+            "recommended_resident_memory_gb": row.get("recommended_resident_memory_gb"),
+            "requires_nvme": bool(row.get("requires_nvme")),
+            "recommended_combined_memory_gb": row.get("recommended_combined_memory_gb"),
             "compose_environment": runtime_meta.get("compose_environment") or [],
             "compose_volumes": runtime_meta.get("compose_volumes") or [],
             "compose_volume_targets": runtime_meta.get("compose_volume_targets") or [],
@@ -5442,6 +5566,9 @@ def load_runtime_inventory(force=False, rebuild_if_missing=True):
     if not force:
         data = read_json_file(RUNTIME_INVENTORY_FILE, {})
         if isinstance(data, dict) and data.get("variants"):
+            changed = _refresh_strata_install_states(data)
+            if changed:
+                write_json_file(RUNTIME_INVENTORY_FILE, data)
             _rebuild_runtime_mode_tables(data)
             with runtime_inventory_lock:
                 runtime_inventory_cache = dict(data)

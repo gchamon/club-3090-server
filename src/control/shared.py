@@ -52,9 +52,50 @@ except Exception:
     tomllib = None
 
 SOURCE_ROOT = str(Path(__file__).resolve().parents[2])
+
+def run_git_as_repository_owner(repo_path, args, timeout=3):
+    """Run a bounded, read-only Git command as the repository directory owner."""
+    try:
+        repo = os.path.abspath(str(repo_path or "").strip())
+        owner_uid = os.stat(repo).st_uid
+        if pwd is None:
+            return ""
+        owner = pwd.getpwuid(owner_uid)
+        preexec_fn = None
+        if os.geteuid() != owner_uid:
+            if os.geteuid() != 0:
+                return ""
+            def drop_privileges():
+                os.setgroups(os.getgrouplist(owner.pw_name, owner.pw_gid))
+                os.setgid(owner.pw_gid)
+                os.setuid(owner_uid)
+            preexec_fn = drop_privileges
+        result = subprocess.run(
+            ["git", "-C", repo, *[str(arg) for arg in args]],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+            preexec_fn=preexec_fn,
+            env={**os.environ, "HOME": owner.pw_dir},
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except Exception:
+        return ""
+
 CLUB3090_DIR = os.path.abspath(os.environ.get("CLUB3090_DIR", os.path.join(SOURCE_ROOT, "club-3090")))
 CONTROL_DIR = os.path.abspath(os.environ.get("CLUB3090_CONTROL_DIR", "/var/lib/club3090-control"))
-SCRIPT_VERSION = os.environ.get("CLUB3090_SCRIPT_VERSION", "unknown")
+MCP_PROTOCOL_VERSION = "2025-03-26"
+_configured_script_version = str(os.environ.get("CLUB3090_SCRIPT_VERSION") or "").strip()
+if re.search(r"v\d+\.\d+\.\d+[a-z]*$", _configured_script_version):
+    SCRIPT_VERSION = _configured_script_version
+else:
+    try:
+        with open(os.path.join(SOURCE_ROOT, "metadata.json"), "r", encoding="utf-8") as _metadata_file:
+            _metadata_version = str(json.load(_metadata_file).get("version") or "").strip()
+        SCRIPT_VERSION = f"v{_metadata_version}" if re.fullmatch(r"\d+\.\d+\.\d+[a-z]*", _metadata_version) else "unknown"
+    except Exception:
+        SCRIPT_VERSION = "unknown"
 SCRIPT_CLUB3090_COMPAT = {}
 _SCRIPT_VERSION_MATCH = re.search(r"v(\d+)\.(\d+)\.(\d+)([a-z]*)\s*$", str(SCRIPT_VERSION or ""))
 DEBUG_LOGS = not (_SCRIPT_VERSION_MATCH and int(_SCRIPT_VERSION_MATCH.group(3)) == 0)
@@ -514,27 +555,27 @@ INSTANCE_VLLM_CACHE_CONTAINER_ROOT = "/root/.cache/club3090-instance"
 
 PRESETS = {
     "qwen_chat": {
-        "chat_template_kwargs": {"enable_thinking": False},
+        "chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True},
         "temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0,
         "presence_penalty": 1.5, "repetition_penalty": 1.0,
     },
     "qwen_general": {
-        "chat_template_kwargs": {"enable_thinking": False},
+        "chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True},
         "temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0,
         "presence_penalty": 1.5, "repetition_penalty": 1.0,
     },
     "qwen_coding": {
-        "chat_template_kwargs": {"enable_thinking": False},
+        "chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True},
         "temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0,
         "presence_penalty": 0, "repetition_penalty": 1.0,
     },
     "qwen_coding_fast": {
-        "chat_template_kwargs": {"enable_thinking": False},
+        "chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True},
         "temperature": 0.8, "top_p": 0.95, "top_k": 20, "min_p": 0,
         "presence_penalty": 0, "repetition_penalty": 1.0,
     },
     "qwen_thinking": {
-        "chat_template_kwargs": {"enable_thinking": True},
+        "chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True},
         "temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0,
         "presence_penalty": 1.5,
     },
@@ -544,27 +585,28 @@ PRESETS = {
         "presence_penalty": 1.5,
     },
     "gemma_coding": {
-        "chat_template_kwargs": {"enable_thinking": False},
+        "chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True},
         "temperature": 1.0, "top_p": 0.95, "top_k": 64, "min_p": 0,
         "presence_penalty": 0, "repetition_penalty": 1.0,
     },
     "gemma_thinking": {
-        "chat_template_kwargs": {"enable_thinking": True},
+        "chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True},
         "temperature": 1.0, "top_p": 0.95, "top_k": 64, "min_p": 0,
         "presence_penalty": 0, "repetition_penalty": 1.0,
     },
 }
 
 DEFAULT_PRESET_DESCRIPTIONS = {
-    "qwen_chat": "Qwen general chat: no thinking, temperature 1.0, top_p 0.95, top_k 20, min_p 0, presence penalty 1.5.",
-    "qwen_general": "Qwen lower-temperature general preset: no thinking, temperature 0.7, top_p 0.8, top_k 20, presence penalty 1.5.",
-    "qwen_coding": "Qwen coding-tuned sampling: no thinking, temperature 0.6, top_p 0.95, no presence penalty.",
-    "qwen_coding_fast": "Qwen faster/looser coding preset: no thinking, temperature 0.8, top_p 0.95, no presence penalty.",
-    "qwen_thinking": "Qwen thinking enabled with temperature 1.0, top_p 0.95, presence penalty 1.5.",
-    "qwen_preserve_thinking": "Qwen thinking enabled and preserved in output with the same base sampling parameters.",
-    "gemma_coding": "Gemma coding preset from Unsloth guidance: no thinking, temperature 1.0, top_p 0.95, top_k 64.",
-    "gemma_thinking": "Gemma thinking preset from Unsloth guidance: enable_thinking true, temperature 1.0, top_p 0.95, top_k 64.",
+    "qwen_chat": "Qwen general chat with thinking enabled and preserved, temperature 1.0, top_p 0.95, top_k 20, min_p 0, presence penalty 1.5.",
+    "qwen_general": "Qwen lower-temperature general preset with thinking enabled and preserved, temperature 0.7, top_p 0.8, top_k 20, presence penalty 1.5.",
+    "qwen_coding": "Qwen coding-tuned sampling with thinking enabled and preserved, temperature 0.6, top_p 0.95, no presence penalty.",
+    "qwen_coding_fast": "Qwen faster/looser coding preset with thinking enabled and preserved, temperature 0.8, top_p 0.95, no presence penalty.",
+    "qwen_thinking": "Qwen thinking enabled and preserved with temperature 1.0, top_p 0.95, presence penalty 1.5.",
+    "qwen_preserve_thinking": "Qwen thinking enabled and preserved with the same base sampling parameters.",
+    "gemma_coding": "Gemma coding preset with thinking enabled and preserved, temperature 1.0, top_p 0.95, top_k 64.",
+    "gemma_thinking": "Gemma preset with thinking enabled and preserved, temperature 1.0, top_p 0.95, top_k 64.",
 }
+
 LENGTH_PREFIXES = {"short-": 4096, "concise-": 512}
 HOP_HEADERS = {"connection","keep-alive","proxy-authenticate","proxy-authorization","te","trailers","transfer-encoding","upgrade","content-length","host"}
 
@@ -774,6 +816,9 @@ power_optimizations_enabled = True
 fan_manual_override = False
 fan_curve_pause_until = 0.0
 power_state = {"gpu":"unknown", "cpu":"unknown", "container":"running", "fans":"auto", "power_optimizations":"enabled", "last_action":"startup", "last_error":""}
+runtime_activity_last_seen = time.time()
+runtime_active_observed = False
+runtime_idle_power_applied = False
 cooling_scope_instance_id = "GLOBAL"
 fan_curve_resume_token = 0
 
@@ -812,46 +857,6 @@ def _sanitize_chat_stream_state_payload(state):
     }
 
 
-def refresh_power_config_globals():
-    global current_profile, current_gpu_profile, current_cpu_profile
-    global POWER_IDLE_AFTER_SECONDS, CONTAINER_STOP_AFTER_SECONDS
-    global GPU_ACTIVE_POWER_LIMIT_W, GPU_IDLE_POWER_LIMIT_W, GPU_IDLE_LOCK_CLOCKS, GPU_ACTIVE_LOCK_CLOCKS
-    global CPU_ACTIVE_GOVERNOR, CPU_IDLE_GOVERNOR, FAN_MAX_SPEED, FAN_MIN_SAFE_SPEED, PERFORMANCE_PROFILES
-    POWER_IDLE_AFTER_SECONDS = config_int("power", "idle_after_seconds", POWER_IDLE_AFTER_SECONDS)
-    CONTAINER_STOP_AFTER_SECONDS = config_int("power", "container_stop_after_seconds", CONTAINER_STOP_AFTER_SECONDS)
-    GPU_ACTIVE_POWER_LIMIT_W = config_int("power", "gpu_active_power_limit_w", GPU_ACTIVE_POWER_LIMIT_W)
-    GPU_IDLE_POWER_LIMIT_W = config_int("power", "gpu_idle_power_limit_w", GPU_IDLE_POWER_LIMIT_W)
-    GPU_IDLE_LOCK_CLOCKS = config_str("power", "gpu_idle_lock_clocks", GPU_IDLE_LOCK_CLOCKS)
-    GPU_ACTIVE_LOCK_CLOCKS = config_str("power", "gpu_active_lock_clocks", GPU_ACTIVE_LOCK_CLOCKS)
-    CPU_ACTIVE_GOVERNOR = config_str("power", "cpu_active_governor", CPU_ACTIVE_GOVERNOR)
-    CPU_IDLE_GOVERNOR = config_str("power", "cpu_idle_governor", CPU_IDLE_GOVERNOR)
-    FAN_MAX_SPEED = config_int("fans", "max_speed", FAN_MAX_SPEED, minimum=1, maximum=100)
-    FAN_MIN_SAFE_SPEED = config_int("fans", "min_safe_speed", FAN_MIN_SAFE_SPEED, minimum=1, maximum=100)
-    PERFORMANCE_PROFILES = {
-        "eco": {"gpu_active": config_int("profiles.eco", "gpu_active", 240), "gpu_idle": config_int("profiles.eco", "gpu_idle", 90), "idle_clocks": config_str("profiles.eco", "idle_clocks", "210,705"), "cpu_active": config_str("profiles.eco", "cpu_active", "schedutil"), "cpu_idle": config_str("profiles.eco", "cpu_idle", "powersave"), "idle_after": config_int("profiles.eco", "idle_after", 300), "stop_after": config_int("profiles.eco", "stop_after", 1800)},
-        "balanced": {"gpu_active": config_int("profiles.balanced", "gpu_active", GPU_ACTIVE_POWER_LIMIT_W), "gpu_idle": config_int("profiles.balanced", "gpu_idle", GPU_IDLE_POWER_LIMIT_W), "idle_clocks": config_str("profiles.balanced", "idle_clocks", GPU_IDLE_LOCK_CLOCKS), "cpu_active": config_str("profiles.balanced", "cpu_active", CPU_ACTIVE_GOVERNOR), "cpu_idle": config_str("profiles.balanced", "cpu_idle", CPU_IDLE_GOVERNOR), "idle_after": config_int("profiles.balanced", "idle_after", POWER_IDLE_AFTER_SECONDS), "stop_after": config_int("profiles.balanced", "stop_after", CONTAINER_STOP_AFTER_SECONDS)},
-        "fast": {"gpu_active": config_int("profiles.fast", "gpu_active", 300), "gpu_idle": config_int("profiles.fast", "gpu_idle", 120), "idle_clocks": config_str("profiles.fast", "idle_clocks", ""), "cpu_active": config_str("profiles.fast", "cpu_active", "schedutil"), "cpu_idle": config_str("profiles.fast", "cpu_idle", "powersave"), "idle_after": config_int("profiles.fast", "idle_after", 900), "stop_after": config_int("profiles.fast", "stop_after", 3600)},
-        "benchmark-ready": {"gpu_active": config_int("profiles.benchmark_ready", "gpu_active", 220), "gpu_idle": config_int("profiles.benchmark_ready", "gpu_idle", 120), "idle_clocks": config_str("profiles.benchmark_ready", "idle_clocks", ""), "cpu_active": config_str("profiles.benchmark_ready", "cpu_active", "schedutil"), "cpu_idle": config_str("profiles.benchmark_ready", "cpu_idle", "powersave"), "idle_after": config_int("profiles.benchmark_ready", "idle_after", 1800), "stop_after": config_int("profiles.benchmark_ready", "stop_after", 7200)},
-        "benchmark-safe": {"gpu_active": config_int("profiles.benchmark_safe", "gpu_active", 200), "gpu_idle": config_int("profiles.benchmark_safe", "gpu_idle", 120), "idle_clocks": config_str("profiles.benchmark_safe", "idle_clocks", ""), "cpu_active": config_str("profiles.benchmark_safe", "cpu_active", "schedutil"), "cpu_idle": config_str("profiles.benchmark_safe", "cpu_idle", "powersave"), "idle_after": config_int("profiles.benchmark_safe", "idle_after", 1800), "stop_after": config_int("profiles.benchmark_safe", "stop_after", 7200)},
-        "turbo": {"gpu_active": config_int("profiles.turbo", "gpu_active", 350), "gpu_idle": config_int("profiles.turbo", "gpu_idle", 160), "idle_clocks": config_str("profiles.turbo", "idle_clocks", ""), "cpu_active": config_str("profiles.turbo", "cpu_active", "performance"), "cpu_idle": config_str("profiles.turbo", "cpu_idle", "schedutil"), "idle_after": config_int("profiles.turbo", "idle_after", 1800), "stop_after": config_int("profiles.turbo", "stop_after", 7200)},
-    }
-    selected_gpu_profile = str(current_profile or "").strip().lower() if current_profile != current_gpu_profile else str(current_gpu_profile or "").strip().lower()
-    active_profile = PERFORMANCE_PROFILES.get(selected_gpu_profile)
-    if active_profile:
-        if current_profile != current_gpu_profile:
-            current_gpu_profile = selected_gpu_profile
-            current_cpu_profile = "performance" if str(active_profile["cpu_active"]).strip().lower() == "performance" else "adaptive"
-            current_profile = selected_gpu_profile
-        GPU_ACTIVE_POWER_LIMIT_W = int(active_profile["gpu_active"])
-        GPU_IDLE_POWER_LIMIT_W = int(active_profile["gpu_idle"])
-        GPU_IDLE_LOCK_CLOCKS = str(active_profile["idle_clocks"])
-        cpu_profile = CPU_POWER_PROFILES.get(str(current_cpu_profile or "").strip().lower())
-        if cpu_profile:
-            CPU_ACTIVE_GOVERNOR = str(cpu_profile["active"])
-            CPU_IDLE_GOVERNOR = str(cpu_profile["idle"])
-        POWER_IDLE_AFTER_SECONDS = int(active_profile["idle_after"])
-        CONTAINER_STOP_AFTER_SECONDS = int(active_profile["stop_after"])
-    return PERFORMANCE_PROFILES
 
 
 def begin_admin_chat_stream_state(conversation_id, **fields):
@@ -972,69 +977,6 @@ def clear_admin_chat_stream_control(conversation_id):
         admin_chat_stream_controls.pop(conversation_id, None)
 
 
-def _apply_profile_globals(profile_name):
-    global current_profile, current_gpu_profile, current_cpu_profile
-    global GPU_ACTIVE_POWER_LIMIT_W, GPU_IDLE_POWER_LIMIT_W
-    global GPU_IDLE_LOCK_CLOCKS, CPU_ACTIVE_GOVERNOR, CPU_IDLE_GOVERNOR
-    global POWER_IDLE_AFTER_SECONDS, CONTAINER_STOP_AFTER_SECONDS
-    refresh_power_config_globals()
-    name = str(profile_name or "").strip().lower()
-    if name in {"standard", "default"}:
-        name = "balanced"
-    if name not in PERFORMANCE_PROFILES:
-        raise ValueError("Invalid performance profile")
-    cfg = PERFORMANCE_PROFILES[name]
-    GPU_ACTIVE_POWER_LIMIT_W = int(cfg["gpu_active"])
-    GPU_IDLE_POWER_LIMIT_W = int(cfg["gpu_idle"])
-    GPU_IDLE_LOCK_CLOCKS = str(cfg["idle_clocks"])
-    current_gpu_profile = name
-    legacy_cpu_profile = "performance" if str(cfg["cpu_active"]).strip().lower() == "performance" else "adaptive"
-    current_cpu_profile = legacy_cpu_profile
-    cpu_cfg = CPU_POWER_PROFILES[legacy_cpu_profile]
-    CPU_ACTIVE_GOVERNOR = str(cpu_cfg["active"])
-    CPU_IDLE_GOVERNOR = str(cpu_cfg["idle"])
-    POWER_IDLE_AFTER_SECONDS = int(cfg["idle_after"])
-    CONTAINER_STOP_AFTER_SECONDS = int(cfg["stop_after"])
-    current_profile = name
-    return name
-
-
-def _apply_gpu_profile_globals(profile_name):
-    global current_profile, current_gpu_profile
-    global GPU_ACTIVE_POWER_LIMIT_W, GPU_IDLE_POWER_LIMIT_W, GPU_IDLE_LOCK_CLOCKS
-    global POWER_IDLE_AFTER_SECONDS, CONTAINER_STOP_AFTER_SECONDS
-    refresh_power_config_globals()
-    name = str(profile_name or "").strip().lower().replace("_", "-")
-    if name in {"standard", "default"}:
-        name = "balanced"
-    if name not in PERFORMANCE_PROFILES:
-        raise ValueError("Invalid GPU power profile")
-    cfg = PERFORMANCE_PROFILES[name]
-    GPU_ACTIVE_POWER_LIMIT_W = int(cfg["gpu_active"])
-    GPU_IDLE_POWER_LIMIT_W = int(cfg["gpu_idle"])
-    GPU_IDLE_LOCK_CLOCKS = str(cfg["idle_clocks"])
-    POWER_IDLE_AFTER_SECONDS = int(cfg["idle_after"])
-    CONTAINER_STOP_AFTER_SECONDS = int(cfg["stop_after"])
-    current_gpu_profile = name
-    current_profile = name
-    return name
-
-
-def _apply_cpu_profile_globals(profile_name):
-    global current_cpu_profile, CPU_ACTIVE_GOVERNOR, CPU_IDLE_GOVERNOR
-    refresh_power_config_globals()
-    name = str(profile_name or "").strip().lower().replace("_", "-")
-    if name in {"adaptive", "schedutil", "balanced", "eco", "fast"}:
-        name = "adaptive"
-    elif name in {"performance", "turbo"}:
-        name = "performance"
-    if name not in CPU_POWER_PROFILES:
-        raise ValueError("Invalid CPU power profile")
-    cfg = CPU_POWER_PROFILES[name]
-    CPU_ACTIVE_GOVERNOR = str(cfg["active"])
-    CPU_IDLE_GOVERNOR = str(cfg["idle"])
-    current_cpu_profile = name
-    return name
 
 
 def _load_repo_env_map():
@@ -1395,9 +1337,26 @@ def maybe_warmup_variant_runtime(spec, ready_url, *, timeout=240):
             time.sleep(1)
     return {"ok": False, "skipped": False, "reason": last_error or "warmup request failed"}
 
+def _local_log_timestamp():
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _timestamp_human_log_line(text):
+    line = str(text or "").rstrip("\r\n")
+    if not line:
+        return ""
+    if re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\s|$)", line):
+        return line
+    return f"{_local_log_timestamp()} {line}"
+
+
+def _timestamp_human_log_lines(text):
+    return [_timestamp_human_log_line(line) for line in str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n") if line]
+
+
 def log_control(message):
     os.makedirs(CONTROL_DIR, exist_ok=True)
-    line = time.strftime("%Y-%m-%d %H:%M:%S") + " " + str(message).rstrip() + "\n"
+    line = _timestamp_human_log_line(message) + "\n"
     try:
         with open(CONTROL_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(line)
@@ -1516,34 +1475,53 @@ def script_user_agent():
 
 def append_audit_text_line(text):
     os.makedirs(CONTROL_DIR, exist_ok=True)
-    line = str(text or "").rstrip("\n") + "\n"
+    lines = _timestamp_human_log_lines(text)
+    if not lines:
+        return
     try:
         with open(AUDIT_LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(line)
+            f.write("\n".join(lines) + "\n")
     except Exception:
         pass
 
 
 def append_debug_text_line(text):
+    global DEBUG_TEXT_CHUNK_PENDING
     os.makedirs(CONTROL_DIR, exist_ok=True)
-    line = str(text or "").rstrip("\n") + "\n"
-    try:
-        with open(DEBUG_LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(line)
-    except Exception:
-        pass
+    with DEBUG_TEXT_CHUNK_LOCK:
+        pending = DEBUG_TEXT_CHUNK_PENDING
+        DEBUG_TEXT_CHUNK_PENDING = ""
+        lines = _timestamp_human_log_lines(pending) + _timestamp_human_log_lines(text)
+        if not lines:
+            return
+        try:
+            with open(DEBUG_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write("".join(f"{line}\n" for line in lines))
+        except Exception:
+            pass
+
+
+DEBUG_TEXT_CHUNK_LOCK = threading.Lock()
+DEBUG_TEXT_CHUNK_PENDING = ""
 
 
 def append_debug_text_chunk(text):
-    os.makedirs(CONTROL_DIR, exist_ok=True)
-    chunk = str(text or "")
+    global DEBUG_TEXT_CHUNK_PENDING
+    chunk = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
     if not chunk:
         return
-    try:
-        with open(DEBUG_LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(chunk)
-    except Exception:
-        pass
+    with DEBUG_TEXT_CHUNK_LOCK:
+        pending = DEBUG_TEXT_CHUNK_PENDING + chunk
+        lines = pending.split("\n")
+        DEBUG_TEXT_CHUNK_PENDING = lines.pop()
+        if not lines:
+            return
+        os.makedirs(CONTROL_DIR, exist_ok=True)
+        try:
+            with open(DEBUG_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write("".join(f"{_timestamp_human_log_line(line)}\n" for line in lines if line))
+        except Exception:
+            pass
 
 
 def _clear_debug_shell_session_locked():
@@ -3868,8 +3846,18 @@ def run_model_update_check(reason="scheduled", inventory=None):
                 current_resources.pop(key, None)
         state["resources"] = current_resources
         state["last_check_finished_at"] = int(time.time())
-        append_audit_text_line(f"[model-update-check] {reason}: checked {checked} resource{'s' if checked != 1 else ''}")
-        return write_model_update_state(state).get("summary") or {}
+        summary = write_model_update_state(state).get("summary") or {}
+        is_scheduled = str(reason or "").strip().lower() == "scheduled"
+        pending = int(summary.get("pending") or 0)
+        errors = int(summary.get("errors") or 0)
+        if not is_scheduled:
+            append_audit_text_line(f"[model-update-check] {reason}: checked {checked} resource{'s' if checked != 1 else ''}")
+        elif pending or errors:
+            append_audit_text_line(
+                f"[model-update-check] scheduled: {pending} update{'s' if pending != 1 else ''} available, "
+                f"{errors} resource check error{'s' if errors != 1 else ''}"
+            )
+        return summary
     except Exception as exc:
         model_update_check_status["last_error"] = str(exc)
         append_audit_text_line(f"[model-update-check] {reason}: failed: {exc}")
@@ -4771,6 +4759,9 @@ def _preset_resource_path_allowed(path, row):
             continue
     return False
 
+def _model_resource_path_allowed_generic(path):
+    return _preset_resource_path_allowed(path, {})
+
 
 def variant_resource_plan_from_row(row, include_missing=False):
     variant = row if isinstance(row, dict) else {}
@@ -4876,6 +4867,8 @@ def _find_runtime_variant_for_resources(selector="", variant_id=""):
 
 def preset_resource_delete_plan(selector="", variant_id=""):
     row = _find_runtime_variant_for_resources(selector, variant_id)
+    if str(row.get("engine") or "").strip().lower() == "strata":
+        raise ValueError("Strata model data is managed by the runtime; generic resource deletion is disabled.")
     plan = variant_resource_plan_from_row(row, include_missing=False)
     return {
         "variant_id": str(row.get("variant_id") or ""),
@@ -5142,6 +5135,8 @@ def _preset_cache_path_allowed(path, row):
 
 def preset_cache_delete_plan(selector="", variant_id=""):
     row = _find_runtime_variant_for_resources(selector, variant_id)
+    if str(row.get("engine") or "").strip().lower() == "strata":
+        raise ValueError("Strata data and caches are managed by the runtime; generic cache deletion is disabled.")
     cache_root = variant_persistent_cache_host_root(row)
     caches = []
     candidates = []
@@ -5516,6 +5511,21 @@ def delete_model_resource_paths(paths):
     if not requested_paths:
         raise ValueError("Choose at least one resource path to delete.")
     inventory = load_runtime_inventory(force=True)
+    strata_paths = [
+        os.path.realpath(os.path.abspath(str(variant.get(field) or "").strip()))
+        for variant in (inventory.get("variants") or [])
+        if str(variant.get("engine") or "").strip().lower() == "strata"
+        for field in ("strata_data_path", "strata_source_path")
+        if str(variant.get(field) or "").strip()
+    ]
+    for requested in requested_paths:
+        for reserved in strata_paths:
+            try:
+                common = os.path.commonpath([reserved, requested])
+            except Exception:
+                continue
+            if common in {reserved, requested}:
+                raise ValueError("Generic model resource deletion cannot target Strata source or persistent data.")
     affected_variants = []
     for variant in inventory.get("variants") or []:
         resources = variant_resource_plan_from_row(variant, include_missing=True).get("resources") or []
@@ -6181,6 +6191,176 @@ def _wait_for_model_update_targets(job_id, prefix, affected_variants):
             time.sleep(10)
 
 
+def _prepare_strata_orca(job_id, prefix, variant, env_map):
+    token = str((env_map or {}).get("HF_TOKEN") or "").strip()
+    if not token:
+        raise RuntimeError("OrcaRouter requires HF_TOKEN already authorized for gated repository orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF.")
+    data_root = os.path.abspath(str((variant or {}).get("strata_data_path") or ""))
+    model_root = os.path.abspath(_resolve_variant_model_dir_root({}))
+    if not data_root or not _path_is_within(model_root, data_root):
+        raise RuntimeError("Orca data path is outside the configured MODEL_DIR.")
+    os.makedirs(data_root, exist_ok=True)
+    filenames = [
+        "Qwen3.8-Flash-Next-Uncensored-IQ3_XXS-00001-of-00002.gguf",
+        "Qwen3.8-Flash-Next-Uncensored-IQ3_XXS-00002-of-00002.gguf",
+    ]
+    step = {
+        "repo_ids": ["orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF"],
+        "filenames": filenames,
+        "local_dir": data_root,
+    }
+    try:
+        _run_hf_download_step(job_id, prefix, step, env_map)
+    except Exception as exc:
+        raise RuntimeError(
+            "OrcaRouter download failed; verify HF_TOKEN is authorized for gated repository "
+            "orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF. "
+            f"Downloader: {str(exc)[:500]}"
+        ) from exc
+    shard1, shard2 = (os.path.join(data_root, name) for name in filenames)
+    if not all(os.path.isfile(path) for path in (shard1, shard2)):
+        raise RuntimeError("OrcaRouter gated download did not produce both IQ3_XXS shards; authorize the token and retry.")
+    source = os.path.abspath(str((variant or {}).get("strata_source_path") or ""))
+    image = str((variant or {}).get("strata_image") or "")
+    config = {
+        "exe": "build/strata",
+        "args": ["--pack", "/data/packs/orca-iq3_xxs", "--native", f"/data/{filenames[0]}", "--ple-gguf", f"/data/{filenames[0]}", "--expert-profile", "/opt/strata/data/expert-profile.bin", "--expert-cache", "auto", "--prefill", "512", "--spec", "4", "--spec-min-p", "0.5", "--mtp", "/data/mtp/rt", "--max-context", "262144", "--kv", "int8"],
+        "cwd": "/opt/strata", "tokenizer": "/data/packs/orca-iq3_xxs/tokenizer",
+        "model_name": "orcarouter-qwen3.8-flash-next-uncensored-iq3_xxs",
+        "log": "/data/strata-orca-iq3_xxs.log", "host": "0.0.0.0", "port": 8080,
+        "fit_max_tokens": True,
+    }
+    config_dir = os.path.join(data_root, "config")
+    os.makedirs(config_dir, exist_ok=True)
+    config_path = os.path.join(config_dir, "strata-orca-iq3_xxs.json")
+    with open(config_path, "w", encoding="utf-8") as handle:
+        json.dump(config, handle, indent=2)
+        handle.write("\n")
+    os.chmod(config_path, 0o600)
+    docker_command = [
+        "docker", "run", "--rm", "-v", f"{data_root}:/data",
+        "-e", "STRATA_GGUF_PY=/opt/strata/third_party/llama.cpp/gguf-py",
+        "--entrypoint", "/bin/bash", image, "-lc",
+        "set -e; cd /opt/strata; "
+        f".venv/bin/python tools/iq_pack.py --gguf /data/{shlex.quote(filenames[0])} --out /data/packs/orca-iq3_xxs --compat-bf16; "
+        ".venv/bin/python tools/mtp_fetch.py fetch --out /data/mtp; "
+        ".venv/bin/python tools/mtp_pack.py --src /data/mtp --experts q2_0 --out /data/mtp/mtp-q2_0.gguf; "
+        ".venv/bin/python tools/mtp_rt.py --gguf /data/mtp/mtp-q2_0.gguf --out /data/mtp/rt; "
+        "cp /opt/strata/data/draft_vocab.bin /data/mtp/rt/draft_vocab.bin",
+    ]
+    process = subprocess.Popen(docker_command, cwd=CLUB3090_DIR, env=env_map, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=False, bufsize=0)
+    _register_model_install_process(job_id, process)
+    try:
+        _stream_process_output_to_audit(process, prefix)
+        if int(process.wait()) != 0:
+            raise RuntimeError("OrcaRouter compatibility packing/MTP preparation failed.")
+    finally:
+        _clear_model_install_process(job_id, process)
+    expected = (
+        shard1, shard2,
+        os.path.join(data_root, "packs", "orca-iq3_xxs", "tokenizer"),
+        os.path.join(data_root, "packs", "orca-iq3_xxs", "index.txt"),
+        os.path.join(data_root, "packs", "orca-iq3_xxs", "dense.bin"),
+        os.path.join(data_root, "packs", "orca-iq3_xxs", "native_experts.txt"),
+        os.path.join(data_root, "mtp", "mtp-q2_0.gguf"),
+        os.path.join(data_root, "mtp", "rt"),
+        os.path.join(data_root, "mtp", "rt", "draft_vocab.bin"),
+        config_path,
+    )
+    if not all(os.path.exists(path) for path in expected):
+        raise RuntimeError("OrcaRouter preparation completed without all required shards, tokenizer, MTP vocabulary, and config artifacts.")
+    if not any(name.endswith(".gguf") or name.endswith(".bin") for name in os.listdir(os.path.join(data_root, "packs", "orca-iq3_xxs"))):
+        raise RuntimeError("OrcaRouter compatibility pack is missing its packed model artifacts.")
+
+
+def _strata_setup_config_is_262k(config):
+    args = config.get("args") if isinstance(config, dict) else None
+    if not isinstance(args, list):
+        return False
+    try:
+        context_index = args.index("--max-context")
+    except ValueError:
+        return False
+    return context_index + 1 < len(args) and str(args[context_index + 1]) == "262144"
+
+
+def _prepare_strata_model(job_id, prefix, variant, env_map):
+    data_root = os.path.abspath(str((variant or {}).get("strata_data_path") or ""))
+    config_path = os.path.abspath(str((variant or {}).get("strata_config_path") or ""))
+    compose_path = os.path.abspath(str((variant or {}).get("derived_compose_path") or ""))
+    builtin_root = os.path.join(CONTROL_DIR, "builtin-models")
+    model_root = os.path.abspath(_resolve_variant_model_dir_root({}))
+    if not data_root or not _path_is_within(model_root, data_root):
+        raise RuntimeError("Strata data path is outside the configured MODEL_DIR.")
+    if not config_path or not _path_is_within(data_root, config_path):
+        raise RuntimeError("Strata setup config path is outside its controller-owned model data directory.")
+    if not compose_path or not _path_is_within(builtin_root, compose_path):
+        raise RuntimeError("Strata Compose file is outside the controller-owned builtin-models directory.")
+
+    config = None
+    if os.path.isfile(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if isinstance(loaded, dict):
+                config = loaded
+        except (OSError, ValueError):
+            pass
+    setup_needed = not _strata_setup_config_is_262k(config)
+    if setup_needed:
+        family = str((variant or {}).get("strata_family") or "").strip()
+        model_token = str((variant or {}).get("strata_model_token") or "").strip()
+        service = str((variant or {}).get("service_name") or "").strip()
+        if not family or not model_token or not service or not os.path.isfile(compose_path):
+            raise RuntimeError("Strata model setup metadata or generated Compose file is missing.")
+        config_name = os.path.basename(config_path)
+        api_key = ensure_strata_api_key()
+        if not api_key:
+            raise RuntimeError("Strata API key could not be read or created securely.")
+        setup_command = (
+            "set -e; cd /opt/strata; "
+            ".venv/bin/python setup.py --setup --yes "
+            f"--family {shlex.quote(family)} --model {shlex.quote(model_token)} "
+            "--context 262144 --vision no --data-dir /data "
+            '--host 0.0.0.0 --api-key "$API_KEY" --port 8080 --no-start --low-ram auto; '
+            f"mkdir -p /data/config; cp /opt/strata/{shlex.quote(config_name)} /data/config/{shlex.quote(config_name)}"
+        )
+        command = [
+            "docker", "compose", "-f", compose_path, "run", "--rm", "--no-deps",
+            "--entrypoint", "/bin/bash", service, "-lc", setup_command,
+        ]
+        prefetch_env = dict(env_map or {})
+        prefetch_env["STRATA_API_KEY"] = api_key
+        prefetch_env["PORT"] = "0"
+        process = subprocess.Popen(
+            command, cwd=CLUB3090_DIR, env=prefetch_env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=False, bufsize=0,
+        )
+        _register_model_install_process(job_id, process)
+        try:
+            _stream_process_output_to_audit(process, prefix)
+            if int(process.wait()) != 0:
+                raise RuntimeError("Strata model download and setup failed.")
+        finally:
+            _clear_model_install_process(job_id, process)
+        if not os.path.isfile(config_path):
+            raise RuntimeError(f"Strata setup completed without prepared config {config_path}.")
+        try:
+            with open(config_path, "r", encoding="utf-8") as handle:
+                config = json.load(handle)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"Strata setup produced an invalid config {config_path}: {exc}") from exc
+        if not isinstance(config, dict) or not _strata_setup_config_is_262k(config):
+            raise RuntimeError(f"Strata setup did not prepare a 262144-token context in {config_path}.")
+    if config.get("fit_max_tokens") is not True:
+        config["fit_max_tokens"] = True
+        write_json_atomic_if_changed(config_path, config, indent=2, sort_keys=True)
+    os.chmod(config_path, 0o600)
+    if setup_needed:
+        append_audit_text_line(f"{prefix} Strata model setup completed with a 262144-token context")
+    else:
+        append_audit_text_line(f"{prefix} Strata model setup is current; verified 262144-token context")
+
 def _run_model_install_job(job_id, model_id, variant_id, install_command, update_mode=False):
     prefix = f"[model-update {model_id}]" if update_mode else f"[model-install {model_id}]"
     append_audit_text_line(f"{prefix} starting {install_command}")
@@ -6229,8 +6409,49 @@ def _run_model_install_job(job_id, model_id, variant_id, install_command, update
             append_audit_text_line(f"{prefix} {message}")
             raise RuntimeError(message)
         setup_install = _parse_setup_install_command(install_command)
-        shell_command = str(install_command or "").strip()
         used_builtin_downloads = False
+        orca_install = str(variant.get("strata_install_mode") or "") == "orca"
+        if str(variant.get("engine") or "").strip().lower() == "strata":
+            if update_mode:
+                raise RuntimeError("Strata presets do not support model update actions")
+            if orca_install and not str(env_map.get("HF_TOKEN") or "").strip():
+                raise RuntimeError("OrcaRouter requires HF_TOKEN already authorized for gated repository orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF.")
+        if str(variant.get("engine") or "").strip().lower() == "strata":
+            if update_mode:
+                raise RuntimeError("Strata presets do not support model update actions")
+            source = os.path.abspath(str(variant.get("strata_source_path") or ""))
+            source_parent = os.path.dirname(source)
+            expected_commit = str(variant.get("strata_commit") or "")
+            image = str(variant.get("strata_image") or "")
+            if not source_parent or not _path_is_within(os.path.join(CONTROL_DIR, "builtin-models"), source):
+                raise RuntimeError("Strata source path is outside the controller-owned builtin-models directory")
+            os.makedirs(source_parent, exist_ok=True)
+            for row in inventory.get("variants") or []:
+                if str(row.get("engine") or "").strip().lower() == "strata":
+                    os.makedirs(str(row.get("strata_data_path") or ""), exist_ok=True)
+            quoted_source = shlex.quote(source)
+            quoted_commit = shlex.quote(expected_commit)
+            quoted_image = shlex.quote(image)
+            image_label = str(globals().get("STRATA_IMAGE_COMMIT_LABEL") or "io.club3090.strata.commit")
+            inspect_format = shlex.quote(f'{{{{ index .Config.Labels "{image_label}" }}}}')
+            quoted_inspect_format = shlex.quote(inspect_format)
+            shell_command = (
+                f"rebuild=0; "
+                f"if [ ! -d {quoted_source}/.git ]; then "
+                f"if [ -e {quoted_source} ]; then rm -rf -- {quoted_source}; fi; "
+                f"git clone https://github.com/Niko1221/Strata.git {quoted_source} || exit $?; rebuild=1; "
+                f"elif [ \"$(git -C {quoted_source} rev-parse HEAD 2>/dev/null)\" != {quoted_commit} ]; then rebuild=1; fi; "
+                f"git -C {quoted_source} fetch --depth 1 origin {quoted_commit} && "
+                f"git -C {quoted_source} checkout --detach {quoted_commit} && "
+                f"test \"$(git -C {quoted_source} rev-parse HEAD)\" = {quoted_commit} && "
+                f"if [ \"$rebuild\" != 1 ] && [ \"$(docker image inspect --format {quoted_inspect_format} {quoted_image} 2>/dev/null || true)\" != {quoted_commit} ]; "
+                f"then rebuild=1; fi; "
+                f"if [ \"$rebuild\" = 1 ] || [ \"$(docker image inspect --format {quoted_inspect_format} {quoted_image} 2>/dev/null || true)\" != {quoted_commit} ]; "
+                f"then docker build --label {shlex.quote(image_label + '=' + expected_commit)} -t {quoted_image} {quoted_source}; fi"
+            )
+            install_command = "strata-image-build"
+        else:
+            shell_command = str(install_command or "").strip()
         if plan and _parse_simple_hf_download_plan(install_command):
             _run_hf_download_plan(job_id, prefix, plan, env_map, force_download=bool(update_mode))
             used_builtin_downloads = True
@@ -6271,6 +6492,10 @@ def _run_model_install_job(job_id, model_id, variant_id, install_command, update
                     monitor.join(timeout=5)
         else:
             rc = 0
+        if rc == 0 and orca_install:
+            _prepare_strata_orca(job_id, prefix, variant, env_map)
+        elif rc == 0 and str(variant.get("engine") or "").strip().lower() == "strata":
+            _prepare_strata_model(job_id, prefix, variant, env_map)
     except Exception as e:
         append_audit_text_line(f"{prefix} launcher error: {e}")
         rc = 999
@@ -6284,7 +6509,34 @@ def _run_model_install_job(job_id, model_id, variant_id, install_command, update
             normalized_files.extend(_normalize_duplicate_model_file_hardlinks())
             for line in normalized_files:
                 append_audit_text_line(f"{prefix} {line}")
-            rebuild_runtime_inventory()
+            if str(variant.get("engine") or "").strip().lower() == "strata":
+                rebuilt_inventory = rebuild_runtime_inventory()
+                rebuilt_variant = next(
+                    (
+                        row for row in (rebuilt_inventory.get("variants") or [])
+                        if str(row.get("variant_id") or "") == str(variant_id or "")
+                    ),
+                    None,
+                )
+                if rebuilt_variant is None:
+                    rc = 999
+                    raise RuntimeError(f"Strata variant {variant_id} is missing from rebuilt runtime inventory")
+                try:
+                    ensure_variant_install_ready(rebuilt_variant)
+                    persisted_inventory = read_json_file(RUNTIME_INVENTORY_FILE, {})
+                    persisted_variant = next(
+                        (
+                            row for row in (persisted_inventory.get("variants") or [])
+                            if str(row.get("variant_id") or "") == str(variant_id or "")
+                        ),
+                        None,
+                    )
+                    if not persisted_variant or str(persisted_variant.get("install_state") or "").strip().lower() != "ready":
+                        reason = str((persisted_variant or {}).get("install_reason") or "persisted inventory does not report ready")
+                        raise RuntimeError(f"Strata variant {variant_id} readiness was not persisted: {reason}")
+                except Exception:
+                    rc = 999
+                    raise
             if update_mode:
                 state = read_model_update_state()
                 for resource in _model_update_plan_resources(variant, install_command):
@@ -6376,6 +6628,8 @@ def start_model_update_job(model_id="", variant_id="", resource_key=""):
             ),
             None,
         )
+    if variant and str(variant.get("engine") or "").strip().lower() == "strata":
+        raise ValueError("Strata runtime data is pinned; generic model updates are disabled.")
     if not variant:
         raise ValueError("Unknown model update target")
     return _start_model_download_job(
@@ -7199,7 +7453,6 @@ def system_metric_peaks_snapshot():
 
 def read_ui_config():
     default = {
-        "show_global_logs": True,
         "active_tab": "overview",
         "selected_scope": "GPU0",
         "current_log_source": "docker",
@@ -7210,8 +7463,6 @@ def read_ui_config():
         if not isinstance(data, dict):
             return default
         merged = dict(default)
-        if "show_global_logs" in data:
-            merged["show_global_logs"] = bool(data.get("show_global_logs"))
         if str(data.get("active_tab") or "") in {"overview", "system", "presets", "users", "metrics", "logs", "audit", "chat"}:
             merged["active_tab"] = str(data.get("active_tab"))
         current_log_source = str(data.get("current_log_source") or "").strip()
@@ -7226,8 +7477,6 @@ def read_ui_config():
 def write_ui_config(data):
     current = read_ui_config()
     original = dict(current)
-    if "show_global_logs" in data:
-        current["show_global_logs"] = bool(data["show_global_logs"])
     if str(data.get("active_tab") or "") in {"overview", "system", "presets", "users", "metrics", "logs", "audit", "chat"}:
         current["active_tab"] = str(data.get("active_tab"))
     current_log_source = str(data.get("current_log_source") or "").strip()

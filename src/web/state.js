@@ -3,7 +3,6 @@ let selectedInstance = "GPU0";
 let logEs = null;
 let logReconnectTimer = null;
 let logCacheRefreshTimer = null;
-let logCacheRefreshNonce = 0;
 let statusPollTimer = null;
 let statusRenderSignatures = Object.create(null);
 let statusOutageStartedAt = 0;
@@ -1421,17 +1420,73 @@ function triggerAdminPanelReload(message = "Reloading the admin panel...", delay
   };
   window.setTimeout(tryReload, Math.max(0, Number(delayMs || 0)));
 }
-function completeUpdateMonitor(payload = {}) {
+async function waitForInferenceService(update = {}) {
+  updateMonitor.waitingForInference = true;
+  if (updateMonitor.statusTimer) {
+    clearInterval(updateMonitor.statusTimer);
+    updateMonitor.statusTimer = null;
+  }
+  const deadline = Date.now() + 60_000;
+  setAuditMsg("System Update finished. Waiting up to 1 minute for the inference service.");
+  while (updateMonitor.active && Date.now() < deadline) {
+    const controller = typeof AbortController === "function" ? new AbortController() : null;
+    const requestTimeoutMs = Math.max(1, Math.min(5_000, deadline - Date.now()));
+    let requestTimeout = null;
+    try {
+      const timeout = new Promise((resolve, reject) => {
+        requestTimeout = window.setTimeout(() => {
+          if (controller) controller.abort();
+          reject(new Error("Inference service status request timed out"));
+        }, requestTimeoutMs);
+      });
+      const status = await Promise.race([
+        fetch(`/admin/status?force=1&_=${Date.now()}`, {
+          cache: "no-store",
+          ...(controller ? { signal: controller.signal } : {}),
+        }).then((response) => response.ok ? response.json() : null),
+        timeout,
+      ]);
+      if (status?.vllm_service === "active" && Date.now() <= deadline) {
+        updateMonitor.waitingForInference = false;
+        completeUpdateMonitor(update, { inferenceChecked: true });
+        return;
+      }
+    } catch (error) {
+    } finally {
+      if (requestTimeout !== null) window.clearTimeout(requestTimeout);
+    }
+    if (Date.now() < deadline) {
+      await new Promise((resolve) => window.setTimeout(resolve, Math.min(2_000, deadline - Date.now())));
+    }
+  }
+  if (!updateMonitor.active) return;
+  updateMonitor.waitingForInference = false;
+  completeUpdateMonitor(update, { inferenceChecked: true, inferenceTimedOut: true });
+}
+function completeUpdateMonitor(payload = {}, options = {}) {
+  if (updateMonitor.waitingForInference && !options.inferenceChecked) return;
+  const successfulSystemUpdate =
+    updateMonitor.scope === "club3090" &&
+    String(payload?.status || "").trim().toLowerCase() === "completed" &&
+    Number(payload?.return_code ?? 0) === 0;
+  if (successfulSystemUpdate && !options.inferenceChecked) {
+    waitForInferenceService(payload).catch(() => {
+      if (!updateMonitor.active) return;
+      updateMonitor.waitingForInference = false;
+      completeUpdateMonitor(payload, { inferenceChecked: true, inferenceTimedOut: true });
+    });
+    return;
+  }
   markUpdateTokenCompleted(payload?.token || updateMonitor.token);
   endUpdateMonitor();
   startExternalUpdateSignalStream();
   const returnCode = Number(payload?.return_code || 0);
-  triggerAdminPanelReload(
-    returnCode === 0
+  const message = options.inferenceTimedOut
+    ? "Inference service did not become active within 1 minute. Check the vLLM service status and logs."
+    : returnCode === 0
       ? "Update completed. Reloading the admin panel..."
-      : `Update finished with status ${payload?.status || "failed"}. Reloading the admin panel...`,
-    400,
-  );
+      : `Update finished with status ${payload?.status || "failed"}. Reloading the admin panel...`;
+  triggerAdminPanelReload(message, options.inferenceTimedOut ? 5000 : 400);
 }
 function updateLogVisualMode() {
   const box = $("log");
@@ -1442,8 +1497,8 @@ function updateLogVisualMode() {
 }
 function endUpdateMonitor() {
   updateMonitor.active = false;
+  updateMonitor.waitingForInference = false;
   updateMonitor.completed = true;
-  updateAcknowledgedToken = "";
   setUpdateUiLocked(false);
   if (updateMonitor.statusTimer) {
     clearInterval(updateMonitor.statusTimer);
@@ -1503,6 +1558,8 @@ function beginUpdateMonitor(payload, scope) {
   }
   updateMonitor.active = true;
   updateMonitor.completed = false;
+  updateMonitor.waitingForInference = false;
+  updateMonitor.scope = String(scope || payload?.scope || "");
   updateMonitor.startedAt = Date.now();
   updateMonitor.streamUrl = String(payload?.stream_url || "").trim();
   updateMonitor.statusUrl = String(payload?.status_url || "").trim();
@@ -1531,6 +1588,8 @@ function beginUpdateMonitor(payload, scope) {
   scheduleRenderedUpdateAcknowledgement(updateMonitor.token);
 }
 function beginPendingUpdateUi(scope) {
+  updateMonitor.scope = String(scope || "");
+  updateMonitor.waitingForInference = false;
   updateMonitor.returnTab = "logs";
   updateMonitor.returnScrollTop = 0;
   updateMonitor.returnLogSource = updateFallbackLogSource(currentLogSource);
@@ -1538,7 +1597,6 @@ function beginPendingUpdateUi(scope) {
   updateMonitor.completed = false;
   updateMonitor.startedAt = Date.now();
   updateMonitor.reloadScheduled = false;
-  currentLogSource = "audit";
   setUpdateUiLocked(true);
   activateTab("logs", true);
   connectLogs(true);

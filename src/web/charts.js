@@ -66,7 +66,6 @@ function popupMetricsState(signature) {
   if (!window.metricsPopupStates[signature]) {
     window.metricsPopupStates[signature] = {
       signature,
-      paneId: "mMain",
       title: "Metrics",
       label: "Main",
       win: null,
@@ -95,35 +94,6 @@ function popupMetricsWindowActive(signature = "") {
     } catch (e) {}
     return Date.now() - Number(state?.lastActiveAt || 0) < 2000;
   });
-}
-function metricPaneLabel(paneId = "mMain") {
-  return {
-    mMain: "Main",
-    mGpu: "GPUs",
-    mCpuRam: "CPU+RAM",
-    mSystem: "System",
-    mNetwork: "Network",
-  }[String(paneId || "mMain")] || "Main";
-}
-function normalizeMetricPaneId(paneId = "") {
-  const normalized = String(paneId || "").trim();
-  return ["mMain", "mGpu", "mCpuRam", "mSystem", "mNetwork"].includes(normalized)
-    ? normalized
-    : "mMain";
-}
-function activeMetricPaneId(doc = document) {
-  const active = doc?.querySelector?.(".metricpane.active");
-  return normalizeMetricPaneId(active?.id || "mMain");
-}
-function setActiveMetricPaneInDocument(doc, paneId) {
-  const nextPaneId = normalizeMetricPaneId(paneId);
-  doc?.querySelectorAll?.(".metricpane")?.forEach((node) => {
-    node.classList.toggle("active", node.id === nextPaneId);
-  });
-  doc?.querySelectorAll?.("[data-metric-pane]")?.forEach((node) => {
-    node.classList.toggle("active", node.getAttribute("data-metric-pane") === nextPaneId);
-  });
-  return nextPaneId;
 }
 let metricTimeValue = 5;
 let metricTimeUnit = "m";
@@ -188,10 +158,8 @@ function syncMetricControls() {
     if (state?.win && !state.win.closed) docs.push(state.win.document);
   });
   docs.forEach((doc) => {
-    const source = doc?.getElementById?.("metricsSourceSelect");
     const value = doc?.getElementById?.("metricsTimeValue");
     const unit = doc?.getElementById?.("metricsTimeUnit");
-    if (source) source.value = activeMetricPaneId(doc);
     if (value) value.value = String(metricTimeValue);
     if (unit) unit.value = metricTimeUnit;
   });
@@ -209,32 +177,14 @@ function setMetricIntervalState(value, unit, options = {}) {
     redrawMetricsSoon();
   }
 }
-function metricSourceChanged(paneId) {
-  const nextPaneId = normalizeMetricPaneId(paneId);
-  setActiveMetricPaneInDocument(document, nextPaneId);
-  Object.values(window.metricsPopupStates || {}).forEach((state) => {
-    if (state?.win && !state.win.closed) {
-      state.paneId = nextPaneId;
-      state.label = metricPaneLabel(nextPaneId);
-      setActiveMetricPaneInDocument(state.win.document, nextPaneId);
-    }
-  });
-  syncMetricControls();
-  writeCachedUiState(currentUiState());
-  queueUiStateSave();
-  redrawMetricsSoon();
-  refreshStatus({ force: true, includeSeries: true }).catch(() => {});
-}
 function metricIntervalChanged(value, unit) {
   setMetricIntervalState(value, unit);
 }
 function currentMetricsPopupTarget() {
-  const paneId = activeMetricPaneId(document);
   return {
     signature: "metrics",
-    paneId,
     title: "Metrics",
-    label: metricPaneLabel(paneId),
+    label: "Metrics",
   };
 }
 function metricsPopoutButtonSvg(detached = false) {
@@ -2004,26 +1954,23 @@ function storageEditorRedo() {
 }
 function metricsPopupPanelHtml() {
   return `<div class="metrics-controls" id="metricsControls">
-            <label class="metrics-control"><span>Source:</span><select id="metricsSourceSelect" aria-label="Metrics source">
-              <option value="mMain">Main</option><option value="mGpu">GPUs</option><option value="mCpuRam">CPU+RAM</option><option value="mSystem">System</option><option value="mNetwork">Network</option>
-            </select></label>
             <label class="metrics-control"><span>Time interval:</span><input id="metricsTimeValue" type="text" inputmode="numeric" value="5" aria-label="Metrics time interval"></label>
             <select id="metricsTimeUnit" aria-label="Metrics time unit">
               <option value="s">Seconds</option><option value="m" selected>Minutes</option>
             </select>
           </div>
           <div id="mMain" class="metricpane active">
+            <h3 class="metric-section-title">Inference</h3>
             <div class="chartgrid">
               <div class="chart"><canvas id="cGpu"></canvas></div>
               <div class="chart"><canvas id="cMem"></canvas></div>
               <div class="chart"><canvas id="cLatency"></canvas></div>
               <div class="chart"><canvas id="cTps"></canvas></div>
             </div>
-          </div>
-          <div id="mGpu" class="metricpane">
             <div id="gpuMetricCharts" class="gpu-chartgrid"></div>
           </div>
-          <div id="mCpuRam" class="metricpane">
+          <div id="mCpuRam" class="metricpane active">
+            <h3 class="metric-section-title">CPU + RAM</h3>
             <div id="ramInfo" class="value smallgap"></div>
             <div class="chartgrid">
               <div class="chart tall"><canvas id="cCpu"></canvas></div>
@@ -2031,24 +1978,26 @@ function metricsPopupPanelHtml() {
             </div>
             <div id="cpuCores" class="coregrid"></div>
           </div>
-          <div id="mSystem" class="metricpane">
-            <div class="chartgrid">
-              <div class="chart"><canvas id="cSystemUtil"></canvas></div>
-            </div>
-            <div class="panel">
-              <h2>System Information</h2>
-              <div id="systemInfo" class="value"></div>
-            </div>
-            <div class="panel">
-              <h2>Storage</h2>
-              <div id="diskInfo"></div>
-            </div>
-          </div>
-          <div id="mNetwork" class="metricpane">
+          <div id="mNetwork" class="metricpane active">
+            <h3 class="metric-section-title">Network</h3>
             <div id="netInfo" class="netgrid"></div>
             <div class="chartgrid">
               <div class="chart"><canvas id="cNetDown"></canvas></div>
               <div class="chart"><canvas id="cNetUp"></canvas></div>
+            </div>
+          </div>
+          <div id="mSystem" class="metricpane active">
+            <h3 class="metric-section-title">System</h3>
+            <div class="system-overview-grid">
+              <div class="chart"><canvas id="cSystemUtil"></canvas></div>
+              <div class="panel">
+                <h2>System Information</h2>
+                <div id="systemInfo" class="value"></div>
+              </div>
+            </div>
+            <div class="panel">
+              <h2>Storage</h2>
+              <div id="diskInfo"></div>
             </div>
           </div>`;
 }
@@ -2229,10 +2178,6 @@ function detachedMetricsPopupHtml(state) {
             window.alert(e && e.message ? e.message : String(e || ""));
           }
         });
-        document.getElementById("metricsSourceSelect")?.addEventListener("change", (event) => {
-          notify();
-          try { invoke("metricSourceChanged", event.target.value); } catch (e) {}
-        });
         const updateInterval = () => {
           notify();
           try {
@@ -2309,7 +2254,6 @@ function renderDetachedMetricsPopup(state, status = lastStatus) {
   if (doc.title !== String(state.title || "Metrics")) doc.title = String(state.title || "Metrics");
   const title = doc.getElementById("popupMetricsTitle");
   if (title && title.textContent !== String(state.title || "Metrics")) title.textContent = String(state.title || "Metrics");
-  setActiveMetricPaneInDocument(doc, state.paneId);
   withMetricsRenderDocument(doc, () => renderMetrics(status || lastStatus || {}, { skipPopups: true }));
   syncMetricControls();
 }
@@ -2347,24 +2291,6 @@ function closeDetachedMetricsPopup(signature) {
     } catch (e) {}
   }
   applyMetricsVisibility();
-}
-function replaceDetachedMetricsPopupPane(signature, paneId) {
-  const state = window.metricsPopupStates[String(signature || "")];
-  const nextPaneId = normalizeMetricPaneId(paneId);
-  if (!state || !nextPaneId || nextPaneId === state.paneId) return false;
-  updateDetachedMetricsPopupPane(signature, nextPaneId);
-  return true;
-}
-function updateDetachedMetricsPopupPane(signature, paneId) {
-  const state = window.metricsPopupStates[String(signature || "")];
-  const nextPaneId = normalizeMetricPaneId(paneId);
-  if (!state || !nextPaneId) return false;
-  state.paneId = nextPaneId;
-  state.label = metricPaneLabel(nextPaneId);
-  setActiveMetricPaneInDocument(document, nextPaneId);
-  renderDetachedMetricsPopup(state, lastStatus);
-  refreshStatus({ force: true, includeSeries: true }).catch(() => {});
-  return true;
 }
 function syncDetachedMetricsPopup(signature, status = lastStatus) {
   const state = window.metricsPopupStates[String(signature || "")];
@@ -2409,7 +2335,6 @@ function toggleMetricsPopout() {
     return;
   }
   const state = popupMetricsState(target.signature);
-  state.paneId = target.paneId;
   state.title = target.title;
   state.label = target.label;
   ensureDetachedMetricsPopupWindow(state);
@@ -3046,32 +2971,7 @@ function renderMetrics(j, options = {}) {
       `OS: ${info.os || "unknown"}<br>Kernel: ${info.kernel || "unknown"}<br>Host: ${info.hostname || "unknown"}<br>User: ${info.username || "unknown"}<br>Machine: ${info.machine || "unknown"}<br>${cpuPackageText}<br>GPUs: ${info.gpus || "unknown"}<br>${memorySummary}<br>${vramSummary}<br>Board/Product: ${info.board || "-"} / ${info.product || "-"}<br>BIOS: ${info.bios || "-"}`;
   const holder = metricsElement("gpuMetricCharts");
   if (holder && j.gpus) {
-    const hasGpuMetric = (key) =>
-      (j.gpus || []).some((gpu) => Number(gpu?.[key] || 0) > 0) ||
-      s.some((point) =>
-        (point.gpus || []).some((gpu) => Number(gpu?.[key] || 0) > 0),
-      );
     const cats = [
-      {
-        key: "util",
-        suffix: "Util",
-        label: "util %",
-        color: "#72c7ff",
-        showPeakLine: true,
-        peakColor: "#b7c0cc",
-        showPeakValue: true,
-        tooltipValueFormatter: (value) => `${formatChartValue(value)}%`,
-      },
-      {
-        key: "mem_pct",
-        suffix: "Mem",
-        label: "VRAM % / GB",
-        color: "#2fc46b",
-        showPeakLine: true,
-        peakColor: "#b7c0cc",
-        showPeakValue: true,
-        tooltipValueFormatter: (value) => `${formatChartValue(value)}%`,
-      },
       {
         key: "temp",
         suffix: "Temp",
@@ -3088,46 +2988,6 @@ function renderMetrics(j, options = {}) {
           { text: `(↑ ${formatChartValue(peak, 1)}°C)`, color: tempColorForValue(peak, "core") },
         ],
       },
-      ...(hasGpuMetric("temp_junction_c") || hasGpuMetric("temp_junction")
-        ? [
-            {
-              key: "temp_junction",
-              suffix: "JunctionTemp",
-              label: "junction °C",
-              color: "#f59e0b",
-              showPeakLine: true,
-              peakColor: "#b7c0cc",
-              showPeakValue: true,
-              valueColor: (current) => tempColorForValue(current, "junction"),
-              tooltipValueFormatter: (value) => `${formatChartValue(value, 1)}°C`,
-              valueFormatterParts: (current, peak) => [
-                { text: `${formatChartValue(current, 1)}°C`, color: tempColorForValue(current, "junction") },
-                { text: " " },
-                { text: `(↑ ${formatChartValue(peak, 1)}°C)`, color: tempColorForValue(peak, "junction") },
-              ],
-            },
-          ]
-        : []),
-      ...(hasGpuMetric("temp_vram_c") || hasGpuMetric("temp_vram")
-        ? [
-            {
-              key: "temp_vram",
-              suffix: "VramTemp",
-              label: "VRAM °C",
-              color: "#fb7185",
-              showPeakLine: true,
-              peakColor: "#b7c0cc",
-              showPeakValue: true,
-              valueColor: (current) => tempColorForValue(current, "vram"),
-              tooltipValueFormatter: (value) => `${formatChartValue(value, 1)}°C`,
-              valueFormatterParts: (current, peak) => [
-                { text: `${formatChartValue(current, 1)}°C`, color: tempColorForValue(current, "vram") },
-                { text: " " },
-                { text: `(↑ ${formatChartValue(peak, 1)}°C)`, color: tempColorForValue(peak, "vram") },
-              ],
-            },
-          ]
-        : []),
       {
         key: "power",
         suffix: "Power",
@@ -3139,38 +2999,25 @@ function renderMetrics(j, options = {}) {
         tooltipValueFormatter: (value) => `${formatChartValue(value)} W`,
       },
     ];
-    holder.innerHTML = cats
-      .map((cat) =>
-        j.gpus
-          .map(
-            (g) =>
-              `<div class="chart"><canvas id="cGpu${g.index}${cat.suffix}"></canvas></div>`,
-          )
+    holder.innerHTML = j.gpus
+      .map((gpu) =>
+        cats
+          .map((cat) => `<div class="chart"><canvas id="cGpu${gpu.index}${cat.suffix}"></canvas></div>`)
           .join(""),
       )
       .join("");
-    cats.forEach((cat) =>
-      j.gpus.forEach((g) => {
-        const color = cat.color;
-        const label = `GPU${g.index} ${cat.label}`;
-        const optionsForGpu = { ...cat };
-        if (cat.key === "mem_pct") {
-          const currentGpuPoint = (currentPoint.gpus || []).find((item) => String(item.index) === String(g.index)) || {};
-          const currentGpuUsedGib = Number(currentGpuPoint.mem_used_gib || Number(g.mem_used_mib || 0) / 1024 || 0);
-          const currentGpuTotalGib = Number(currentGpuPoint.mem_total_gib || Number(g.mem_total_mib || 0) / 1024 || 0);
-          optionsForGpu.valueFormatter = (current, peak) =>
-            `${formatChartValue(current)}% · ${formatChartValue(currentGpuUsedGib, 2)} GB (${UI_ARROW_UP} ${formatChartValue(currentGpuTotalGib > 0 ? (Number(peak || 0) / 100) * currentGpuTotalGib : currentGpuUsedGib, 2)} GB)`;
-        }
+    j.gpus.forEach((gpu) =>
+      cats.forEach((cat) => {
         drawGpuSeries(
-          `cGpu${g.index}${cat.suffix}`,
+          `cGpu${gpu.index}${cat.suffix}`,
           s,
-          g.index,
+          gpu.index,
           cat.key,
-          label,
-          color,
+          `GPU${gpu.index} ${cat.label}`,
+          cat.color,
           {
-            ...optionsForGpu,
-            persistentPeakValue: persistentGpuMetricPeakValue(j, g.index, cat.key),
+            ...cat,
+            persistentPeakValue: persistentGpuMetricPeakValue(j, gpu.index, cat.key),
           },
         );
       }),

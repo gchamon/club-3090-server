@@ -88,7 +88,7 @@ fi
 progress "Validating server and upstream checkouts"
 [[ -x "${ROOT}/install.sh" && -f "${ROOT}/src/control/http_server.py" && -f "${ROOT}/src/web/base.html" ]] || fail "run this script from a complete Club-3090 Server checkout"
 for helper in prepare-headless-x.sh start-vllm-last-mode.sh follow-vllm-log.sh refresh-ip-certificate.sh; do
-  [[ -x "${ROOT}/scripts/club3090-server/${helper}" ]] || fail "missing executable checkout helper: ${ROOT}/scripts/club3090-server/${helper}"
+  [[ -x "${ROOT}/scripts/${helper}" ]] || fail "missing executable checkout helper: ${ROOT}/scripts/${helper}"
 done
 for unit in club3090-control.service club3090-benchmarks.service club3090-updater.service club3090-headless-x.service club3090-console-log.service club3090-vllm.service club3090-cert-refresh.service club3090-cert-refresh.timer; do
   [[ -r "${ROOT}/systemd/${unit}" ]] || fail "missing systemd unit template: ${ROOT}/systemd/${unit}"
@@ -183,6 +183,15 @@ with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, prefix=
 os.chmod(temporary, 0o600)
 os.replace(temporary, path)
 PY
+if [[ "${CLUB3090_RUNNING_FROM_UPDATER:-0}" != "1" ]]; then
+  progress "Refreshing updater state"
+  "${SUDO[@]}" env \
+    PYTHONPATH="${ROOT}/src" \
+    CLUB3090_CONTROL_DIR="${STATE}" \
+    CLUB3090_SERVER_DIR="${ROOT}" \
+    python3 -m build.updater --reset-state
+fi
+
 
 install_unit() {
   local source="$1" target="$2" line
@@ -217,33 +226,11 @@ if [[ "${CLUB3090_RUNNING_FROM_UPDATER:-0}" != "1" ]]; then
 fi
 progress "Stopping services before applying the installed configuration"
 "${SUDO[@]}" systemctl stop "${service_restart_targets[@]}"
-progress "Starting services; systemd may wait for startup"
-service_health_targets=(club3090-control.service club3090-updater.service club3090-vllm.service)
-wait_for_services_healthy() {
-  local timeout_seconds=60 deadline service
-  local -a services=("${service_health_targets[@]}")
-  local -a inactive=()
-  deadline=$((SECONDS + timeout_seconds))
-  progress "Checking service health with systemd (up to ${timeout_seconds}s)"
-  while ((SECONDS < deadline)); do
-    inactive=()
-    for service in "${services[@]}"; do
-      "${SUDO[@]}" systemctl is-active --quiet "${service}" || inactive+=("${service}")
-    done
-    if ((${#inactive[@]} == 0)); then
-      progress "Healthy: all managed services report active"
-      return 0
-    fi
-    progress "Waiting for active services: ${inactive[*]}"
-    sleep 2
-  done
-  fail "service health check timed out after ${timeout_seconds}s; inactive: ${inactive[*]}. Inspect with journalctl -u <service>"
-}
-if ! "${SUDO[@]}" systemctl start "${service_restart_targets[@]}"; then
-  progress "systemd start returned a failure; checking final service states"
+progress "Submitting service start jobs without waiting for startup"
+if ! "${SUDO[@]}" systemctl --no-block start "${service_restart_targets[@]}"; then
+  progress "systemd start-job submission returned a failure"
 fi
 progress "Installation complete"
-wait_for_services_healthy
 
 printf 'Installed Club-3090 Server services from %s\n' "${ROOT}"
 printf 'Upstream runtime: %s\nMutable state: %s\nConfiguration: %s\n' "${UPSTREAM}" "${STATE}" "${ENV_FILE}"

@@ -35,7 +35,7 @@ function ensureV413Layout() {
     );
     if (openUsers) openUsers.remove();
   }
-  const singleCard = [...document.querySelectorAll("#aiStudioTextModels .panel")].find(
+  const singleCard = [...document.querySelectorAll("#aiStudioContent .panel")].find(
     (panel) => {
       const h = panel.querySelector(".panel-head h2,h2");
       return (
@@ -51,7 +51,7 @@ function ensureV413Layout() {
     if (title) title.textContent = "Model Presets";
   }
   const customTitle = [
-    ...document.querySelectorAll("#aiStudioTextModels .panel .panel-head h2"),
+    ...document.querySelectorAll("#aiStudioContent .panel .panel-head h2"),
   ].find((h) => (h.textContent || "").trim() === "Custom Preset Templates");
   if (customTitle) customTitle.textContent = "Custom Configuration Endpoints";
   if ($("presetScopePanel")) $("presetScopePanel").remove();
@@ -940,7 +940,7 @@ function renderOverviewTracker() {
     .join("")}</div>`;
 }
 function renderLogTracker() {
-  const card = document.querySelector(".logs.panel");
+  const card = $("logCard");
   if (!card) return;
   let row = $("logTrackerRow");
   if (!row) {

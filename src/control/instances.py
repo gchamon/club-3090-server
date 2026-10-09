@@ -558,6 +558,7 @@ def instance_entrypoint_override(spec):
 
 def write_instance_artifacts(instance):
     spec = instance_variant_spec(instance)
+    is_strata = is_strata_variant(spec)
     paths = instance_paths(instance)
     os.makedirs(paths["dir"], exist_ok=True)
     visible_devices = instance_host_visible_devices(instance)
@@ -567,29 +568,46 @@ def write_instance_artifacts(instance):
         for idx in (instance.get("gpu_indices") or [instance["gpu_index"]])
     )
     cache_root = variant_persistent_cache_host_root(spec) if variant_uses_vllm(spec) else ""
-    if not cache_root:
+    if not is_strata and not cache_root:
         cache_root = ensure_instance_runtime_cache_link(instance["id"])
-    ensure_vllm_runtime_cache_dirs(cache_root)
-    patch_bindings = instance_patch_bind_overrides(spec)
+    if not is_strata:
+        ensure_vllm_runtime_cache_dirs(cache_root)
+    patch_bindings = [] if is_strata else instance_patch_bind_overrides(spec)
     model_dir_root = _resolve_variant_model_dir_root(spec)
-    ensure_compose_chat_template_targets(spec, model_dir_root)
-    ensure_carnice_model_support_files(spec, model_dir_root)
+    if not is_strata:
+        ensure_compose_chat_template_targets(spec, model_dir_root)
+        ensure_carnice_model_support_files(spec, model_dir_root)
     repo_env = _load_repo_env_map()
     launch_env = resolve_variant_launch_env(spec)
+    strata_api_key = ""
+    if is_strata:
+        strata_api_key = ensure_strata_api_key()
+        if not strata_api_key:
+            raise RuntimeError("Strata API key could not be read or created securely.")
+        launch_env["STRATA_API_KEY"] = strata_api_key
     with open(paths["env"], "w", encoding="utf-8") as f:
         for key in sorted(repo_env):
             if key in {"PORT", "CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES", "MODEL_DIR", "CLUB3090_GPU"}:
                 continue
+            if is_strata and key in {"VLLM_CACHE_ROOT", "TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR"}:
+                continue
             value = str(repo_env.get(key) or "").replace("\r", " ").replace("\n", " ")
             f.write(f"{key}={value}\n")
         for key in sorted(launch_env):
+            if is_strata and key in {"VLLM_CACHE_ROOT", "TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR"}:
+                continue
             value = str(launch_env.get(key) or "").replace("\r", " ").replace("\n", " ")
             f.write(f"{key}={value}\n")
-        f.write(f"MODEL_DIR={model_dir_root}\n")
+        if not is_strata:
+            f.write(f"MODEL_DIR={model_dir_root}\n")
         f.write(f"PORT={int(instance['port'])}\n")
         f.write(f"ESTATE_GPUS={visible_devices}\n")
         f.write(f"CUDA_VISIBLE_DEVICES={runtime_cuda_visible_devices}\n")
         f.write(f"NVIDIA_VISIBLE_DEVICES={visible_devices}\n")
+        if is_strata:
+            f.write("GPU=0\n")
+    if is_strata:
+        os.chmod(paths["env"], 0o600)
     override = (
         "services:\n"
         f"  {spec['service_name']}:\n"
@@ -598,9 +616,17 @@ def write_instance_artifacts(instance):
         f"      - ESTATE_GPUS={visible_devices}\n"
         f"      - CUDA_VISIBLE_DEVICES={runtime_cuda_visible_devices}\n"
         f"      - NVIDIA_VISIBLE_DEVICES={visible_devices}\n"
-        f"      - VLLM_CACHE_ROOT={GLOBAL_VLLM_CACHE_CONTAINER_ROOT}/vllm\n"
-        f"      - TORCHINDUCTOR_CACHE_DIR={GLOBAL_VLLM_CACHE_CONTAINER_ROOT}/torchinductor\n"
-        f"      - TRITON_CACHE_DIR={GLOBAL_VLLM_CACHE_CONTAINER_ROOT}/triton\n"
+    )
+    if is_strata:
+        override += "      - GPU=0\n"
+        override += f"      - STRATA_API_KEY={strata_api_key}\n"
+    else:
+        override += (
+            f"      - VLLM_CACHE_ROOT={GLOBAL_VLLM_CACHE_CONTAINER_ROOT}/vllm\n"
+            f"      - TORCHINDUCTOR_CACHE_DIR={GLOBAL_VLLM_CACHE_CONTAINER_ROOT}/torchinductor\n"
+            f"      - TRITON_CACHE_DIR={GLOBAL_VLLM_CACHE_CONTAINER_ROOT}/triton\n"
+        )
+    override += (
         "    deploy:\n"
         "      resources:\n"
         "        reservations:\n"
@@ -609,12 +635,30 @@ def write_instance_artifacts(instance):
         "              device_ids:\n"
         f"{device_id_lines}"
         "              capabilities: [gpu]\n"
-        "    volumes:\n"
-        f"      - {cache_root}:{GLOBAL_VLLM_CACHE_CONTAINER_ROOT}\n"
     )
+    if is_strata and str(spec.get("strata_install_mode") or "") == "orca":
+        override += (
+            "    entrypoint: !override\n"
+            "      - /opt/strata/.venv/bin/python\n"
+            "      - -m\n"
+            "      - serve.server\n"
+            "    command: !override\n"
+            "      - --engine\n"
+            "      - strata\n"
+            "      - --config\n"
+            "      - /data/config/strata-orca-iq3_xxs.json\n"
+            "      - --host\n"
+            "      - 0.0.0.0\n"
+            "      - --port\n"
+            "      - \"8080\"\n"
+        )
+    if not is_strata:
+        override += "    volumes:\n"
+        override += f"      - {cache_root}:{GLOBAL_VLLM_CACHE_CONTAINER_ROOT}\n"
     for source, target in patch_bindings:
         override += f"      - {source}:{target}:ro\n"
-    override += instance_entrypoint_override(spec)
+    if not is_strata:
+        override += instance_entrypoint_override(spec)
     override += (
         "    labels:\n"
         f"      club3090.instance_id: \"{instance['id']}\"\n"
@@ -627,7 +671,12 @@ def write_instance_artifacts(instance):
     )
     with open(paths["override"], "w", encoding="utf-8") as f:
         f.write(override)
+    if is_strata:
+        os.chmod(paths["override"], 0o600)
+    with open(paths["override"], "w", encoding="utf-8") as f:
+        f.write(override)
     return paths
+
 
 
 def ensure_instance_artifacts(instance):
@@ -751,6 +800,10 @@ def _run_instance_compose_up(instance):
 
 def _instance_launch(instance):
     spec = instance_variant_spec(instance)
+    if is_strata_variant(spec):
+        hardware = evaluate_strata_hardware(instance.get("gpu_indices") or [instance.get("gpu_index")])
+        if hardware.get("hardware_blocked"):
+            raise RuntimeError(hardware.get("hardware_block_reason") or "Strata hardware prerequisites are not met.")
     ensure_variant_install_ready(spec)
     preflight_instance_docker_images(instance, context="preset launch")
     return _run_instance_compose_up(instance)
@@ -759,13 +812,24 @@ def _instance_launch(instance):
 def _instance_wait_until_ready(instance):
     spec = instance_variant_spec(instance)
     ready_url = instance_ready_url(instance)
-    wait_for_runtime_ready(
-        instance_container_name(instance),
-        ready_url,
-        timeout=900,
-        engine_family=variant_engine_family(spec),
-    )
-    warmup = maybe_warmup_variant_runtime(spec, ready_url)
+    strata = is_strata_variant(spec)
+    try:
+        wait_for_runtime_ready(
+            instance_container_name(instance),
+            ready_url,
+            timeout=300 if strata else 900,
+            engine_family=variant_engine_family(spec),
+        )
+    except RuntimeError as exc:
+        if not strata or not str(exc).startswith("Timed out waiting for runtime readiness at "):
+            raise
+        stop_rc, stop_output = stop_instance(instance["id"], timeout=60)
+        if stop_rc != 0:
+            raise RuntimeError(
+                f"{exc}\nTimed-out Strata instance stop failed (rc={stop_rc}): {stop_output}"
+            ) from exc
+        raise
+    warmup = {"skipped": True, "reason": "strata-does-not-use-vllm-warmup"} if is_strata_variant(spec) else maybe_warmup_variant_runtime(spec, ready_url)
     if warmup.get("skipped"):
         log_control(f"INSTANCE warmup skipped {instance['id']} mode={instance['mode']}: {warmup.get('reason')}")
     elif warmup.get("ok"):
@@ -781,7 +845,8 @@ def start_instances_parallel(instances):
     targets = [dict(instance) for instance in (instances or []) if instance]
     if not targets:
         return {"started": [], "failed": []}
-    globals().get("ensure_default_runtime_power", lambda *args, **kwargs: None)("start_instances_parallel", force=True)
+    if any(not is_strata_variant(instance_variant_spec(row)) for row in targets):
+        globals().get("ensure_default_runtime_power", lambda *args, **kwargs: None)("start_instances_parallel", force=True)
     started = [None] * len(targets)
     failed = []
     launch_threads = []
@@ -852,7 +917,8 @@ def start_instance(instance_id, track_switch_job=True):
                 finished_at=0,
                 error="",
             )
-        globals().get("ensure_default_runtime_power", lambda *args, **kwargs: None)("start_instance", force=True)
+        if not is_strata_variant(instance_variant_spec(instance)):
+            globals().get("ensure_default_runtime_power", lambda *args, **kwargs: None)("start_instance", force=True)
         result = _instance_launch(instance)
         _instance_wait_until_ready(instance)
         if track_switch_job:
@@ -870,19 +936,32 @@ def start_instance(instance_id, track_switch_job=True):
         raise
 
 
-def stop_instance(instance_id):
+def stop_instance(instance_id, timeout=600):
     instance = get_instance(instance_id)
     if not instance:
         raise ValueError(f"Unknown instance: {instance_id}")
     if not instance.get("mode"):
         return 0, "No preset selected."
     cmd = instance_compose_args(instance) + ["down"]
-    rc, out = run_cmd(cmd, timeout=600, cwd=instance_compose_project_dir(instance), env=instance_stop_subprocess_env())
+    rc, out = run_cmd(cmd, timeout=max(1, int(timeout)), cwd=instance_compose_project_dir(instance), env=instance_stop_subprocess_env())
     if rc != 0:
         rc2, out2 = run_cmd(["docker", "rm", "-f", instance_container_name(instance)], timeout=120)
         out = (out or "") + f"\nmanual rm rc={rc2} {out2}"
     log_control(f"INSTANCE stop {instance['id']} rc={rc}: {out[-4000:]}")
     return rc, out[-4000:]
+
+def stop_managed_instances():
+    results = []
+    for instance in read_instances_config():
+        if not instance.get("mode"):
+            continue
+        instance_id = str(instance.get("id") or "")
+        try:
+            rc, output = stop_instance(instance_id)
+        except Exception as exc:
+            rc, output = 1, str(exc)
+        results.append({"id": instance_id, "rc": int(rc or 0), "output": str(output or "")[-4000:]})
+    return results
 
 def _configured_scope_targets_for_mode(instance_id="", mode=""):
     selector = canonical_mode_selector(mode) if mode else ""
@@ -1371,6 +1450,11 @@ def instance_snapshot(instance, dual_mode=None):
     spec = instance_variant_spec(instance)
     boot_state = runtime_boot_state(container, ready_url, variant_engine_family(spec))
     assigned = instance_assignment(instance, dual_mode=dual_mode)
+    hardware = (
+        evaluate_strata_hardware(instance.get("gpu_indices") or [instance.get("gpu_index")])
+        if is_strata_variant(spec)
+        else {"hardware_blocked": False, "hardware_block_reason": ""}
+    )
     return {
         "id": instance["id"],
         "kind": instance.get("kind", "single"),
@@ -1383,6 +1467,8 @@ def instance_snapshot(instance, dual_mode=None):
         "container": container,
         "running": bool(boot_state.get("running")),
         "booting": bool(boot_state.get("booting")),
+        "hardware_blocked": bool(hardware.get("hardware_blocked")),
+        "hardware_block_reason": hardware.get("hardware_block_reason") or "",
         "container_state": boot_state.get("status") or "",
         "ready_url": ready_url,
         "proxy_prefix": f"/{instance['id']}",
@@ -1457,10 +1543,13 @@ def runtime_boot_state(container_name="", ready_url="", engine_family=""):
     try:
         if name:
             failure_reason = _container_boot_failure_reason(name)
-            api_ready = _runtime_models_available_once(name, target_url, min_interval=(15 if engine == "vllm" else 2))
-            bootstrap_ready = _container_bootstrap_complete(name) if engine == "vllm" else False
-            port_ready = _ready_url_port_open(target_url, timeout=0.25) if engine and engine != "vllm" else False
-            ready = bool(state.get("running")) and (api_ready or bootstrap_ready or port_ready)
+            if engine == "strata":
+                ready = bool(state.get("running")) and strata_runtime_ready(name, target_url)
+            else:
+                api_ready = _runtime_models_available_once(name, target_url, min_interval=(15 if engine == "vllm" else 2))
+                bootstrap_ready = _container_bootstrap_complete(name) if engine == "vllm" else False
+                port_ready = _ready_url_port_open(target_url, timeout=0.25) if engine and engine != "vllm" else False
+                ready = bool(state.get("running")) and (api_ready or bootstrap_ready or port_ready)
     except Exception:
         ready = False
     booting = bool(name and state.get("running") and not ready and not failure_reason)

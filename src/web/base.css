@@ -134,6 +134,19 @@ header {
   font-size: 18px;
   font-weight: 800;
 }
+.brand-version-link {
+  color: inherit;
+  text-decoration-color: var(--muted);
+  text-underline-offset: 2px;
+}
+.brand-version-link:hover {
+  color: var(--blue);
+}
+.brand-version-link:focus-visible {
+  border-radius: 2px;
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
 .pill {
   flex: 0 1 min(352px, calc(100vw - 120px));
   width: min(352px, calc(100vw - 120px));
@@ -496,6 +509,13 @@ label.label input[type="checkbox"] {
 .metricpane.active {
   display: block;
 }
+.metric-section-title {
+  margin: 16px 0 10px;
+  font-size: 14px;
+}
+.metricpane.active + .metricpane.active .metric-section-title {
+  margin-top: 24px;
+}
 .metric-popout-btn {
   display: none;
   flex: 0 0 auto;
@@ -615,6 +635,25 @@ body.logs-tab .log-popout-btn {
   background-position: calc(100% - 14px) 50%;
   background-repeat: no-repeat;
   background-size: 12px 12px;
+}
+.log-theme-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  white-space: nowrap;
+}
+.log-theme-select {
+  min-width: 145px;
+  max-width: 180px;
+  padding: 7px 10px;
+  border: 1px solid #2c3a4f;
+  border-radius: 9px;
+  background: var(--field);
+  color: var(--text);
+}
+.log-theme-select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 .resizable-surface {
   position: relative;
@@ -745,13 +784,16 @@ body.resize-active * {
   color: #111;
   font-weight: 700;
 }
+#logCard {
+  display: none;
+}
 .log-card-hidden {
   display: none !important;
 }
 .logs-tab .container {
   min-height: calc(100dvh - 108px);
 }
-.logs-tab .logs.panel {
+.logs-tab #logCard {
   display: flex;
   flex-direction: column;
   height: auto;
@@ -762,22 +804,22 @@ body.resize-active * {
 .logs-tab .log {
   resize: none;
 }
-.logs.panel.log-card-update-mode {
+#logCard.log-card-update-mode {
   height: auto;
   min-height: 0;
 }
-.logs.panel.log-card-update-mode .resizable-surface-log {
+#logCard.log-card-update-mode .resizable-surface-log {
   min-height: 0;
 }
-.logs.panel.log-card-update-mode .surface-resize-handle {
+#logCard.log-card-update-mode .surface-resize-handle {
   display: none;
 }
-.logs.panel.log-card-update-mode .log {
+#logCard.log-card-update-mode .log {
   height: 540px;
   min-height: 540px;
   max-height: 540px;
 }
-.logs.panel.log-card-detached {
+#logCard.log-card-detached {
   display: none !important;
 }
 .logs-tab .content-tab {
@@ -818,6 +860,15 @@ body.resize-active * {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 10px;
+}
+.system-overview-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: stretch;
+  gap: 10px;
+}
+.system-overview-grid > .panel {
+  margin-bottom: 0;
 }
 .netgrid + .chartgrid {
   margin-top: 10px;
@@ -4027,27 +4078,14 @@ details[open] > summary .score-collapse-cue::before {
   box-shadow: 0 0 0 1px #5ff5e84a !important;
 }
 .update-lock-active .tab,
-.update-lock-active .logtools button,
+.update-lock-active .logtools button:not(#copyCurrentLogBtn):not(#downloadAllLogsBtn),
 .update-lock-active .logtools input,
-.update-lock-active .logtools select,
-.update-lock-active .logs .logheadchecks,
-.update-lock-active .logs .logheadchecks input,
-.update-lock-active .logs .logheadchecks select {
+.update-lock-active .logtools select {
   pointer-events: none;
   opacity: 0.45;
 }
-.update-lock-active .logtools input#searchQuery {
-  pointer-events: none;
-}
 .update-lock-active .logs textarea#log {
   opacity: 1;
-}
-.log-source-panel-disabled {
-  opacity: 0.74;
-}
-.log-source-panel-disabled .subtabs,
-.log-source-panel-disabled .preset-actions {
-  pointer-events: none;
 }
 .assistant-modal-card {
   width: min(1120px, calc(100vw - 32px));
@@ -5567,6 +5605,12 @@ details[open] > summary .score-collapse-cue::before {
   border-radius: 10px;
   background: rgba(15, 28, 42, 0.72);
 }
+.ai-studio-runtime-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
 .ai-studio-runtime-empty {
   color: #b8c8d8;
 }
@@ -5590,6 +5634,28 @@ details[open] > summary .score-collapse-cue::before {
   min-width: 0;
   gap: 4px;
   overflow-wrap: anywhere;
+}
+.ai-studio-runtime-title-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.ai-studio-runtime-autostart {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin: 0;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.ai-studio-runtime-title {
+  color: var(--text);
+  font: inherit;
+  font-weight: 700;
 }
 .ai-studio-runtime-actions {
   display: flex;
@@ -8127,6 +8193,9 @@ details[open] > summary .score-collapse-cue::before {
   .chartgrid {
     grid-template-columns: 1fr;
   }
+  .system-overview-grid {
+    grid-template-columns: 1fr;
+  }
   .gpu-chartgrid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 6px;
@@ -8193,7 +8262,7 @@ details[open] > summary .score-collapse-cue::before {
     flex: 1 1 180px;
     max-width: none;
   }
-  .logs-tab .logs.panel {
+  .logs-tab #logCard {
     height: auto;
     min-height: 0;
   }

@@ -7,7 +7,7 @@ Wants=docker.service
 [Service]
 Type=simple
 EnvironmentFile=-@ENV_FILE@
-ExecStart=@SOURCE_ROOT@/scripts/club3090-server/follow-vllm-log.sh
+ExecStart=@SOURCE_ROOT@/scripts/follow-vllm-log.sh
 Restart=always
 RestartSec=5
 StandardOutput=tty

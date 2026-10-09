@@ -6,6 +6,7 @@ _PACKAGE_FILE = _Path(__file__).resolve()
 _SOURCE_DIR = _Path(__file__).resolve().parent
 _SOURCE_ORDER = (
     "qwen38_catalog.py",
+    "strata_catalog.py",
     "chat.py",
     "services_config.py",
     "runtime_inventory.py",

@@ -2,6 +2,27 @@ import control as _control
 globals().update({name: value for name, value in vars(_control).items() if not name.startswith("__")})
 del _control
 
+def _current_source_commit():
+    configured_root = str(os.environ.get("CLUB3090_SERVER_DIR") or "").strip()
+    repo_root = configured_root if configured_root and os.path.isabs(configured_root) else SOURCE_ROOT
+    commit = run_git_as_repository_owner(repo_root, ["rev-parse", "HEAD"])
+    commit = str(commit or "").strip().lower()
+    return commit if re.fullmatch(r"[0-9a-f]{40}", commit) else ""
+
+
+SCRIPT_COMMIT = _current_source_commit()
+
+
+def _admin_version_commit_link():
+    short_commit = SCRIPT_COMMIT[:7] if SCRIPT_COMMIT else "unknown"
+    label = xml_escape(f"{SCRIPT_VERSION} - {short_commit}")
+    if not SCRIPT_COMMIT:
+        return label
+    url = f"https://github.com/gchamon/club-3090-server/tree/{SCRIPT_COMMIT}"
+    return f'<a class="brand-version-link" href="{url}">{label}</a>'
+
+
+
 class CommonMixin:
     def log_message(self, fmt, *args):
         return
@@ -425,7 +446,13 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             "/admin/logs",
             "/admin/chat",
         }:
-            html = get_admin_html_template().replace("__SCRIPT_VERSION__", SCRIPT_VERSION).replace(":8008/admin", f":{ADMIN_PORT}/admin").replace(":8009", f":{PROXY_PORT}")
+            html = (
+                get_admin_html_template()
+                .replace("__SCRIPT_VERSION__", SCRIPT_VERSION)
+                .replace("__VERSION_COMMIT_LINK__", _admin_version_commit_link())
+                .replace(":8008/admin", f":{ADMIN_PORT}/admin")
+                .replace(":8009", f":{PROXY_PORT}")
+            )
             self.queue_header("Cache-Control", "no-store, no-cache, must-revalidate")
             self.queue_header("Pragma", "no-cache")
             self.send_bytes(html.encode("utf-8"), "text/html; charset=utf-8")
@@ -939,6 +966,7 @@ class AdminHandler(CommonMixin, BaseHTTPRequestHandler):
             try:
                 ensure_benchmark_idle("Model DB rebuild")
                 inventory = enrich_runtime_inventory_cache_sizes(rebuild_runtime_inventory())
+                inventory["variants"] = enrich_strata_hardware_rows(inventory.get("variants") or [])
                 inventory = enrich_inventory_model_update_state(inventory)
                 benchmark_inventory = benchmark_rebuild_inventory_state_file(reason="runtime inventory rebuilt from admin")
                 log_audit("admin_runtime_inventory_rebuilt", models=len(inventory.get("models") or []), variants=len(inventory.get("variants") or []))
@@ -2391,8 +2419,9 @@ class ProxyHandler(CommonMixin, BaseHTTPRequestHandler):
             }, 503)
             return
         is_completion_request = body is not None and proxy_completion_path(upstream_path)
+        is_model_list_request = upstream_path.split("?", 1)[0] == "/v1/models"
         server_swap_enabled = proxy_swap_feature_enabled()
-        requested_selector = proxy_requested_selector(body, preset_name) if is_completion_request else ""
+        requested_selector = proxy_requested_selector(body, preset_name) if is_completion_request or is_model_list_request else ""
         requested_target = None
         requested_spec = None
         if requested_selector:
@@ -2400,7 +2429,7 @@ class ProxyHandler(CommonMixin, BaseHTTPRequestHandler):
             if requested_target:
                 target = requested_target
                 target_spec = requested_spec or target_spec
-            elif server_swap_enabled:
+            elif server_swap_enabled and not is_model_list_request:
                 target_spec = requested_spec or resolve_variant_spec(requested_selector) or target_spec
         if is_completion_request:
             body = apply_preset(body, preset_name, cap, target_spec)
@@ -2413,6 +2442,16 @@ class ProxyHandler(CommonMixin, BaseHTTPRequestHandler):
             self.send_json(payload, code)
             return
         auth_context = auth_result[1]
+        strata_request = str((requested_spec or {}).get("engine") or (requested_spec or {}).get("engine_family") or "").strip().lower() == "strata"
+        if strata_request and not requested_target:
+            self.send_json({
+                "error": "No ready Strata instance is running for this preset. Start it from Instances.",
+                "requested_model": requested_selector,
+                "instances": "/admin/instances",
+            }, 503)
+            return
+        if strata_request:
+            swap_handled_model = True
         if is_completion_request and requested_selector and not requested_target:
             requested_target, requested_spec = proxy_running_target_for_selector(requested_selector, instance_id=instance_id)
             if requested_target:
@@ -2449,7 +2488,7 @@ class ProxyHandler(CommonMixin, BaseHTTPRequestHandler):
         needs_model = upstream_path.startswith("/v1/models") or is_completion_request
         try:
             if needs_model:
-                if is_completion_request and requested_selector and swap_allowed:
+                if is_completion_request and requested_selector and swap_allowed and not strata_request:
                     live_target, live_spec = proxy_running_target_for_selector(requested_selector, instance_id=instance_id)
                     if live_target:
                         target = live_target
@@ -2504,6 +2543,8 @@ class ProxyHandler(CommonMixin, BaseHTTPRequestHandler):
                 metrics["failed_requests"] += 1
                 metrics["last_latency_s"] = latency
                 metrics["last_status"] = status
+                if metrics["active_requests"] == 0:
+                    last_request_finished_at = time.time()
             record_user_usage(auth_context.get("user_name"), auth_context.get("count_request", False), status, request_usage, response_usage, latency)
             log_control(f"PROXY startup failed requested={requested_selector or ''} instance={target_id} queued={queued_for_swap} error={startup_error}")
             self.send_json({
@@ -2525,11 +2566,12 @@ class ProxyHandler(CommonMixin, BaseHTTPRequestHandler):
                 log_stream_start_generation = int(log_snapshot.get("generation") or 0)
                 log_stream_start_seq = int(log_snapshot.get("seq") or 0)
         url = f"http://127.0.0.1:{instance_runtime_port(target) if target else active_port()}" + upstream_path
-        headers = {k:v for k,v in self.headers.items() if k.lower() not in HOP_HEADERS}
-        for secret_header in ("Authorization", "authorization", "X-API-Key", "x-api-key", "api-key"):
-            headers.pop(secret_header, None)
+        secret_headers = {"authorization", "x-api-key", "api-key"}
+        headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_HEADERS and k.lower() not in secret_headers}
         if body is not None:
             headers["Content-Type"] = headers.get("Content-Type", "application/json")
+        if str((target_spec or {}).get("engine") or (target_spec or {}).get("engine_family") or "").strip().lower() == "strata":
+            headers["Authorization"] = f"Bearer {ensure_strata_api_key()}"
         req = urllib.request.Request(url, data=body, headers=headers, method=self.command)
         try:
             with urllib.request.urlopen(req, timeout=None) as r:
@@ -2930,8 +2972,18 @@ def main():
         rebuilt = rebuild_runtime_inventory()
         print(json.dumps({"ok": True, "models": len(rebuilt.get("models") or []), "variants": len(rebuilt.get("variants") or [])}))
         return
+    if len(sys.argv) > 1 and sys.argv[1] == "--stop-managed-instances":
+        load_runtime_inventory(force=not os.path.exists(RUNTIME_INVENTORY_FILE), rebuild_if_missing=True)
+        results = stop_managed_instances()
+        for row in results:
+            state = "stopped" if int(row.get("rc") or 0) == 0 else "failed"
+            print(f"{row.get('id') or 'instance'} {state}: {row.get('output') or ''}")
+        if any(int(row.get("rc") or 0) != 0 for row in results):
+            raise SystemExit(1)
+        return
     if len(sys.argv) > 1 and sys.argv[1] == "--boot-enabled-instances":
         load_runtime_inventory(force=not os.path.exists(RUNTIME_INVENTORY_FILE), rebuild_if_missing=True)
+        restore_persisted_performance_profile(apply_now=True)
         boot_enabled_instances()
         return
     log_control("control service starting")

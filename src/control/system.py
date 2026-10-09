@@ -1,3 +1,108 @@
+STRATA_COMPILED_COMPUTE_CAPABILITIES = frozenset({"7.5", "8.0", "8.6", "8.9", "12.0"})
+
+
+def is_strata_variant(spec):
+    row = spec if isinstance(spec, dict) else {}
+    return str(row.get("engine_id") or row.get("profile_engine_id") or row.get("engine_profile") or row.get("engine") or "").strip().lower() == "strata"
+
+
+def evaluate_strata_hardware(assigned_gpu_indices=None):
+    """Return deterministic host/GPU prerequisites for the pinned Strata image."""
+    if platform.system().lower() != "linux":
+        return {"hardware_blocked": True, "hardware_block_reason": "Strata requires a Linux host."}
+    docker = shutil.which("docker")
+    if not docker:
+        return {"hardware_blocked": True, "hardware_block_reason": "Docker is unavailable."}
+    docker_rc, runtimes = run_cmd([docker, "info", "--format", "{{json .Runtimes}}"], timeout=8)
+    if docker_rc != 0:
+        return {"hardware_blocked": True, "hardware_block_reason": "Docker is unavailable."}
+    try:
+        runtime_map = json.loads(str(runtimes or "").strip())
+    except Exception:
+        runtime_map = {}
+    runtime_available = isinstance(runtime_map, dict) and "nvidia" in runtime_map
+    if not runtime_available:
+        cdi_rc, cdi_output = run_cmd(
+            [docker, "info", "--format", "{{json .DiscoveredDevices}}"],
+            timeout=8,
+        )
+        try:
+            cdi_devices = json.loads(str(cdi_output or "").strip()) if cdi_rc == 0 else []
+        except Exception:
+            cdi_devices = []
+        cdi_available = isinstance(cdi_devices, list) and any(
+            isinstance(device, dict)
+            and device.get("Source") == "cdi"
+            and str(device.get("ID") or "").startswith("nvidia.com/gpu=")
+            for device in cdi_devices
+        )
+        if not cdi_available:
+            return {
+                "hardware_blocked": True,
+                "hardware_block_reason": "Docker has neither the NVIDIA runtime nor a discovered NVIDIA CDI GPU device.",
+            }
+    nvidia_smi = shutil.which("nvidia-smi")
+    if not nvidia_smi:
+        return {"hardware_blocked": True, "hardware_block_reason": "nvidia-smi is unavailable; no usable NVIDIA GPU can be reported."}
+    rc, output = run_cmd(
+        [nvidia_smi, "--query-gpu=index,compute_cap,driver_version", "--format=csv,noheader,nounits"],
+        timeout=8,
+    )
+    if rc != 0 or not str(output or "").strip():
+        return {"hardware_blocked": True, "hardware_block_reason": "nvidia-smi cannot report a usable assigned GPU."}
+    gpus = {}
+    driver_versions = []
+    for line in str(output or "").splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 3:
+            continue
+        try:
+            index = int(parts[0])
+        except Exception:
+            continue
+        if not parts[1] or parts[1].lower() in {"n/a", "[not supported]"}:
+            continue
+        gpus[index] = parts[1]
+        driver_versions.append(parts[2])
+    if not gpus or not driver_versions:
+        return {"hardware_blocked": True, "hardware_block_reason": "nvidia-smi cannot report a usable assigned GPU."}
+
+    def version_tuple(text):
+        match = re.match(r"^\s*(\d+)(?:\.(\d+))?", str(text or ""))
+        return tuple(int(part or 0) for part in match.groups()) if match else ()
+
+    if any(not version_tuple(version) or version_tuple(version) < (580, 0) for version in driver_versions):
+        return {"hardware_blocked": True, "hardware_block_reason": "NVIDIA driver 580 or newer is required."}
+    if assigned_gpu_indices is None:
+        candidates = list(gpus.values())
+    else:
+        try:
+            indices = [int(index) for index in assigned_gpu_indices]
+        except Exception:
+            indices = []
+        candidates = [gpus[index] for index in indices if index in gpus]
+        if len(candidates) != len(indices) or not candidates:
+            return {"hardware_blocked": True, "hardware_block_reason": "nvidia-smi cannot report the assigned GPU."}
+    if not any(capability in STRATA_COMPILED_COMPUTE_CAPABILITIES for capability in candidates):
+        return {
+            "hardware_blocked": True,
+            "hardware_block_reason": "No assigned GPU has a Strata-supported compute capability (7.5, 8.0, 8.6, 8.9, or 12.0).",
+        }
+    return {"hardware_blocked": False, "hardware_block_reason": ""}
+
+
+def enrich_strata_hardware_rows(rows):
+    result = []
+    hardware = None
+    for source in rows or []:
+        row = dict(source or {})
+        if is_strata_variant(row):
+            if hardware is None:
+                hardware = evaluate_strata_hardware()
+            row.update(hardware)
+        result.append(row)
+    return result
+
 def _normalize_ratio_percent(value):
     number = safe_float(value)
     if number <= 1.0:
@@ -2193,6 +2298,8 @@ def build_status_snapshot(refresh_remote_metadata=False):
         recent = list(recent_requests)
 
     runtime_inventory = enrich_inventory_model_update_state(load_runtime_inventory())
+    runtime_inventory["variants"] = enrich_strata_hardware_rows(runtime_inventory.get("variants") or [])
+    runtime_inventory["models"] = enrich_strata_hardware_rows(runtime_inventory.get("models") or [])
     local_installer_metadata = read_local_installer_metadata()
     self_update_state = read_self_update_state()
     remote_update_metadata = cached_remote_script_metadata(refresh=refresh_remote_metadata)
@@ -3418,29 +3525,53 @@ def wake_on_lan(mac=None, broadcast=None):
     return {"mac": mac, "broadcast": broadcast}
 
 def apply_performance_profile(name):
-    profile_name = _apply_profile_globals(name)
-    log_control(f"PROFILE requested name={name}")
+    global runtime_activity_last_seen, runtime_idle_power_applied
+    profile_name = str(name or "").strip().lower()
+    if profile_name in {"standard", "default"}:
+        profile_name = "balanced"
+    if profile_name not in PERFORMANCE_PROFILES:
+        raise ValueError("Invalid performance profile")
     write_server_config({"active_power_profile": profile_name})
+    profile_name = _apply_profile_globals(profile_name)
+    log_control(f"PROFILE requested name={name}")
     clear_gpu_session_peaks()
     result = {"cpu": apply_cpu_active_power(), "gpu": apply_gpu_active_power(force=True), "profile": profile_name}
+    with metrics_lock:
+        runtime_activity_last_seen = time.time()
+        runtime_idle_power_applied = False
     log_control(f"PROFILE applied name={profile_name} cpu={result.get('cpu')} gpu={result.get('gpu')}")
     return result
 
 
 def apply_gpu_power_profile(name):
-    profile_name = _apply_gpu_profile_globals(name)
-    log_control(f"GPU PROFILE requested name={name}")
+    global runtime_activity_last_seen, runtime_idle_power_applied
+    profile_name = str(name or "").strip().lower().replace("_", "-")
+    if profile_name in {"standard", "default"}:
+        profile_name = "balanced"
+    if profile_name not in PERFORMANCE_PROFILES:
+        raise ValueError("Invalid GPU power profile")
     write_server_config({"active_gpu_power_profile": profile_name})
+    profile_name = _apply_gpu_profile_globals(profile_name)
+    log_control(f"GPU PROFILE requested name={name}")
     clear_gpu_session_peaks()
     result = {"gpu": apply_gpu_active_power(force=True), "gpu_profile": profile_name}
+    with metrics_lock:
+        runtime_activity_last_seen = time.time()
+        runtime_idle_power_applied = False
     log_control(f"GPU PROFILE applied name={profile_name} gpu={result.get('gpu')}")
     return result
 
 
 def apply_cpu_power_profile(name):
-    profile_name = _apply_cpu_profile_globals(name)
-    log_control(f"CPU PROFILE requested name={name}")
+    profile_name = str(name or "").strip().lower().replace("_", "-")
+    if profile_name in {"adaptive", "schedutil", "balanced", "eco", "fast"}:
+        profile_name = "adaptive"
+    elif profile_name in {"performance", "turbo"}:
+        profile_name = "performance"
+    if profile_name not in CPU_POWER_PROFILES:
+        raise ValueError("Invalid CPU power profile")
     write_server_config({"active_cpu_power_profile": profile_name})
+    profile_name = _apply_cpu_profile_globals(profile_name)
     result = {"cpu": apply_cpu_active_power(), "cpu_profile": profile_name}
     log_control(f"CPU PROFILE applied name={profile_name} cpu={result.get('cpu')}")
     return result
@@ -4123,40 +4254,125 @@ def ensure_vllm_running_for_request(instance_id=None):
         power_state["container"] = "running"
 
 
+def runtime_log_indicates_active_inference(container_name, now=None):
+    name = str(container_name or "").strip()
+    if not name:
+        return False
+    try:
+        watcher = get_runtime_log_watcher(name)
+        snapshot = watcher.snapshot() if watcher is not None else {}
+        lines = [str(line or "").strip() for line in str((snapshot or {}).get("text") or "").splitlines()]
+        now_ms = int(float(now if now is not None else time.time()) * 1000)
+        fresh_lines = []
+        for line in lines:
+            timestamp, message = split_timestamped_docker_log_line(line)
+            timestamp_ms = chat_timestamp_ms(timestamp, default=-1)
+            age_ms = now_ms - timestamp_ms
+            if timestamp_ms > 0 and -5000 <= age_ms <= 15000:
+                fresh_lines.append(message.strip())
+        if not fresh_lines:
+            return False
+        metrics_row = parse_runtime_log_metrics("\n".join(fresh_lines))
+        if any(int(metrics_row.get(key) or 0) > 0 for key in ("running_requests", "waiting_requests", "pending_requests", "swapped_requests")):
+            return True
+        lifecycle_markers = (
+            ("[strata] writing a tool call:", False),
+            ("[strata] thinking:", True),
+            ("[strata] done:", False),
+            ("[strata] error:", False),
+            ("[strata] failed:", False),
+            ("[strata] cancelled:", False),
+            ("[strata] canceled:", False),
+        )
+        for line in reversed(fresh_lines):
+            normalized = line.lower()
+            for marker, active in lifecycle_markers:
+                if normalized.startswith(marker):
+                    return active
+        return False
+    except Exception as exc:
+        log_control(f"POWER inference log check failed container={name}: {exc}")
+        return False
+
+
+def managed_inference_active(now=None):
+    with metrics_lock:
+        if int(metrics.get("active_requests") or 0) > 0:
+            return True
+    containers = set()
+    try:
+        for instance in read_instances_config():
+            try:
+                if instance_running(instance):
+                    container = str(instance_runtime_container_name(instance) or "").strip()
+                    if container:
+                        containers.add(container)
+            except Exception:
+                continue
+    except Exception as exc:
+        log_control(f"POWER runtime inventory check failed: {exc}")
+    try:
+        container = str(current_container() or "").strip()
+        if container:
+            containers.add(container)
+    except Exception as exc:
+        log_control(f"POWER current runtime check failed: {exc}")
+    return any(runtime_log_indicates_active_inference(container, now=now) for container in containers)
+
+
+def reconcile_runtime_power(now=None):
+    global runtime_activity_last_seen, runtime_active_observed, runtime_idle_power_applied
+    now = float(now if now is not None else time.time())
+    if benchmark_power_actions_owned():
+        return {"active": True, "reason": "benchmark"}
+    if script_power_actions_owned():
+        ensure_default_runtime_power("script_job")
+        with metrics_lock:
+            runtime_activity_last_seen = now
+            runtime_active_observed = True
+            runtime_idle_power_applied = False
+        return {"active": True, "reason": "script_job"}
+    inference_active = managed_inference_active(now=now)
+    studio_active = bool(globals().get("image_studio_activity_active", lambda: False)())
+    booting = switch_job_active()
+    active = inference_active or studio_active or booting
+    if active:
+        with metrics_lock:
+            was_active = runtime_active_observed
+            runtime_activity_last_seen = now
+            runtime_active_observed = True
+            runtime_idle_power_applied = False
+        if not was_active:
+            ensure_default_runtime_power("runtime_activity_detected")
+        if studio_active:
+            ensure_default_runtime_power("ai_studio_queue")
+        return {"active": True, "reason": "inference" if inference_active else ("ai_studio" if studio_active else "runtime_startup")}
+    with metrics_lock:
+        runtime_active_observed = False
+        idle_since = max(float(runtime_activity_last_seen or 0.0), float(last_request_finished_at or 0.0))
+        idle_applied = runtime_idle_power_applied
+    idle_for = max(0.0, now - idle_since)
+    if idle_for >= POWER_IDLE_AFTER_SECONDS and not idle_applied:
+        apply_cpu_idle_power()
+        apply_gpu_idle_power()
+        with metrics_lock:
+            runtime_idle_power_applied = True
+        return {"active": False, "idle_applied": True, "idle_for_seconds": idle_for}
+    return {"active": False, "idle_applied": False, "idle_for_seconds": idle_for}
+
+
 def idle_watchdog():
-    idle_power_applied = False
+    last_fan_update = 0.0
     while True:
         try:
-            if benchmark_power_actions_owned():
-                idle_power_applied = False
-                time.sleep(15)
-                continue
-            if script_power_actions_owned():
-                ensure_default_runtime_power("script_job")
-                idle_power_applied = False
-                time.sleep(15)
-                continue
+            reconcile_runtime_power()
             now = time.time()
-            studio_active = bool(globals().get("image_studio_activity_active", lambda: False)())
-            if studio_active:
-                ensure_default_runtime_power("ai_studio_queue")
-            with metrics_lock:
-                active = metrics.get("active_requests", 0)
-                booting = switch_job_active()
-                idle_for = 0 if active > 0 or booting or studio_active else max(0.0, now - last_request_finished_at)
-            if active == 0 and not booting and not studio_active and idle_for >= POWER_IDLE_AFTER_SECONDS and not idle_power_applied:
-                apply_cpu_idle_power()
-                apply_gpu_idle_power()
-                idle_power_applied = True
-            if active > 0 or booting or studio_active or idle_for < POWER_IDLE_AFTER_SECONDS:
-                idle_power_applied = False
-            if power_optimizations_enabled and not fan_manual_override:
-                # Refresh manual fan curve periodically even while idle; Linux/NVIDIA
-                # auto fan behavior can leave 3090 fans off until temps are too high.
+            if now - last_fan_update >= 15.0 and power_optimizations_enabled and not fan_manual_override:
                 apply_fan_curve_once()
+                last_fan_update = now
         except Exception as e:
             log_control(f"POWER watchdog error: {e}")
-        time.sleep(15)
+        time.sleep(2)
 
 
 def image_studio_power_watchdog():
@@ -4460,6 +4676,47 @@ def _container_boot_failure_reason(container_name):
     return "\n".join(unique[-4:])
 
 
+def strata_runtime_ready(container_name, base_url, timeout=1.5):
+    """Return true only when Strata's public health and authenticated API are ready."""
+    root = str(base_url or "").strip().rstrip("/")
+    if not root:
+        return False
+    if root.endswith("/v1/models"):
+        root = root[:-len("/v1/models")]
+    try:
+        health = urllib.request.Request(
+            f"{root}/health",
+            headers={"Accept": "application/json", "User-Agent": "club3090-control/ready-probe"},
+            method="GET",
+        )
+        with urllib.request.urlopen(health, timeout=timeout) as response:
+            if not 200 <= int(getattr(response, "status", 0) or 0) < 300:
+                return False
+        api_key = ensure_strata_api_key()
+        if not api_key:
+            return False
+        models = urllib.request.Request(
+            f"{root}/v1/models",
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {api_key}",
+                "User-Agent": "club3090-control/ready-probe",
+            },
+            method="GET",
+        )
+        with urllib.request.urlopen(models, timeout=timeout) as response:
+            return 200 <= int(getattr(response, "status", 0) or 0) < 300
+    except Exception:
+        return False
+
+
+def _runtime_engine_ready_once(container_name, ready_url, engine_family):
+    engine = str(engine_family or "").strip().lower()
+    if engine == "strata":
+        return strata_runtime_ready(container_name, ready_url)
+    return _runtime_models_available_once(container_name, ready_url, min_interval=(15 if engine == "vllm" else 2))
+
+
 def _runtime_models_available_once(container_name, ready_url, min_interval=15):
     target_url = str(ready_url or "").strip()
     if not target_url:
@@ -4525,10 +4782,10 @@ def wait_for_runtime_ready(container_name, ready_url, timeout=900, engine_family
                 )
         elif seen_container:
             raise RuntimeError(f"Container {name} disappeared before reaching ready state.")
-        api_ready = _runtime_models_available_once(name, target_url, min_interval=(15 if engine == "vllm" else 2))
+        api_ready = _runtime_engine_ready_once(name, target_url, engine)
         bootstrap_ready = _container_bootstrap_complete(name) if engine == "vllm" else False
-        port_ready = _ready_url_port_open(target_url, timeout=0.4) if engine and engine != "vllm" else False
-        if not name or api_ready or bootstrap_ready or port_ready:
+        port_ready = _ready_url_port_open(target_url, timeout=0.4) if engine and engine not in {"vllm", "strata"} else False
+        if (not name and engine != "strata") or api_ready or bootstrap_ready or port_ready:
             return True
         time.sleep(1)
     if name and not seen_container:
@@ -4674,3 +4931,107 @@ def run_switch(mode):
                 power_state["last_action"] = f"switch_failed_{selector}"
                 power_state["last_error"] = str(first_error)[-1000:]
             raise
+
+def refresh_power_config_globals():
+    global current_profile, current_gpu_profile, current_cpu_profile
+    global POWER_IDLE_AFTER_SECONDS, CONTAINER_STOP_AFTER_SECONDS
+    global GPU_ACTIVE_POWER_LIMIT_W, GPU_IDLE_POWER_LIMIT_W, GPU_IDLE_LOCK_CLOCKS, GPU_ACTIVE_LOCK_CLOCKS
+    global CPU_ACTIVE_GOVERNOR, CPU_IDLE_GOVERNOR, FAN_MAX_SPEED, FAN_MIN_SAFE_SPEED, PERFORMANCE_PROFILES
+    POWER_IDLE_AFTER_SECONDS = config_int("power", "idle_after_seconds", POWER_IDLE_AFTER_SECONDS)
+    CONTAINER_STOP_AFTER_SECONDS = config_int("power", "container_stop_after_seconds", CONTAINER_STOP_AFTER_SECONDS)
+    GPU_ACTIVE_POWER_LIMIT_W = config_int("power", "gpu_active_power_limit_w", GPU_ACTIVE_POWER_LIMIT_W)
+    GPU_IDLE_POWER_LIMIT_W = config_int("power", "gpu_idle_power_limit_w", GPU_IDLE_POWER_LIMIT_W)
+    GPU_IDLE_LOCK_CLOCKS = config_str("power", "gpu_idle_lock_clocks", GPU_IDLE_LOCK_CLOCKS)
+    GPU_ACTIVE_LOCK_CLOCKS = config_str("power", "gpu_active_lock_clocks", GPU_ACTIVE_LOCK_CLOCKS)
+    CPU_ACTIVE_GOVERNOR = config_str("power", "cpu_active_governor", CPU_ACTIVE_GOVERNOR)
+    CPU_IDLE_GOVERNOR = config_str("power", "cpu_idle_governor", CPU_IDLE_GOVERNOR)
+    FAN_MAX_SPEED = config_int("fans", "max_speed", FAN_MAX_SPEED, minimum=1, maximum=100)
+    FAN_MIN_SAFE_SPEED = config_int("fans", "min_safe_speed", FAN_MIN_SAFE_SPEED, minimum=1, maximum=100)
+    PERFORMANCE_PROFILES = {
+        "eco": {"gpu_active": config_int("profiles.eco", "gpu_active", 240), "gpu_idle": config_int("profiles.eco", "gpu_idle", 90), "idle_clocks": config_str("profiles.eco", "idle_clocks", "210,705"), "cpu_active": config_str("profiles.eco", "cpu_active", "schedutil"), "cpu_idle": config_str("profiles.eco", "cpu_idle", "powersave"), "idle_after": config_int("profiles.eco", "idle_after", 300), "stop_after": config_int("profiles.eco", "stop_after", 1800)},
+        "balanced": {"gpu_active": config_int("profiles.balanced", "gpu_active", GPU_ACTIVE_POWER_LIMIT_W), "gpu_idle": config_int("profiles.balanced", "gpu_idle", GPU_IDLE_POWER_LIMIT_W), "idle_clocks": config_str("profiles.balanced", "idle_clocks", GPU_IDLE_LOCK_CLOCKS), "cpu_active": config_str("profiles.balanced", "cpu_active", CPU_ACTIVE_GOVERNOR), "cpu_idle": config_str("profiles.balanced", "cpu_idle", CPU_IDLE_GOVERNOR), "idle_after": config_int("profiles.balanced", "idle_after", POWER_IDLE_AFTER_SECONDS), "stop_after": config_int("profiles.balanced", "stop_after", CONTAINER_STOP_AFTER_SECONDS)},
+        "fast": {"gpu_active": config_int("profiles.fast", "gpu_active", 300), "gpu_idle": config_int("profiles.fast", "gpu_idle", 120), "idle_clocks": config_str("profiles.fast", "idle_clocks", ""), "cpu_active": config_str("profiles.fast", "cpu_active", "schedutil"), "cpu_idle": config_str("profiles.fast", "cpu_idle", "powersave"), "idle_after": config_int("profiles.fast", "idle_after", 900), "stop_after": config_int("profiles.fast", "stop_after", 3600)},
+        "benchmark-ready": {"gpu_active": config_int("profiles.benchmark_ready", "gpu_active", 220), "gpu_idle": config_int("profiles.benchmark_ready", "gpu_idle", 120), "idle_clocks": config_str("profiles.benchmark_ready", "idle_clocks", ""), "cpu_active": config_str("profiles.benchmark_ready", "cpu_active", "schedutil"), "cpu_idle": config_str("profiles.benchmark_ready", "cpu_idle", "powersave"), "idle_after": config_int("profiles.benchmark_ready", "idle_after", 1800), "stop_after": config_int("profiles.benchmark_ready", "stop_after", 7200)},
+        "benchmark-safe": {"gpu_active": config_int("profiles.benchmark_safe", "gpu_active", 200), "gpu_idle": config_int("profiles.benchmark_safe", "gpu_idle", 120), "idle_clocks": config_str("profiles.benchmark_safe", "idle_clocks", ""), "cpu_active": config_str("profiles.benchmark_safe", "cpu_active", "schedutil"), "cpu_idle": config_str("profiles.benchmark_safe", "cpu_idle", "powersave"), "idle_after": config_int("profiles.benchmark_safe", "idle_after", 1800), "stop_after": config_int("profiles.benchmark_safe", "stop_after", 7200)},
+        "turbo": {"gpu_active": config_int("profiles.turbo", "gpu_active", 350), "gpu_idle": config_int("profiles.turbo", "gpu_idle", 160), "idle_clocks": config_str("profiles.turbo", "idle_clocks", ""), "cpu_active": config_str("profiles.turbo", "cpu_active", "performance"), "cpu_idle": config_str("profiles.turbo", "cpu_idle", "schedutil"), "idle_after": config_int("profiles.turbo", "idle_after", 1800), "stop_after": config_int("profiles.turbo", "stop_after", 7200)},
+    }
+    selected_gpu_profile = str(current_profile or "").strip().lower() if current_profile != current_gpu_profile else str(current_gpu_profile or "").strip().lower()
+    active_profile = PERFORMANCE_PROFILES.get(selected_gpu_profile)
+    if active_profile:
+        if current_profile != current_gpu_profile:
+            current_gpu_profile = selected_gpu_profile
+            current_cpu_profile = "performance" if str(active_profile["cpu_active"]).strip().lower() == "performance" else "adaptive"
+            current_profile = selected_gpu_profile
+        GPU_ACTIVE_POWER_LIMIT_W = int(active_profile["gpu_active"])
+        GPU_IDLE_POWER_LIMIT_W = int(active_profile["gpu_idle"])
+        GPU_IDLE_LOCK_CLOCKS = str(active_profile["idle_clocks"])
+        cpu_profile = CPU_POWER_PROFILES.get(str(current_cpu_profile or "").strip().lower())
+        if cpu_profile:
+            CPU_ACTIVE_GOVERNOR = str(cpu_profile["active"])
+            CPU_IDLE_GOVERNOR = str(cpu_profile["idle"])
+        POWER_IDLE_AFTER_SECONDS = int(active_profile["idle_after"])
+        CONTAINER_STOP_AFTER_SECONDS = int(active_profile["stop_after"])
+    return PERFORMANCE_PROFILES
+
+def _apply_profile_globals(profile_name):
+    global current_profile, current_gpu_profile, current_cpu_profile
+    global GPU_ACTIVE_POWER_LIMIT_W, GPU_IDLE_POWER_LIMIT_W
+    global GPU_IDLE_LOCK_CLOCKS, CPU_ACTIVE_GOVERNOR, CPU_IDLE_GOVERNOR
+    global POWER_IDLE_AFTER_SECONDS, CONTAINER_STOP_AFTER_SECONDS
+    refresh_power_config_globals()
+    name = str(profile_name or "").strip().lower()
+    if name in {"standard", "default"}:
+        name = "balanced"
+    if name not in PERFORMANCE_PROFILES:
+        raise ValueError("Invalid performance profile")
+    cfg = PERFORMANCE_PROFILES[name]
+    GPU_ACTIVE_POWER_LIMIT_W = int(cfg["gpu_active"])
+    GPU_IDLE_POWER_LIMIT_W = int(cfg["gpu_idle"])
+    GPU_IDLE_LOCK_CLOCKS = str(cfg["idle_clocks"])
+    current_gpu_profile = name
+    legacy_cpu_profile = "performance" if str(cfg["cpu_active"]).strip().lower() == "performance" else "adaptive"
+    current_cpu_profile = legacy_cpu_profile
+    cpu_cfg = CPU_POWER_PROFILES[legacy_cpu_profile]
+    CPU_ACTIVE_GOVERNOR = str(cpu_cfg["active"])
+    CPU_IDLE_GOVERNOR = str(cpu_cfg["idle"])
+    POWER_IDLE_AFTER_SECONDS = int(cfg["idle_after"])
+    CONTAINER_STOP_AFTER_SECONDS = int(cfg["stop_after"])
+    current_profile = name
+    return name
+
+def _apply_gpu_profile_globals(profile_name):
+    global current_profile, current_gpu_profile
+    global GPU_ACTIVE_POWER_LIMIT_W, GPU_IDLE_POWER_LIMIT_W, GPU_IDLE_LOCK_CLOCKS
+    global POWER_IDLE_AFTER_SECONDS, CONTAINER_STOP_AFTER_SECONDS
+    refresh_power_config_globals()
+    name = str(profile_name or "").strip().lower().replace("_", "-")
+    if name in {"standard", "default"}:
+        name = "balanced"
+    if name not in PERFORMANCE_PROFILES:
+        raise ValueError("Invalid GPU power profile")
+    cfg = PERFORMANCE_PROFILES[name]
+    GPU_ACTIVE_POWER_LIMIT_W = int(cfg["gpu_active"])
+    GPU_IDLE_POWER_LIMIT_W = int(cfg["gpu_idle"])
+    GPU_IDLE_LOCK_CLOCKS = str(cfg["idle_clocks"])
+    POWER_IDLE_AFTER_SECONDS = int(cfg["idle_after"])
+    CONTAINER_STOP_AFTER_SECONDS = int(cfg["stop_after"])
+    current_gpu_profile = name
+    current_profile = name
+    return name
+
+
+def _apply_cpu_profile_globals(profile_name):
+    global current_cpu_profile, CPU_ACTIVE_GOVERNOR, CPU_IDLE_GOVERNOR
+    refresh_power_config_globals()
+    name = str(profile_name or "").strip().lower().replace("_", "-")
+    if name in {"adaptive", "schedutil", "balanced", "eco", "fast"}:
+        name = "adaptive"
+    elif name in {"performance", "turbo"}:
+        name = "performance"
+    if name not in CPU_POWER_PROFILES:
+        raise ValueError("Invalid CPU power profile")
+    cfg = CPU_POWER_PROFILES[name]
+    CPU_ACTIVE_GOVERNOR = str(cfg["active"])
+    CPU_IDLE_GOVERNOR = str(cfg["idle"])
+    current_cpu_profile = name
+    return name
