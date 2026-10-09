@@ -1875,3 +1875,109 @@ console.log("four Metrics sections render together; aggregate inference and per-
     if result.returncode:
         return False, f"Metrics dashboard smoke failed: {result.stderr.strip() or result.stdout.strip()}"
     return True, result.stdout.strip()
+
+
+def run_logs_theme_smoke_test(root: Path) -> tuple[bool, str]:
+    root = Path(root).resolve()
+    script = r'''
+const fs = require("fs");
+const vm = require("vm");
+const elements = {};
+function element(id) {
+  return elements[id] || (elements[id] = {
+    id, value: "original", innerHTML: "", textContent: "", dataset: {},
+    classList: { toggle() {} },
+  });
+}
+for (const id of ["logThemeSelect", "logRender", "log"]) element(id);
+const values = new Map([["club3090.log-theme.v1", "warm-paper"]]);
+const localStorage = {
+  getItem(key) { return values.get(key) ?? null; },
+  setItem(key, value) { values.set(key, String(value)); },
+};
+const document = {
+  head: { appendChild(style) { elements[style.id] = style; } },
+  getElementById: element,
+  createElement() { return { id: "", textContent: "", dataset: {} }; },
+};
+const window = { logPopupStates: {} };
+const context = {
+  window, document, localStorage, console, Object, String, Array, Set, Map,
+  escapeHtml: (text) => String(text).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;"),
+  $: (id) => document.getElementById(id),
+};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync("src/web/logs.js", "utf8"), context);
+const selector = element("logThemeSelect");
+if (selector.value !== "warm-paper" || !selector.innerHTML.includes("High-Contrast Light")) {
+  throw new Error("Saved theme was not restored into the selector");
+}
+if (element("logRender").dataset.logTheme !== "warm-paper" || element("log").dataset.logTheme !== "warm-paper") {
+  throw new Error("Saved theme was not applied to both main log surfaces");
+}
+if (!element("logThemeStyles").textContent.includes(".ansi-red{color:#a12e28;}")) {
+  throw new Error("Light theme does not retain a readable semantic ANSI palette");
+}
+const themes = vm.runInContext("LOG_THEMES", context);
+function luminance(hex) {
+  const [r, g, b] = hex.slice(1).match(/../g).map((component) => {
+    const channel = parseInt(component, 16) / 255;
+    return channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4;
+  });
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+function contrast(first, second) {
+  const values = [luminance(first), luminance(second)].sort((a, b) => b - a);
+  return (values[0] + 0.05) / (values[1] + 0.05);
+}
+for (const [name, theme] of Object.entries(themes)) {
+  if (name === "original") continue;
+  const pairs = [[theme.foreground, theme.background], [theme.updateForeground, theme.background]];
+  for (const foreground of Object.values(theme.ansiForegrounds)) {
+    for (const background of Object.values(theme.ansiBackgrounds)) pairs.push([foreground, background]);
+  }
+  const minimum = Math.min(...pairs.map(([foreground, background]) => contrast(foreground, background)));
+  if (minimum < 4.5) throw new Error(`${name} palette contrast falls below WCAG AA: ${minimum.toFixed(2)}`);
+}
+const popupElements = {
+  popupLogText: element("popupLogText"),
+  popupLogThemeSelect: element("popupLogThemeSelect"),
+};
+const popupDocument = { getElementById(id) { return popupElements[id] || null; } };
+window.logPopupStates.audit = { win: { closed: false, document: popupDocument } };
+context.setLogTheme("cool-mist");
+if (values.get("club3090.log-theme.v1") !== "cool-mist" ||
+    selector.value !== "cool-mist" ||
+    element("logRender").dataset.logTheme !== "cool-mist" ||
+    popupElements.popupLogText.dataset.logTheme !== "cool-mist" ||
+    popupElements.popupLogThemeSelect.value !== "cool-mist") {
+  throw new Error("Theme selection did not persist and synchronize main and detached viewers");
+}
+const popupHtml = context.detachedLogPopupHtml({ signature: "audit", title: "Audit Logs" });
+if (!popupHtml.includes('id="popupLogThemeSelect"') ||
+    !popupHtml.includes('data-log-theme="cool-mist"') ||
+    !popupHtml.includes('value="cool-mist" selected')) {
+  throw new Error("Detached popup did not render the active theme and selector");
+}
+if (context.setLogTheme("invalid") !== "original" ||
+    element("logRender").dataset.logTheme !== "original" ||
+    popupElements.popupLogThemeSelect.value !== "original") {
+  throw new Error("Invalid theme value did not fall back to Original");
+}
+context.localStorage.setItem = () => { throw new Error("storage unavailable"); };
+if (context.setLogTheme("high-contrast-light") !== "high-contrast-light" ||
+    element("logRender").dataset.logTheme !== "high-contrast-light") {
+  throw new Error("Theme selection failed when browser storage was unavailable");
+}
+console.log("Logs theme persistence, original fallback, ANSI contrast, and popup synchronization passed");
+'''
+    node = shutil.which("node")
+    if not node:
+        return False, "node executable required for Logs theme smoke"
+    result = subprocess.run(
+        [node, "-e", script], cwd=str(root), capture_output=True,
+        text=True, check=False, timeout=15,
+    )
+    if result.returncode:
+        return False, f"Logs theme smoke failed: {result.stderr.strip() or result.stdout.strip()}"
+    return True, result.stdout.strip()

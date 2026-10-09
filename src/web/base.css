@@ -636,6 +636,25 @@ body.logs-tab .log-popout-btn {
   background-repeat: no-repeat;
   background-size: 12px 12px;
 }
+.log-theme-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  white-space: nowrap;
+}
+.log-theme-select {
+  min-width: 145px;
+  max-width: 180px;
+  padding: 7px 10px;
+  border: 1px solid #2c3a4f;
+  border-radius: 9px;
+  background: var(--field);
+  color: var(--text);
+}
+.log-theme-select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
 .resizable-surface {
   position: relative;
   padding: 0 0 12px 0;

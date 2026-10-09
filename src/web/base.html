@@ -814,6 +814,15 @@
               ><input type="checkbox" id="autoscroll" checked />
               auto-scroll</label
             >
+            <label class="log-theme-control"
+              >Theme
+              <select id="logThemeSelect" class="log-theme-select" aria-label="Log output theme" onchange="setLogTheme(this.value)">
+                <option value="original">Original</option>
+                <option value="warm-paper">Warm Paper</option>
+                <option value="cool-mist">Cool Mist</option>
+                <option value="high-contrast-light">High-Contrast Light</option>
+              </select>
+            </label>
             <button type="button" class="btn" id="copyCurrentLogBtn" onclick="copyCurrentLog()">Copy log</button>
             <button type="button" class="btn" id="downloadAllLogsBtn" onclick="downloadAllLogs()">Download all logs</button>
             <span id="logActionMsg" class="script-log-action-msg" role="status" aria-live="polite"></span>
