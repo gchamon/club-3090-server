@@ -20,6 +20,7 @@ Use systemd's journal to inspect service output, for example `journalctl -u club
 
 ## Strata presets
 
+
 The Model DB lists instance-scoped Strata presets. Install the pinned Strata runtime from a preset card, then select and start a preset in **Instances**. The shared runtime image and source checkout are installed once; each preset keeps its persistent model data, prepared pack, MTP tensors, and setup config at `${MODEL_DIR}/strata-<preset>`. Generated Compose files and the shared source checkout stay below `${CLUB3090_CONTROL_DIR}/builtin-models`. Stop or remove an instance from **Instances**; generic model-resource and cache deletion do not apply to Strata.
 Controller-managed Strata presets are prepared for the model's trained 262,144-token context (over 200K); this is a configured maximum, not a promise that every host can run it efficiently. The server clamps an oversized requested completion to the remaining context instead of rejecting an otherwise valid prompt. Existing preset data keeps its previous context until refreshed: after updating the controller, use **Install** on each existing Strata preset, then restart it from **Instances**. Confirm the active capacity at `/v1/strata/<preset>/models` in the returned model's `meta.n_ctx`.
 
@@ -79,3 +80,19 @@ sudo ./uninstall.sh
 It removes registered service units and `/etc/club3090-server.env`, while keeping the repository checkout and mutable runtime data intact. Dependency packages remain installed; uninstallation does not remove them. Preserve or remove runtime data separately according to your retention needs.
 
 See [Removed Model Manager](removed-model-manager.md) for remaining model-resource cleanup controls and their effect on shared assets.
+## Chat thinking defaults
+
+Default chat presets enable thinking and preserve reasoning in the response when the selected model/runtime supports it. The Chat interface displays returned reasoning in an expandable **Thinking** card.
+
+To disable thinking for a custom preset, open **Presets** in the admin interface and set both fields under `chat_template_kwargs` to `false`:
+
+```json
+{
+  "chat_template_kwargs": {
+    "enable_thinking": false,
+    "preserve_thinking": false
+  }
+}
+```
+
+For a custom preset, save these values with the preset's other parameters. Default presets are locked; create a custom preset with the desired parameters instead. `preserve_thinking: true` also enables thinking. Backend support varies, so disabling these options may not suppress reasoning if the runtime ignores them.

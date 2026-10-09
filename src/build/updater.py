@@ -411,7 +411,6 @@ def finalize_job(return_code, operation):
 
 def run_update_job(scope_name, label, command, source, operation):
     append_update_log(f"[self-update service] starting {label} via {source}")
-    append_update_log(f"[self-update service] command: {command}")
     rc = 1
     try:
         proc = subprocess.Popen(

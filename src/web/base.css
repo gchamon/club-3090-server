@@ -509,6 +509,13 @@ label.label input[type="checkbox"] {
 .metricpane.active {
   display: block;
 }
+.metric-section-title {
+  margin: 16px 0 10px;
+  font-size: 14px;
+}
+.metricpane.active + .metricpane.active .metric-section-title {
+  margin-top: 24px;
+}
 .metric-popout-btn {
   display: none;
   flex: 0 0 auto;
@@ -834,6 +841,19 @@ body.resize-active * {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 10px;
+}
+.system-overview-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: stretch;
+  gap: 10px;
+}
+.system-overview-grid > .chart {
+  height: auto;
+  min-height: 180px;
+}
+.system-overview-grid > .panel {
+  margin-bottom: 0;
 }
 .netgrid + .chartgrid {
   margin-top: 10px;
@@ -8134,6 +8154,9 @@ details[open] > summary .score-collapse-cue::before {
     grid-template-columns: 1fr;
   }
   .chartgrid {
+    grid-template-columns: 1fr;
+  }
+  .system-overview-grid {
     grid-template-columns: 1fr;
   }
   .gpu-chartgrid {

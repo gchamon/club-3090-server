@@ -211,7 +211,6 @@ function setMetricIntervalState(value, unit, options = {}) {
 }
 function metricSourceChanged(paneId) {
   const nextPaneId = normalizeMetricPaneId(paneId);
-  setActiveMetricPaneInDocument(document, nextPaneId);
   Object.values(window.metricsPopupStates || {}).forEach((state) => {
     if (state?.win && !state.win.closed) {
       state.paneId = nextPaneId;
@@ -2013,6 +2012,7 @@ function metricsPopupPanelHtml() {
             </select>
           </div>
           <div id="mMain" class="metricpane active">
+            <h3 class="metric-section-title">Inference</h3>
             <div class="chartgrid">
               <div class="chart"><canvas id="cGpu"></canvas></div>
               <div class="chart"><canvas id="cMem"></canvas></div>
@@ -2020,10 +2020,8 @@ function metricsPopupPanelHtml() {
               <div class="chart"><canvas id="cTps"></canvas></div>
             </div>
           </div>
-          <div id="mGpu" class="metricpane">
-            <div id="gpuMetricCharts" class="gpu-chartgrid"></div>
-          </div>
           <div id="mCpuRam" class="metricpane">
+            <h3 class="metric-section-title">CPU + RAM</h3>
             <div id="ramInfo" class="value smallgap"></div>
             <div class="chartgrid">
               <div class="chart tall"><canvas id="cCpu"></canvas></div>
@@ -2031,24 +2029,30 @@ function metricsPopupPanelHtml() {
             </div>
             <div id="cpuCores" class="coregrid"></div>
           </div>
-          <div id="mSystem" class="metricpane">
-            <div class="chartgrid">
-              <div class="chart"><canvas id="cSystemUtil"></canvas></div>
-            </div>
-            <div class="panel">
-              <h2>System Information</h2>
-              <div id="systemInfo" class="value"></div>
-            </div>
-            <div class="panel">
-              <h2>Storage</h2>
-              <div id="diskInfo"></div>
-            </div>
+          <div id="mGpu" class="metricpane">
+            <h3 class="metric-section-title">GPU</h3>
+            <div id="gpuMetricCharts" class="gpu-chartgrid"></div>
           </div>
           <div id="mNetwork" class="metricpane">
+            <h3 class="metric-section-title">Network</h3>
             <div id="netInfo" class="netgrid"></div>
             <div class="chartgrid">
               <div class="chart"><canvas id="cNetDown"></canvas></div>
               <div class="chart"><canvas id="cNetUp"></canvas></div>
+            </div>
+          </div>
+          <div id="mSystem" class="metricpane">
+            <h3 class="metric-section-title">System</h3>
+            <div class="system-overview-grid">
+              <div class="chart"><canvas id="cSystemUtil"></canvas></div>
+              <div class="panel">
+                <h2>System Information</h2>
+                <div id="systemInfo" class="value"></div>
+              </div>
+            </div>
+            <div class="panel">
+              <h2>Storage</h2>
+              <div id="diskInfo"></div>
             </div>
           </div>`;
 }

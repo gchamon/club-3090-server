@@ -555,27 +555,27 @@ INSTANCE_VLLM_CACHE_CONTAINER_ROOT = "/root/.cache/club3090-instance"
 
 PRESETS = {
     "qwen_chat": {
-        "chat_template_kwargs": {"enable_thinking": False},
+        "chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True},
         "temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0,
         "presence_penalty": 1.5, "repetition_penalty": 1.0,
     },
     "qwen_general": {
-        "chat_template_kwargs": {"enable_thinking": False},
+        "chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True},
         "temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0,
         "presence_penalty": 1.5, "repetition_penalty": 1.0,
     },
     "qwen_coding": {
-        "chat_template_kwargs": {"enable_thinking": False},
+        "chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True},
         "temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0,
         "presence_penalty": 0, "repetition_penalty": 1.0,
     },
     "qwen_coding_fast": {
-        "chat_template_kwargs": {"enable_thinking": False},
+        "chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True},
         "temperature": 0.8, "top_p": 0.95, "top_k": 20, "min_p": 0,
         "presence_penalty": 0, "repetition_penalty": 1.0,
     },
     "qwen_thinking": {
-        "chat_template_kwargs": {"enable_thinking": True},
+        "chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True},
         "temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0,
         "presence_penalty": 1.5,
     },
@@ -585,27 +585,28 @@ PRESETS = {
         "presence_penalty": 1.5,
     },
     "gemma_coding": {
-        "chat_template_kwargs": {"enable_thinking": False},
+        "chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True},
         "temperature": 1.0, "top_p": 0.95, "top_k": 64, "min_p": 0,
         "presence_penalty": 0, "repetition_penalty": 1.0,
     },
     "gemma_thinking": {
-        "chat_template_kwargs": {"enable_thinking": True},
+        "chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True},
         "temperature": 1.0, "top_p": 0.95, "top_k": 64, "min_p": 0,
         "presence_penalty": 0, "repetition_penalty": 1.0,
     },
 }
 
 DEFAULT_PRESET_DESCRIPTIONS = {
-    "qwen_chat": "Qwen general chat: no thinking, temperature 1.0, top_p 0.95, top_k 20, min_p 0, presence penalty 1.5.",
-    "qwen_general": "Qwen lower-temperature general preset: no thinking, temperature 0.7, top_p 0.8, top_k 20, presence penalty 1.5.",
-    "qwen_coding": "Qwen coding-tuned sampling: no thinking, temperature 0.6, top_p 0.95, no presence penalty.",
-    "qwen_coding_fast": "Qwen faster/looser coding preset: no thinking, temperature 0.8, top_p 0.95, no presence penalty.",
-    "qwen_thinking": "Qwen thinking enabled with temperature 1.0, top_p 0.95, presence penalty 1.5.",
-    "qwen_preserve_thinking": "Qwen thinking enabled and preserved in output with the same base sampling parameters.",
-    "gemma_coding": "Gemma coding preset from Unsloth guidance: no thinking, temperature 1.0, top_p 0.95, top_k 64.",
-    "gemma_thinking": "Gemma thinking preset from Unsloth guidance: enable_thinking true, temperature 1.0, top_p 0.95, top_k 64.",
+    "qwen_chat": "Qwen general chat with thinking enabled and preserved, temperature 1.0, top_p 0.95, top_k 20, min_p 0, presence penalty 1.5.",
+    "qwen_general": "Qwen lower-temperature general preset with thinking enabled and preserved, temperature 0.7, top_p 0.8, top_k 20, presence penalty 1.5.",
+    "qwen_coding": "Qwen coding-tuned sampling with thinking enabled and preserved, temperature 0.6, top_p 0.95, no presence penalty.",
+    "qwen_coding_fast": "Qwen faster/looser coding preset with thinking enabled and preserved, temperature 0.8, top_p 0.95, no presence penalty.",
+    "qwen_thinking": "Qwen thinking enabled and preserved with temperature 1.0, top_p 0.95, presence penalty 1.5.",
+    "qwen_preserve_thinking": "Qwen thinking enabled and preserved with the same base sampling parameters.",
+    "gemma_coding": "Gemma coding preset with thinking enabled and preserved, temperature 1.0, top_p 0.95, top_k 64.",
+    "gemma_thinking": "Gemma preset with thinking enabled and preserved, temperature 1.0, top_p 0.95, top_k 64.",
 }
+
 LENGTH_PREFIXES = {"short-": 4096, "concise-": 512}
 HOP_HEADERS = {"connection","keep-alive","proxy-authenticate","proxy-authorization","te","trailers","transfer-encoding","upgrade","content-length","host"}
 

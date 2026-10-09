@@ -699,13 +699,6 @@
             </div>
           </div>
           <div class="metrics-controls" id="metricsControls">
-            <label class="metrics-control"><span>Source:</span><select id="metricsSourceSelect" aria-label="Metrics source" onchange="metricSourceChanged(this.value)">
-              <option value="mMain">Main</option>
-              <option value="mGpu">GPUs</option>
-              <option value="mCpuRam">CPU+RAM</option>
-              <option value="mSystem">System</option>
-              <option value="mNetwork">Network</option>
-            </select></label>
             <label class="metrics-control"><span>Time interval:</span><input id="metricsTimeValue" type="text" inputmode="numeric" value="5" aria-label="Metrics time interval" onchange="metricIntervalChanged(this.value, document.getElementById('metricsTimeUnit')?.value)"></label>
             <select id="metricsTimeUnit" aria-label="Metrics time unit" onchange="metricIntervalChanged(document.getElementById('metricsTimeValue')?.value, this.value)">
               <option value="s">Seconds</option>
@@ -721,6 +714,7 @@
             here.
           </div>
           <div id="mMain" class="metricpane active">
+            <h3 class="metric-section-title">Inference</h3>
             <div class="chartgrid">
               <div class="chart"><canvas id="cGpu"></canvas></div>
               <div class="chart"><canvas id="cMem"></canvas></div>
@@ -728,10 +722,8 @@
               <div class="chart"><canvas id="cTps"></canvas></div>
             </div>
           </div>
-          <div id="mGpu" class="metricpane">
-            <div id="gpuMetricCharts" class="gpu-chartgrid"></div>
-          </div>
-          <div id="mCpuRam" class="metricpane">
+          <div id="mCpuRam" class="metricpane active">
+            <h3 class="metric-section-title">CPU + RAM</h3>
             <div id="ramInfo" class="value smallgap"></div>
             <div class="chartgrid">
               <div class="chart tall"><canvas id="cCpu"></canvas></div>
@@ -739,24 +731,30 @@
             </div>
             <div id="cpuCores" class="coregrid"></div>
           </div>
-          <div id="mSystem" class="metricpane">
-            <div class="chartgrid">
-              <div class="chart"><canvas id="cSystemUtil"></canvas></div>
-            </div>
-            <div class="panel">
-              <h2>System Information</h2>
-              <div id="systemInfo" class="value"></div>
-            </div>
-            <div class="panel">
-              <h2>Storage</h2>
-              <div id="diskInfo"></div>
-            </div>
+          <div id="mGpu" class="metricpane active">
+            <h3 class="metric-section-title">GPU</h3>
+            <div id="gpuMetricCharts" class="gpu-chartgrid"></div>
           </div>
-          <div id="mNetwork" class="metricpane">
+          <div id="mNetwork" class="metricpane active">
+            <h3 class="metric-section-title">Network</h3>
             <div id="netInfo" class="netgrid"></div>
             <div class="chartgrid">
               <div class="chart"><canvas id="cNetDown"></canvas></div>
               <div class="chart"><canvas id="cNetUp"></canvas></div>
+            </div>
+          </div>
+          <div id="mSystem" class="metricpane active">
+            <h3 class="metric-section-title">System</h3>
+            <div class="system-overview-grid">
+              <div class="chart"><canvas id="cSystemUtil"></canvas></div>
+              <div class="panel">
+                <h2>System Information</h2>
+                <div id="systemInfo" class="value"></div>
+              </div>
+            </div>
+            <div class="panel">
+              <h2>Storage</h2>
+              <div id="diskInfo"></div>
             </div>
           </div>
         </div>
