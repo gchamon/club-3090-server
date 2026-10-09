@@ -1059,12 +1059,14 @@ def run_strata_preset_smoke_test(root: Path) -> tuple[bool, str]:
     with tempfile.TemporaryDirectory(prefix="club3090-strata-preset-") as temp_raw:
         temp = Path(temp_raw)
         state_dir = temp / "state"
+        model_dir = temp / "models"
         upstream = temp / "upstream"
         upstream.mkdir()
         env = dict(os.environ)
         env.update(
             CLUB3090_CONTROL_DIR=str(state_dir),
             CLUB3090_DIR=str(upstream),
+            MODEL_DIR=str(model_dir),
             CLUB3090_SERVER_DIR=str(root),
             PYTHONPATH=str(root / "src"),
             PYTHONDONTWRITEBYTECODE="1",
@@ -1116,27 +1118,36 @@ def run_strata_preset_smoke_test(root: Path) -> tuple[bool, str]:
                 f"row=json.loads({json.dumps(json.dumps(rows['strata/qwen3.8-flash-next-iq2-xs']))}); "
                 "original_check_output=subprocess.check_output; original_run=subprocess.run; "
                 "subprocess.check_output=lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError()); "
-                "subprocess.run=lambda *a, **k: types.SimpleNamespace(returncode=1); "
+                "subprocess.run=lambda *a, **k: types.SimpleNamespace(returncode=1, stdout=''); "
                 "state=control._detect_variant_install_state(row, ''); "
-                "assert state['install_state']=='requires_download' and 'Pinned Strata source' in state['install_reason'] and 'runtime image' in state['install_reason']; "
-                f"subprocess.check_output=lambda *a, **k: {json.dumps(control_commit := '82f46a8c8f475f001ad76d92f58f4a4f8ffb0253')}; "
-                "subprocess.run=lambda *a, **k: types.SimpleNamespace(returncode=0); "
+                "assert state['install_state']=='requires_download' and 'Pinned Strata source' in state['install_reason'] and 'runtime image' in state['install_reason'], state; "
+                f"control_commit={json.dumps('82f46a8c8f475f001ad76d92f58f4a4f8ffb0253')}; "
+                "subprocess.check_output=lambda *a, **k: control_commit; "
+                "subprocess.run=lambda *a, **k: types.SimpleNamespace(returncode=0, stdout=''); "
                 "state=control._detect_variant_install_state(row, ''); "
-                "assert state['install_state']=='requires_download' and 'prepared config' in state['install_reason']; "
+                "assert state['install_state']=='requires_download' and 'prepared config' in state['install_reason'] and 'io.club3090.strata.commit=missing' in state['install_reason'], state; "
+                "inspect_calls=[]; "
+                "subprocess.run=lambda args, **kwargs: (inspect_calls.append((args,kwargs)) or types.SimpleNamespace(returncode=0, stdout=control_commit+'\\n')); "
+                "assert control.strata_image_commit(row['strata_image'])==control_commit; "
+                "assert inspect_calls[-1][0][:3]==['docker','image','inspect'] and 'io.club3090.strata.commit' in inspect_calls[-1][0][4], inspect_calls; "
+                "subprocess.run=lambda *a, **k: types.SimpleNamespace(returncode=0, stdout=control_commit); "
                 "blocked_source='try:\\n control.ensure_variant_install_ready(row)\\nexcept RuntimeError as exc:\\n assert \\'prepared config\\' in str(exc)\\nelse:\\n raise AssertionError(\\'launch guard accepted an unprepared Strata model\\')'; exec(blocked_source); "
                 "os.makedirs(os.path.dirname(row['strata_config_path']), exist_ok=True); "
                 "open(row['strata_config_path'], 'w').write('{}'); "
-                "assert control._detect_variant_install_state(row, '')['install_state']=='ready'; "
+                "assert control._detect_variant_install_state(row, '')['install_state']=='ready', control._detect_variant_install_state(row, ''); "
                 "row['install_state']='requires_download'; row['install_reason']='Install the pinned Strata runtime image and source checkout.'; "
                 "control.write_json_file(control.RUNTIME_INVENTORY_FILE, {'variants':[row]}); "
                 "control.runtime_inventory_cache={}; control.runtime_inventory_built_at=0; "
                 "assert control.load_runtime_inventory(force=False)['variants'][0]['install_state']=='ready'; "
                 "assert control.read_json_file(control.RUNTIME_INVENTORY_FILE, {})['variants'][0]['install_reason']==''; "
-                "subprocess.run=lambda *a, **k: types.SimpleNamespace(returncode=1); "
+                "subprocess.run=lambda *a, **k: types.SimpleNamespace(returncode=0, stdout='wrong-commit'); "
                 "state=control._detect_variant_install_state(row, ''); "
-                "assert state['install_state']=='requires_download' and 'runtime image' in state['install_reason']; "
+                "assert state['install_state']=='requires_download' and 'image label' in state['install_reason'], state; "
+                "subprocess.run=lambda *a, **k: types.SimpleNamespace(returncode=1, stdout=''); "
+                "state=control._detect_variant_install_state(row, ''); "
+                "assert state['install_state']=='requires_download' and 'runtime image' in state['install_reason'], state; "
                 "subprocess.check_output=lambda *a, **k: 'wrong-commit'; "
-                "subprocess.run=lambda *a, **k: types.SimpleNamespace(returncode=0); "
+                "subprocess.run=lambda *a, **k: types.SimpleNamespace(returncode=0, stdout=control_commit); "
                 "state=control._detect_variant_install_state(row, ''); "
                 "assert state['install_state']=='requires_download' and 'Pinned Strata source' in state['install_reason']; "
                 "subprocess.check_output=original_check_output; subprocess.run=original_run",
@@ -1199,12 +1210,12 @@ def run_strata_preset_smoke_test(root: Path) -> tuple[bool, str]:
                 "s._repo_subprocess_env=lambda: dict(os.environ); "
                 "s._release_model_install_download_locks=lambda *a, **k: None; "
                 "s.ensure_variant_install_ready=lambda row: (_ for _ in ()).throw(AssertionError('install readiness must receive rebuilt row')) if row is not rebuilt_variant or row['install_state']!='ready' else None; "
-                "class_source='class Proc:\\n returncode=0\\n stdout=None\\n def wait(self): return 0\\n'; "
-                "exec(class_source); s.subprocess.Popen=lambda *a, **k: Proc(); "
+                "class_source='class Proc:\\n returncode=0\\n stdout=None\\n def wait(self): return 0\\n'; exec(class_source); commands=[]; s.subprocess.Popen=lambda *a, **k: (commands.append(a[0]) or Proc()); "
                 "s._run_model_install_job('job-strata-ready','qwen3.8-flash-next',variant['variant_id'],'strata-image-build'); "
                 "job=s.model_install_jobs['job-strata-ready']; "
                 "assert job['status']=='success' and job['return_code']==0 and job['inventory_rebuild_ok'] is True, (job, rebuild_calls, logs); "
-                "assert len(rebuild_calls)==1, (job, rebuild_calls, logs)",
+                "assert len(rebuild_calls)==1, (job, rebuild_calls, logs); "
+                "assert '--label io.club3090.strata.commit=82f46a8c8f475f001ad76d92f58f4a4f8ffb0253' in commands[0][2], commands",
             ],
             cwd=str(root / "src"), env=env, capture_output=True,
             text=True, check=False, timeout=15,
@@ -1220,22 +1231,25 @@ def run_strata_preset_smoke_test(root: Path) -> tuple[bool, str]:
                 "os.makedirs(data, exist_ok=True); "
                 "part=os.path.join(data,'Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf.part'); "
                 "open(part,'w').write('partial'); "
-                "os.path.exists(config) and os.unlink(config); assert not os.path.exists(config); "
+                "os.makedirs(os.path.dirname(config), exist_ok=True); json.dump({'args':['--max-context','32768']}, open(config,'w')); "
                 "variant['service_name']='strata'; s.ensure_strata_api_key=lambda: 'test-key'; "
                 "s._register_model_install_process=lambda *a, **k: None; s._clear_model_install_process=lambda *a, **k: None; "
                 "s._stream_process_output_to_audit=lambda *a, **k: None; s.append_audit_text_line=lambda *a, **k: None; "
-                "calls=[]; class_source='class Proc:\\n def __init__(self, code): self.code=code; self.returncode=code; self.stdout=None\\n def wait(self):\\n  if self.code==0: os.makedirs(os.path.dirname(config), exist_ok=True); open(config,chr(119)).write(chr(123)+chr(125))\\n  return self.code'; exec(class_source); "
+                "calls=[]; class_source='class Proc:\\n def __init__(self, code): self.code=code; self.returncode=code; self.stdout=None\\n def wait(self):\\n  if self.code==0: os.makedirs(os.path.dirname(config), exist_ok=True); json.dump({\\'args\\':[\\'--max-context\\',\\'262144\\']}, open(config,\\'w\\'))\\n  return self.code'; exec(class_source); "
                 "popen_source='def popen(args, **kwargs):\\n calls.append((args,kwargs)); return Proc(1 if len(calls)==1 else 0)'; exec(popen_source); "
                 "s.subprocess.Popen=popen; failure_source='try:\\n s._prepare_strata_model(\"job\",\"[model-install test]\",variant,dict(os.environ))\\nexcept RuntimeError as exc:\\n assert \"download and setup failed\" in str(exc)\\nelse:\\n raise AssertionError(\"failed Strata prefetch was accepted\")'; exec(failure_source); "
-                "assert os.path.isfile(part) and not os.path.exists(config); "
+                "assert os.path.isfile(part) and json.load(open(config))['args'][1]=='32768'; "
                 "s._prepare_strata_model('job','[model-install test]',variant,dict(os.environ)); "
-                "assert os.path.isfile(config) and os.path.isfile(part); "
+                "assert os.path.isfile(config) and os.path.isfile(part); prepared=json.load(open(config)); assert prepared['args'][1]=='262144' and prepared['fit_max_tokens'] is True and os.stat(config).st_mode & 0o777==0o600; "
                 "args,kwargs=calls[1]; joined=' '.join(args); setup=args[-1]; "
                 "assert args[:2]==['docker','compose'] and ' run --rm --no-deps ' in f' {joined} '; "
                 "assert '--setup --yes' in setup and '--model IQ2_XS' in setup and '--family qwen' in setup and '--no-start' in setup; "
                 "assert '/data/config/strata-iq2_xs.json' in setup and 'API_KEY' in setup; "
                 "assert kwargs['env']['STRATA_API_KEY']=='test-key' and kwargs['env']['PORT']=='0'; "
-                "s._prepare_strata_model('job','[model-install test]',variant,dict(os.environ)); assert len(calls)==2",
+                "s._prepare_strata_model('job','[model-install test]',variant,dict(os.environ)); assert len(calls)==2; "
+                "json.dump({'args':['--max-context','262144']}, open(config,'w')); before=len(calls); "
+                "s._prepare_strata_model('job','[model-install test]',variant,dict(os.environ)); "
+                "assert len(calls)==before and json.load(open(config))['fit_max_tokens'] is True"
             ],
             cwd=str(root / "src"), env=env, capture_output=True,
             text=True, check=False, timeout=15,
@@ -1249,6 +1263,12 @@ def run_strata_preset_smoke_test(root: Path) -> tuple[bool, str]:
             data = Path(row.get("strata_data_path") or row.get("data_path") or "")
             compose_paths.add(str(compose))
             data_paths.add(str(data))
+            if data.parent != model_dir or not data.name.startswith("strata-"):
+                return False, f"{selector} data root is not an isolated MODEL_DIR/strata-<preset> path: {data}"
+            if compose.parent.parent != state_dir / "builtin-models":
+                return False, f"{selector} Compose path escaped controller-owned metadata: {compose}"
+            if Path(row.get("strata_config_path") or "").parent.parent != data:
+                return False, f"{selector} setup config is not inside its MODEL_DIR data root"
             if row.get("strata_model_token") != model_token:
                 return False, f"{selector} has wrong Strata MODEL token"
             expected_model_id = "qwen3.8-flash-next" if family != "orca" else "orcarouter-qwen3.8-flash-next-uncensored-iq3_xxs"
@@ -1286,6 +1306,7 @@ def run_strata_preset_smoke_test(root: Path) -> tuple[bool, str]:
             if (
                 f"FAMILY: {family}" not in compose_text
                 or f"MODEL: {model_token}" not in compose_text
+                or f"{data}:/data" not in compose_text
                 or "${PORT}:8080" not in compose_text
                 or 'PORT: "8080"' not in compose_text
                 or "/data" not in compose_text
@@ -1519,7 +1540,7 @@ with patch.object(control, "resolve_variant_spec", return_value=blocked_row), \
     assert target is None, target
 import tempfile
 import control.shared as shared
-orca_data = os.path.join(control.CONTROL_DIR, "builtin-models", "orca-smoke")
+orca_data = os.path.join(os.environ["MODEL_DIR"], "strata-orca-smoke")
 orca_variant = {"strata_data_path": orca_data, "strata_source_path": os.path.join(control.CONTROL_DIR, "builtin-models", "strata", "source"), "strata_image": "club3090-strata:v0.1.40.1"}
 with patch.object(shared, "_run_hf_download_step", side_effect=AssertionError("download ran without token")):
     try:
@@ -1562,6 +1583,7 @@ with patch.object(shared, "_run_hf_download_step", side_effect=fake_orca_downloa
 orca_config = open(os.path.join(orca_data, "config", "strata-orca-iq3_xxs.json"), encoding="utf-8").read()
 assert "orcarouter-qwen3.8-flash-next-uncensored-iq3_xxs" in orca_config
 assert "fixture-secret" not in orca_config and "api_key" not in orca_config.lower()
+assert json.loads(orca_config)["fit_max_tokens"] is True
 import io
 import threading
 log_dir = tempfile.mkdtemp(prefix="strata-log-fixture-")
@@ -1625,4 +1647,4 @@ finally:
         )
         if evaluator_run.returncode:
             return False, f"Strata hardware evaluator smoke failed: {evaluator_run.stderr.strip() or evaluator_run.stdout.strip()}"
-        return True, "ten Strata variants preserve selector/token/family metadata, advisory fit details, Orca preparation, timestamped logs, and hardware evaluator behavior"
+        return True, "ten Strata variants use isolated MODEL_DIR data roots, pinned-image labels, selector/token/family metadata, Orca preparation, and hardware evaluator behavior"

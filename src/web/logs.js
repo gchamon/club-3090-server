@@ -990,7 +990,7 @@ applyLogVisibility = function () {
   document.body.classList.toggle("logs-tab", isLogs);
   document.body.classList.toggle("log-popup-open", popupLogWindowOpen());
   document.body.classList.remove("audit-tab");
-  const card = document.querySelector(".logs.panel");
+  const card = $("logCard");
   const currentPopup = currentLogPopupTarget();
   const detached = popupLogWindowOpen(currentPopup.signature);
   if (card) card.classList.toggle("log-card-hidden", detached || !isLogs);

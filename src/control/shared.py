@@ -6285,8 +6285,9 @@ def _prepare_strata_orca(job_id, prefix, variant, env_map):
     if not token:
         raise RuntimeError("OrcaRouter requires HF_TOKEN already authorized for gated repository orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF.")
     data_root = os.path.abspath(str((variant or {}).get("strata_data_path") or ""))
-    if not data_root or not _path_is_within(os.path.join(CONTROL_DIR, "builtin-models"), data_root):
-        raise RuntimeError("Orca data path is outside the controller-owned builtin-models directory.")
+    model_root = os.path.abspath(_resolve_variant_model_dir_root({}))
+    if not data_root or not _path_is_within(model_root, data_root):
+        raise RuntimeError("Orca data path is outside the configured MODEL_DIR.")
     os.makedirs(data_root, exist_ok=True)
     filenames = [
         "Qwen3.8-Flash-Next-Uncensored-IQ3_XXS-00001-of-00002.gguf",
@@ -6312,10 +6313,11 @@ def _prepare_strata_orca(job_id, prefix, variant, env_map):
     image = str((variant or {}).get("strata_image") or "")
     config = {
         "exe": "build/strata",
-        "args": ["--pack", "/data/packs/orca-iq3_xxs", "--native", f"/data/{filenames[0]}", "--ple-gguf", f"/data/{filenames[0]}", "--expert-profile", "/opt/strata/data/expert-profile.bin", "--expert-cache", "auto", "--prefill", "512", "--spec", "4", "--spec-min-p", "0.5", "--mtp", "/data/mtp/rt", "--max-context", "32768", "--kv", "int8"],
+        "args": ["--pack", "/data/packs/orca-iq3_xxs", "--native", f"/data/{filenames[0]}", "--ple-gguf", f"/data/{filenames[0]}", "--expert-profile", "/opt/strata/data/expert-profile.bin", "--expert-cache", "auto", "--prefill", "512", "--spec", "4", "--spec-min-p", "0.5", "--mtp", "/data/mtp/rt", "--max-context", "262144", "--kv", "int8"],
         "cwd": "/opt/strata", "tokenizer": "/data/packs/orca-iq3_xxs/tokenizer",
         "model_name": "orcarouter-qwen3.8-flash-next-uncensored-iq3_xxs",
         "log": "/data/strata-orca-iq3_xxs.log", "host": "0.0.0.0", "port": 8080,
+        "fit_max_tokens": True,
     }
     config_dir = os.path.join(data_root, "config")
     os.makedirs(config_dir, exist_ok=True)
@@ -6360,58 +6362,93 @@ def _prepare_strata_orca(job_id, prefix, variant, env_map):
         raise RuntimeError("OrcaRouter compatibility pack is missing its packed model artifacts.")
 
 
+def _strata_setup_config_is_262k(config):
+    args = config.get("args") if isinstance(config, dict) else None
+    if not isinstance(args, list):
+        return False
+    try:
+        context_index = args.index("--max-context")
+    except ValueError:
+        return False
+    return context_index + 1 < len(args) and str(args[context_index + 1]) == "262144"
+
+
 def _prepare_strata_model(job_id, prefix, variant, env_map):
     data_root = os.path.abspath(str((variant or {}).get("strata_data_path") or ""))
     config_path = os.path.abspath(str((variant or {}).get("strata_config_path") or ""))
     compose_path = os.path.abspath(str((variant or {}).get("derived_compose_path") or ""))
     builtin_root = os.path.join(CONTROL_DIR, "builtin-models")
-    if not data_root or not _path_is_within(builtin_root, data_root):
-        raise RuntimeError("Strata data path is outside the controller-owned builtin-models directory.")
+    model_root = os.path.abspath(_resolve_variant_model_dir_root({}))
+    if not data_root or not _path_is_within(model_root, data_root):
+        raise RuntimeError("Strata data path is outside the configured MODEL_DIR.")
     if not config_path or not _path_is_within(data_root, config_path):
         raise RuntimeError("Strata setup config path is outside its controller-owned model data directory.")
     if not compose_path or not _path_is_within(builtin_root, compose_path):
         raise RuntimeError("Strata Compose file is outside the controller-owned builtin-models directory.")
-    if os.path.isfile(config_path):
-        append_audit_text_line(f"{prefix} Strata model setup already exists; skipping prefetch")
-        return
-    family = str((variant or {}).get("strata_family") or "").strip()
-    model_token = str((variant or {}).get("strata_model_token") or "").strip()
-    service = str((variant or {}).get("service_name") or "").strip()
-    if not family or not model_token or not service or not os.path.isfile(compose_path):
-        raise RuntimeError("Strata model setup metadata or generated Compose file is missing.")
-    config_name = os.path.basename(config_path)
-    api_key = ensure_strata_api_key()
-    if not api_key:
-        raise RuntimeError("Strata API key could not be read or created securely.")
-    setup_command = (
-        "set -e; cd /opt/strata; "
-        ".venv/bin/python setup.py --setup --yes "
-        f"--family {shlex.quote(family)} --model {shlex.quote(model_token)} "
-        "--context 32768 --vision no --data-dir /data "
-        '--host 0.0.0.0 --api-key "$API_KEY" --port 8080 --no-start --low-ram auto; '
-        f"mkdir -p /data/config; cp /opt/strata/{shlex.quote(config_name)} /data/config/{shlex.quote(config_name)}"
-    )
-    command = [
-        "docker", "compose", "-f", compose_path, "run", "--rm", "--no-deps",
-        "--entrypoint", "/bin/bash", service, "-lc", setup_command,
-    ]
-    prefetch_env = dict(env_map or {})
-    prefetch_env["STRATA_API_KEY"] = api_key
-    prefetch_env["PORT"] = "0"
-    process = subprocess.Popen(
-        command, cwd=CLUB3090_DIR, env=prefetch_env,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=False, bufsize=0,
-    )
-    _register_model_install_process(job_id, process)
-    try:
-        _stream_process_output_to_audit(process, prefix)
-        if int(process.wait()) != 0:
-            raise RuntimeError("Strata model download and setup failed.")
-    finally:
-        _clear_model_install_process(job_id, process)
-    if not os.path.isfile(config_path):
-        raise RuntimeError(f"Strata setup completed without prepared config {config_path}.")
 
+    config = None
+    if os.path.isfile(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if isinstance(loaded, dict):
+                config = loaded
+        except (OSError, ValueError):
+            pass
+    setup_needed = not _strata_setup_config_is_262k(config)
+    if setup_needed:
+        family = str((variant or {}).get("strata_family") or "").strip()
+        model_token = str((variant or {}).get("strata_model_token") or "").strip()
+        service = str((variant or {}).get("service_name") or "").strip()
+        if not family or not model_token or not service or not os.path.isfile(compose_path):
+            raise RuntimeError("Strata model setup metadata or generated Compose file is missing.")
+        config_name = os.path.basename(config_path)
+        api_key = ensure_strata_api_key()
+        if not api_key:
+            raise RuntimeError("Strata API key could not be read or created securely.")
+        setup_command = (
+            "set -e; cd /opt/strata; "
+            ".venv/bin/python setup.py --setup --yes "
+            f"--family {shlex.quote(family)} --model {shlex.quote(model_token)} "
+            "--context 262144 --vision no --data-dir /data "
+            '--host 0.0.0.0 --api-key "$API_KEY" --port 8080 --no-start --low-ram auto; '
+            f"mkdir -p /data/config; cp /opt/strata/{shlex.quote(config_name)} /data/config/{shlex.quote(config_name)}"
+        )
+        command = [
+            "docker", "compose", "-f", compose_path, "run", "--rm", "--no-deps",
+            "--entrypoint", "/bin/bash", service, "-lc", setup_command,
+        ]
+        prefetch_env = dict(env_map or {})
+        prefetch_env["STRATA_API_KEY"] = api_key
+        prefetch_env["PORT"] = "0"
+        process = subprocess.Popen(
+            command, cwd=CLUB3090_DIR, env=prefetch_env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=False, bufsize=0,
+        )
+        _register_model_install_process(job_id, process)
+        try:
+            _stream_process_output_to_audit(process, prefix)
+            if int(process.wait()) != 0:
+                raise RuntimeError("Strata model download and setup failed.")
+        finally:
+            _clear_model_install_process(job_id, process)
+        if not os.path.isfile(config_path):
+            raise RuntimeError(f"Strata setup completed without prepared config {config_path}.")
+        try:
+            with open(config_path, "r", encoding="utf-8") as handle:
+                config = json.load(handle)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"Strata setup produced an invalid config {config_path}: {exc}") from exc
+        if not isinstance(config, dict) or not _strata_setup_config_is_262k(config):
+            raise RuntimeError(f"Strata setup did not prepare a 262144-token context in {config_path}.")
+    if config.get("fit_max_tokens") is not True:
+        config["fit_max_tokens"] = True
+        write_json_atomic_if_changed(config_path, config, indent=2, sort_keys=True)
+    os.chmod(config_path, 0o600)
+    if setup_needed:
+        append_audit_text_line(f"{prefix} Strata model setup completed with a 262144-token context")
+    else:
+        append_audit_text_line(f"{prefix} Strata model setup is current; verified 262144-token context")
 
 def _run_model_install_job(job_id, model_id, variant_id, install_command, update_mode=False):
     prefix = f"[model-update {model_id}]" if update_mode else f"[model-install {model_id}]"
@@ -6482,9 +6519,11 @@ def _run_model_install_job(job_id, model_id, variant_id, install_command, update
                 if str(row.get("engine") or "").strip().lower() == "strata":
                     os.makedirs(str(row.get("strata_data_path") or ""), exist_ok=True)
             quoted_source = shlex.quote(source)
-            quoted_parent = shlex.quote(source_parent)
             quoted_commit = shlex.quote(expected_commit)
             quoted_image = shlex.quote(image)
+            image_label = str(globals().get("STRATA_IMAGE_COMMIT_LABEL") or "io.club3090.strata.commit")
+            inspect_format = shlex.quote(f'{{{{ index .Config.Labels "{image_label}" }}}}')
+            quoted_inspect_format = shlex.quote(inspect_format)
             shell_command = (
                 f"rebuild=0; "
                 f"if [ ! -d {quoted_source}/.git ]; then "
@@ -6494,8 +6533,10 @@ def _run_model_install_job(job_id, model_id, variant_id, install_command, update
                 f"git -C {quoted_source} fetch --depth 1 origin {quoted_commit} && "
                 f"git -C {quoted_source} checkout --detach {quoted_commit} && "
                 f"test \"$(git -C {quoted_source} rev-parse HEAD)\" = {quoted_commit} && "
-                f"if [ \"$rebuild\" = 1 ] || ! docker image inspect {quoted_image} >/dev/null 2>&1; "
-                f"then docker build -t {quoted_image} {quoted_source}; fi"
+                f"if [ \"$rebuild\" != 1 ] && [ \"$(docker image inspect --format {quoted_inspect_format} {quoted_image} 2>/dev/null || true)\" != {quoted_commit} ]; "
+                f"then rebuild=1; fi; "
+                f"if [ \"$rebuild\" = 1 ] || [ \"$(docker image inspect --format {quoted_inspect_format} {quoted_image} 2>/dev/null || true)\" != {quoted_commit} ]; "
+                f"then docker build --label {shlex.quote(image_label + '=' + expected_commit)} -t {quoted_image} {quoted_source}; fi"
             )
             install_command = "strata-image-build"
         else:

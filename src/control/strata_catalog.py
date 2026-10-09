@@ -3,6 +3,8 @@ import os
 
 
 STRATA_COMMIT = "82f46a8c8f475f001ad76d92f58f4a4f8ffb0253"
+
+STRATA_IMAGE_COMMIT_LABEL = "io.club3090.strata.commit"
 STRATA_IMAGE = "club3090-strata:v0.1.40.1"
 STRATA_FIT_GUIDANCE_GB = {"Q2_0": 37.6, "IQ2_XS": 39.2, "IQ3_XXS": 47.0, "IQ3_S": 54.8}
 STRATA_VARIANTS = (
@@ -27,7 +29,7 @@ def _strata_base_compose(model_token, family, service, data_root):
     environment:
       FAMILY: {family}
       MODEL: {model_token}
-      CONTEXT: "32768"
+      CONTEXT: "262144"
       VISION: "no"
       LOW_RAM: auto
       HOST: 0.0.0.0
@@ -69,16 +71,18 @@ def strata_setup_config_path(data_root, family, model_token, install_mode="stand
 
 
 def strata_builtin_custom_model_rows():
-    root = os.path.abspath(os.path.join(CONTROL_DIR, "builtin-models"))
-    source = os.path.join(root, "strata", "source")
+    control_root = os.path.abspath(os.path.join(CONTROL_DIR, "builtin-models"))
+    model_root = os.path.abspath(_resolve_variant_model_dir_root({}))
+    source = os.path.join(control_root, "strata", "source")
     rows = []
     for variant in STRATA_VARIANTS:
         slug = variant["slug"]
         model_token = variant["model"]
         selector = variant.get("selector") or f"strata/qwen3.8-flash-next-{slug}"
-        overlay = os.path.join(root, f"strata-qwen3.8-flash-next-{slug}" if variant["family"] == "qwen" else f"strata-{slug}")
+        overlay_name = f"strata-qwen3.8-flash-next-{slug}" if variant["family"] == "qwen" else f"strata-{slug}"
+        overlay = os.path.join(control_root, overlay_name)
         compose = os.path.join(overlay, "compose.yaml")
-        data = os.path.join(overlay, "data")
+        data = os.path.join(model_root, overlay_name)
         os.makedirs(overlay, exist_ok=True)
         text = _strata_base_compose(model_token, variant["family"], "strata", data)
         if variant.get("install_mode") == "orca":
@@ -100,7 +104,7 @@ def strata_builtin_custom_model_rows():
             "model_display_name": "Qwen 3.8 Flash Next", "profile_model_id": model_id,
             "profile_engine_id": "strata", "engine": "strata", "engine_display": "Strata",
             "engine_profile": "strata", "topology": "single", "compose_path": compose,
-            "compose_rel_path": os.path.relpath(compose, root).replace(os.sep, "/"),
+            "compose_rel_path": os.path.relpath(compose, control_root).replace(os.sep, "/"),
             "compose_meta": {"service_name": "strata", "port": 8080, "served_model_name": variant.get("served", "qwen3.8-flash-next")},
             "inventory_origin": "control_catalog", "source_kind": "curated", "custom_preset": True,
             "install_command": "strata-image-build", "install_reason": "Install the pinned Strata runtime and prepare its model data.",
@@ -115,7 +119,7 @@ def strata_builtin_custom_model_rows():
             "recommended_resident_memory_gb": variant.get("resident"),
             "requires_nvme": bool(variant.get("nvme")),
             "recommended_combined_memory_gb": variant.get("combined"),
-            "max_ctx": 32768, "vision": "no", "requires_min_gpu_count": 1, "requires_sm": "75+",
+            "max_ctx": 262144, "vision": "no", "requires_min_gpu_count": 1, "requires_sm": "75+",
             "caveats": variant.get("caveat") or (f"Combined RAM+VRAM fit guidance: {variant['combined']:g} GB; advisory only (Strata low-RAM mode)." if variant.get("combined") else ""),
         }
         rows.append(row)

@@ -758,7 +758,7 @@ body.resize-active * {
   color: #111;
   font-weight: 700;
 }
-.logs.panel {
+#logCard {
   display: none;
 }
 .log-card-hidden {
@@ -767,7 +767,7 @@ body.resize-active * {
 .logs-tab .container {
   min-height: calc(100dvh - 108px);
 }
-.logs-tab .logs.panel {
+.logs-tab #logCard {
   display: flex;
   flex-direction: column;
   height: auto;
@@ -778,22 +778,22 @@ body.resize-active * {
 .logs-tab .log {
   resize: none;
 }
-.logs.panel.log-card-update-mode {
+#logCard.log-card-update-mode {
   height: auto;
   min-height: 0;
 }
-.logs.panel.log-card-update-mode .resizable-surface-log {
+#logCard.log-card-update-mode .resizable-surface-log {
   min-height: 0;
 }
-.logs.panel.log-card-update-mode .surface-resize-handle {
+#logCard.log-card-update-mode .surface-resize-handle {
   display: none;
 }
-.logs.panel.log-card-update-mode .log {
+#logCard.log-card-update-mode .log {
   height: 540px;
   min-height: 540px;
   max-height: 540px;
 }
-.logs.panel.log-card-detached {
+#logCard.log-card-detached {
   display: none !important;
 }
 .logs-tab .content-tab {
@@ -8202,7 +8202,7 @@ details[open] > summary .score-collapse-cue::before {
     flex: 1 1 180px;
     max-width: none;
   }
-  .logs-tab .logs.panel {
+  .logs-tab #logCard {
     height: auto;
     min-height: 0;
   }

@@ -7326,7 +7326,7 @@ function sortInventoryVariants(rows) {
   });
 }
 function ensureDynamicPresetLayout() {
-  const presets = $("aiStudioTextModels");
+  const presets = $("aiStudioContent");
   if (!presets) return;
   const firstPanel = presets.querySelector(".panel");
   if (!firstPanel) return;
@@ -9894,8 +9894,7 @@ function renderAIStudioTab() {
   const typeHost = $("aiStudioModelTypes");
   const contentHost = $("aiStudioContent");
   const resourceView = $("aiStudioResourceView");
-  const textModels = $("aiStudioTextModels");
-  if (!typeHost || !contentHost || !resourceView || !textModels) return;
+  if (!typeHost || !contentHost || !resourceView) return;
   const counts = [
     ["text", "Text Models"],
     ["image", "Image Models"],
@@ -9906,7 +9905,7 @@ function renderAIStudioTab() {
   setHtmlIfChanged(typeHost, `<div class="ai-studio-summary-row">${counts.map(([key, label]) => `<button type="button" class="resource-manager-total-card ai-studio-model-type${aiStudioModelType === key ? " active" : ""}" aria-pressed="${aiStudioModelType === key ? "true" : "false"}" onclick="selectAIStudioModelType('${key}')"><span class="resource-manager-total-label">${label}</span><span class="resource-manager-total-value">${key === "text" ? aiStudioTextModelCount() : aiStudioModelTypeCount(key)}</span></button>`).join("")}</div>`);
   const textMode = aiStudioModelType === "text";
   resourceView.classList.toggle("hidden", textMode);
-  textModels.classList.toggle("hidden", !textMode);
+  contentHost.classList.toggle("hidden", !textMode);
   if (!textMode) setHtmlIfChanged(resourceView, renderAIStudioView());
 }
 function renderAIStudioView() {

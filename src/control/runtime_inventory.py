@@ -2498,7 +2498,7 @@ def _resolve_variant_model_dir_root(variant=None):
     if host_model_dir:
         return os.path.normpath(host_model_dir)
     env_map = _load_repo_env_map()
-    raw = str(env_map.get("MODEL_DIR") or "").strip()
+    raw = str(os.environ.get("MODEL_DIR") or env_map.get("MODEL_DIR") or "").strip()
     if not raw:
         return os.path.join(CLUB3090_DIR, "models-cache")
     if os.path.isabs(raw):
@@ -4312,6 +4312,27 @@ def _container_model_subpath(model_path):
     return path.strip("/")
 
 
+def strata_image_commit(image):
+    try:
+        result = subprocess.run(
+            [
+                "docker", "image", "inspect",
+                "--format", f'{{{{ index .Config.Labels "{STRATA_IMAGE_COMMIT_LABEL}" }}}}',
+                str(image or ""),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+    except Exception:
+        return ""
+    if result.returncode != 0:
+        return ""
+    return str(result.stdout or "").strip()
+
+
 def _detect_variant_install_state(variant, model_dir_root):
     if str((variant or {}).get("engine") or "").strip().lower() == "strata":
         source = str((variant or {}).get("strata_source_path") or os.path.join(CONTROL_DIR, "builtin-models", "strata", "source"))
@@ -4321,11 +4342,8 @@ def _detect_variant_install_state(variant, model_dir_root):
         except Exception:
             commit = ""
         source_ready = commit == STRATA_COMMIT
-        try:
-            image_exists = subprocess.run(["docker", "image", "inspect", image], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8).returncode == 0
-        except Exception:
-            image_exists = False
-        image_ready = image_exists
+        image_commit = strata_image_commit(image)
+        image_ready = image_commit == STRATA_COMMIT
         data = str((variant or {}).get("strata_data_path") or "")
         model_token = str((variant or {}).get("strata_model_token") or "")
         family = str((variant or {}).get("strata_family") or "")
@@ -4352,7 +4370,7 @@ def _detect_variant_install_state(variant, model_dir_root):
         if not source_ready:
             reasons.append(f"Pinned Strata source at {source} is not at commit {STRATA_COMMIT}.")
         if not image_ready:
-            reasons.append(f"Strata runtime image {image} is unavailable.")
+            reasons.append(f"Strata runtime image {image} is not built from pinned source commit {STRATA_COMMIT} (image label {STRATA_IMAGE_COMMIT_LABEL}={image_commit or 'missing'}).")
         if not config_ready:
             reasons.append(f"Strata model setup is incomplete: expected prepared config {config_path}.")
         if install_mode == "orca" and not artifacts_ready:
