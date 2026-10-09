@@ -1664,3 +1664,43 @@ finally:
         if evaluator_run.returncode:
             return False, f"Strata hardware evaluator smoke failed: {evaluator_run.stderr.strip() or evaluator_run.stdout.strip()}"
         return True, "ten Strata variants use isolated MODEL_DIR data roots, pinned-image labels, selector/token/family metadata, Orca preparation, and hardware evaluator behavior"
+
+
+def run_metrics_dashboard_smoke_test(root: Path) -> tuple[bool, str]:
+    root = Path(root).resolve()
+    script = r'''
+const fs = require("fs");
+const vm = require("vm");
+const window = { metricsPopupStates: {}, addEventListener() {} };
+const context = {
+  window, document: {}, console, setTimeout, clearTimeout, URLSearchParams,
+  Date, Math, Number, String, Object, Array, Map, Set, Promise,
+};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync("src/web/charts.js", "utf8"), context);
+const html = context.metricsPopupPanelHtml();
+const sections = ["Inference", "CPU + RAM", "GPU", "Network", "System"];
+for (const section of sections) {
+  if (!html.includes(`<h3 class="metric-section-title">${section}</h3>`)) {
+    throw new Error(`Missing Metrics section: ${section}`);
+  }
+}
+if ((html.match(/class="metricpane active"/g) || []).length !== sections.length) {
+  throw new Error("Metrics sections are not all simultaneously active");
+}
+if (html.includes("metricsSourceSelect")) throw new Error("Obsolete Source selector remains");
+if (!html.includes('id="metricsTimeValue"') || !html.includes('id="metricsTimeUnit"')) {
+  throw new Error("Time interval controls are missing");
+}
+console.log("all five Metrics sections render together with interval controls");
+'''
+    node = shutil.which("node")
+    if not node:
+        return False, "node executable required for Metrics dashboard smoke"
+    result = subprocess.run(
+        [node, "-e", script], cwd=str(root), capture_output=True,
+        text=True, check=False, timeout=15,
+    )
+    if result.returncode:
+        return False, f"Metrics dashboard smoke failed: {result.stderr.strip() or result.stdout.strip()}"
+    return True, result.stdout.strip()

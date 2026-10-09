@@ -1932,9 +1932,6 @@ post = async function (path, obj, label = "", options = {}) {
     throw e;
   }
 };
-metricTab = function (e, n) {
-  metricSourceChanged(n);
-};
 togglePowerOptimizations = async function () {
   const enable =
     $("optToggle") && $("optToggle").textContent.includes("Enable");

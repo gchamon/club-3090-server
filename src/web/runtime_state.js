@@ -584,7 +584,6 @@ function currentUiState() {
     : { value: 5, unit: "m" };
   return {
     active_tab: normalizeTabName(activeTabName),
-    active_metric_pane: typeof activeMetricPaneId === "function" ? activeMetricPaneId(document) : "mMain",
     metric_time_value: Number(metricInterval.value || 5),
     metric_time_unit: String(metricInterval.unit || "m"),
     tab_scroll_positions: { ...tabScrollPositions, [normalizeTabName(activeTabName)]: currentPageScrollTop() },
@@ -639,9 +638,6 @@ function hydrateUiState(cfg) {
       const key = normalizeTabName(name);
       tabScrollPositions[key] = Math.max(0, Number(value || 0));
     });
-  }
-  if (typeof setActiveMetricPaneInDocument === "function") {
-    setActiveMetricPaneInDocument(document, state.active_metric_pane || "mMain");
   }
   if (typeof setMetricIntervalState === "function") {
     setMetricIntervalState(state.metric_time_value, state.metric_time_unit, { persist: false, refresh: false });
