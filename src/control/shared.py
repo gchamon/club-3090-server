@@ -3945,8 +3945,18 @@ def run_model_update_check(reason="scheduled", inventory=None):
                 current_resources.pop(key, None)
         state["resources"] = current_resources
         state["last_check_finished_at"] = int(time.time())
-        append_audit_text_line(f"[model-update-check] {reason}: checked {checked} resource{'s' if checked != 1 else ''}")
-        return write_model_update_state(state).get("summary") or {}
+        summary = write_model_update_state(state).get("summary") or {}
+        is_scheduled = str(reason or "").strip().lower() == "scheduled"
+        pending = int(summary.get("pending") or 0)
+        errors = int(summary.get("errors") or 0)
+        if not is_scheduled:
+            append_audit_text_line(f"[model-update-check] {reason}: checked {checked} resource{'s' if checked != 1 else ''}")
+        elif pending or errors:
+            append_audit_text_line(
+                f"[model-update-check] scheduled: {pending} update{'s' if pending != 1 else ''} available, "
+                f"{errors} resource check error{'s' if errors != 1 else ''}"
+            )
+        return summary
     except Exception as exc:
         model_update_check_status["last_error"] = str(exc)
         append_audit_text_line(f"[model-update-check] {reason}: failed: {exc}")

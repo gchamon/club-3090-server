@@ -559,8 +559,10 @@ raise SystemExit(bool(result))
                 sys.executable, "-c",
                 "import control.shared as shared; events=[]; shared.append_audit_text_line=events.append; "
                 "shared.refresh_status_snapshot=lambda: None; "
+                "summary=shared.run_model_update_check('scheduled', {'variants': []}); "
+                "assert isinstance(summary, dict) and not events, (summary, events); "
                 "summary=shared.run_model_update_check('smoke', {'variants': []}); "
-                "assert isinstance(summary, dict); "
+                "assert isinstance(summary, dict) and any('checked 0 resources' in event for event in events), (summary, events); "
                 "assert not any('_repo_subprocess_env' in str(event) or 'NameError' in str(event) for event in events); "
                 "print('model update checker passed')",
             ],
