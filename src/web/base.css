@@ -848,10 +848,6 @@ body.resize-active * {
   align-items: stretch;
   gap: 10px;
 }
-.system-overview-grid > .chart {
-  height: auto;
-  min-height: 180px;
-}
 .system-overview-grid > .panel {
   margin-bottom: 0;
 }

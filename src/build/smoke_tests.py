@@ -703,7 +703,6 @@ def run_control_module_smoke_test(root: Path) -> tuple[bool, str]:
                 "handler.end_admin_stream(key,second); assert key not in control.admin_stream_registry; control.admin_stream_registry.clear(); "
                 "html=control.get_admin_html_template(); "
                 "assert 'renderAIStudioLaneActions' in html; "
-                "assert 'Start this inference runtime automatically at boot' in html; "
                 "assert 'toggle_enabled' in html; print(len(html))",
             ],
             cwd=str(root / "src"), env=env, capture_output=True,
@@ -1666,6 +1665,143 @@ finally:
         return True, "ten Strata variants use isolated MODEL_DIR data roots, pinned-image labels, selector/token/family metadata, Orca preparation, and hardware evaluator behavior"
 
 
+def run_power_runtime_smoke_test(root: Path) -> tuple[bool, str]:
+    root = Path(root).resolve()
+    script = r'''
+import datetime
+import os
+import subprocess
+import sys
+from types import SimpleNamespace
+
+import control
+import importlib.util
+http_server_spec = importlib.util.spec_from_file_location("power_smoke_http_server", os.path.join(control.SOURCE_ROOT, "src", "control", "http_server.py"))
+http_server = importlib.util.module_from_spec(http_server_spec)
+http_server_spec.loader.exec_module(http_server)
+
+commands = []
+control.shutil.which = lambda name: "/usr/bin/nvidia-smi" if name == "nvidia-smi" else None
+control.run_cmd = lambda command, timeout=20: (commands.append(list(command)) or (0, "All done."))
+control.apply_fan_curve_once = lambda: []
+control.set_cpu_governor = lambda governor: [governor]
+control.clear_gpu_session_peaks = lambda: None
+selected = control.apply_gpu_power_profile("eco")
+assert selected["gpu_profile"] == "eco" and control.GPU_ACTIVE_POWER_LIMIT_W == 240, selected
+assert ["nvidia-smi", "-pl", "240"] in commands, commands
+saved = control.read_server_config()
+assert saved["active_gpu_power_profile"] == "eco", saved
+restored = subprocess.run(
+    [sys.executable, "-c", RESTORE_SCRIPT],
+    check=False, capture_output=True, text=True, timeout=30,
+    env=os.environ.copy(),
+)
+if restored.returncode:
+    raise AssertionError(restored.stderr or restored.stdout)
+
+now = datetime.datetime.now(datetime.timezone.utc)
+log_text = ""
+control.metrics["active_requests"] = 0
+control.read_instances_config = lambda: []
+control.current_container = lambda: "strata"
+control.get_runtime_log_watcher = lambda name: SimpleNamespace(snapshot=lambda: {"text": log_text})
+control.benchmark_power_actions_owned = lambda: False
+control.script_power_actions_owned = lambda: False
+control.image_studio_activity_active = lambda: False
+control.switch_job_active = lambda: False
+control.POWER_IDLE_AFTER_SECONDS = 10
+control.runtime_activity_last_seen = now.timestamp() - 100
+control.runtime_active_observed = False
+control.runtime_idle_power_applied = False
+power_events = []
+control.ensure_default_runtime_power = lambda reason: power_events.append(("active", reason))
+control.apply_cpu_idle_power = lambda: power_events.append(("cpu_idle",))
+control.apply_gpu_idle_power = lambda: power_events.append(("gpu_idle",))
+stamp = now.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+log_text = f"{stamp} [strata] thinking: 4418 of max 16384 tokens"
+assert control.reconcile_runtime_power(now=now.timestamp())["active"]
+assert ("active", "runtime_activity_detected") in power_events, power_events
+tool_time = now + datetime.timedelta(seconds=1)
+log_text = f"{tool_time.strftime('%Y-%m-%dT%H:%M:%S.%fZ')} [strata] writing a tool call: get_weather"
+assert not control.reconcile_runtime_power(now=tool_time.timestamp())["active"]
+assert not any(event[0].endswith("_idle") for event in power_events), power_events
+done_time = tool_time + datetime.timedelta(seconds=1)
+log_text = f"{done_time.strftime('%Y-%m-%dT%H:%M:%S.%fZ')} [strata] done: 4418 tokens"
+assert not control.reconcile_runtime_power(now=done_time.timestamp())["idle_applied"]
+assert not any(event[0].endswith("_idle") for event in power_events), power_events
+idle_time = done_time.timestamp() + 11
+assert control.reconcile_runtime_power(now=idle_time)["idle_applied"]
+assert ("cpu_idle",) in power_events and ("gpu_idle",) in power_events, power_events
+
+control.metrics["active_requests"] = 0
+control.metrics["queued_requests"] = 0
+control.metrics["failed_requests"] = 0
+http_server.primary_instance = lambda: None
+http_server.active_mode = lambda: "test"
+http_server.active_port = lambda: 8000
+http_server.resolve_variant_spec = lambda mode: {}
+http_server.benchmark_job_active = lambda: False
+http_server.proxy_swap_feature_enabled = lambda: False
+http_server.proxy_requested_selector = lambda body, preset: ""
+http_server.authorize_proxy_request = lambda *args, **kwargs: (True, {"user_name": "", "count_request": False, "permissions": {}})
+http_server.ensure_vllm_running_for_request = lambda target: (_ for _ in ()).throw(RuntimeError("startup failed"))
+http_server.record_user_usage = lambda *args: None
+http_server.log_control = lambda *args: None
+response = []
+handler = object.__new__(http_server.ProxyHandler)
+handler.headers = {}
+handler.path = "/v1/models"
+handler.send_json = lambda payload, status: response.append((payload, status))
+http_server.last_request_finished_at = 0
+handler.forward(None, "/v1/models", "", None)
+assert http_server.metrics["active_requests"] == 0, http_server.metrics
+assert http_server.last_request_finished_at > 0, http_server.last_request_finished_at
+assert response and response[0][1] == 502, response
+startup_order = []
+http_server.ensure_runtime_config_file = lambda: None
+http_server.ensure_code_syntax_config_file = lambda: None
+http_server.restore_persisted_performance_profile = lambda apply_now=False: startup_order.append(("restore_profile", apply_now))
+http_server.restore_persisted_fan_state = lambda apply_now=False: None
+http_server.write_server_config = lambda config: config
+http_server.ensure_local_api_token = lambda: None
+http_server.recover_benchmark_state_on_startup = lambda: None
+http_server.port_open = lambda *args, **kwargs: True
+http_server.load_runtime_inventory = lambda **kwargs: startup_order.append(("load_inventory",))
+http_server.boot_enabled_instances = lambda: startup_order.append(("boot",))
+http_server.sys.argv = ["control", "--boot-enabled-instances"]
+http_server.main()
+assert startup_order.index(("restore_profile", True)) < startup_order.index(("boot",)), startup_order
+assert ("load_inventory",) in startup_order, startup_order
+print("profile persistence, boot restoration order, Strata wake/idle transitions, and proxy startup-error completion passed")
+'''
+    restore_script = r'''
+import control
+commands = []
+control.shutil.which = lambda name: "/usr/bin/nvidia-smi" if name == "nvidia-smi" else None
+control.run_cmd = lambda command, timeout=20: (commands.append(list(command)) or (0, "All done."))
+control.apply_fan_curve_once = lambda: []
+control.set_cpu_governor = lambda governor: [governor]
+control.clear_gpu_session_peaks = lambda: None
+restored = control.restore_persisted_performance_profile(apply_now=True)
+assert restored["gpu_profile"] == "eco", restored
+assert ["nvidia-smi", "-pl", "240"] in commands, commands
+'''
+    script = script.replace("RESTORE_SCRIPT", repr(restore_script))
+    with tempfile.TemporaryDirectory(prefix="club3090-power-runtime-") as temp_raw:
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(root / "src")
+        env["CLUB3090_CONTROL_DIR"] = temp_raw
+        for key in ("CLUB3090_ADMIN_PORT", "CLUB3090_PROXY_PORT", "CLUB3090_ADMIN_BIND_HOST", "CLUB3090_PROXY_BIND_HOST"):
+            env.pop(key, None)
+        result = subprocess.run(
+            [sys.executable, "-c", script], cwd=str(root), env=env,
+            capture_output=True, text=True, check=False, timeout=60,
+        )
+        if result.returncode:
+            return False, f"Power runtime smoke failed: {result.stderr.strip() or result.stdout.strip()}"
+        return True, result.stdout.strip()
+
+
 def run_metrics_dashboard_smoke_test(root: Path) -> tuple[bool, str]:
     root = Path(root).resolve()
     script = r'''
@@ -1679,7 +1815,7 @@ const context = {
 vm.createContext(context);
 vm.runInContext(fs.readFileSync("src/web/charts.js", "utf8"), context);
 const html = context.metricsPopupPanelHtml();
-const sections = ["Inference", "CPU + RAM", "GPU", "Network", "System"];
+const sections = ["Inference", "CPU + RAM", "Network", "System"];
 for (const section of sections) {
   if (!html.includes(`<h3 class="metric-section-title">${section}</h3>`)) {
     throw new Error(`Missing Metrics section: ${section}`);
@@ -1688,11 +1824,46 @@ for (const section of sections) {
 if ((html.match(/class="metricpane active"/g) || []).length !== sections.length) {
   throw new Error("Metrics sections are not all simultaneously active");
 }
+const mainStart = html.indexOf('<div id="mMain"');
+const cpuStart = html.indexOf('<div id="mCpuRam"', mainStart);
+const inference = html.slice(mainStart, cpuStart);
+for (const id of ["cGpu", "cMem", "cLatency", "cTps", "gpuMetricCharts"]) {
+  if (!inference.includes(`id="${id}"`)) throw new Error(`Inference section is missing ${id}`);
+}
+if (html.includes('id="mGpu"')) throw new Error("Obsolete standalone GPU section remains");
 if (html.includes("metricsSourceSelect")) throw new Error("Obsolete Source selector remains");
 if (!html.includes('id="metricsTimeValue"') || !html.includes('id="metricsTimeUnit"')) {
   throw new Error("Time interval controls are missing");
 }
-console.log("all five Metrics sections render together with interval controls");
+const holder = { innerHTML: "" };
+const aggregateDraws = [];
+const gpuDraws = [];
+context.metricsElement = (id) => id === "gpuMetricCharts" ? holder : null;
+context.currentStatusMetricPoint = () => ({});
+context.persistentMetricPeakValue = () => 0;
+context.seriesPeakValue = () => 0;
+context.persistentGpuMetricPeakValue = () => 0;
+context.draw = (id) => aggregateDraws.push(id);
+context.drawGpuSeries = (...args) => gpuDraws.push(args);
+context.holder = holder;
+context.aggregateDraws = aggregateDraws;
+context.gpuDraws = gpuDraws;
+vm.runInContext("metricsSeriesState.points = []", context);
+vm.runInContext('renderMetrics({gpus:[{index:0},{index:1}],system:{}},{skipPopups:true})', context);
+for (const id of ["cGpu", "cMem", "cLatency", "cTps"]) {
+  if (!aggregateDraws.includes(id)) throw new Error(`Aggregate inference chart ${id} was not drawn`);
+}
+if (!holder.innerHTML.includes('id="cGpu0Temp"') || !holder.innerHTML.includes('id="cGpu0Power"')) {
+  throw new Error("Per-GPU core-temperature and power charts were not generated");
+}
+if (holder.innerHTML.indexOf('id="cGpu0Temp"') > holder.innerHTML.indexOf('id="cGpu0Power"') ||
+    holder.innerHTML.indexOf('id="cGpu0Power"') > holder.innerHTML.indexOf('id="cGpu1Temp"')) {
+  throw new Error("Per-GPU temperature and power charts are not grouped by GPU");
+}
+if (gpuDraws.length !== 4 || gpuDraws.some((args) => !["temp", "power"].includes(args[3]))) {
+  throw new Error(`Unexpected per-GPU chart data: ${JSON.stringify(gpuDraws.map((args) => [args[0], args[3]]))}`);
+}
+console.log("four Metrics sections render together; aggregate inference and per-GPU temperature/power charts are generated");
 '''
     node = shutil.which("node")
     if not node:

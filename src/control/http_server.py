@@ -2543,6 +2543,8 @@ class ProxyHandler(CommonMixin, BaseHTTPRequestHandler):
                 metrics["failed_requests"] += 1
                 metrics["last_latency_s"] = latency
                 metrics["last_status"] = status
+                if metrics["active_requests"] == 0:
+                    last_request_finished_at = time.time()
             record_user_usage(auth_context.get("user_name"), auth_context.get("count_request", False), status, request_usage, response_usage, latency)
             log_control(f"PROXY startup failed requested={requested_selector or ''} instance={target_id} queued={queued_for_swap} error={startup_error}")
             self.send_json({
@@ -2981,6 +2983,7 @@ def main():
         return
     if len(sys.argv) > 1 and sys.argv[1] == "--boot-enabled-instances":
         load_runtime_inventory(force=not os.path.exists(RUNTIME_INVENTORY_FILE), rebuild_if_missing=True)
+        restore_persisted_performance_profile(apply_now=True)
         boot_enabled_instances()
         return
     log_control("control service starting")
