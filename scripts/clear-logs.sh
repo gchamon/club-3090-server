@@ -14,6 +14,14 @@ if [[ ! -d "${CONTROL_DIR}" ]]; then
   printf 'Control directory does not exist: %s\n' "${CONTROL_DIR}" >&2
   exit 1
 fi
+for directory in "${CONTROL_DIR}" "${CONTROL_DIR}/benchmarks"; do
+  [[ ! -d "${directory}" ]] && continue
+  if [[ ! -r "${directory}" || ! -x "${directory}" ]]; then
+    printf 'No read/search permission for log directory: %s (run with sudo if needed)\n' "${directory}" >&2
+    exit 1
+  fi
+done
+
 
 for file in "${LOG_FILES[@]}"; do
   [[ ! -e "${file}" && ! -L "${file}" ]] && continue
