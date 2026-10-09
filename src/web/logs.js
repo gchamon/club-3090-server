@@ -882,21 +882,11 @@ function logPopoutButtonSvg(detached = false) {
     ? '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 19H5v-5m0 5 7-7" fill="none" /><path d="M14 17h3a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2H9a2 2 0 0 0-2 2v3" fill="none" /></svg>'
     : '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 5h5v5m0-5-7 7" fill="none" /><path d="M10 7H7a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-3" fill="none" /></svg>';
 }
-function currentLogSettingsKey() {
-  return currentLogPopupTarget().signature || String(currentLogSource || "docker");
-}
-function currentLogGlobalEnabled() {
-  const key = currentLogSettingsKey();
-  if (Object.prototype.hasOwnProperty.call(showGlobalLogSources, key)) {
-    return !!showGlobalLogSources[key];
-  }
-  return !!showGlobalLogs;
-}
 function currentLogSourceDetached() {
   return popupLogWindowOpen(currentLogPopupTarget().signature);
 }
 function logViewerVisible() {
-  return !currentLogSourceDetached() && (activeTabName === "logs" || effectiveShowGlobalLogs());
+  return !currentLogSourceDetached() && activeTabName === "logs";
 }
 function logIsNearBottom(box = $("logRender") || $("log")) {
   if (!box) return true;
@@ -1003,17 +993,9 @@ applyLogVisibility = function () {
   const card = document.querySelector(".logs.panel");
   const currentPopup = currentLogPopupTarget();
   const detached = popupLogWindowOpen(currentPopup.signature);
-  if (card)
-    card.classList.toggle(
-      "log-card-hidden",
-      detached || (!isLogs && !effectiveShowGlobalLogs()),
-    );
+  if (card) card.classList.toggle("log-card-hidden", detached || !isLogs);
   if (card) card.classList.toggle("log-card-update-mode", currentLogSource === "update");
   if ($("logTitle")) $("logTitle").textContent = currentLogHeading();
-  if ($("showGlobalLogs")) {
-    $("showGlobalLogs").checked = effectiveShowGlobalLogs();
-    $("showGlobalLogs").disabled = currentLogSourceDetached();
-  }
   if ($("logPopoutBtn")) {
     const updatePopoutBlocked = updateMonitor.active && currentLogSource === "update";
     $("logPopoutBtn").title = detached ? "Reattach logs" : "Pop out logs";
@@ -1221,10 +1203,9 @@ async function downloadAllLogs() {
   }
 }
 async function refreshBackgroundLogCaches() {
+  if (!logViewerVisible()) return;
   const currentSource = String(currentLogSource || "docker");
-  const ordered = logViewerVisible()
-    ? Array.from(knownLogSources).filter((source) => source !== currentSource)
-    : [currentSource, ...Array.from(knownLogSources).filter((source) => source !== currentSource)];
+  const ordered = Array.from(knownLogSources).filter((source) => source !== currentSource);
   for (const source of ordered) {
     if (source === "update") continue;
     try {
@@ -1233,13 +1214,13 @@ async function refreshBackgroundLogCaches() {
   }
 }
 function scheduleLogCacheRefresh(delayMs = LOG_CACHE_REFRESH_MS) {
-  logCacheRefreshNonce += 1;
-  if (logCacheRefreshTimer) clearInterval(logCacheRefreshTimer);
-  const delay = Math.max(LOG_CACHE_REFRESH_MS, Number(delayMs || LOG_CACHE_REFRESH_MS));
+  clearInterval(logCacheRefreshTimer);
+  logCacheRefreshTimer = null;
+  const delay = Number(delayMs);
+  if (!(delay > 0) || !logViewerVisible()) return;
   logCacheRefreshTimer = setInterval(() => {
     refreshBackgroundLogCaches().catch(() => {});
-  }, delay);
-  if (delayMs === 0) refreshBackgroundLogCaches().catch(() => {});
+  }, Math.max(LOG_CACHE_REFRESH_MS, delay));
 }
 function scheduleLogStreamReconnect(delayMs = 5000) {
   if (logReconnectTimer) clearTimeout(logReconnectTimer);
@@ -1785,21 +1766,9 @@ setCurrentLogSource = function (source, options = {}) {
   noteKnownLogSource(currentLogSource);
   applyLogVisibility();
   if (typeof writeUiStateToLocation === "function") writeUiStateToLocation({ active_tab: activeTabName, current_log_source: currentLogSource });
-  connectLogs(true);
-  scheduleLogCacheRefresh(LOG_CACHE_REFRESH_MS);
-  updateLogVisualMode();
-};
-setShowGlobalLogs = function (v) {
-  showGlobalLogs = !!v;
-  showGlobalLogSources[currentLogSettingsKey()] = !!v;
-  window.showGlobalLogSources = showGlobalLogSources;
-  applyLogVisibility();
-  queueUiStateSave({
-    show_global_logs: showGlobalLogs,
-    show_global_logs_by_source: { ...showGlobalLogSources },
-  });
-  connectLogs(false);
+  if (logViewerVisible()) connectLogs(true);
   scheduleLogCacheRefresh(logViewerVisible() ? LOG_CACHE_REFRESH_MS : 0);
+  updateLogVisualMode();
 };
 setScope = function (scope, reconnect = true) {
   const ids = new Set(scopeItems().map((x) => x.id));
@@ -1816,7 +1785,7 @@ setScope = function (scope, reconnect = true) {
   updateScopedCards();
   applyLogVisibility();
   queueUiStateSave();
-  if (reconnect) connectLogs(true);
+  if (reconnect && logViewerVisible()) connectLogs(true);
 };
 function focusAuditLogs() {
   if (currentLogSource !== "audit") setCurrentLogSource("audit");

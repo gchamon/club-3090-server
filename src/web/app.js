@@ -5574,10 +5574,6 @@ function renderStatusUi(j, previousStatus = null, options = {}) {
   const power = j?.power || {};
   const renderErrors = [];
   if (j?.benchmarks?.job) syncBenchmarkModalControlLock(j.benchmarks.job, j.benchmarks);
-  if ($("showGlobalLogs")) {
-    $("showGlobalLogs").checked = effectiveShowGlobalLogs();
-    $("showGlobalLogs").disabled = currentLogSourceDetached();
-  }
   renderStatusSurface("connection", j.__status_cache, () => renderStatusConnectionBanner(j), renderErrors);
   renderStatusSurface("overview", [
     j.metrics, j.power, j.system, j.system_metric_peaks, j.uptime_seconds,
@@ -5635,7 +5631,7 @@ function renderStatusUi(j, previousStatus = null, options = {}) {
   }
   safeRenderStep("tab sync", () => syncActiveTabDisplay(), renderErrors);
   reconcileUpdateUiFromStatus(j);
-  if (activeTabName === "logs" || effectiveShowGlobalLogs()) connectLogs(false);
+  if (activeTabName === "logs") connectLogs(false);
   if (!options.cached) {
     handleSwitchJobTransition(previousStatus, j);
     handleBenchmarkJobTransition(previousStatus, j);
@@ -9849,11 +9845,12 @@ function renderAIStudioRuntimePanel(status = lastStatus) {
   const instances = Array.isArray(status?.instances) ? status.instances : [];
   const runtimes = Array.isArray(status?.running_runtimes) ? status.running_runtimes : [];
   const rows = instances.filter((item) => String(item?.mode || "").trim());
+  const header = `<div class="ai-studio-runtime-head"><strong>Inference runtimes</strong><a class="btn" href="/admin/logs?log_source=docker">Logs</a></div>`;
   if (!rows.length) {
-    setHtmlIfChanged(host, `<div class="ai-studio-runtime-empty">No inference engine is selected or running.</div>`);
+    setHtmlIfChanged(host, `${header}<div class="ai-studio-runtime-empty">No inference engine is selected or running.</div>`);
     return;
   }
-  setHtmlIfChanged(host, `<div class="ai-studio-runtime-head"><strong>Inference runtimes</strong></div><div class="ai-studio-runtime-rows">${rows.map((item) => {
+  setHtmlIfChanged(host, `${header}<div class="ai-studio-runtime-rows">${rows.map((item) => {
     const runtime = runtimes.find((row) => String(row?.id || "").toUpperCase() === String(item.id || "").toUpperCase()) || {};
     const variant = findVariantBySelector(item.mode);
     const active = !!(runtime.running ?? item.running);

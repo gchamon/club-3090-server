@@ -3,7 +3,6 @@ let selectedInstance = "GPU0";
 let logEs = null;
 let logReconnectTimer = null;
 let logCacheRefreshTimer = null;
-let logCacheRefreshNonce = 0;
 let statusPollTimer = null;
 let statusRenderSignatures = Object.create(null);
 let statusOutageStartedAt = 0;

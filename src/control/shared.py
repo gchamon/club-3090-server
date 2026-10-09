@@ -7501,7 +7501,6 @@ def system_metric_peaks_snapshot():
 
 def read_ui_config():
     default = {
-        "show_global_logs": True,
         "active_tab": "overview",
         "selected_scope": "GPU0",
         "current_log_source": "docker",
@@ -7512,8 +7511,6 @@ def read_ui_config():
         if not isinstance(data, dict):
             return default
         merged = dict(default)
-        if "show_global_logs" in data:
-            merged["show_global_logs"] = bool(data.get("show_global_logs"))
         if str(data.get("active_tab") or "") in {"overview", "system", "presets", "users", "metrics", "logs", "audit", "chat"}:
             merged["active_tab"] = str(data.get("active_tab"))
         current_log_source = str(data.get("current_log_source") or "").strip()
@@ -7528,8 +7525,6 @@ def read_ui_config():
 def write_ui_config(data):
     current = read_ui_config()
     original = dict(current)
-    if "show_global_logs" in data:
-        current["show_global_logs"] = bool(data["show_global_logs"])
     if str(data.get("active_tab") or "") in {"overview", "system", "presets", "users", "metrics", "logs", "audit", "chat"}:
         current["active_tab"] = str(data.get("active_tab"))
     current_log_source = str(data.get("current_log_source") or "").strip()

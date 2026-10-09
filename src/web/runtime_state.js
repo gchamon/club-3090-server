@@ -592,8 +592,6 @@ function currentUiState() {
     ai_studio_model_type: normalizeAIStudioModelType(aiStudioModelType) || "image",
     current_log_source: normalizeUiLogSource(currentLogSource),
     selected_log_instance_id: String(selectedLogInstanceId || ""),
-    show_global_logs: !!showGlobalLogs,
-    show_global_logs_by_source: { ...showGlobalLogSources },
   };
 }
 function queueUiStateSave(extra = {}) {
@@ -650,16 +648,6 @@ function hydrateUiState(cfg) {
   }
   aiStudioModelType = normalizeAIStudioModelType(state.ai_studio_model_type) || aiStudioModelType;
   currentLogSource = normalizeUiLogSource(state.current_log_source);
-  showGlobalLogs =
-    typeof state.show_global_logs === "boolean"
-      ? state.show_global_logs
-      : showGlobalLogs;
-  showGlobalLogSources =
-    state.show_global_logs_by_source &&
-    typeof state.show_global_logs_by_source === "object"
-      ? { ...state.show_global_logs_by_source }
-      : showGlobalLogSources;
-  window.showGlobalLogSources = showGlobalLogSources;
   const ids = new Set(scopeItems().map((x) => x.id));
   const candidate = state.selected_scope || selectedScope || "GLOBAL";
   selectedScope =

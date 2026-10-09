@@ -758,6 +758,9 @@ body.resize-active * {
   color: #111;
   font-weight: 700;
 }
+.logs.panel {
+  display: none;
+}
 .log-card-hidden {
   display: none !important;
 }
@@ -5566,6 +5569,12 @@ details[open] > summary .score-collapse-cue::before {
   border: 1px solid #2e4b67;
   border-radius: 10px;
   background: rgba(15, 28, 42, 0.72);
+}
+.ai-studio-runtime-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
 }
 .ai-studio-runtime-empty {
   color: #b8c8d8;

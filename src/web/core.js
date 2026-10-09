@@ -17,9 +17,6 @@ const DETACHED_METRICS_MODE = urlParams.get("detached") === "metrics";
 const DETACHED_METRICS_INITIAL_PANE = String(urlParams.get("pane") || "").trim();
 let lastStatus = null;
 let activeTabName = "overview";
-let showGlobalLogs = true;
-let showGlobalLogSources =
-  window.showGlobalLogSources || (window.showGlobalLogSources = Object.create(null));
 let currentLogSource = "docker";
 let selectedScriptLogJobId = "";
 const knownLogSources = new Set(["docker", "audit", "debug", "benchmarks", "script"]);
@@ -121,9 +118,6 @@ function popupLogWindowActive(signature = "") {
     } catch (e) {}
     return Date.now() - Number(state?.lastActiveAt || 0) < 2000;
   });
-}
-function effectiveShowGlobalLogs() {
-  return currentLogGlobalEnabled() && !currentLogSourceDetached();
 }
 function escapeHtml(value) {
   return String(value || "")
